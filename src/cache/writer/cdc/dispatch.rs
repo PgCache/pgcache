@@ -393,7 +393,9 @@ impl WriterCdc {
         change: SchemaChange,
     ) -> CacheResult<()> {
         for created in change.partitions_created {
-            core.table_partition_add(created);
+            core.table_partition_add(created)
+                .await
+                .attach_loc("a partition created under a cached table")?;
         }
         let signalled = change
             .altered_tables
@@ -433,6 +435,17 @@ impl WriterCdc {
                 core.publication_oids.remove(&relation_oid);
             }
         }
+        if change.views_changed {
+            let cached: Vec<Oid> = core
+                .cache
+                .tables
+                .iter()
+                .map(|table| table.relation_oid)
+                .collect();
+            core.write_aliases_reload(&cached)
+                .await
+                .attach_loc("a view changed on origin")?;
+        }
         Ok(())
     }
 
@@ -458,6 +471,7 @@ impl WriterCdc {
         if let Some(table) = core.cache.tables.remove1(&relation_oid) {
             core.forgotten_tables.push(table);
             core.relations_dirty = true;
+            core.write_aliases_publish();
         }
         Ok(())
     }

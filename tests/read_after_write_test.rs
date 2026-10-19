@@ -1057,3 +1057,156 @@ async fn test_gate_update_of_unreferenced_column_serves_join_read() -> Result<()
 
     Ok(())
 }
+
+// ==================== partition and view aliases (PGC-447) ====================
+
+/// PGC-447: a write to a partition child is matched to a cached read of the
+/// partitioned root. The root, not the child, is the relation the read names
+/// and CDC streams under `publish_via_partition_root`. The insert keeps its
+/// row-level precision through the alias: a read disjoint from the inserted
+/// row still serves.
+#[tokio::test]
+async fn test_gate_matches_partition_child_write_to_cached_root() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&RAW_LAG).await?;
+    ctx.query(
+        "CREATE TABLE pr (id int primary key, v int) PARTITION BY RANGE (id)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "CREATE TABLE pr_lo PARTITION OF pr FOR VALUES FROM (0) TO (100)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "CREATE TABLE pr_hi PARTITION OF pr FOR VALUES FROM (100) TO (200)",
+        &[],
+    )
+    .await?;
+    ctx.query("INSERT INTO pr VALUES (1, 10), (2, 20)", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+
+    // Narrow read first: registered after the full one it would be subsumed.
+    register(&mut ctx, "SELECT id, v FROM pr WHERE id = 1").await?;
+    register(&mut ctx, "SELECT id, v FROM pr").await?;
+
+    // Insert straight into the child; a read of the root must see it under
+    // lag (a stale hit returns 2 rows).
+    ctx.simple_query("INSERT INTO pr_lo (id, v) VALUES (3, 30)")
+        .await?;
+    let res = ctx.simple_query("SELECT id, v FROM pr").await?;
+    assert_eq!(
+        row_count(&res),
+        3,
+        "a read of the root must see the connection's insert into its partition"
+    );
+    // The disjoint read of the root still serves: the rows came over with
+    // the alias.
+    let m = ctx.metrics().await?;
+    let _ = ctx
+        .simple_query("SELECT id, v FROM pr WHERE id = 1")
+        .await?;
+    let _ = assert_cache_hit(&mut ctx, m).await?;
+
+    ctx.cdc_apply_settle().await?;
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query("SELECT id, v FROM pr").await?;
+    assert_eq!(row_count(&res), 3);
+    let _ = assert_cache_hit(&mut ctx, m).await?;
+    Ok(())
+}
+
+/// PGC-447, the other direction: a partition cached on its own, written
+/// through its root.
+#[tokio::test]
+async fn test_gate_matches_root_write_to_cached_partition() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&RAW_LAG).await?;
+    ctx.query(
+        "CREATE TABLE pc (id int primary key, v int) PARTITION BY RANGE (id)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "CREATE TABLE pc_lo PARTITION OF pc FOR VALUES FROM (0) TO (100)",
+        &[],
+    )
+    .await?;
+    ctx.query("INSERT INTO pc VALUES (1, 10), (2, 20)", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+
+    register(&mut ctx, "SELECT id, v FROM pc_lo").await?;
+
+    ctx.simple_query("INSERT INTO pc VALUES (3, 30)").await?;
+    let res = ctx.simple_query("SELECT id, v FROM pc_lo").await?;
+    assert_eq!(
+        row_count(&res),
+        3,
+        "a read of the partition must see the connection's insert through its root"
+    );
+
+    ctx.cdc_apply_settle().await?;
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query("SELECT id, v FROM pc_lo").await?;
+    assert_eq!(row_count(&res), 3);
+    let _ = assert_cache_hit(&mut ctx, m).await?;
+    Ok(())
+}
+
+/// PGC-447: a write through an auto-updatable view is matched to a cached
+/// read of the base table.
+#[tokio::test]
+async fn test_gate_matches_view_write_to_base_table() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&RAW_LAG).await?;
+    ctx.query("CREATE TABLE vb (id int primary key, v int)", &[])
+        .await?;
+    ctx.query("CREATE VIEW vb_view AS SELECT id, v FROM vb", &[])
+        .await?;
+    ctx.query("INSERT INTO vb VALUES (1, 10)", &[]).await?;
+    ctx.cdc_apply_settle().await?;
+
+    let q = "SELECT id, v FROM vb WHERE id = 1";
+    register(&mut ctx, q).await?;
+
+    ctx.simple_query("UPDATE vb_view SET v = 99 WHERE id = 1")
+        .await?;
+    let res = ctx.simple_query(q).await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("v", "99")])?;
+
+    ctx.cdc_apply_settle().await?;
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(q).await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("v", "99")])?;
+    let _ = assert_cache_hit(&mut ctx, m).await?;
+    Ok(())
+}
+
+/// PGC-447: a view created after the base table was cached is learned from
+/// the schema-change signal (ADR-058), so a write through it is matched too.
+#[tokio::test]
+async fn test_gate_learns_view_created_after_registration() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&RAW_LAG).await?;
+    ctx.query("CREATE TABLE vl (id int primary key, v int)", &[])
+        .await?;
+    ctx.query("INSERT INTO vl VALUES (1, 10)", &[]).await?;
+    ctx.cdc_apply_settle().await?;
+
+    let q = "SELECT id, v FROM vl WHERE id = 1";
+    register(&mut ctx, q).await?;
+
+    // The DDL itself is a connection-scoped write on this connection; let it
+    // and the signal settle so only the view write below is pending.
+    ctx.query("CREATE VIEW vl_view AS SELECT id, v FROM vl", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+    let m = ctx.metrics().await?;
+    let _ = ctx.simple_query(q).await?;
+    let _ = assert_cache_hit(&mut ctx, m).await?;
+
+    ctx.simple_query("UPDATE vl_view SET v = 99 WHERE id = 1")
+        .await?;
+    let res = ctx.simple_query(q).await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("v", "99")])?;
+    Ok(())
+}

@@ -251,6 +251,20 @@ pub enum WriteClass {
     ConnectionUnstampable,
 }
 
+impl WriteClass {
+    /// The target relation of a table-scoped write; `None` for the
+    /// connection-scoped classes.
+    pub fn relation(&self) -> Option<&RelationRef> {
+        match self {
+            WriteClass::InsertRows(insert) => Some(&insert.relation),
+            WriteClass::DeleteRows(delete) => Some(&delete.relation),
+            WriteClass::UpdateRows(update) => Some(&update.relation),
+            WriteClass::Table(relation) => Some(relation),
+            WriteClass::Connection | WriteClass::ConnectionUnstampable => None,
+        }
+    }
+}
+
 /// One VALUES row, positionally aligned with [`InsertStatement::columns`].
 /// `None` = cell value unknown (DEFAULT, cast, expression, ...) — a cell
 /// that can never prove disjointness.

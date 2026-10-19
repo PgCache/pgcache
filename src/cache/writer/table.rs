@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use ecow::EcoString;
@@ -9,10 +10,11 @@ use tracing::{debug, error, info, instrument, warn};
 
 use super::core::WriterCore;
 use crate::cache::messages::PartitionCreated;
+use crate::cache::types::WriteAliasMap;
 use crate::cache::{CacheError, CacheResult, MapIntoReport};
 use crate::catalog::{
-    CatalogTable, ColumnMetadata, ColumnPosition, ColumnStore, IndexMetadata, TableMetadata,
-    cache_type_name_resolve,
+    CatalogTable, ColumnMetadata, ColumnPosition, ColumnStore, IndexMetadata, RelationName,
+    TableMetadata, WriteAlias, cache_type_name_resolve,
 };
 use crate::oid::{Oid, TypeOid};
 use crate::result::error_chain_format;
@@ -172,6 +174,11 @@ impl WriterCore {
         let replica_identity_full = self.query_replica_identity_full(relation_oid).await?;
         let partitions = self.query_table_partitions_get(relation_oid).await?;
         let ancestors = self.query_table_ancestors_get(relation_oid).await?;
+        let write_aliases = self
+            .query_write_aliases_get(&[relation_oid])
+            .await?
+            .remove(&relation_oid)
+            .unwrap_or_default();
 
         let table = TableMetadata {
             replica_identity_full,
@@ -183,6 +190,7 @@ impl WriterCore {
             indexes,
             partitions,
             ancestors,
+            write_aliases,
         };
 
         Ok(table)
@@ -326,6 +334,94 @@ impl WriterCore {
             .await
             .map_into_report::<CacheError>()?;
         Ok(rows.iter().map(|row| row.get::<_, Oid>(0)).collect())
+    }
+
+    /// The relations a write can name whose rows are a root's: every
+    /// partition below and above it, and the views over any of those, views
+    /// over views included (`pg_depend` from a view's rewrite rule to the
+    /// relations it reads). Keyed by root; a root with no aliases has no entry.
+    #[instrument(skip_all)]
+    pub(super) async fn query_write_aliases_get(
+        &self,
+        roots: &[Oid],
+    ) -> CacheResult<HashMap<Oid, Vec<WriteAlias>>> {
+        if roots.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let sql = r"
+            WITH RECURSIVE down(root, oid) AS (
+                SELECT oid, oid FROM unnest($1::oid[]) AS r(oid)
+                UNION
+                SELECT d.root, i.inhrelid FROM pg_inherits i JOIN down d ON i.inhparent = d.oid
+            ), up(root, oid) AS (
+                SELECT oid, oid FROM unnest($1::oid[]) AS r(oid)
+                UNION
+                SELECT u.root, i.inhparent FROM pg_inherits i JOIN up u ON i.inhrelid = u.oid
+            ), related(root, oid) AS (
+                (SELECT root, oid FROM down UNION SELECT root, oid FROM up)
+                UNION
+                SELECT v.root, r.ev_class
+                  FROM related v
+                  JOIN pg_depend d ON d.refclassid = 'pg_class'::regclass AND d.refobjid = v.oid
+                  JOIN pg_rewrite r ON d.classid = 'pg_rewrite'::regclass AND r.oid = d.objid
+                  JOIN pg_class c ON c.oid = r.ev_class AND c.relkind = 'v'
+                 WHERE r.ev_class <> v.oid
+            )
+            SELECT rel.root::oid, n.nspname, c.relname, c.relkind = 'v' AS is_view
+              FROM related rel
+              JOIN pg_class c ON c.oid = rel.oid
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE rel.oid <> rel.root
+        ";
+        let rows = self
+            .db_origin
+            .query(sql, &[&roots])
+            .await
+            .map_into_report::<CacheError>()?;
+        let mut aliases: HashMap<Oid, Vec<WriteAlias>> = HashMap::new();
+        for row in rows {
+            let schema: &str = row.get(1);
+            let name: &str = row.get(2);
+            aliases
+                .entry(row.get::<_, Oid>(0))
+                .or_default()
+                .push(WriteAlias {
+                    relation: RelationName {
+                        schema: schema.into(),
+                        name: name.into(),
+                    },
+                    is_view: row.get(3),
+                });
+        }
+        Ok(aliases)
+    }
+
+    /// Republish the write-alias map the read-after-write gate expands a
+    /// forwarded write with (ADR-048). Called after every change to the
+    /// cached tables or their alias lists.
+    pub(super) fn write_aliases_publish(&self) {
+        let map = WriteAliasMap::from_tables(self.cache.tables.iter().map(|table| &**table));
+        self.state_view.write_aliases.store(Arc::new(map));
+    }
+
+    /// Reload the alias lists of the cached tables in `roots` from the origin
+    /// catalog and republish the map.
+    pub(super) async fn write_aliases_reload(&mut self, roots: &[Oid]) -> CacheResult<()> {
+        let mut aliases = self.query_write_aliases_get(roots).await?;
+        for root in roots {
+            let Some(table) = self.cache.tables.get1(root) else {
+                continue;
+            };
+            let write_aliases = aliases.remove(root).unwrap_or_default();
+            if table.write_aliases == write_aliases {
+                continue;
+            }
+            let mut table = (**table).clone();
+            table.write_aliases = write_aliases;
+            self.cache.tables.insert_overwrite(table.into());
+        }
+        self.write_aliases_publish();
+        Ok(())
     }
 
     #[instrument(skip_all)]
@@ -545,6 +641,9 @@ impl WriterCore {
             .iter()
             .filter_map(|oid| self.cache.tables.remove1(oid))
             .collect();
+        if !tables.is_empty() {
+            self.write_aliases_publish();
+        }
         self.cache_table_objects_drop(&tables).await;
     }
 
@@ -627,11 +726,16 @@ impl WriterCore {
 
     /// A partition created under a cached table (directly or under one of its
     /// partitions): extend the partition list so a later truncate or drop of
-    /// it resolves to the table. A registration that loaded the catalog after
-    /// the create already lists it.
-    pub(super) fn table_partition_add(&mut self, created: PartitionCreated) {
-        for owner in self.tables_holding_relation(created.parent) {
-            let Some(table) = self.cache.tables.get1(&owner) else {
+    /// it resolves to the table, and reload the write aliases so a write to it
+    /// does. A registration that loaded the catalog after the create already
+    /// lists it.
+    pub(super) async fn table_partition_add(
+        &mut self,
+        created: PartitionCreated,
+    ) -> CacheResult<()> {
+        let owners = self.tables_holding_relation(created.parent);
+        for owner in &owners {
+            let Some(table) = self.cache.tables.get1(owner) else {
                 continue;
             };
             if table.partitions.contains(&created.partition) {
@@ -641,6 +745,7 @@ impl WriterCore {
             table.partitions.push(created.partition);
             self.cache.tables.insert_overwrite(table.into());
         }
+        self.write_aliases_reload(&owners).await
     }
 }
 
@@ -707,11 +812,17 @@ impl WriterCore {
         }
         table_metadata.partitions = self.query_table_partitions_get(relation_oid).await?;
         table_metadata.ancestors = self.query_table_ancestors_get(relation_oid).await?;
+        table_metadata.write_aliases = self
+            .query_write_aliases_get(&[relation_oid])
+            .await?
+            .remove(&relation_oid)
+            .unwrap_or_default();
 
         self.cache_table_create_from_metadata(&table_metadata)
             .await?;
 
         self.cache.tables.insert_overwrite(table_metadata.into());
+        self.write_aliases_publish();
 
         Ok(())
     }

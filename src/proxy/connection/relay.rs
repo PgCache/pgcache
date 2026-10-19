@@ -721,7 +721,8 @@ impl ConnectionState {
     /// The single apply point for every forward path.
     pub(super) fn forwarded_effects_apply(&mut self, effects: &StatementEffects) {
         if let Some(class) = &effects.write {
-            self.write_log.record(class);
+            let aliases = self.dispatch_handle.write_aliases();
+            self.write_log.record(class, aliases.as_deref());
         }
         let in_block = self.forwarding_into_block();
         let settings = effects.settings;

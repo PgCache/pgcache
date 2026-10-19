@@ -64,6 +64,9 @@ pub(crate) struct SchemaChange {
     /// `CREATE TABLE … PARTITION OF`: a new, empty partition. Nothing to
     /// evict, but the parent's partition list must learn of it.
     pub(crate) partitions_created: Vec<PartitionCreated>,
+    /// A view was created, replaced, altered or dropped: the write-alias
+    /// lists of the cached tables are reloaded (ADR-048).
+    pub(crate) views_changed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +82,7 @@ impl SchemaChange {
             && self.dropped_tables.is_empty()
             && self.truncated_tables.is_empty()
             && self.partitions_created.is_empty()
+            && !self.views_changed
     }
 }
 

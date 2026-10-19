@@ -130,6 +130,29 @@ pub struct TableMetadata {
     /// signalled on an ancestor is resolved to this table through the list.
     /// Empty for a plain table or a root.
     pub ancestors: Vec<Oid>,
+    /// Every relation a forwarded write can name whose rows are this table's:
+    /// the partitions below and above it, and the views over any of those
+    /// (views over views included). The read-after-write gate expands a write
+    /// to such a name into this table (ADR-048). Empty for a plain table with
+    /// no views.
+    pub write_aliases: Vec<WriteAlias>,
+}
+
+/// A schema-qualified relation name.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RelationName {
+    pub schema: EcoString,
+    pub name: EcoString,
+}
+
+/// One entry of [`TableMetadata::write_aliases`]. A write through a view
+/// cannot keep its rows (view columns may be renamed or computed), so the gate
+/// records it as an opaque write on the table; a partition shares the table's
+/// column names and keeps row-level precision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteAlias {
+    pub relation: RelationName,
+    pub is_view: bool,
 }
 
 impl TableMetadata {
@@ -176,6 +199,7 @@ impl TableMetadata {
             replica_identity_full: false,
             partitions: Vec::new(),
             ancestors: Vec::new(),
+            write_aliases: Vec::new(),
         }
     }
 }

@@ -61,6 +61,7 @@ async fn cache_tables_ensure(
         {
             let table = core.cache_table_create(Some(&schema), table_name).await?;
             core.cache.tables.insert_overwrite(table.into());
+            core.write_aliases_publish();
         }
     }
     Ok(())

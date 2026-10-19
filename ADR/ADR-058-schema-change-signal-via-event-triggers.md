@@ -32,7 +32,7 @@ Two event triggers on origin, on `ddl_command_end` and `sql_drop`, emit each com
 
 ### Positive
 - `DROP TABLE`, a quiet `ALTER TABLE`, partition attach/detach, and a partition's truncate or drop now invalidate at the right point in the stream.
-- The same channel carries policy, grant and view objects for later consumers; the parser already sees and ignores them.
+- The same channel carries policy, grant and view objects for later consumers. View objects already have one: any change to a view reloads the write-alias lists the read-after-write gate matches on (ADR-048). Policy and grant objects are parsed and ignored.
 - Degrades gracefully: no triggers, no change in behaviour, and preflight says so.
 
 ### Negative

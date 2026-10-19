@@ -18,6 +18,7 @@ Each connection maintains a per-connection **write log** of the writes it forwar
 - **Settled watermark.** Every origin transaction committing at or below it is either applied to the cache or produced no decodable output. Advanced from two sources: the commit-only apply advance, and a keepalive's LSN once the writer is drained — sound because a logical walsender's keepalive carries its *sent* position, past which every decodable commit was already emitted in stream order. The keepalive source is what lets entries clear across non-decodable WAL (DDL, writes to unpublished tables, idle origin), where no commit will ever arrive.
 - **Conservative write classification.** `INSERT` with an explicit column list and literal/parameter `VALUES` is row-enumerable; `UPDATE`/`DELETE`/`MERGE`/`TRUNCATE` are table-level; anything unclassifiable (DDL, `CALL`, `EXPLAIN ANALYZE`, multi-statement, volatile-function `SELECT`) is connection-level; a plain `EXPLAIN` only plans and is read-only. `PREPARE TRANSACTION` is unstampable and clears only at connection close. Every fallback widens scope, never misses a write.
 - **Row-level disjointness reuses subsumption.** A single-table read's per-column ranges (from the constraint analyzer) exclude an inserted row when a known cell falls outside the read's range; comparisons are numeric-aware so integer/float spellings match by value.
+- **Writes land where their rows do.** A write names a relation, a read names the table it is cached under, and Postgres lets those differ: a write to a partition child (or to the root of a partition cached on its own) and a write through an updatable view. The writer keeps, per cached table, the relations whose writes land in it (its partition tree both ways and the views over any of it, from the origin catalog, kept current by the schema-change signal of ADR-058) and publishes the inverted map; recording a write expands it into every cached table it aliases. A partition write keeps its rows (the columns are the table's); a view write is recorded opaque. The expansion runs on the writing connection, so the read path is untouched.
 - **Bounded state.** Writes aggregate per table; each table carries its own active/waiting tier pair with a per-table commit-LSN bound, so a fresh write never gates an already-applied one and one table's clearance is never held back by another table's later bound. A probe stamps each table independently (a table with a racing write is skipped and re-probed alone). All row-precise stores are capped and overflow degrades that table to opaque.
 
 ## Rationale
@@ -43,14 +44,14 @@ Each connection maintains a per-connection **write log** of the writes it forwar
 - Row-level precision covers single-table INSERT reads only; joins and `UPDATE`/`DELETE` stay table/connection-conservative (later stages: ADR-049 for UPDATE/DELETE, ADR-054 for in-transaction serving).
 - Clearance liveness floor: when the WAL tail is non-decodable, entries clear only at the next keepalive, so the forward window can extend to the keepalive cadence (extra forwards, not a wedge).
 - The commit-LSN probe adds one origin round-trip per write-then-idle boundary.
-- **Known exclusion (PGC-447)**: the gate matches pending writes to reads by
-  relation *name*, so a write routed through an auto-updatable view, or
-  directly into a partition child while the parent is cached, is not matched
-  to reads of the underlying/parent table — such writes sit outside the
+- **Known exclusion**: a view with an `INSTEAD OF` trigger or a `DO INSTEAD`
+  rule can write to tables it does not read, which the alias map (built from
+  what the view reads) does not see. Such writes sit outside the
   per-connection read-your-writes guarantee (CDC still corrects the cache;
-  the exposure is the same-connection commit→settle window). A point-in-time
-  name mapping goes stale on view creation / partition attach, so the fix is
-  deferred to origin schema-change observation (PGC-458).
+  the exposure is the same-connection commit→settle window).
+- While the cache restarts no alias map is published and a write is recorded
+  under its own name only; nothing is served from cache then, and a query
+  registered afterwards populates from a snapshot past the write's commit.
 
 ## Implementation Notes
-The settled watermark is published as an atomic on the per-generation `CacheStateView` and read through the live dispatch, never a cached handle from a dead generation (which would read frozen-high). The gate lives in the `OriginDrain` arm of the connection loop; write classification runs at cacheability-analysis time. This is Stage 1 scope; UPDATE/DELETE predicate intersection and in-transaction serving are follow-ups.
+The settled watermark is published as an atomic on the per-generation `CacheStateView` and read through the live dispatch, never a cached handle from a dead generation (which would read frozen-high). The gate lives in the `OriginDrain` arm of the connection loop; write classification runs at cacheability-analysis time. The alias map is `WriteAliasMap` on `CacheStateView`, built from `TableMetadata::write_aliases` (loaded in `writer/table.rs`) and read through `CacheDispatchHandle::write_aliases` when the connection records a write. This is Stage 1 scope; UPDATE/DELETE predicate intersection and in-transaction serving are follow-ups.

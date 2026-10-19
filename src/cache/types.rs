@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
+use ecow::EcoString;
 use hdrhistogram::Histogram;
 use iddqd::{BiHashItem, BiHashMap, IdHashMap, bi_upcast};
 use rootcause::Report;
@@ -18,7 +19,7 @@ use super::update_query::UpdateQueries;
 use crate::oid::Oid;
 use crate::{
     cache::{CacheError, CacheResult, memo::ResultMemo, mv::MvMeta, query::CacheableQuery},
-    catalog::Catalog,
+    catalog::{Catalog, RelationName, TableMetadata},
     query::{
         Fingerprint, FingerprintDashMap, QueryShape, SessionKeyDashMap,
         resolve::{ColumnsByTable, ResolvedQuery},
@@ -166,6 +167,65 @@ impl Cache {
 /// Written by the writer thread, read by the CDC processor.
 pub(super) type ActiveRelations = Arc<ArcSwap<HashSet<Oid>>>;
 
+/// A cached table a write to the aliasing relation lands rows in
+/// ([`TableMetadata::write_aliases`], inverted).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteAliasTarget {
+    /// The aliasing relation's schema; its bare name keys the map.
+    pub alias_schema: EcoString,
+    pub table: RelationName,
+    /// Record the write as opaque on the table (a view alias) rather than
+    /// carrying its rows over (a partition alias).
+    pub opaque: bool,
+}
+
+/// The relations a forwarded write can name that land rows in a cached table,
+/// each with the tables it lands in: the partition trees and views of every
+/// cached table, inverted and keyed by the alias's bare name. Published by the
+/// writer whenever the cached tables or their alias lists change, read by the
+/// read-after-write gate when it records a write (ADR-048).
+#[derive(Debug, Default)]
+pub struct WriteAliasMap(HashMap<EcoString, Vec<WriteAliasTarget>>);
+
+impl WriteAliasMap {
+    pub fn from_tables<'a>(tables: impl Iterator<Item = &'a TableMetadata>) -> Self {
+        let mut map: HashMap<EcoString, Vec<WriteAliasTarget>> = HashMap::new();
+        for table in tables {
+            for alias in &table.write_aliases {
+                map.entry(alias.relation.name.clone())
+                    .or_default()
+                    .push(WriteAliasTarget {
+                        alias_schema: alias.relation.schema.clone(),
+                        table: RelationName {
+                            schema: table.schema.clone(),
+                            name: table.name.clone(),
+                        },
+                        opaque: alias.is_view,
+                    });
+            }
+        }
+        Self(map)
+    }
+
+    /// The cached tables a write to `schema.name` lands in. An unqualified
+    /// write matches the alias under any schema, as the gate's read side does.
+    pub fn targets(
+        &self,
+        schema: Option<&str>,
+        name: &str,
+    ) -> impl Iterator<Item = &WriteAliasTarget> {
+        self.0
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter(move |target| schema.is_none_or(|schema| target.alias_schema == schema))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// Per-query operational metrics.
 ///
 /// All writes go through `DashMap::get_mut()`, which holds an exclusive shard lock
@@ -300,6 +360,10 @@ pub struct CacheStateView {
     /// gate's forward attribution (PGC-440): a forward whose blocking bound is
     /// at or below it is waiting on apply/settle, above it on origin delivery.
     pub received_lsn: Arc<AtomicU64>,
+    /// The write-alias map for the read-after-write gate (ADR-048), published
+    /// whole by the writer on every change to the cached tables or their alias
+    /// lists; a connection loads it wait-free when it records a write.
+    pub write_aliases: ArcSwap<WriteAliasMap>,
     /// Empty cache-hit latency histogram cloned into each query's metrics, so
     /// the one fallible construction happens at startup. Auto-resizing (starts
     /// at a few hundred bytes, grows on record) rather than fixed-range — a
@@ -342,6 +406,7 @@ impl CacheStateView {
             serve_pool: Arc::new(ServePool::default()),
             settled_lsn: Arc::new(AtomicU64::new(0)),
             received_lsn: Arc::new(AtomicU64::new(0)),
+            write_aliases: ArcSwap::from_pointee(WriteAliasMap::default()),
             memo: ResultMemo::new(dynamic),
             latency_template,
         })

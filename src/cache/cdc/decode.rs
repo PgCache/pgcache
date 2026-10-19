@@ -71,6 +71,7 @@ pub(super) fn parse_relation_to_table_metadata(relation_body: &RelationBody) -> 
         indexes: Vec::new(),
         partitions: Vec::new(),
         ancestors: Vec::new(),
+        write_aliases: Vec::new(),
     }
 }
 

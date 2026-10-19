@@ -47,6 +47,9 @@ struct TruncatedObject {
 const TABLE: &str = "table";
 /// A foreign table can be a partition too.
 const FOREIGN_TABLE: &str = "foreign table";
+/// Any command on a view (create, replace, alter, rename) or its drop: the
+/// write-alias lists are reloaded rather than tracked per view.
+const VIEW: &str = "view";
 
 /// The one command tag that changes an existing table: every subcommand
 /// (columns, ATTACH/DETACH PARTITION, RLS flags, OWNER, RENAME) reports it.
@@ -69,6 +72,10 @@ pub(super) fn schema_change_parse(content: &[u8]) -> Result<SchemaChange, serde_
             for object in objects {
                 let tag = object.tag.as_str();
                 let object_type = object.object_type.as_str();
+                if object_type == VIEW {
+                    change.views_changed = true;
+                    continue;
+                }
                 match (tag, object.oid, object.parent) {
                     (ALTER_TABLE, Some(oid), _) if is_table(object_type) => {
                         change.altered_tables.push(Oid::from_raw(oid));
@@ -87,7 +94,9 @@ pub(super) fn schema_change_parse(content: &[u8]) -> Result<SchemaChange, serde_
         }
         Payload::Drop { objects } => {
             for object in objects {
-                if let Some(oid) = object.oid
+                if object.object_type == VIEW {
+                    change.views_changed = true;
+                } else if let Some(oid) = object.oid
                     && is_table(&object.object_type)
                 {
                     change.dropped_tables.push(Oid::from_raw(oid));
@@ -156,6 +165,30 @@ mod tests {
             change.dropped_tables,
             vec![Oid::from_raw(16384), Oid::from_raw(16500)]
         );
+    }
+
+    /// Any command on a view, and a view's drop, flag the alias reload; the
+    /// view's dependent objects in the drop payload do not.
+    #[test]
+    fn test_schema_change_parse_flags_view_changes() {
+        let created = br#"{"kind":"ddl","objects":[
+            {"tag":"CREATE VIEW","type":"view","oid":16400,"identity":"public.v","parent":null}]}"#;
+        let change = schema_change_parse(created).expect("parse ddl payload");
+        assert!(change.views_changed);
+        assert!(change.altered_tables.is_empty());
+        assert!(!change.is_empty());
+
+        let dropped = br#"{"kind":"drop","objects":[
+            {"type":"view","oid":16400,"identity":"public.v","original":true},
+            {"type":"type","oid":16402,"identity":"public.v","original":false},
+            {"type":"rule","oid":16403,"identity":"\"_RETURN\" on public.v","original":false}]}"#;
+        let change = schema_change_parse(dropped).expect("parse drop payload");
+        assert!(change.views_changed);
+        assert!(change.dropped_tables.is_empty());
+
+        let grant = br#"{"kind":"ddl","objects":[
+            {"tag":"GRANT","type":"TABLE","oid":null,"identity":null,"parent":null}]}"#;
+        assert!(!schema_change_parse(grant).expect("parse").views_changed);
     }
 
     #[test]

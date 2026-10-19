@@ -776,6 +776,7 @@ impl<'t> Planner<'t> {
             replica_identity_full: false,
             partitions: Vec::new(),
             ancestors: Vec::new(),
+            write_aliases: Vec::new(),
             relation_oid: Oid::from_raw(0),
             name: derived_alias.clone(),
             schema: EcoString::new(),

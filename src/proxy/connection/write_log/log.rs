@@ -12,6 +12,7 @@ use super::aggregate::{
 };
 use super::tiers::{ConnectionTiers, TableTiers};
 use super::{DisjointKinds, RawBlocker, RawDecision, RawForwardReason};
+use crate::cache::WriteAliasMap;
 use crate::pg::Lsn;
 use crate::query::ast::rope::QueryTree;
 use crate::query::constraints::{
@@ -90,7 +91,11 @@ impl WriteLog {
 
     /// Record a forwarded write into its table's (or the connection's) active
     /// tier. No-op when disabled.
-    pub(crate) fn record(&mut self, class: &WriteClass) {
+    ///
+    /// A write to a partition or through a view lands rows in the cached
+    /// tables `aliases` maps it to (ADR-048), so it is recorded under each of
+    /// those as well: with its rows for a partition, opaque for a view.
+    pub(crate) fn record(&mut self, class: &WriteClass, aliases: Option<&WriteAliasMap>) {
         if !self.enabled {
             return;
         }
@@ -104,11 +109,55 @@ impl WriteLog {
         }
         crate::metrics::handles().raw.writes_recorded.increment(1);
         match class {
+            WriteClass::Connection => {
+                self.connection.active = Some(seq);
+            }
+            WriteClass::ConnectionUnstampable => {
+                self.connection.unstampable = true;
+                self.connection.active = None;
+                self.connection.waiting = None;
+                // Every read forwards until close; per-table state is moot.
+                self.tables.clear();
+            }
+            WriteClass::InsertRows(_)
+            | WriteClass::DeleteRows(_)
+            | WriteClass::UpdateRows(_)
+            | WriteClass::Table(_) => {
+                let Some(relation) = class.relation() else {
+                    return;
+                };
+                self.table_record(relation, class, seq);
+                let targets: Vec<(RelationRef, bool)> = aliases
+                    .into_iter()
+                    .flat_map(|aliases| aliases.targets(relation.schema.as_deref(), &relation.name))
+                    .map(|target| {
+                        let table = RelationRef {
+                            schema: Some(target.table.schema.clone()),
+                            name: target.table.name.clone(),
+                        };
+                        (table, target.opaque)
+                    })
+                    .collect();
+                for (table, opaque) in &targets {
+                    if *opaque {
+                        self.table_active(table, seq).degrade_opaque();
+                    } else {
+                        self.table_record(table, class, seq);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Record a table-scoped write under `relation`, which may be the write's
+    /// own target or a cached table it aliases.
+    fn table_record(&mut self, relation: &RelationRef, class: &WriteClass, seq: u64) {
+        match class {
             // Row-enumerable INSERT: keep the rows for row-level disjointness
             // (PGC-369), unless the table is already opaque or the rows overflow
             // the cap (then degrade to opaque).
             WriteClass::InsertRows(insert) => {
-                let agg = self.table_active(&insert.relation, seq);
+                let agg = self.table_active(relation, seq);
                 if !agg.opaque {
                     let mut inserts = agg.inserts.take().unwrap_or_default();
                     if inserts.fold(insert) {
@@ -126,7 +175,7 @@ impl WriteLog {
             // disjointness (PGC-381), unless the table is already opaque or the
             // predicate count overflows the cap (then degrade to opaque).
             WriteClass::DeleteRows(delete) => {
-                let agg = self.table_active(&delete.relation, seq);
+                let agg = self.table_active(relation, seq);
                 if !agg.opaque {
                     let overflow = match equality_tuple_build(&delete.comparisons) {
                         Some((columns, values)) => {
@@ -153,7 +202,7 @@ impl WriteLog {
             // image for the two-sided disjointness check (PGC-382), unless the
             // table is opaque or the predicate count overflows the cap.
             WriteClass::UpdateRows(update) => {
-                let agg = self.table_active(&update.relation, seq);
+                let agg = self.table_active(relation, seq);
                 if !agg.opaque {
                     let overflow = match update_tuple_build(update) {
                         Some((shape, tuple)) => {
@@ -175,19 +224,10 @@ impl WriteLog {
                     }
                 }
             }
-            WriteClass::Table(relation) => {
+            WriteClass::Table(_) => {
                 self.table_active(relation, seq).degrade_opaque();
             }
-            WriteClass::Connection => {
-                self.connection.active = Some(seq);
-            }
-            WriteClass::ConnectionUnstampable => {
-                self.connection.unstampable = true;
-                self.connection.active = None;
-                self.connection.waiting = None;
-                // Every read forwards until close; per-table state is moot.
-                self.tables.clear();
-            }
+            WriteClass::Connection | WriteClass::ConnectionUnstampable => {}
         }
     }
 

@@ -25,7 +25,7 @@ use crate::cache::reg_bucket::RegRateBucket;
 use crate::cache::reply::ReplySender;
 use crate::cache::serve_decision::{DecisionInput, EntrySnapshot, ServeDecision, serve_decide};
 use crate::cache::types::{
-    CacheStateView, CachedQueryState, CachedQueryView, CachedReadForm, QueryMetrics,
+    CacheStateView, CachedQueryState, CachedQueryView, CachedReadForm, QueryMetrics, WriteAliasMap,
 };
 use crate::cache::{CacheError, CacheResult, fast_path};
 use crate::pg::Lsn;
@@ -119,6 +119,12 @@ impl CacheDispatch {
     /// forward attribution (PGC-440) to split apply lag from delivery lag.
     pub fn received_lsn(&self) -> Lsn {
         Lsn::from_raw(self.state_view.received_lsn.load(Ordering::Relaxed))
+    }
+
+    /// The write-alias map for this generation: which cached tables a write
+    /// to a partition or a view lands rows in (ADR-048).
+    pub fn write_aliases(&self) -> Arc<WriteAliasMap> {
+        self.state_view.write_aliases.load_full()
     }
 
     /// The resolved form of a registered (Ready) query, if present. Used by the
