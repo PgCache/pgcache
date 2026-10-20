@@ -59,6 +59,15 @@ pub fn table_constraints_subsumed(
     if !cached.where_analysis_complete {
         return false;
     }
+    // A same-table `a = b` filters the cached rows but has no column range,
+    // so it never reaches `table_constraints`.
+    if cached
+        .equivalences
+        .iter()
+        .any(|eq| !eq.is_join() && eq.left.table == table)
+    {
+        return false;
+    }
 
     let cached_for_table = cached.table_constraints.get(table);
     let new_for_table = new.table_constraints.get(table);

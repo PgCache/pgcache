@@ -586,3 +586,34 @@ async fn test_subsumption_same_name_across_schemas_not_subsumed() -> Result<(), 
 
     Ok(())
 }
+
+/// A cached `a = b` holds only the rows where the two columns agree, so a
+/// narrower query on another column must not be served from it.
+#[tokio::test]
+async fn test_subsumption_same_table_equality_not_full_table() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE sub_ceq (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+        &[],
+    )
+    .await?;
+    ctx.query("INSERT INTO sub_ceq VALUES (1, 1, 1), (5, 1, 2)", &[])
+        .await?;
+    ctx.cdc_decode_settle().await?;
+
+    let m = ctx.metrics().await?;
+    ctx.simple_query("SELECT id, a, b FROM sub_ceq WHERE a = b")
+        .await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    let res = ctx
+        .simple_query("SELECT id, a, b FROM sub_ceq WHERE id = 5")
+        .await?;
+    assert_eq!(res.len(), 3); // 1 row
+    assert_row_at(&res, 1, &[("id", "5"), ("a", "1"), ("b", "2")])?;
+    let _m = assert_not_subsumed(&mut ctx, m).await?;
+
+    Ok(())
+}
