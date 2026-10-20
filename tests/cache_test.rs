@@ -894,3 +894,59 @@ async fn test_cache_same_name_other_schema_cdc_insert() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// Each reference of a self-join filters on its own: a CDC row is matched
+/// against the reference it can stand in for. A change that only one
+/// reference's filter admits is applied, and one neither admits leaves the
+/// cached result alone (PGC-517).
+#[tokio::test]
+async fn test_cache_self_join_filters_per_reference_cdc() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "create table sjf (id int primary key, kind text, partner int)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "insert into sjf values (1, 'x', 2), (2, 'y', null), (3, 'x', 4), (4, 'z', null)",
+        &[],
+    )
+    .await?;
+    ctx.cdc_decode_settle().await?;
+
+    let query = "\
+        select a.id as a_id, b.id as b_id from sjf a \
+        join sjf b on b.id = a.partner where a.kind = 'x' and b.kind = 'y' order by a.id";
+    let m = ctx.metrics().await?;
+    ctx.simple_query(query).await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    // Matches neither reference's filter: the cached result stands.
+    ctx.query("insert into sjf values (6, 'z', null)", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 3, "only (1, 2)");
+    assert_row_at(&res, 1, &[("a_id", "1"), ("b_id", "2")])?;
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    // Row 4 now passes only `b`'s filter, which attaches row 3.
+    ctx.query("update sjf set kind = 'y' where id = 4", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+    let (proxied, origin) = ctx.proxy_and_origin_rows(query).await?;
+    assert_eq!(origin.len(), 2, "(1, 2) and (3, 4)");
+    assert_eq!(proxied, origin);
+
+    // Row 2 leaves `b`'s filter, which detaches row 1.
+    ctx.query("update sjf set kind = 'z' where id = 2", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+    let (proxied, origin) = ctx.proxy_and_origin_rows(query).await?;
+    assert_eq!(origin.len(), 1, "(3, 4)");
+    assert_eq!(proxied, origin);
+
+    Ok(())
+}

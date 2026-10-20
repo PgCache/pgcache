@@ -5,30 +5,24 @@ use crate::catalog::TableMetadata;
 use crate::pg::protocol::ByteString;
 use crate::query::ast::BinaryOp;
 use crate::query::cast::cast_target_coerce_text;
-use crate::query::constraints::{QueryConstraints, TableConstraint};
+use crate::query::constraints::TableConstraint;
 use crate::query::evaluate::literal_compare;
 use crate::query::typed_compare::typed_compare;
 
-/// Check that every WHERE constraint for `table_metadata` matches `row_data`.
-/// Returns true when there are no constraints for this table (full-scan
-/// cached query), or when every constraint evaluates to true on the row.
+/// Check that every filter of an update query's reference matches
+/// `row_data`. True when there are none (a full-scan reference).
 ///
 /// CastComparison constraints coerce the row's wire-text via
 /// `cast_target_coerce_text` and compare via `literal_compare`; a coercion
 /// failure is treated as non-match (the row would have errored at origin).
 pub(super) fn row_constraints_match(
-    constraints: &QueryConstraints,
+    filters: &[TableConstraint],
     table_metadata: &TableMetadata,
     row_data: &[Option<ByteString>],
 ) -> bool {
-    constraints
-        .table_constraints
-        .get(table_metadata.name.as_str())
-        .is_none_or(|constraints| {
-            constraints
-                .iter()
-                .all(|constraint| constraint_row_matches(constraint, table_metadata, row_data))
-        })
+    filters
+        .iter()
+        .all(|constraint| constraint_row_matches(constraint, table_metadata, row_data))
 }
 
 /// A constraint on a column the table or row doesn't carry is skipped.
@@ -201,8 +195,9 @@ pub(super) fn join_membership_unchanged(
         return false;
     }
 
-    !update_query.link_columns.is_empty()
-        && update_query.link_columns.iter().all(|col| {
+    let link_columns = &update_query.predicates.link_columns;
+    !link_columns.is_empty()
+        && link_columns.iter().all(|col| {
             table_metadata
                 .primary_key_columns
                 .iter()
@@ -212,7 +207,6 @@ pub(super) fn join_membership_unchanged(
 
 #[cfg(test)]
 mod tests {
-    use ecow::EcoString;
     use tokio_postgres::types::Type;
 
     use super::*;
@@ -252,11 +246,7 @@ mod tests {
     }
 
     fn constraint_matches(constraint: TableConstraint, row: &[Option<ByteString>]) -> bool {
-        let mut constraints = QueryConstraints::default();
-        constraints
-            .table_constraints
-            .insert(EcoString::from("users"), vec![constraint]);
-        row_constraints_match(&constraints, &fixture_table(), row)
+        row_constraints_match(&[constraint], &fixture_table(), row)
     }
 
     fn id_equals(value: i64) -> TableConstraint {
@@ -278,9 +268,8 @@ mod tests {
 
     #[test]
     fn test_no_constraints_for_table_matches() {
-        let constraints = QueryConstraints::default();
         let row = row(Some("alice"), None);
-        assert!(row_constraints_match(&constraints, &fixture_table(), &row));
+        assert!(row_constraints_match(&[], &fixture_table(), &row));
     }
 
     #[test]

@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use ecow::EcoString;
+use rootcause::Report;
 
 use super::update_classify::{
     limit_order_keys_collect, limit_window_columns_collect, pg_batchable_classify,
@@ -18,14 +19,13 @@ use crate::cache::{CacheError, CacheResult};
 use crate::catalog::Catalog;
 use crate::oid::Oid;
 use crate::query::Fingerprint;
-use crate::query::ast::rope::{Body, NodeKind, QueryTree, Table, TreeBuilder, View};
-use crate::query::constraints::{QueryConstraints, TableConstraint, query_constraints_analyze};
+use crate::query::ast::rope::{Body, NodeKind, QueryTree, TreeBuilder, View};
 use crate::query::decorrelate::query_decorrelate;
 use crate::query::literal_settings::LiteralSettings;
 use crate::query::predicate::CompiledPredicate;
-use crate::query::predicates::{QueryBranchPredicates, query_branch_predicates_build};
+use crate::query::predicates::query_branch_predicates_build;
 use crate::query::resolve::ResolveResult;
-use crate::query::resolve::{Bindings, QueryBranch, ResolvedQuery, TableSlot};
+use crate::query::resolve::ResolvedQuery;
 use crate::query::transform::{
     LiteralCanonOutcome, PgEvalTemplate, query_literals_canonicalise, query_predicate_pushdown,
 };
@@ -134,53 +134,6 @@ pub fn query_decorrelate_checked(
         .attach_loc("decorrelating correlated subqueries")
 }
 
-/// The constraints of an update branch, read at the branch's position.
-fn branch_constraints(bound: &ResolvedQuery, branch: QueryBranch<'_>) -> QueryConstraints {
-    query_constraints_analyze(bound, branch.select)
-}
-
-/// The link columns of every reference to `relation_oid` in the branch: one
-/// update query covers them all.
-fn branch_link_columns(
-    predicates: &QueryBranchPredicates,
-    bindings: &Bindings,
-    relation_oid: Oid,
-) -> Vec<EcoString> {
-    let mut link_columns: Vec<EcoString> = Vec::new();
-    for reference in predicates.table_references() {
-        let is_relation = matches!(bindings.slot(reference.slot),
-            Some(TableSlot::Base { table, .. }) if table.relation_oid == relation_oid);
-        let Some(relation) = is_relation
-            .then(|| predicates.relation_predicates(bindings, reference.slot))
-            .flatten()
-        else {
-            continue;
-        };
-        for column in relation.link_columns {
-            if !link_columns.contains(&column) {
-                link_columns.push(column);
-            }
-        }
-    }
-    link_columns
-}
-
-/// The filters of the reference `table` binds when population loads every
-/// row they describe; `None` when it doesn't.
-fn reference_subsumer_region(
-    predicates: &QueryBranchPredicates,
-    bindings: &Bindings,
-    table: Table<'_>,
-) -> Option<Vec<TableConstraint>> {
-    let slot = bindings.source(table.id())?;
-    predicates
-        .table_reference_predicates(slot)?
-        .exact
-        .then(|| predicates.relation_predicates(bindings, slot))
-        .flatten()
-        .map(|relation| relation.filters)
-}
-
 /// The relations whose every reference sits in one SELECT branch. Several
 /// branches load the union of their rows, which one region doesn't describe.
 fn single_branch_relations(update_queries: &[TableUpdateQuery<'_>]) -> HashSet<Oid> {
@@ -242,10 +195,20 @@ pub fn query_admission_analyze(
         let source = bound_update.source;
         let relation_oid = bound_update.relation_oid;
         let branch = bound_update.branch;
-        let constraints = branch_constraints(update_source, branch);
-        let predicates = query_branch_predicates_build(update_source, branch.select);
         let bindings = update_source.bindings();
-        let link_columns = branch_link_columns(&predicates, bindings, relation_oid);
+        let relation = bindings
+            .source(table_node.id())
+            .and_then(|slot| {
+                query_branch_predicates_build(update_source, branch.select)
+                    .relation_predicates(bindings, slot)
+            })
+            .ok_or_else(|| {
+                debug_assert!(
+                    false,
+                    "an update query's table is a reference of its branch"
+                );
+                Report::from(CacheError::InvalidQuery)
+            })?;
         let eval_strategy = update_eval_strategy_classify(branch, source);
         let pg_batchable = depth == AdmissionDepth::Full
             && eval_strategy == UpdateEvalStrategy::PgEval
@@ -281,9 +244,9 @@ pub fn query_admission_analyze(
         // it; needs the relation's TableMetadata.
         let pg_eval_template =
             if depth == AdmissionDepth::Full && eval_strategy == UpdateEvalStrategy::PgEval {
-                tables
-                    .get1(&relation_oid)
-                    .and_then(|table_metadata| PgEvalTemplate::build(branch, table_metadata))
+                tables.get1(&relation_oid).and_then(|table_metadata| {
+                    PgEvalTemplate::build(branch, table_metadata, table_node.id())
+                })
             } else {
                 None
             };
@@ -295,8 +258,8 @@ pub fn query_admission_analyze(
             bound: Arc::clone(update_source),
             branch: branch.select.id(),
             source,
-            constraints,
-            link_columns,
+            table: table_node.id(),
+            predicates: relation,
             has_limit,
             eval_strategy,
             limit_window_columns,
@@ -316,25 +279,10 @@ pub fn query_admission_analyze(
             update_query.change_dependent = update_query.update_invalidation_possible();
         }
 
-        // A relation appearing more than once (a self-join) has its
-        // constraints extracted per occurrence but keyed by table *name*, so
-        // they collapse into one set that only holds for one arm (PGC-256).
-        // Index it as *unconstrained* — the broadest candidate class.
-        let self_joined = update_query.bound.relation_occurrences(relation_oid) > 1;
-        let index_constraints = if self_joined {
-            Vec::new()
-        } else {
-            update_query
-                .constraints
-                .table_constraints
-                .get(table_name.as_str())
-                .cloned()
-                .unwrap_or_default()
-        };
-        let subsumer_region = single_branch
-            .contains(&relation_oid)
-            .then(|| reference_subsumer_region(&predicates, bindings, table_node))
-            .flatten();
+        let index_constraints = update_query.predicates.filters.clone();
+        let subsumer_region = (single_branch.contains(&relation_oid)
+            && update_query.predicates.exact)
+            .then(|| update_query.predicates.filters.clone());
 
         admissions.push(TableAdmission {
             relation_oid,
@@ -481,9 +429,8 @@ mod tests {
     /// Each update query's table with its link columns.
     type TableLinkColumns = &'static [(&'static str, &'static [&'static str])];
 
-    /// Each update query's link columns, over every reference to its
-    /// relation in the branch, whether the conjunct linking them is
-    /// recognized or not.
+    /// Each update query's link columns, those of its own reference, whether
+    /// the conjunct linking them is recognized or not.
     #[test]
     fn test_update_query_link_columns() {
         #[rustfmt::skip]
@@ -495,9 +442,9 @@ mod tests {
              &[("a", &["id", "x"]), ("b", &["id", "y"])]),
             ("SELECT * FROM a LEFT JOIN b ON b.id = a.id AND a.x = 1",
              &[("a", &["id", "x"]), ("b", &["id"])]),
-            // One admission per reference, each with both references' links.
+            // One update query per reference, each with its own links.
             ("SELECT * FROM a e JOIN a m ON m.id = e.x",
-             &[("a", &["id", "x"]), ("a", &["id", "x"])]),
+             &[("a", &["id"]), ("a", &["x"])]),
             ("SELECT * FROM a WHERE x IN (SELECT id FROM b)", &[("a", &["x"]), ("b", &[])]),
         ];
         for (sql, expected) in cases {
@@ -507,6 +454,7 @@ mod tests {
                 .map(|admission| {
                     let mut columns: Vec<String> = admission
                         .update_query
+                        .predicates
                         .link_columns
                         .iter()
                         .map(ToString::to_string)

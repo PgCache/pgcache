@@ -43,6 +43,5 @@ pub use predicate_pushdown::query_predicate_pushdown;
 pub use substitute::query_tree_parameters_replace;
 pub use values::{
     BATCH_IDX_COLUMN, PgEvalTemplate, TableOccurrence, membership_batch_into,
-    membership_unnest_into, membership_values_all_into, membership_values_into,
-    table_occurrences_find,
+    membership_unnest_into, membership_values_into, table_occurrence_at, table_occurrences_find,
 };

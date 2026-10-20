@@ -104,12 +104,12 @@ fn row_relevant(
     table_metadata: &TableMetadata,
     event: &RowEvent,
 ) -> bool {
-    if update_query
-        .constraints
-        .table_constraints
-        .contains_key(table_metadata.name.as_str())
-    {
-        row_constraints_match(&update_query.constraints, table_metadata, event.row_data)
+    if !update_query.predicates.filters.is_empty() {
+        row_constraints_match(
+            &update_query.predicates.filters,
+            table_metadata,
+            event.row_data,
+        )
     } else {
         !join_membership_unchanged(update_query, table_metadata, event.key_data)
     }
@@ -157,9 +157,11 @@ fn row_uncached_invalidates(
         // cascade to affect other tables' result set membership (e.g. a new
         // match may activate a downstream join path that was previously
         // NULL-padded). Invalidate if the row is relevant to this query.
-        UpdateQuerySource::OuterJoinOptional => {
-            row_constraints_match(&update_query.constraints, table_metadata, event.row_data)
-        }
+        UpdateQuerySource::OuterJoinOptional => row_constraints_match(
+            &update_query.predicates.filters,
+            table_metadata,
+            event.row_data,
+        ),
     }
 }
 
@@ -209,7 +211,7 @@ fn row_cached_invalidates(
         return true;
     }
     link_columns_changed(update_query, row_changes)
-        && row_constraints_match(&update_query.constraints, table_metadata, row_data)
+        && row_constraints_match(&update_query.predicates.filters, table_metadata, row_data)
 }
 
 /// LIMIT windowing: an UPDATE that changes a column defining this query's
@@ -239,12 +241,12 @@ fn limit_window_move_invalidates(
     // in-place upsert plus serve-time re-sort keeps the window correct without
     // invalidation. Only demotions (and anything direction can't prove) can
     // open an uncached gap at the boundary.
-    row_constraints_match(&update_query.constraints, table_metadata, row_data)
+    row_constraints_match(&update_query.predicates.filters, table_metadata, row_data)
         && !window_move_is_promotion(update_query, table_metadata, row_data, row_changes)
 }
 
 fn link_columns_changed(update_query: &UpdateQuery, row_changes: &RowChanges) -> bool {
-    update_query.link_columns.iter().any(|column| {
+    update_query.predicates.link_columns.iter().any(|column| {
         // Missing column would mean the query links on a column that wasn't
         // projected — a builder invariant violation. Default to changed
         // (→ invalidate): the safe direction, since assuming unchanged could

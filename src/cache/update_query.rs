@@ -15,8 +15,9 @@ use crate::query::ast::NodeId;
 #[cfg(feature = "proxy")]
 use crate::query::constraint_index::ColumnForms;
 use crate::query::constraint_index::ConstraintIndex;
-use crate::query::constraints::{QueryConstraints, TableConstraint};
+use crate::query::constraints::TableConstraint;
 use crate::query::predicate::CompiledPredicate;
+use crate::query::predicates::RelationPredicates;
 use crate::query::resolve::{QueryBranch, ResolvedQuery};
 use crate::query::transform::PgEvalTemplate;
 use crate::query::{Fingerprint, FingerprintMap, FingerprintSet};
@@ -142,11 +143,12 @@ pub struct UpdateQuery {
     pub branch: NodeId,
     /// Whether this table was found directly in FROM or inside a subquery
     pub source: UpdateQuerySource,
-    /// WHERE clause constraints for CDC invalidation filtering
-    pub constraints: QueryConstraints,
-    /// This relation's columns whose change can alter which partner rows its
-    /// rows meet, over every reference to it in the branch.
-    pub link_columns: Vec<EcoString>,
+    /// The table reference it stands for: the `Table` node of the branch.
+    pub table: NodeId,
+    /// What that reference's rows answer to, by column name: the filters CDC
+    /// matches rows against and the link columns whose change can move a row
+    /// to partners that were never loaded.
+    pub predicates: RelationPredicates,
     /// Whether the parent cached query has a LIMIT (max_limit.is_some()).
     /// Used by CDC to determine if DELETE should trigger invalidation.
     pub has_limit: bool,
@@ -206,12 +208,6 @@ impl UpdateQuery {
         }
     }
 
-    /// Whether `other` evaluates the same branch the same way: a second
-    /// reference to the relation in one branch adds nothing.
-    fn duplicates(&self, other: &UpdateQuery) -> bool {
-        self.branch.index() == other.branch.index() && self.source == other.source
-    }
-
     /// The branch CDC evaluates a changed row against.
     pub fn branch(&self) -> CacheResult<QueryBranch<'_>> {
         QueryBranch::find(&self.bound, self.branch).ok_or_else(|| {
@@ -239,7 +235,7 @@ impl UpdateQuery {
             && self.has_limit
             && !self.limit_window_columns.is_empty())
         // Cached path: a link column on this table changing can invalidate.
-        || !self.link_columns.is_empty()
+        || !self.predicates.link_columns.is_empty()
         // Uncached path: any multi-table FromClause query invalidates on a row
         // that newly satisfies the join — the partner side may not be cached,
         // so in-place maintenance can't materialize it. Independent of whether
@@ -492,7 +488,7 @@ impl UpdateQueries {
     }
 
     /// Register `fingerprint`'s update queries on this relation, replacing
-    /// any it had. Duplicates of one branch collapse to one entry.
+    /// any it had: one entry per table reference.
     pub fn fingerprint_insert(
         &mut self,
         fingerprint: Fingerprint,
@@ -503,14 +499,10 @@ impl UpdateQueries {
         let mut entries: Vec<UpdateQuery> = Vec::with_capacity(registrations.len());
         let mut subsumer = None;
         for registration in registrations {
-            // A duplicate's reference is loaded too, so its region holds.
             if subsumer.is_none() {
                 subsumer = registration.subsumer_region;
             }
             let mut update_query = registration.update_query;
-            if entries.iter().any(|entry| entry.duplicates(&update_query)) {
-                continue;
-            }
             update_query.fingerprint = fingerprint;
             update_query.ordinal = entries.len();
             self.eval_index
@@ -708,16 +700,23 @@ mod tests {
         assert_eq!(queries.fingerprint_count(), 1);
         assert!(row_candidate(&queries, "x"));
         assert!(row_candidate(&queries, "y"));
+        assert!(!row_candidate(&queries, "z"));
     }
 
-    /// Two references in one branch evaluate the same way, so they keep one.
+    /// Each reference of a self-join is its own entry with its own filters,
+    /// so a row matching either reference's filter is a candidate and one
+    /// matching neither is not.
     #[test]
-    fn test_update_queries_same_branch_duplicate_collapsed() {
+    fn test_update_queries_self_join_entry_per_reference() {
         let queries = registered(
-            "SELECT a.id FROM items a JOIN items b ON b.id = a.id",
+            "SELECT a.id FROM items a JOIN items b ON b.id = a.id \
+             WHERE a.kind = 'x' AND b.kind = 'y'",
             false,
         );
-        assert_eq!(queries.queries_of(FINGERPRINT).len(), 1);
+        assert_eq!(queries.queries_of(FINGERPRINT).len(), 2);
+        assert!(row_candidate(&queries, "x"));
+        assert!(row_candidate(&queries, "y"));
+        assert!(!row_candidate(&queries, "z"));
     }
 
     /// Registering a fingerprint again replaces its whole group.

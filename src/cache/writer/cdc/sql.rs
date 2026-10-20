@@ -11,7 +11,7 @@ use crate::oid::Oid;
 use crate::pg::identifier_quote_into;
 use crate::pg::protocol::ByteString;
 use crate::query::Fingerprint;
-use crate::query::transform::membership_values_all_into;
+use crate::query::transform::{membership_values_into, table_occurrence_at};
 use crate::result::error_chain_format;
 
 /// Append `items` to `buf` separated by `sep`, each rendered by `render`.
@@ -233,16 +233,11 @@ impl WriterCdc {
         }))
     }
 
-    /// Append one cached query's membership predicate into `buf` as a complete
-    /// boolean expression, with the CDC row's values substituted for the changed
-    /// table.
-    ///
-    /// The relation is substituted once per FROM occurrence and the results are
-    /// OR'd: `EXISTS (…)`, or `EXISTS (…) OR EXISTS (…)` for a self-join. A row
-    /// belongs to the result if it can stand in for **any** occurrence, so the
-    /// disjunction *is* the membership test — substituting a single arm
-    /// under-approximates it and evicts rows the other arm still needs
-    /// (PGC-256). Read-only; evaluated against the pre-transaction snapshot.
+    /// Append one update query's membership predicate into `buf` as a complete
+    /// boolean expression, with the CDC row's values substituted for its own
+    /// table reference. A self-join's other references have entries of their
+    /// own, and a row is kept when any entry matches (PGC-256). Read-only;
+    /// evaluated against the pre-transaction snapshot.
     pub(super) fn cache_predicate_into(
         buf: &mut String,
         update_query: &UpdateQuery,
@@ -252,8 +247,13 @@ impl WriterCdc {
         if pg_eval_template_render(buf, update_query, row_data) {
             return Ok(());
         }
-        membership_values_all_into(buf, update_query.branch()?, table_metadata, row_data)
-            .map_err(|e| e.context_transform(CacheError::from))
+        let branch = update_query.branch()?;
+        let occurrence = table_occurrence_at(branch, update_query.table)
+            .map_err(|e| e.context_transform(CacheError::from))?;
+        buf.push_str("EXISTS (");
+        membership_values_into(buf, branch, table_metadata, row_data, &occurrence);
+        buf.push(')');
+        Ok(())
     }
 
     /// Append an unconditional upsert for `row_data` into `buf` —

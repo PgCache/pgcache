@@ -13,7 +13,7 @@ use super::{AstTransformError, AstTransformResult};
 use crate::catalog::TableMetadata;
 use crate::pg::protocol::ByteString;
 use crate::query::ast::rope::deparse::branch_select_into;
-use crate::query::ast::{Deparse, LiteralValue, emit_escaped_string_literal};
+use crate::query::ast::{Deparse, LiteralValue, NodeId, emit_escaped_string_literal};
 use crate::query::resolve::{QueryBranch, SlotId, SourceOverride, TableSlot};
 
 /// Synthetic leading column carrying each batched row's ordinal through the
@@ -56,6 +56,24 @@ pub fn table_occurrences_find(
         return Err(Report::from(AstTransformError::MissingTable));
     }
     Ok(occurrences)
+}
+
+/// The FROM occurrence the `Table` node at `table` binds.
+pub fn table_occurrence_at(
+    branch: QueryBranch<'_>,
+    table: NodeId,
+) -> AstTransformResult<TableOccurrence> {
+    let bindings = branch.bound.bindings();
+    let slot = bindings
+        .source(table)
+        .ok_or_else(|| Report::from(AstTransformError::MissingTable))?;
+    let Some(table_slot @ TableSlot::Base { .. }) = bindings.slot(slot) else {
+        return Err(Report::from(AstTransformError::MissingTable));
+    };
+    Ok(TableOccurrence {
+        slot,
+        alias: EcoString::from(table_slot.qualifier()),
+    })
 }
 
 /// The relation's sole FROM occurrence. Errors when it appears more than once —
@@ -134,26 +152,6 @@ fn values_source(rows: &[Vec<LiteralValue>]) -> String {
     source
 }
 
-/// `EXISTS (…)` per FROM occurrence of the relation, OR'd: a row belongs to
-/// the result if it can stand in for **any** occurrence, so testing one arm
-/// of a self-join under-approximates membership (PGC-256).
-pub fn membership_values_all_into(
-    buf: &mut String,
-    branch: QueryBranch<'_>,
-    table_metadata: &TableMetadata,
-    row_data: &[Option<ByteString>],
-) -> AstTransformResult<()> {
-    let mut sep = "";
-    for occurrence in table_occurrences_find(branch, table_metadata)? {
-        buf.push_str(sep);
-        buf.push_str("EXISTS (");
-        membership_values_into(buf, branch, table_metadata, row_data, &occurrence);
-        buf.push(')');
-        sep = " OR ";
-    }
-    Ok(())
-}
-
 /// `SELECT true` over the branch with `occurrence` standing in for the
 /// single-row `VALUES` of `row_data`, aliased as that occurrence.
 pub fn membership_values_into(
@@ -191,8 +189,12 @@ impl PgEvalTemplate {
     /// Build the template for one PgEval query over `table_metadata`, or `None`
     /// if the relation does not occur exactly once or the sentinel split is
     /// ambiguous — the caller then falls back to the per-row render.
-    pub fn build(branch: QueryBranch<'_>, table_metadata: &TableMetadata) -> Option<Self> {
-        let occurrence = table_occurrence_single(branch, table_metadata).ok()?;
+    pub fn build(
+        branch: QueryBranch<'_>,
+        table_metadata: &TableMetadata,
+        table: NodeId,
+    ) -> Option<Self> {
+        let occurrence = table_occurrence_at(branch, table).ok()?;
         let columns: Vec<EcoString> = table_metadata
             .columns
             .iter()
@@ -561,27 +563,64 @@ mod tests {
         );
     }
 
+    /// Each `Table` node of a self-join stands in for its own arm only; a
+    /// row is kept when any arm's update query matches (PGC-256).
     #[test]
-    fn test_self_join_tests_every_arm() {
+    fn test_self_join_occurrence_per_table_node() {
         let users = users();
         let catalog = catalog(&[&users]);
         let bound = bound(
             "SELECT a.name FROM users a JOIN users b ON a.id = b.id",
             &catalog,
         );
-        let mut buf = String::new();
-        membership_values_all_into(
-            &mut buf,
-            branch(&bound),
-            &users,
-            &row(&[Some("1"), Some("x")]),
-        )
-        .expect("render");
+        let rendered: Vec<String> = branch(&bound)
+            .select
+            .direct_tables()
+            .into_iter()
+            .map(|table| {
+                let occurrence =
+                    table_occurrence_at(branch(&bound), table.id()).expect("occurrence");
+                let mut buf = String::new();
+                membership_values_into(
+                    &mut buf,
+                    branch(&bound),
+                    &users,
+                    &row(&[Some("1"), Some("x")]),
+                    &occurrence,
+                );
+                buf
+            })
+            .collect();
         assert_eq!(
-            buf,
-            "EXISTS (SELECT true FROM (VALUES ('1'::int4, 'x'::text)) a(id, name) JOIN public.users b ON a.id = b.id) \
-             OR EXISTS (SELECT true FROM public.users a JOIN (VALUES ('1'::int4, 'x'::text)) b(id, name) ON a.id = b.id)"
+            rendered,
+            [
+                "SELECT true FROM (VALUES ('1'::int4, 'x'::text)) a(id, name) JOIN public.users b ON a.id = b.id",
+                "SELECT true FROM public.users a JOIN (VALUES ('1'::int4, 'x'::text)) b(id, name) ON a.id = b.id",
+            ]
         );
+    }
+
+    /// A self-join arm gets its own prepared template, rendering what the
+    /// per-row path renders for that arm.
+    #[test]
+    fn test_pg_eval_template_per_self_join_arm() {
+        let users = users();
+        let catalog = catalog(&[&users]);
+        let bound = bound(
+            "SELECT a.name FROM users a JOIN users b ON a.id = b.id WHERE b.name = 'y'",
+            &catalog,
+        );
+        let r = row(&[Some("1"), Some("x")]);
+        for table in branch(&bound).select.direct_tables() {
+            let template =
+                PgEvalTemplate::build(branch(&bound), &users, table.id()).expect("template builds");
+            let occurrence = table_occurrence_at(branch(&bound), table.id()).expect("occurrence");
+            let mut expected = String::new();
+            membership_values_into(&mut expected, branch(&bound), &users, &r, &occurrence);
+            let mut fast = String::new();
+            assert!(template.render_into(&mut fast, &r));
+            assert_eq!(fast, expected);
+        }
     }
 
     #[test]
@@ -659,7 +698,14 @@ mod tests {
             "SELECT ten, count(*) AS c FROM onek GROUP BY ten HAVING count(*) > 0",
         ] {
             let bound = bound(sql, &catalog);
-            let template = PgEvalTemplate::build(branch(&bound), &onek).expect("template builds");
+            let table = branch(&bound)
+                .select
+                .direct_tables()
+                .first()
+                .copied()
+                .expect("one table");
+            let template =
+                PgEvalTemplate::build(branch(&bound), &onek, table.id()).expect("template builds");
             for r in &rows {
                 let occurrence =
                     table_occurrence_single(branch(&bound), &onek).expect("one occurrence");
@@ -683,11 +729,15 @@ mod tests {
             &[("id", "int4"), ("ten", "int4"), ("name", "text")],
         );
         let catalog = catalog(&[&onek]);
-        let template = PgEvalTemplate::build(
-            branch(&bound("SELECT * FROM onek WHERE ten = 7", &catalog)),
-            &onek,
-        )
-        .expect("template builds");
+        let bound = bound("SELECT * FROM onek WHERE ten = 7", &catalog);
+        let table = branch(&bound)
+            .select
+            .direct_tables()
+            .first()
+            .copied()
+            .expect("one table");
+        let template =
+            PgEvalTemplate::build(branch(&bound), &onek, table.id()).expect("template builds");
         let mut buf = String::from("EXISTS (");
         assert!(!template.render_into(&mut buf, &row(&[Some("1"), Some("7")])));
         assert_eq!(
