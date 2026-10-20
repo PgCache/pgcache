@@ -225,6 +225,7 @@ pub fn query_admission_analyze(
         let table_name = table_node.name().clone();
         let mut update_query = UpdateQuery {
             fingerprint,
+            ordinal: 0,
             bound: Arc::clone(update_source),
             branch: branch.select.id(),
             source,
@@ -265,17 +266,16 @@ pub fn query_admission_analyze(
                 .cloned()
                 .unwrap_or_default()
         };
-        // - has_limit: limited queries are excluded from subsumption.
-        // - !where_analysis_complete: the WHERE couldn't be fully analyzed,
-        //   so coverage isn't reasonable (PGC-106).
-        let subsumer_eligible =
-            !self_joined && !has_limit && update_query.constraints.where_analysis_complete;
+        // !where_analysis_complete: the WHERE couldn't be fully analyzed, so
+        // coverage isn't reasonable (PGC-106). A LIMIT also excludes a parent.
+        let subsumer_shape = !self_joined && update_query.constraints.where_analysis_complete;
 
         admissions.push(TableAdmission {
             relation_oid,
             table_name,
             update_query,
-            subsumer_eligible,
+            subsumer_shape,
+            subsumer_eligible: subsumer_shape && !has_limit,
             index_constraints,
         });
     }

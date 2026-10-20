@@ -397,7 +397,7 @@ impl WriterCore {
             out.clear();
             return;
         };
-        update_queries.eval_index.candidates_point_into(
+        update_queries.eval_candidates_into(
             |column| {
                 if pk_only
                     && !table_metadata

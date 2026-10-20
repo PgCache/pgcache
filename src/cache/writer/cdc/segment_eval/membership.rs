@@ -9,7 +9,7 @@ use tokio_postgres::{SimpleQueryMessage, Statement};
 use tracing::{error, warn};
 
 use super::{PreparedEvalKey, RelationBatch, SegmentMembership, chunk_arrays_build};
-use crate::cache::update_query::{UpdateEvalStrategy, UpdateQueries, UpdateQuery};
+use crate::cache::update_query::{UpdateEvalStrategy, UpdateQueries, UpdateQuery, UpdateQueryKey};
 use crate::cache::writer::cdc::row_match::update_query_matches_locally;
 use crate::cache::writer::cdc::{PG_EVAL_CHUNK, PG_EVAL_ROW_CHUNK, WriterCdc};
 use crate::cache::writer::core::WriterCore;
@@ -18,7 +18,6 @@ use crate::cache::{CacheError, CacheResult, MapIntoReport};
 use crate::catalog::TableMetadata;
 use crate::oid::Oid;
 use crate::pg::protocol::ByteString;
-use crate::query::Fingerprint;
 use crate::query::transform::{membership_batch_into, membership_unnest_into};
 use crate::result::error_chain_format;
 
@@ -73,12 +72,10 @@ fn segment_rows_bucket(
 /// Whether some fresh query already matched this event.
 fn fresh_hit(
     fresh: &[&UpdateQuery],
-    hits: &HashSet<(usize, Fingerprint)>,
+    hits: &HashSet<(usize, UpdateQueryKey)>,
     event_idx: usize,
 ) -> bool {
-    fresh
-        .iter()
-        .any(|q| hits.contains(&(event_idx, q.fingerprint)))
+    fresh.iter().any(|q| hits.contains(&(event_idx, q.key())))
 }
 
 /// Whether a still-maintained LocalEval query matches the row.
@@ -87,7 +84,7 @@ fn local_eval_match_any(
     update_queries: &UpdateQueries,
     row: &[Option<ByteString>],
 ) -> bool {
-    update_queries.queries.values().any(|q| {
+    update_queries.iter().any(|q| {
         q.eval_strategy == UpdateEvalStrategy::LocalEval
             && !core.frame_invalidations.contains(&q.fingerprint)
             && update_query_matches_locally(q, row)
@@ -133,8 +130,7 @@ impl WriterCdc {
             return Ok(());
         };
         let batchable: Vec<&UpdateQuery> = update_queries
-            .queries
-            .values()
+            .iter()
             .filter(|q| q.eval_strategy == UpdateEvalStrategy::PgEval && q.pg_batchable)
             .collect();
         // A multi-row VALUES needs uniform arity; rows narrower than the
@@ -187,14 +183,14 @@ impl WriterCdc {
 
     /// Evaluate `queries` against `rows` in `UNION ALL`-combined multi-row
     /// VALUES statements (`PG_EVAL_ROW_CHUNK` rows × `PG_EVAL_CHUNK` queries per
-    /// statement), inserting `(event index, fingerprint)` matches into `hits`.
+    /// statement), inserting `(event index, update query)` matches into `hits`.
     /// No-op when either side is empty.
     async fn membership_chunks_eval(
         &mut self,
         table_metadata: &TableMetadata,
         queries: &[&UpdateQuery],
         rows: &[EventRow<'_>],
-        hits: &mut HashSet<(usize, Fingerprint)>,
+        hits: &mut HashSet<(usize, UpdateQueryKey)>,
     ) -> CacheResult<()> {
         if queries.is_empty() {
             return Ok(());
@@ -227,7 +223,7 @@ impl WriterCdc {
     ) -> CacheResult<Statement> {
         let key = PreparedEvalKey {
             relation_oid: table_metadata.relation_oid,
-            fingerprint: update_query.fingerprint,
+            update_query: update_query.key(),
         };
         if let Some(statement) = self.prepared_membership.get(&key) {
             crate::metrics::handles().cdc.prepared_hits.increment(1);
@@ -259,7 +255,7 @@ impl WriterCdc {
         table_metadata: &TableMetadata,
         queries: &[&UpdateQuery],
         row_chunk: &[EventRow<'_>],
-        hits: &mut HashSet<(usize, Fingerprint)>,
+        hits: &mut HashSet<(usize, UpdateQueryKey)>,
     ) -> CacheResult<()> {
         let (ordinals, column_arrays) =
             chunk_arrays_build(table_metadata, row_chunk, |&(_, row)| row);
@@ -269,12 +265,12 @@ impl WriterCdc {
             params.push(array);
         }
 
-        let mut statements: Vec<(Fingerprint, Statement)> = Vec::with_capacity(queries.len());
+        let mut statements: Vec<(UpdateQueryKey, Statement)> = Vec::with_capacity(queries.len());
         for update_query in queries {
             let statement = self
                 .membership_statement(table_metadata, update_query)
                 .await?;
-            statements.push((update_query.fingerprint, statement));
+            statements.push((update_query.key(), statement));
         }
 
         // Concurrent execution = pipelined on the single connection.
@@ -289,7 +285,7 @@ impl WriterCdc {
         // the inline fallback, which does its own counting.
         let mut executed = 0u64;
         let mut first_error = None;
-        for ((fingerprint, _), execution) in statements.iter().zip(executions) {
+        for ((update_query, _), execution) in statements.iter().zip(executions) {
             let result_rows = match execution {
                 Ok(rows) => rows,
                 Err(e) => {
@@ -297,7 +293,7 @@ impl WriterCdc {
                     // falls back to inline for this chunk.
                     self.prepared_membership.pop(&PreparedEvalKey {
                         relation_oid: table_metadata.relation_oid,
-                        fingerprint: *fingerprint,
+                        update_query: *update_query,
                     });
                     first_error.get_or_insert(CacheError::PgError(e));
                     continue;
@@ -310,7 +306,7 @@ impl WriterCdc {
                 };
                 #[allow(clippy::cast_sign_loss)] // ordinals are 0..chunk len
                 if let Some(&(event_idx, _)) = row_chunk.get(local_idx as usize) {
-                    hits.insert((event_idx, *fingerprint));
+                    hits.insert((event_idx, *update_query));
                 }
             }
         }
@@ -332,7 +328,7 @@ impl WriterCdc {
         table_metadata: &TableMetadata,
         queries: &[&UpdateQuery],
         row_chunk: &[EventRow<'_>],
-        hits: &mut HashSet<(usize, Fingerprint)>,
+        hits: &mut HashSet<(usize, UpdateQueryKey)>,
     ) -> CacheResult<()> {
         let chunk_rows: Vec<&[Option<ByteString>]> =
             row_chunk.iter().map(|(_, row)| *row).collect();
@@ -375,7 +371,7 @@ impl WriterCdc {
                 if let (Some(update_query), Some(&(event_idx, _))) =
                     (query_chunk.get(ordinal), row_chunk.get(local_idx))
                 {
-                    hits.insert((event_idx, update_query.fingerprint));
+                    hits.insert((event_idx, update_query.key()));
                 }
             }
         }
@@ -384,7 +380,7 @@ impl WriterCdc {
 }
 
 impl RelationBatch {
-    /// Record which events and fingerprints the membership batch covered, so
+    /// Record which events and update queries the membership batch covered, so
     /// the decide pass knows when to consult `hits`.
     fn coverage_record(
         &mut self,
@@ -397,7 +393,7 @@ impl RelationBatch {
             .extend(batch_rows.iter().map(|(event_idx, _)| *event_idx));
         self.rest_covered
             .extend(rest_rows.iter().map(|(event_idx, _)| *event_idx));
-        self.fresh_fps = fresh.iter().map(|q| q.fingerprint).collect();
-        self.rest_fps = rest.iter().map(|q| q.fingerprint).collect();
+        self.fresh_keys = fresh.iter().map(|q| q.key()).collect();
+        self.rest_keys = rest.iter().map(|q| q.key()).collect();
     }
 }

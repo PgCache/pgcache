@@ -61,7 +61,7 @@ fn maintained_candidates<'a>(
     candidates
         .iter()
         .filter(|fingerprint| !core.frame_invalidations.contains(fingerprint))
-        .filter_map(|fingerprint| update_queries.queries.get(fingerprint))
+        .flat_map(|fingerprint| update_queries.queries_of(*fingerprint))
 }
 
 /// Batch-covered PgEval queries consult the segment matrix — no round-trip.
@@ -77,11 +77,10 @@ fn pg_eval_batched_match<'a>(
     let Some(view) = batch else {
         return (false, pg_eval);
     };
-    let (batched, fallback): (Vec<&UpdateQuery>, Vec<&UpdateQuery>) = pg_eval
-        .into_iter()
-        .partition(|q| view.covers(q.fingerprint));
+    let (batched, fallback): (Vec<&UpdateQuery>, Vec<&UpdateQuery>) =
+        pg_eval.into_iter().partition(|q| view.covers(q.key()));
     let mut matched = false;
-    for update_query in batched.iter().filter(|q| view.hit(q.fingerprint)) {
+    for update_query in batched.iter().filter(|q| view.hit(q.key())) {
         trace!(
             "update_queries batched pg-eval matched fingerprint {}",
             update_query.fingerprint
@@ -147,7 +146,7 @@ impl WriterCdc {
             return Ok(false);
         };
 
-        let total_queries = update_queries.queries.len();
+        let total_queries = update_queries.update_query_count();
         trace!("update_queries_execute_batch start [{total_queries}]");
         if total_queries == 0 {
             return Ok(false);

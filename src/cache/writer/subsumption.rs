@@ -51,11 +51,12 @@ impl SubsumerSource for WriterSubsumerSource<'_> {
                 // index; the fine-grained gates run per candidate in
                 // `subsumption_covered`.
                 update_queries
-                    .subsumption
-                    .candidates(&keyed)
+                    .subsumption_candidates(&keyed)
                     .into_iter()
                     .filter_map(move |fingerprint| {
-                        let update_query = update_queries.queries.get(&fingerprint)?;
+                        let [update_query] = update_queries.queries_of(fingerprint) else {
+                            return None;
+                        };
                         let parent = self.cache.cached_queries.get1(&fingerprint);
                         Some(SubsumerCandidate {
                             constraints: &update_query.constraints,

@@ -1809,3 +1809,57 @@ async fn test_correlated_scalar_and_exists_combined() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// Kind a nodes without a kind b child, by a self-correlated NOT EXISTS: the
+/// table is referenced in FROM and in the subquery, and an insert relevant to
+/// either reference alone must reach the result.
+#[tokio::test]
+async fn test_correlated_not_exists_self_reference_cdc_insert() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE leaf_nodes (id INTEGER PRIMARY KEY, parent_id INTEGER, kind TEXT)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO leaf_nodes VALUES (1, NULL, 'a'), (2, 1, 'a'), (3, 1, 'b')",
+        &[],
+    )
+    .await?;
+    ctx.cdc_decode_settle().await?;
+
+    let query = "SELECT e.id FROM leaf_nodes e WHERE e.kind = 'a' AND NOT EXISTS \
+                 (SELECT 1 FROM leaf_nodes n WHERE n.parent_id = e.id AND n.kind = 'b') ORDER BY e.id";
+
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(
+        res.len(),
+        3,
+        "node 2, the one kind a node without a kind b child"
+    );
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 3, "cached: node 2");
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    ctx.query("INSERT INTO leaf_nodes VALUES (4, NULL, 'a')", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 4, "the inserted node reaches the result");
+
+    ctx.query("INSERT INTO leaf_nodes VALUES (5, 2, 'b')", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+
+    let res = ctx.simple_query(query).await?;
+    assert_row_at(&res, 1, &[("id", "4")])?;
+    assert_eq!(res.len(), 3, "a kind b child removes node 2");
+
+    Ok(())
+}

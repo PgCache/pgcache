@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use ecow::EcoString;
@@ -6,10 +7,15 @@ use iddqd::{IdHashItem, id_upcast};
 use rootcause::Report;
 
 use crate::cache::{CacheError, CacheResult};
+#[cfg(feature = "proxy")]
+use crate::id_hash::BuildIdHasher;
+use crate::id_hash::impl_id_hashable;
 use crate::oid::Oid;
 use crate::query::ast::NodeId;
+#[cfg(feature = "proxy")]
+use crate::query::constraint_index::ColumnForms;
 use crate::query::constraint_index::ConstraintIndex;
-use crate::query::constraints::QueryConstraints;
+use crate::query::constraints::{QueryConstraints, TableConstraint};
 use crate::query::predicate::CompiledPredicate;
 use crate::query::resolve::{QueryBranch, ResolvedQuery};
 use crate::query::transform::PgEvalTemplate;
@@ -97,11 +103,38 @@ pub enum UpdateQuerySource {
     OuterJoinOptional,
 }
 
+/// One update query of a cached query on a relation. A query that reads the
+/// relation from several branches has one per branch, numbered by `ordinal`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpdateQueryKey {
+    pub fingerprint: Fingerprint,
+    pub ordinal: usize,
+}
+
+impl Hash for UpdateQueryKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // `IdHasher` keeps one write, so the ordinal is mixed into the
+        // fingerprint, which is already a uniform hash.
+        state.write_u64(
+            self.fingerprint.get() ^ (self.ordinal as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+        );
+    }
+}
+
+impl_id_hashable!(UpdateQueryKey);
+
+/// `HashSet` of `UpdateQueryKey` with the passthrough hasher.
+#[cfg(feature = "proxy")]
+pub(crate) type UpdateQueryKeySet = HashSet<UpdateQueryKey, BuildIdHasher<UpdateQueryKey>>;
+
 /// Query used to update cached results when data changes
 #[derive(Debug, Clone)]
 pub struct UpdateQuery {
     /// Fingerprint of cached query that generated this update query
     pub fingerprint: Fingerprint,
+    /// Position among the fingerprint's update queries on this relation,
+    /// assigned when they are registered.
+    pub ordinal: usize,
     /// The query the update query is a branch of: the cached query, or its
     /// decorrelated form. Every update query derived from it shares it.
     pub bound: Arc<ResolvedQuery>,
@@ -164,6 +197,19 @@ pub struct UpdateQuery {
 }
 
 impl UpdateQuery {
+    pub fn key(&self) -> UpdateQueryKey {
+        UpdateQueryKey {
+            fingerprint: self.fingerprint,
+            ordinal: self.ordinal,
+        }
+    }
+
+    /// Whether `other` evaluates the same branch the same way: a second
+    /// reference to the relation in one branch adds nothing.
+    fn duplicates(&self, other: &UpdateQuery) -> bool {
+        self.branch.index() == other.branch.index() && self.source == other.source
+    }
+
     /// The branch CDC evaluates a changed row against.
     pub fn branch(&self) -> CacheResult<QueryBranch<'_>> {
         QueryBranch::find(&self.bound, self.branch).ok_or_else(|| {
@@ -201,32 +247,49 @@ impl UpdateQuery {
     }
 }
 
+/// An update query to register, with what the relation's indexes take.
+pub struct UpdateQueryRegistration {
+    pub update_query: UpdateQuery,
+    /// Constraints to index under, in their key forms.
+    pub index_constraints: Vec<TableConstraint>,
+    /// Eligible as a subsumption parent but for a LIMIT, which can change
+    /// after registration.
+    pub subsumer_shape: bool,
+}
+
 /// Collection of update queries for a specific relation.
 ///
-/// `queries` is keyed by fingerprint for O(1) lookup. `subsumption` is a typed
-/// index over the queries' WHERE-clause constraints used by
-/// `subsumption_check` for sub-linear candidate lookup (see PGC-119).
+/// `queries` holds every update query of a fingerprint on the relation: one
+/// per branch reading it (PGC-506). A fingerprint's group is registered and
+/// removed as a whole, through `fingerprint_insert`/`fingerprint_remove`,
+/// which keep the indexes and carve-outs in lockstep with it.
 #[derive(Debug)]
 pub struct UpdateQueries {
     pub relation_oid: Oid,
-    pub queries: FingerprintMap<UpdateQuery>,
-    pub subsumption: ConstraintIndex<Fingerprint>,
+    queries: FingerprintMap<Vec<UpdateQuery>>,
+    /// Typed index over subsumption parents' WHERE-clause constraints, for
+    /// sub-linear candidate lookup (PGC-119). Holds the `subsumer_constraints`
+    /// fingerprints without a LIMIT.
+    subsumption: ConstraintIndex<Fingerprint>,
+    /// Index constraints of each fingerprint that could parent a subsumption:
+    /// one update query on the relation, of subsumer shape.
+    subsumer_constraints: FingerprintMap<Vec<TableConstraint>>,
     /// Per-table constraint index over the *full* update-query population of
     /// this relation — LocalEval and PgEval alike (PGC-292). Probed point-wise
-    /// (`candidates_point`) to narrow CDC per-row work: the upsert matcher
+    /// (`eval_candidates_into`) to narrow CDC per-row work: the upsert matcher
     /// (`update_queries_execute_batch`, which filters to LocalEval after the
     /// probe), the memo-eviction pass, and `mv_dirty_mark_removed_row`. Queries
     /// with no/partial extractable constraints land in the unconstrained class
     /// and are returned for every row, so narrowing never drops a true match
     /// (no stale reads).
-    pub eval_index: ConstraintIndex<Fingerprint>,
+    eval_index: ConstraintIndex<UpdateQueryKey>,
     /// ADR-045 invalidation carve-outs — queries that can invalidate even when
     /// the changed row is not in the `eval_index` candidate set, so the narrowed
     /// invalidation pass must always include them. `always_check`: Subquery /
     /// OuterJoinOptional sources (invalidate unconditionally). `has_limit_from`:
     /// `has_limit` FromClause queries (a DELETE invalidates all of them; an
     /// UPDATE of a limit predicate column can push a row out of their window).
-    /// Both maintained on `query_insert`/`query_remove`.
+    /// A fingerprint is in a set when any of its update queries qualifies.
     pub always_check: FingerprintSet,
     pub has_limit_from: FingerprintSet,
     /// Refcounted union of `predicate_columns` over `has_limit_from`. Lets the
@@ -238,14 +301,13 @@ pub struct UpdateQueries {
     /// (PGC-334); columns of queries with `order_by_keys == None` are excluded
     /// (those queries never consult direction).
     limit_order_columns: HashMap<EcoString, usize>,
-    /// Bumped on every `query_insert`/`query_remove`. Keys the batched
-    /// row-change prepared-statement cache so a registration that changes
+    /// Bumped on every insert/remove. Keys the batched row-change
+    /// prepared-statement cache so a registration that changes
     /// `limit_order_columns` (or the column contract generally) can't keep
     /// serving a stale prepared projection list.
     epoch: u64,
-    /// Count of queries with `change_dependent == true`. Maintained on
-    /// insert/remove via `change_dependent_account` so `needs_change_eval` is
-    /// O(1) on the CDC hot path. Derivable from `queries`; `needs_change_eval`
+    /// Count of update queries with `change_dependent == true`, so
+    /// `needs_change_eval` is O(1) on the CDC hot path. `needs_change_eval`
     /// debug-asserts it against a recompute so a missed account call can't
     /// silently desync (a missed increment risks stale reads, a missed
     /// decrement disables the PGC-227 skip).
@@ -258,6 +320,7 @@ impl UpdateQueries {
             relation_oid,
             queries: HashMap::default(),
             subsumption: ConstraintIndex::new(),
+            subsumer_constraints: HashMap::default(),
             eval_index: ConstraintIndex::new(),
             always_check: FingerprintSet::default(),
             has_limit_from: FingerprintSet::default(),
@@ -266,6 +329,51 @@ impl UpdateQueries {
             epoch: 0,
             change_dependent_count: 0,
         }
+    }
+
+    /// The update queries `fingerprint` registered on this relation.
+    pub fn queries_of(&self, fingerprint: Fingerprint) -> &[UpdateQuery] {
+        self.queries.get(&fingerprint).map_or(&[], Vec::as_slice)
+    }
+
+    /// Every update query on this relation.
+    pub fn iter(&self) -> impl Iterator<Item = &UpdateQuery> {
+        self.queries.values().flatten()
+    }
+
+    /// The fingerprints with update queries on this relation.
+    pub fn fingerprints(&self) -> impl Iterator<Item = Fingerprint> + '_ {
+        self.queries.keys().copied()
+    }
+
+    pub fn fingerprint_count(&self) -> usize {
+        self.queries.len()
+    }
+
+    pub fn update_query_count(&self) -> usize {
+        self.queries.values().map(Vec::len).sum()
+    }
+
+    /// The fingerprints whose update queries a row with `col_forms_fn`'s
+    /// values could satisfy, into `out` (cleared first).
+    #[cfg(feature = "proxy")]
+    pub(crate) fn eval_candidates_into<F>(&self, col_forms_fn: F, out: &mut FingerprintSet)
+    where
+        F: Fn(&str) -> ColumnForms,
+    {
+        self.eval_index
+            .candidates_point_into(col_forms_fn, out, |key| key.fingerprint);
+    }
+
+    /// The columns the eval index probes a row by.
+    pub fn eval_index_columns(&self) -> impl Iterator<Item = &EcoString> {
+        self.eval_index.columns()
+    }
+
+    /// Subsumption parents whose constraints might cover `keyed`, the new
+    /// query's constraints in their key forms.
+    pub fn subsumption_candidates(&self, keyed: &[TableConstraint]) -> FingerprintSet {
+        self.subsumption.candidates(keyed).into_iter().collect()
     }
 
     /// Carve-out membership for a query: `(always_check, has_limit_fromclause)`.
@@ -278,37 +386,37 @@ impl UpdateQueries {
         (always, limit_from)
     }
 
-    /// Add (`added`) or remove a query's carve-out memberships, keeping
+    /// Add (`added`) or remove a fingerprint's carve-out memberships, keeping
     /// `always_check` / `has_limit_from` / `limit_predicate_columns` /
-    /// `limit_order_columns` in lockstep with `queries`. Idempotent per
-    /// fingerprint for the sets; refcounted for the column unions so
-    /// replacement (same fingerprint, changed shape) and multiple limit
-    /// queries sharing a column are handled correctly.
-    fn carveout_account(&mut self, fp: Fingerprint, q: &UpdateQuery, added: bool) {
-        let (always, limit_from) = Self::carveout_membership(q);
-        if always {
-            if added {
+    /// `limit_order_columns` in lockstep with `queries`. The sets hold the
+    /// fingerprint when any of `entries` qualifies; the column unions are
+    /// refcounted per entry, so several limit queries sharing a column are
+    /// handled correctly.
+    fn carveout_account(&mut self, fp: Fingerprint, entries: &[UpdateQuery], added: bool) {
+        for q in entries {
+            let (always, limit_from) = Self::carveout_membership(q);
+            if always && added {
                 self.always_check.insert(fp);
-            } else {
-                self.always_check.remove(&fp);
+            }
+            if limit_from {
+                if added {
+                    self.has_limit_from.insert(fp);
+                }
+                Self::column_refcounts_account(
+                    &mut self.limit_predicate_columns,
+                    q.predicate_columns.iter(),
+                    added,
+                );
+                Self::column_refcounts_account(
+                    &mut self.limit_order_columns,
+                    q.order_by_keys.iter().flatten().map(|k| &k.column),
+                    added,
+                );
             }
         }
-        if limit_from {
-            if added {
-                self.has_limit_from.insert(fp);
-            } else {
-                self.has_limit_from.remove(&fp);
-            }
-            Self::column_refcounts_account(
-                &mut self.limit_predicate_columns,
-                q.predicate_columns.iter(),
-                added,
-            );
-            Self::column_refcounts_account(
-                &mut self.limit_order_columns,
-                q.order_by_keys.iter().flatten().map(|k| &k.column),
-                added,
-            );
+        if !added {
+            self.always_check.remove(&fp);
+            self.has_limit_from.remove(&fp);
         }
     }
 
@@ -360,51 +468,93 @@ impl UpdateQueries {
     pub fn needs_change_eval(&self) -> bool {
         debug_assert_eq!(
             self.change_dependent_count,
-            self.queries.values().filter(|q| q.change_dependent).count(),
+            self.iter().filter(|q| q.change_dependent).count(),
             "change_dependent_count desynced from queries — insert/remove must go \
-             through query_insert/query_remove"
+             through fingerprint_insert/fingerprint_remove"
         );
         self.change_dependent_count > 0
     }
 
-    /// Insert (or replace) an update query, keeping `change_dependent_count` in
-    /// sync with `queries`. Returns the replaced entry, if any. Replacement is
-    /// real: the same fingerprint can be registered more than once for a
-    /// relation (e.g. a self-correlated subquery decorrelates into multiple
-    /// update queries over the same table), and the map is keyed by fingerprint.
-    pub fn query_insert(&mut self, query: UpdateQuery) -> Option<UpdateQuery> {
-        let fp = query.fingerprint;
+    /// Register `fingerprint`'s update queries on this relation, replacing
+    /// any it had. Duplicates of one branch collapse to one entry.
+    pub fn fingerprint_insert(
+        &mut self,
+        fingerprint: Fingerprint,
+        registrations: Vec<UpdateQueryRegistration>,
+    ) {
+        self.fingerprint_remove(fingerprint);
         self.epoch += 1;
-        // Un-account any replaced entry before accounting the new one: the
-        // carve-out sets are idempotent per fingerprint, so the reverse order
-        // would let the removal cancel the fresh insert.
-        let prev = self.queries.remove(&fp);
-        if let Some(prev) = &prev {
-            self.change_dependent_account(prev.change_dependent, false);
-            self.carveout_account(fp, prev, false);
+        let mut entries: Vec<UpdateQuery> = Vec::with_capacity(registrations.len());
+        let mut subsumer = None;
+        for registration in registrations {
+            let mut update_query = registration.update_query;
+            if entries.iter().any(|entry| entry.duplicates(&update_query)) {
+                continue;
+            }
+            update_query.fingerprint = fingerprint;
+            update_query.ordinal = entries.len();
+            self.eval_index
+                .insert(update_query.key(), &registration.index_constraints);
+            self.change_dependent_account(update_query.change_dependent, true);
+            if registration.subsumer_shape {
+                subsumer = Some(registration.index_constraints);
+            }
+            entries.push(update_query);
         }
-        self.change_dependent_account(query.change_dependent, true);
-        self.carveout_account(fp, &query, true);
-        self.queries.insert(fp, query);
-        prev
+        // More than one update query reads the relation more than once, which
+        // no single-relation parent does.
+        if let (Some(constraints), [entry]) = (subsumer, entries.as_slice()) {
+            if !entry.has_limit {
+                self.subsumption.insert(fingerprint, &constraints);
+            }
+            self.subsumer_constraints.insert(fingerprint, constraints);
+        }
+        self.carveout_account(fingerprint, &entries, true);
+        self.queries.insert(fingerprint, entries);
     }
 
-    /// Remove an update query by fingerprint, keeping `change_dependent_count`
-    /// in sync with `queries`. Returns the removed entry, if any.
-    pub fn query_remove(&mut self, fingerprint: Fingerprint) -> Option<UpdateQuery> {
-        let removed = self.queries.remove(&fingerprint);
-        if let Some(removed) = &removed {
-            self.epoch += 1;
-            self.change_dependent_account(removed.change_dependent, false);
-            self.carveout_account(fingerprint, removed, false);
+    /// Remove every update query of `fingerprint` on this relation, with its
+    /// index entries. Returns whether it had any.
+    pub fn fingerprint_remove(&mut self, fingerprint: Fingerprint) -> bool {
+        self.subsumption.remove(fingerprint);
+        self.subsumer_constraints.remove(&fingerprint);
+        let Some(entries) = self.queries.remove(&fingerprint) else {
+            return false;
+        };
+        self.epoch += 1;
+        for entry in &entries {
+            self.eval_index.remove(entry.key());
+            self.change_dependent_account(entry.change_dependent, false);
         }
-        removed
+        self.carveout_account(fingerprint, &entries, false);
+        true
+    }
+
+    /// Set whether `fingerprint`'s parent query has a LIMIT, re-deriving what
+    /// depends on it: the carve-outs, `change_dependent`, and its place in
+    /// the subsumption index, which holds only unlimited parents.
+    pub fn has_limit_set(&mut self, fingerprint: Fingerprint, has_limit: bool, table_name: &str) {
+        let Some(mut entries) = self.queries.remove(&fingerprint) else {
+            return;
+        };
+        self.epoch += 1;
+        self.carveout_account(fingerprint, &entries, false);
+        for entry in &mut entries {
+            self.change_dependent_account(entry.change_dependent, false);
+            entry.has_limit = has_limit;
+            entry.change_dependent = entry.update_invalidation_possible(table_name);
+            self.change_dependent_account(entry.change_dependent, true);
+        }
+        self.carveout_account(fingerprint, &entries, true);
+        self.queries.insert(fingerprint, entries);
+        self.subsumption.remove(fingerprint);
+        if !has_limit && let Some(constraints) = self.subsumer_constraints.get(&fingerprint) {
+            self.subsumption.insert(fingerprint, constraints);
+        }
     }
 
     /// Account for a query being added to / removed from the set. `added`
-    /// increments on insert, decrements on remove. Private: callers mutate
-    /// `queries` only via `query_insert`/`query_remove`, which keep the count
-    /// in lockstep.
+    /// increments on insert, decrements on remove.
     fn change_dependent_account(&mut self, change_dependent: bool, added: bool) {
         if !change_dependent {
             return;
@@ -425,4 +575,203 @@ impl IdHashItem for UpdateQueries {
     }
 
     id_upcast!();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::hash::BuildHasher;
+
+    use iddqd::BiHashMap;
+    use postgres_types::Type;
+
+    use super::*;
+    use crate::cache::admission::{AdmissionDepth, AdmissionQuery, query_admission_analyze};
+    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
+    use crate::id_hash::BuildIdHasher;
+    use crate::oid::TypeOid;
+    use crate::pg::protocol::ByteString;
+    use crate::query::constraint_index::{row_value_forms, table_constraints_keyed};
+
+    const FINGERPRINT: Fingerprint = Fingerprint::from_raw(0x5eed);
+    const ITEMS_OID: u32 = 1001;
+
+    fn column(name: &str, position: i16, data_type: Type, type_name: &str) -> ColumnMetadata {
+        ColumnMetadata {
+            name: name.into(),
+            position: ColumnPosition::from_raw(position),
+            type_oid: TypeOid::from_raw(data_type.oid()),
+            data_type,
+            type_name: type_name.into(),
+            cache_type_name: type_name.into(),
+            is_primary_key: position == 1,
+        }
+    }
+
+    fn items() -> TableMetadata {
+        TableMetadata::for_test(
+            "items",
+            ITEMS_OID,
+            [
+                column("id", 1, Type::INT4, "int4"),
+                column("kind", 2, Type::TEXT, "text"),
+            ],
+        )
+    }
+
+    fn catalog() -> Catalog {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(items().into());
+        tables
+    }
+
+    /// The registrations of `sql` on `items`, built as the writer builds them.
+    fn registrations(sql: &str, has_limit: bool) -> Vec<UpdateQueryRegistration> {
+        let tables = catalog();
+        let bound =
+            Arc::new(ResolvedQuery::parse_resolve(sql, &tables, &["public"]).expect("resolve"));
+        let analysis = query_admission_analyze(
+            AdmissionQuery {
+                bound: &bound,
+                decorrelated: None,
+            },
+            FINGERPRINT,
+            has_limit,
+            &HashSet::new(),
+            &tables,
+            AdmissionDepth::Full,
+        )
+        .expect("analyze");
+        analysis
+            .tables
+            .into_iter()
+            .map(|admission| UpdateQueryRegistration {
+                index_constraints: table_constraints_keyed(&admission.index_constraints, &items()),
+                update_query: admission.update_query,
+                subsumer_shape: admission.subsumer_shape,
+            })
+            .collect()
+    }
+
+    fn registered(sql: &str, has_limit: bool) -> UpdateQueries {
+        let mut queries = UpdateQueries::new(Oid::from_raw(ITEMS_OID));
+        queries.fingerprint_insert(FINGERPRINT, registrations(sql, has_limit));
+        queries
+    }
+
+    /// Whether the eval index offers the fingerprint for an `items` row of `kind`.
+    fn row_candidate(queries: &UpdateQueries, kind: &str) -> bool {
+        let table = items();
+        let row: Vec<Option<ByteString>> = vec![Some("1".into()), Some(kind.into())];
+        let mut candidates = FingerprintSet::default();
+        queries.eval_candidates_into(|c| row_value_forms(&table, &row, c), &mut candidates);
+        candidates.contains(&FINGERPRINT)
+    }
+
+    fn subsumer(queries: &UpdateQueries) -> bool {
+        queries.subsumption_candidates(&[]).contains(&FINGERPRINT)
+            || queries
+                .subsumption_candidates(&[TableConstraint::Comparison(
+                    "kind".into(),
+                    crate::query::ast::BinaryOp::Equal,
+                    crate::query::ast::LiteralValue::String("x".into()),
+                )])
+                .contains(&FINGERPRINT)
+    }
+
+    const UNION: &str = "SELECT id FROM items WHERE kind = 'x' \
+                         UNION SELECT id FROM items WHERE kind = 'y'";
+
+    /// Each branch reading the relation keeps its own update query, and a
+    /// row matching either branch reaches the fingerprint (PGC-506).
+    #[test]
+    fn test_update_queries_branch_each_registered() {
+        let queries = registered(UNION, false);
+        assert_eq!(queries.queries_of(FINGERPRINT).len(), 2);
+        assert_eq!(queries.fingerprint_count(), 1);
+        assert!(row_candidate(&queries, "x"));
+        assert!(row_candidate(&queries, "y"));
+    }
+
+    /// Two references in one branch evaluate the same way, so they keep one.
+    #[test]
+    fn test_update_queries_same_branch_duplicate_collapsed() {
+        let queries = registered(
+            "SELECT a.id FROM items a JOIN items b ON b.id = a.id",
+            false,
+        );
+        assert_eq!(queries.queries_of(FINGERPRINT).len(), 1);
+    }
+
+    /// Registering a fingerprint again replaces its whole group.
+    #[test]
+    fn test_update_queries_insert_replaces_group() {
+        let mut queries = registered(UNION, false);
+        queries.fingerprint_insert(
+            FINGERPRINT,
+            registrations("SELECT id FROM items WHERE kind = 'x'", false),
+        );
+        assert_eq!(queries.update_query_count(), 1);
+        assert!(row_candidate(&queries, "x"));
+        assert!(!row_candidate(&queries, "y"));
+    }
+
+    /// Removing a fingerprint clears its group, its index entries and its
+    /// carve-outs.
+    #[test]
+    fn test_update_queries_remove_clears_indexes() {
+        let mut queries = registered(
+            "SELECT id FROM items WHERE kind = 'x' \
+             AND id IN (SELECT id FROM items WHERE kind = 'y')",
+            false,
+        );
+        assert_eq!(queries.queries_of(FINGERPRINT).len(), 2);
+        assert!(queries.always_check.contains(&FINGERPRINT));
+        assert!(queries.fingerprint_remove(FINGERPRINT));
+        assert_eq!(queries.update_query_count(), 0);
+        assert!(queries.always_check.is_empty());
+        assert!(!row_candidate(&queries, "x"));
+        assert!(!row_candidate(&queries, "y"));
+        assert!(!queries.fingerprint_remove(FINGERPRINT));
+    }
+
+    /// A LIMIT keeps a parent out of the subsumption index; dropping it
+    /// re-adds the parent and its carve-outs follow.
+    #[test]
+    fn test_update_queries_has_limit_set_reindexes() {
+        let mut queries = registered("SELECT id FROM items WHERE kind = 'x'", true);
+        assert!(queries.has_limit_from.contains(&FINGERPRINT));
+        assert!(!subsumer(&queries));
+
+        queries.has_limit_set(FINGERPRINT, false, "items");
+        assert!(queries.has_limit_from.is_empty());
+        assert!(subsumer(&queries));
+
+        queries.has_limit_set(FINGERPRINT, true, "items");
+        assert!(queries.has_limit_from.contains(&FINGERPRINT));
+        assert!(!subsumer(&queries));
+    }
+
+    /// A fingerprint with several update queries on the relation never
+    /// parents a subsumption, with or without a LIMIT.
+    #[test]
+    fn test_update_queries_several_never_subsumer() {
+        let mut queries = registered(UNION, false);
+        assert!(!subsumer(&queries));
+        queries.has_limit_set(FINGERPRINT, true, "items");
+        queries.has_limit_set(FINGERPRINT, false, "items");
+        assert!(!subsumer(&queries));
+    }
+
+    /// Update queries of one fingerprint hash apart; the first hashes as its
+    /// fingerprint.
+    #[test]
+    fn test_update_query_key_hash() {
+        let hasher = BuildIdHasher::<UpdateQueryKey>::default();
+        let key = |ordinal| UpdateQueryKey {
+            fingerprint: FINGERPRINT,
+            ordinal,
+        };
+        assert_eq!(hasher.hash_one(key(0)), FINGERPRINT.get());
+        assert_ne!(hasher.hash_one(key(0)), hasher.hash_one(key(1)));
+    }
 }

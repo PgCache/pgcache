@@ -689,7 +689,7 @@ impl WriterCdc {
             row_changes: None,
         };
         let mut pg_eval: Vec<&UpdateQuery> = Vec::new();
-        for update_query in update_queries.queries.values() {
+        for update_query in update_queries.iter() {
             if core.frame_invalidations.contains(&update_query.fingerprint) {
                 continue;
             }

@@ -46,7 +46,7 @@ impl RelationFetchSpec {
     fn build(core: &WriterCore, relation_oid: Oid) -> Self {
         let update_queries = core.cache.update_queries.get(&relation_oid);
         let index_columns: Vec<EcoString> = update_queries
-            .map(|uq| uq.eval_index.columns().cloned().collect())
+            .map(|uq| uq.eval_index_columns().cloned().collect())
             .unwrap_or_default();
         let mut spec = Self {
             needs_changes: update_queries.is_some_and(|uq| uq.needs_change_eval()),

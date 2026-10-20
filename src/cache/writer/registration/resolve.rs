@@ -17,7 +17,7 @@ use crate::cache::messages::RegisterRequest;
 use crate::cache::mv::{query_has_join, query_has_window};
 use crate::cache::mv_shape::ShapeGate;
 use crate::cache::types::SharedQueryShape;
-use crate::cache::update_query::UpdateQueries;
+use crate::cache::update_query::{UpdateQueries, UpdateQueryRegistration};
 use crate::cache::writer::core::WriterCore;
 use crate::cache::{CacheError, CacheResult, ReportExt};
 use crate::oid::Oid;
@@ -229,27 +229,37 @@ impl WriterRegistration {
         )?;
 
         let mut relation_oids = Vec::new();
+        let mut registrations: Vec<(Oid, Vec<UpdateQueryRegistration>)> = Vec::new();
         for admission in analysis.tables {
             let relation_oid = admission.relation_oid;
             // Index under each literal's key form for its column's type, so
             // the row probe and the region probe match on value (PGC-478).
-            let keyed = core
+            let index_constraints = core
                 .cache
                 .tables
                 .get1(&relation_oid)
                 .map(|table| table_constraints_keyed(&admission.index_constraints, table))
-                .unwrap_or_else(|| admission.index_constraints.clone());
-            let mut queries = core
-                .cache
+                .unwrap_or(admission.index_constraints);
+            let registration = UpdateQueryRegistration {
+                update_query: admission.update_query,
+                index_constraints,
+                subsumer_shape: admission.subsumer_shape,
+            };
+            match registrations
+                .iter_mut()
+                .find(|(oid, _)| *oid == relation_oid)
+            {
+                Some((_, group)) => group.push(registration),
+                None => registrations.push((relation_oid, vec![registration])),
+            }
+            relation_oids.push(relation_oid);
+        }
+        for (relation_oid, group) in registrations {
+            core.cache
                 .update_queries
                 .entry(relation_oid)
-                .or_insert_with(|| UpdateQueries::new(relation_oid));
-            queries.query_insert(admission.update_query);
-            if admission.subsumer_eligible {
-                queries.subsumption.insert(fingerprint, &keyed);
-            }
-            queries.eval_index.insert(fingerprint, &keyed);
-            relation_oids.push(relation_oid);
+                .or_insert_with(|| UpdateQueries::new(relation_oid))
+                .fingerprint_insert(fingerprint, group);
         }
         Ok(relation_oids)
     }

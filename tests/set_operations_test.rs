@@ -470,3 +470,99 @@ async fn test_set_op_union_join_constraint_filter() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// Both branches of a UNION over one table keep the table current: a row
+/// inserted for the first branch must reach the cached result even though
+/// the second branch registers its own update query for the same table.
+#[tokio::test]
+async fn test_set_op_union_same_table_first_branch_cdc_insert() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE union_items (id INTEGER PRIMARY KEY, name TEXT, kind TEXT)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO union_items VALUES (1, 'a', 'x'), (2, 'b', 'y'), (3, 'c', 'z')",
+        &[],
+    )
+    .await?;
+
+    let query = "SELECT id, name FROM union_items WHERE kind = 'x' \
+                 UNION \
+                 SELECT id, name FROM union_items WHERE kind = 'y' \
+                 ORDER BY id";
+
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 4, "union returns a and b");
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 4, "cached union returns a and b");
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    ctx.origin_query("INSERT INTO union_items VALUES (4, 'd', 'x')", &[])
+        .await?;
+    ctx.origin_query("INSERT INTO union_items VALUES (5, 'e', 'y')", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+
+    let res = ctx.simple_query(query).await?;
+    assert_row_at(&res, 3, &[("id", "4"), ("name", "d")])?;
+    assert_row_at(&res, 4, &[("id", "5"), ("name", "e")])?;
+    assert_eq!(res.len(), 6, "both inserted rows reach the result");
+
+    Ok(())
+}
+
+/// Updates and deletes reach each branch of a UNION over one table: a row
+/// renamed in the first branch, a row moved into the second, and a row
+/// deleted from the second.
+#[tokio::test]
+async fn test_set_op_union_same_table_update_delete_cdc() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE union_upd (id INTEGER PRIMARY KEY, name TEXT, kind TEXT)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO union_upd VALUES (1, 'a', 'x'), (2, 'b', 'y'), (3, 'c', 'z')",
+        &[],
+    )
+    .await?;
+
+    let query = "SELECT id, name FROM union_upd WHERE kind = 'x' \
+                 UNION \
+                 SELECT id, name FROM union_upd WHERE kind = 'y' \
+                 ORDER BY id";
+
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 4, "union returns a and b");
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 4, "cached union returns a and b");
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    ctx.origin_query("UPDATE union_upd SET name = 'a2' WHERE id = 1", &[])
+        .await?;
+    ctx.origin_query("UPDATE union_upd SET kind = 'y' WHERE id = 3", &[])
+        .await?;
+    ctx.origin_query("DELETE FROM union_upd WHERE id = 2", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+
+    let res = ctx.simple_query(query).await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("name", "a2")])?;
+    assert_row_at(&res, 2, &[("id", "3"), ("name", "c")])?;
+    assert_eq!(res.len(), 4, "a2 and c remain");
+
+    Ok(())
+}

@@ -89,7 +89,7 @@ impl WriterCore {
             .cache
             .update_queries
             .iter()
-            .map(|entry| entry.queries.len())
+            .map(|entry| entry.update_query_count())
             .fold((0usize, 0usize), |(sum, max), n| (sum + n, max.max(n)));
         crate::metrics::handles()
             .state

@@ -264,9 +264,9 @@ impl WriterCore {
             .cache
             .update_queries
             .iter()
-            .filter(|entry| !entry.queries.is_empty())
-            .min_by_key(|entry| entry.queries.len())
-            .map(|entry| entry.queries.keys().copied().collect::<Vec<Fingerprint>>());
+            .filter(|entry| entry.fingerprint_count() > 0)
+            .min_by_key(|entry| entry.fingerprint_count())
+            .map(|entry| entry.fingerprints().collect::<Vec<Fingerprint>>());
         let Some(fingerprints) = fingerprints else {
             return Ok(());
         };

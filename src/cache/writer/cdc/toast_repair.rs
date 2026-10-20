@@ -415,7 +415,7 @@ impl WriterCdc {
         );
         if let Some(update_queries) = core.cache.update_queries.get(&relation_oid) {
             core.frame_invalidations
-                .extend(update_queries.queries.values().map(|q| q.fingerprint));
+                .extend(update_queries.fingerprints());
         }
         crate::metrics::handles().cdc.toast_fallbacks.increment(1);
     }

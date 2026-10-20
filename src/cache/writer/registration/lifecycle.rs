@@ -14,48 +14,22 @@ use crate::cache::messages::PopulationMerge;
 use crate::cache::writer::core::{QueryServing, WriterCore};
 use crate::oid::Oid;
 use crate::query::Fingerprint;
-use crate::query::constraint_index::table_constraints_keyed;
 use crate::timing::{duration_to_ns_u64, duration_to_us_u64};
 
-/// Update the `has_limit` bit on the query's update queries. Limited queries
-/// are ineligible parents for subsumption, so the index entry is dropped when
-/// the bit goes false → true and (re-)added when it goes true → false.
-fn subsumption_limit_reindex(
+/// Set the `has_limit` bit on the query's update queries, re-deriving what
+/// depends on it there. Limited queries are ineligible subsumption parents.
+fn update_queries_limit_set(
     core: &mut WriterCore,
     fingerprint: Fingerprint,
     relation_oids: &[Oid],
     has_limit: bool,
 ) {
     for oid in relation_oids {
-        let table = core.cache.tables.get1(oid);
-        let table_name = table.map(|t| t.name.clone());
-        let Some(mut queries) = core.cache.update_queries.get_mut(oid) else {
+        let Some(table_name) = core.cache.tables.get1(oid).map(|t| t.name.clone()) else {
             continue;
         };
-        if let Some(uq) = queries.queries.get_mut(&fingerprint) {
-            uq.has_limit = has_limit;
-        }
-        if has_limit {
-            queries.subsumption.remove(fingerprint);
-            continue;
-        }
-        let Some(name) = table_name else {
-            continue;
-        };
-        let constraints = queries
-            .queries
-            .get(&fingerprint)
-            .filter(|uq| uq.constraints.where_analysis_complete)
-            .map(|uq| {
-                uq.constraints
-                    .table_constraints
-                    .get(name.as_str())
-                    .cloned()
-                    .unwrap_or_default()
-            });
-        if let Some(tcs) = constraints {
-            let keyed = table.map_or_else(|| tcs.clone(), |t| table_constraints_keyed(&tcs, t));
-            queries.subsumption.insert(fingerprint, &keyed);
+        if let Some(mut queries) = core.cache.update_queries.get_mut(oid) {
+            queries.has_limit_set(fingerprint, has_limit, &table_name);
         }
     }
 }
@@ -229,7 +203,7 @@ impl WriterRegistration {
             core.cache.cached_queries.insert_overwrite(cached);
         }
 
-        subsumption_limit_reindex(core, fingerprint, &relation_oids, new_max_limit.is_some());
+        update_queries_limit_set(core, fingerprint, &relation_oids, new_max_limit.is_some());
 
         let serving = QueryServing {
             generation: new_generation,

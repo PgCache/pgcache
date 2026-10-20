@@ -37,7 +37,7 @@ use index::{Membership, SubsumptionClass};
 pub(crate) use keyed::table_constraints_keyed;
 
 #[cfg(feature = "proxy")]
-pub(crate) use point::row_value_forms;
+pub(crate) use point::{ColumnForms, row_value_forms};
 
 /// `HashMap` keyed by an id type with the passthrough identity hasher.
 type IdMap<K, V> = HashMap<K, V, BuildIdHasher<K>>;

@@ -31,6 +31,9 @@ pub struct TableAdmission {
     /// CDC-eval caches (`compiled_where`, `pg_eval_template`,
     /// `pg_batchable`, `change_dependent`) are left unset.
     pub update_query: UpdateQuery,
+    /// Eligible for the subsumption index but for a LIMIT, which a limit
+    /// bump can change after registration.
+    pub subsumer_shape: bool,
     /// Mirrors the writer's `can_subsume`: eligible for the subsumption
     /// index. The remaining gates (parent readiness, parent single-relation)
     /// are checked per lookup in [`subsumption_covered`].

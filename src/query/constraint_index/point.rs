@@ -22,7 +22,7 @@ use crate::query::typed_compare::{ValueKind, wire_text_index_key};
 /// adding a fourth reinterpretation is a compile error (`[_; 3]` can't hold it)
 /// — forcing a deliberate decision about the capacity rather than a silent
 /// heap spill. Empty slots are `None`; iterate with `.iter().flatten()`.
-pub(super) type ColumnForms = [Option<ColumnRange>; 3];
+pub(crate) type ColumnForms = [Option<ColumnRange>; 3];
 
 /// Per-column `ValueKey`s extracted from a column's `Equal` forms — one slot per
 /// `ColumnForms` slot (a form is keyable or it isn't), same fixed-array rules.
@@ -137,16 +137,23 @@ impl<K: IdHashable + Copy> ConstraintIndex<K> {
         F: Fn(&str) -> ColumnForms,
     {
         let mut candidates = IdSet::default();
-        self.candidates_point_into(col_forms_fn, &mut candidates);
+        self.candidates_point_into(col_forms_fn, &mut candidates, |key| key);
         candidates
     }
 
     /// Like [`candidates_point`], but fills a caller-provided set (cleared first)
     /// instead of allocating a fresh one — lets the CDC hot path reuse a scratch
     /// set, retaining its (possibly large) capacity across probes (PGC-341/344).
-    pub(crate) fn candidates_point_into<F>(&self, col_forms_fn: F, candidates: &mut IdSet<K>)
-    where
+    /// Each candidate goes in as `project` maps it.
+    pub(crate) fn candidates_point_into<F, O, P>(
+        &self,
+        col_forms_fn: F,
+        candidates: &mut IdSet<O>,
+        project: P,
+    ) where
         F: Fn(&str) -> ColumnForms,
+        O: IdHashable,
+        P: Fn(K) -> O,
     {
         candidates.clear();
         for (column_set, class) in &self.classes {
@@ -179,7 +186,7 @@ impl<K: IdHashable + Copy> ConstraintIndex<K> {
             if key_sets.iter().all(|ks| ks.iter().any(Option::is_some)) {
                 for tuple in value_key_product(&key_sets) {
                     if let Some(fps) = class.equality.get(&tuple) {
-                        candidates.extend(fps);
+                        candidates.extend(fps.iter().copied().map(&project));
                     }
                 }
             } else {
@@ -190,11 +197,17 @@ impl<K: IdHashable + Copy> ConstraintIndex<K> {
                         ks.iter().all(Option::is_none) || ks.iter().flatten().any(|k| k == t)
                     });
                     if matches {
-                        candidates.extend(fps);
+                        candidates.extend(fps.iter().copied().map(&project));
                     }
                 }
             }
-            candidates.extend(class.complex.candidates_point(&col_forms));
+            candidates.extend(
+                class
+                    .complex
+                    .candidates_point(&col_forms)
+                    .into_iter()
+                    .map(&project),
+            );
         }
     }
 }

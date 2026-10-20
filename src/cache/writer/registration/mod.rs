@@ -428,9 +428,7 @@ impl WriterRegistration {
                 // No cached_query but `update_queries_register` may have run
                 // before the failure — sweep orphan entries by fingerprint.
                 for mut entry in core.cache.update_queries.iter_mut() {
-                    entry.query_remove(fingerprint);
-                    entry.subsumption.remove(fingerprint);
-                    entry.eval_index.remove(fingerprint);
+                    entry.fingerprint_remove(fingerprint);
                 }
             }
         }

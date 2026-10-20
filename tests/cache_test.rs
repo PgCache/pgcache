@@ -805,6 +805,49 @@ async fn test_cache_self_join_cached_update_uncached_partner() -> Result<(), Err
     Ok(())
 }
 
+/// A table named both in FROM and in a subquery has a change relevant to
+/// each occurrence: an inserted row meeting only the outer predicate must
+/// reach the cached result.
+#[tokio::test]
+async fn test_cache_repeated_table_outer_occurrence_cdc_insert() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "create table emp_sub (id int primary key, name text, manager_id int, dept text)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "insert into emp_sub values (1,'ceo',null,'exec'), (2,'alice',1,'x')",
+        &[],
+    )
+    .await?;
+    ctx.cdc_decode_settle().await?;
+
+    let query = "\
+        select id, name from emp_sub where dept = 'x' \
+        and manager_id in (select id from emp_sub where dept = 'exec') order by id";
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 3, "query returns alice");
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 3, "cached query returns alice");
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    ctx.query("insert into emp_sub values (3,'bob',1,'x')", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+
+    let res = ctx.simple_query(query).await?;
+    assert_row_at(&res, 2, &[("id", "3"), ("name", "bob")])?;
+    assert_eq!(res.len(), 4, "bob reaches the result");
+
+    Ok(())
+}
+
 /// Two tables of one name in different schemas are separate relations: a
 /// literal on one must not filter CDC rows of the other.
 #[tokio::test]

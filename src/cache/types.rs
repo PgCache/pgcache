@@ -155,9 +155,7 @@ impl Cache {
     pub fn update_queries_remove_fingerprint(&mut self, fingerprint: Fingerprint, oids: &[Oid]) {
         for oid in oids {
             if let Some(mut queries) = self.update_queries.get_mut(oid) {
-                queries.query_remove(fingerprint);
-                queries.subsumption.remove(fingerprint);
-                queries.eval_index.remove(fingerprint);
+                queries.fingerprint_remove(fingerprint);
             }
         }
     }

@@ -797,3 +797,52 @@ async fn test_left_join_on_preserved_literal_cdc_update() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// A LEFT self-join's preserved occurrence is not its optional side: an
+/// inserted node that attaches a tag the join had dropped must reach the
+/// cached result.
+#[tokio::test]
+async fn test_left_self_join_preserved_occurrence_cdc_insert() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE lsj_nodes (id INTEGER PRIMARY KEY, parent_id INTEGER)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "CREATE TABLE lsj_tags (id INTEGER PRIMARY KEY, node_id INTEGER)",
+        &[],
+    )
+    .await?;
+    ctx.query("INSERT INTO lsj_nodes VALUES (1, NULL), (2, 1)", &[])
+        .await?;
+    ctx.query("INSERT INTO lsj_tags VALUES (10, 1), (30, 3)", &[])
+        .await?;
+    ctx.cdc_decode_settle().await?;
+
+    let query = "SELECT a.id, b.id, g.id \
+                 FROM lsj_nodes a LEFT JOIN lsj_nodes b ON b.parent_id = a.id \
+                 JOIN lsj_tags g ON g.node_id = a.id \
+                 ORDER BY a.id, b.id";
+
+    let m = ctx.metrics().await?;
+    let (proxied, origin) = proxy_and_origin_rows(&mut ctx, query).await?;
+    assert_eq!(proxied, origin, "initial result");
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    let (proxied, origin) = proxy_and_origin_rows(&mut ctx, query).await?;
+    assert_eq!(proxied, origin, "cached result");
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    ctx.origin_query("INSERT INTO lsj_nodes VALUES (3, NULL)", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+
+    let (proxied, origin) = proxy_and_origin_rows(&mut ctx, query).await?;
+    assert_eq!(origin.len(), 2, "origin attaches tag 30 to node 3");
+    assert_eq!(proxied, origin, "result after preserved-occurrence insert");
+
+    Ok(())
+}

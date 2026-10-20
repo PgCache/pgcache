@@ -50,9 +50,9 @@ pub(super) fn eval_candidates_into(
         core.cache.update_queries.get(&relation_oid),
         core.cache.tables.get1(&relation_oid),
     ) {
-        (Some(uqs), Some(table_metadata)) => uqs
-            .eval_index
-            .candidates_point_into(|c| row_value_forms(table_metadata, row, c), out),
+        (Some(uqs), Some(table_metadata)) => {
+            uqs.eval_candidates_into(|c| row_value_forms(table_metadata, row, c), out);
+        }
         _ => out.clear(),
     }
 }
@@ -380,9 +380,9 @@ pub(super) fn update_queries_check_invalidate(
     narrowed_candidates(update_queries, event, candidates)
         .filter(|fingerprint| {
             update_queries
-                .queries
-                .get(fingerprint)
-                .is_some_and(|q| query_row_invalidates(q, table_metadata, event))
+                .queries_of(*fingerprint)
+                .iter()
+                .any(|q| query_row_invalidates(q, table_metadata, event))
         })
         .collect()
 }
