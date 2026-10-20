@@ -35,8 +35,8 @@ pub struct TableAdmission {
     /// bump can change after registration.
     pub subsumer_shape: bool,
     /// Mirrors the writer's `can_subsume`: eligible for the subsumption
-    /// index. The remaining gates (parent readiness, parent single-relation)
-    /// are checked per lookup in [`subsumption_covered`].
+    /// index. Parent readiness is checked per lookup in
+    /// [`subsumption_covered`].
     pub subsumer_eligible: bool,
     /// Constraints to index under (empty for self-joins — the broadest
     /// class, so no true match is dropped).
@@ -54,10 +54,6 @@ pub struct SubsumerCandidate<'a> {
     /// The candidate update query's constraints (per-table, per-branch).
     pub constraints: &'a QueryConstraints,
     pub has_limit: bool,
-    /// The candidate's parent query references exactly one relation.
-    /// Multi-table parents have implicit join filtering constraint analysis
-    /// doesn't capture, so coverage can't be reasoned about.
-    pub single_relation: bool,
     /// The parent is Ready: populated, not invalidated. Always true for
     /// pgcache-fit's infinite-cache model.
     pub ready: bool,

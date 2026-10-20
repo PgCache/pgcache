@@ -27,7 +27,6 @@ struct RelationSubsumers {
 struct AdmittedSubsumer {
     constraints: std::rc::Rc<QueryConstraints>,
     has_limit: bool,
-    single_relation: bool,
 }
 
 impl RelationSubsumers {
@@ -48,9 +47,6 @@ impl SubsumerRegistry {
     /// candidates. Eligibility was decided by the shared admission analysis;
     /// the remaining gates run per lookup in `subsumption_covered`.
     pub fn subsumer_register(&mut self, analysis: &CacheableAnalysis) {
-        // The writer's gate counts relation_oids with duplicates (one per
-        // update query), so a same-table UNION parent is multi-relation.
-        let single_relation = analysis.admissions.len() == 1;
         for admission in &analysis.admissions {
             if !admission.subsumer_eligible {
                 continue;
@@ -67,7 +63,6 @@ impl SubsumerRegistry {
                 AdmittedSubsumer {
                     constraints: std::rc::Rc::clone(&admission.constraints),
                     has_limit: analysis.has_limit,
-                    single_relation,
                 },
             );
         }
@@ -109,7 +104,6 @@ impl SubsumerSource for SubsumerRegistry {
                             .map(|subsumer| SubsumerCandidate {
                                 constraints: &subsumer.constraints,
                                 has_limit: subsumer.has_limit,
-                                single_relation: subsumer.single_relation,
                                 ready: true,
                             })
                     })
@@ -188,9 +182,9 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_table_parent_rejected_at_lookup() {
-        // Multi-table parents are indexed (like the writer) but rejected per
-        // lookup by the single_relation gate.
+    fn test_inner_join_parent_not_admitted() {
+        // The inner join drops users without orders, so the parent didn't
+        // load every user.
         let analyses = corpus_analyze(&[
             "SELECT * FROM users u JOIN orders o ON u.id = o.user_id",
             "SELECT * FROM users WHERE id = 5",
@@ -198,6 +192,22 @@ mod tests {
         let mut registry = SubsumerRegistry::new();
         registry.subsumer_register(&analyses[0]);
         assert!(!registry.query_subsumed(&analyses[1]));
+    }
+
+    #[test]
+    fn test_left_join_preserved_parent_subsumes() {
+        // A LEFT JOIN keeps every user its WHERE admits, whatever the ON
+        // clause says; the orders it loaded are only the matched ones.
+        let analyses = corpus_analyze(&[
+            "SELECT * FROM users u LEFT JOIN orders o \
+             ON u.id = o.user_id AND o.rank = u.id + 1 WHERE u.name = 'a'",
+            "SELECT * FROM users WHERE name = 'a' AND id = 5",
+            "SELECT * FROM orders WHERE user_id = 5",
+        ]);
+        let mut registry = SubsumerRegistry::new();
+        registry.subsumer_register(&analyses[0]);
+        assert!(registry.query_subsumed(&analyses[1]));
+        assert!(!registry.query_subsumed(&analyses[2]));
     }
 
     #[test]

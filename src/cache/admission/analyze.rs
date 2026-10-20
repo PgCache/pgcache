@@ -8,7 +8,7 @@ use ecow::EcoString;
 
 use super::update_classify::{
     limit_order_keys_collect, limit_window_columns_collect, pg_batchable_classify,
-    predicate_columns_collect, update_eval_strategy_classify,
+    predicate_columns_collect, table_complete_classify, update_eval_strategy_classify,
 };
 use super::{AdmissionAnalysis, TableAdmission};
 use crate::cache::mv_shape::{ShapeGate, shape_classify};
@@ -268,7 +268,9 @@ pub fn query_admission_analyze(
         };
         // !where_analysis_complete: the WHERE couldn't be fully analyzed, so
         // coverage isn't reasonable (PGC-106). A LIMIT also excludes a parent.
-        let subsumer_shape = !self_joined && update_query.constraints.where_analysis_complete;
+        let subsumer_shape = !self_joined
+            && update_query.constraints.where_analysis_complete
+            && table_complete_classify(branch, table_node);
 
         admissions.push(TableAdmission {
             relation_oid,
@@ -284,4 +286,116 @@ pub fn query_admission_analyze(
         transformed: decorrelated.is_some(),
         tables: admissions,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use iddqd::BiHashMap;
+    use postgres_types::Type;
+
+    use super::*;
+    use crate::catalog::{ColumnMetadata, ColumnPosition, TableMetadata};
+    use crate::oid::TypeOid;
+
+    fn catalog() -> Catalog {
+        let int_column = |name: &str, position: i16| ColumnMetadata {
+            name: name.into(),
+            position: ColumnPosition::from_raw(position),
+            type_oid: TypeOid::from_raw(23),
+            data_type: Type::INT4,
+            type_name: "int4".into(),
+            cache_type_name: "int4".into(),
+            is_primary_key: position == 1,
+        };
+        let mut tables = BiHashMap::new();
+        for (oid, name) in (1001..).zip(["a", "b", "c"]) {
+            tables.insert_overwrite(
+                TableMetadata::for_test(
+                    name,
+                    oid,
+                    [int_column("id", 1), int_column("x", 2), int_column("y", 3)],
+                )
+                .into(),
+            );
+        }
+        tables
+    }
+
+    /// Each update query's table with its subsumer shape, sorted.
+    fn subsumer_shapes(sql: &str) -> Vec<(String, bool)> {
+        let tables = catalog();
+        let bound =
+            Arc::new(ResolvedQuery::parse_resolve(sql, &tables, &["public"]).expect("resolve"));
+        let aggregate_functions = HashSet::from([EcoString::from("count")]);
+        let decorrelated = query_decorrelate_checked(&bound, &aggregate_functions)
+            .expect("decorrelate")
+            .map(Arc::new);
+        let analysis = query_admission_analyze(
+            AdmissionQuery {
+                bound: &bound,
+                decorrelated: decorrelated.as_ref(),
+            },
+            Fingerprint::from_raw(1),
+            false,
+            &aggregate_functions,
+            &tables,
+            AdmissionDepth::DecisionOnly,
+        )
+        .expect("analyze");
+        let mut shapes: Vec<(String, bool)> = analysis
+            .tables
+            .iter()
+            .map(|admission| (admission.table_name.to_string(), admission.subsumer_shape))
+            .collect();
+        shapes.sort();
+        shapes
+    }
+
+    /// A table is a subsumer only where population loads every row its
+    /// constraints describe: no join on its path can drop one, and WHERE
+    /// reads it alone.
+    #[test]
+    fn test_subsumer_shape_table_complete() {
+        #[rustfmt::skip]
+        let cases: &[(&str, &[(&str, bool)])] = &[
+            ("SELECT * FROM a WHERE x = 1", &[("a", true)]),
+            ("SELECT * FROM a LEFT JOIN b ON b.id = a.id WHERE a.x = 1",
+             &[("a", true), ("b", false)]),
+            ("SELECT * FROM a RIGHT JOIN b ON b.id = a.id WHERE b.x = 1",
+             &[("a", false), ("b", true)]),
+            ("SELECT * FROM a LEFT JOIN (b JOIN c ON c.id = b.id) ON b.id = a.id",
+             &[("a", true), ("b", false), ("c", false)]),
+            ("SELECT * FROM (a LEFT JOIN b ON b.id = a.id) JOIN c ON c.id = a.id",
+             &[("a", false), ("b", false), ("c", false)]),
+            ("SELECT * FROM a, b WHERE a.x = 1",
+             &[("a", false), ("b", false)]),
+            // An ON the extractor can't read drops no preserved row.
+            ("SELECT * FROM a LEFT JOIN b ON b.id = a.id AND b.y = a.x + 1",
+             &[("a", true), ("b", false)]),
+            // A WHERE on the nullable side drops unmatched or matched rows.
+            ("SELECT * FROM a LEFT JOIN b ON b.id = a.id WHERE b.x = 1",
+             &[("a", false), ("b", false)]),
+            ("SELECT * FROM a LEFT JOIN b ON b.id = a.id WHERE b.x IS NULL",
+             &[("a", false), ("b", false)]),
+            ("SELECT * FROM a WHERE x = 1 OR y = 2", &[("a", false)]),
+            // Indexed, but `table_constraints_subsumed` refuses it as a parent.
+            ("SELECT * FROM a WHERE x = y", &[("a", true)]),
+            ("SELECT * FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.id = a.id)",
+             &[("a", false), ("b", false)]),
+            // A derived table's table is judged in its own branch.
+            ("SELECT * FROM a JOIN (SELECT * FROM b WHERE x = 1) d ON d.id = a.id",
+             &[("a", false), ("b", true)]),
+            ("SELECT id FROM a WHERE x = 1 UNION SELECT id FROM b WHERE x = 2",
+             &[("a", true), ("b", true)]),
+            ("SELECT id FROM a WHERE x = 1 UNION SELECT id FROM a WHERE x = 2",
+             &[("a", false), ("a", false)]),
+        ];
+        for (sql, expected) in cases {
+            let expected: Vec<(String, bool)> = expected
+                .iter()
+                .map(|(table, shape)| (table.to_string(), *shape))
+                .collect();
+            assert_eq!(subsumer_shapes(sql), expected, "{sql}");
+        }
+    }
 }

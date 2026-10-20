@@ -25,7 +25,7 @@ Examples:
 ### What Cannot Be Subsumed
 
 - **Cached queries with LIMIT**: May not have loaded all matching rows
-- **Multi-table cached queries**: Join filtering creates implicit constraints that constraint analysis doesn't capture — only single-table cached queries are subsumption candidates
+- **Tables a cached query didn't load in full**: a cached query is a candidate for a table only when the table is complete in its branch — every join between the branch's FROM root and the table is a LEFT join with it on the left or a RIGHT join with it on the right, and the branch's WHERE reads no other table. Population loads exactly the rows its constraints describe then. Inner and cross joins, the nullable side of an outer join, and a WHERE on another table disqualify it; ON clauses never do. A table in a derived table, CTE or subquery is judged in its own branch
 - **Set operations** (UNION/INTERSECT/EXCEPT): Per-branch constraint analysis not yet implemented
 - **OR predicates**: Constraint extraction treats these as opaque
 - **Inequality constraints in cached query**: Implication checking (e.g. `id > 10` implies `id > 5`) not yet implemented
@@ -41,7 +41,7 @@ The subsumption check is per-table, not across the full constraint set. For each
 - `CheckOnly` — only check subsumption, don't register (for pending queries below the admission threshold)
 
 **Writer** (`writer/query.rs`): During `query_register()`, after resolving the query and extracting constraints:
-1. `subsumption_check()` iterates each relation OID, looking up existing `UpdateQuery` entries that are Ready, non-limited, and backed by single-table cached queries
+1. `subsumption_check()` iterates each relation OID, looking up existing `UpdateQuery` entries that are Ready, non-limited, and complete for that table
 2. For each, calls `table_constraints_subsumed()` to check if the cached equality constraints are a subset of the new query's constraints
 3. If all tables are covered: `query_subsume()` assigns a generation, stamps rows in the cache DB (same `SET mem.query_generation` pattern as eviction bumps), registers metadata, marks `Ready`, and responds `SubsumptionResult::Subsumed`
 4. If not subsumed: responds `SubsumptionResult::NotSubsumed` immediately, then proceeds with population (if `AdmitAction::Admit`) or does nothing (if `CheckOnly`)
@@ -57,7 +57,7 @@ If the cache DB execution fails (e.g. table dropped by concurrent eviction), sub
 ## Rationale
 - **Per-register oneshot** for the subsumption result gives the coordinator a synchronous answer for each request without complex event-loop coordination. The coordinator awaits inline, which is acceptable because the writer responds promptly (before dispatching population)
 - **Per-table checking** prevents false subsumption in multi-table queries where only some tables have coverage
-- **Single-table restriction** on cached query candidates avoids reasoning about join selectivity, which constraint analysis doesn't capture
+- **Per-table completeness** rather than single-table candidates: population loads a table's part of every FROM row that passes WHERE, so a table no join can drop rows from, and that WHERE filters only through its own constraints, holds exactly what its constraints describe. Join selectivity is never reasoned about
 - **Equality-only v1** covers the highest-value cases (multi-tenant filtering, reference tables) while keeping the logic simple and provably correct. Inequality subsumption can be added later with pairwise implication checks
 - **Reusing generation stamping** avoids duplicating data — the rows are already in the cache table, they just need their generation updated
 
@@ -72,7 +72,7 @@ If the cache DB execution fails (e.g. table dropped by concurrent eviction), sub
 ### Negative
 - Every first-miss now waits for the writer to process registration and check subsumption before being forwarded to origin (if not subsumed). This adds a few milliseconds to the non-subsumed path, small relative to a typical origin round-trip
 - Equality-only checking misses range-narrowing opportunities (e.g. `id > 10` implying `id > 5`)
-- Multi-table cached queries are never subsumption candidates, even when they could theoretically provide coverage
+- Inner-joined tables are never candidates, even when a foreign key guarantees every row a partner
 
 ## Implementation Notes
 - Subsumption check: `subsumption_check()` and `query_subsume()` in `src/cache/writer/query.rs`

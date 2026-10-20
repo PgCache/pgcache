@@ -64,7 +64,6 @@ impl SubsumerSource for WriterSubsumerSource<'_> {
                             ready: parent.is_some_and(|q| {
                                 !q.invalidated && q.registration_started_at.is_none()
                             }),
-                            single_relation: parent.is_some_and(|q| q.relation_oids.len() == 1),
                         })
                     })
             })

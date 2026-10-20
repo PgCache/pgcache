@@ -33,7 +33,7 @@ pub fn subsumption_constraints(bound: &ResolvedQuery, select: Select<'_>) -> Que
 
 /// Whether every relation of the new query is covered by some registered
 /// candidate whose constraints are implied by the new query's. Candidate
-/// gates: no LIMIT, parent Ready, parent references exactly one relation.
+/// gates: no LIMIT, parent Ready.
 ///
 /// `relations` are the new query's `(relation_oid, table_name)` pairs; an
 /// empty list is never covered. The new query's constraints must come from a
@@ -59,12 +59,10 @@ pub fn subsumption_covered(
                 let SubsumerCandidate {
                     constraints,
                     has_limit,
-                    single_relation,
                     ready,
                 } = candidate;
                 !has_limit
                     && ready
-                    && single_relation
                     && table_constraints_subsumed(new_constraints, constraints, table_name)
             })
     })

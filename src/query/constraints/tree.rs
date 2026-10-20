@@ -61,6 +61,7 @@ pub fn query_constraints_analyze(bound: &ResolvedQuery, select: Select<'_>) -> Q
     if let Some(where_clause) = select.where_clause() {
         collector.where_analyze(where_clause);
     }
+    let where_analysis_complete = collector.complete;
     for source in select.from() {
         collector.join_source_analyze(source);
     }
@@ -71,7 +72,7 @@ pub fn query_constraints_analyze(bound: &ResolvedQuery, select: Select<'_>) -> Q
         collector.outer_equalities,
         collector.outer_match_columns,
         &repeated_tables,
-        collector.complete,
+        where_analysis_complete,
     )
 }
 

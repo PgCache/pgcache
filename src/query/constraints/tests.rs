@@ -1079,6 +1079,31 @@ fn test_or_clause_marks_incomplete() {
     assert!(!constraints.where_analysis_complete);
 }
 
+/// Only the WHERE decides completeness: an ON the extractor can't read
+/// leaves it complete.
+#[test]
+fn test_where_analysis_complete_ignores_on() {
+    let tables = catalog(&["users", "orders"]);
+    let cases = [
+        (
+            "SELECT * FROM users u LEFT JOIN orders o ON o.id = u.id AND o.name = lower(u.name)",
+            true,
+        ),
+        (
+            "SELECT * FROM users u JOIN orders o ON o.id = u.id AND o.name = lower(u.name)",
+            true,
+        ),
+        (
+            "SELECT * FROM users u JOIN orders o ON o.id = u.id WHERE u.name = lower(o.name)",
+            false,
+        ),
+    ];
+    for (sql, complete) in cases {
+        let constraints = constraints_of(sql, &tables);
+        assert_eq!(constraints.where_analysis_complete, complete, "{sql}");
+    }
+}
+
 #[test]
 fn test_subsumption_full_scan_still_subsumes() {
     // Sanity check that the new gate doesn't regress the legitimate

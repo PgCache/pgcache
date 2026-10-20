@@ -501,8 +501,8 @@ impl UpdateQueries {
             }
             entries.push(update_query);
         }
-        // More than one update query reads the relation more than once, which
-        // no single-relation parent does.
+        // Several update queries on the relation load the union of their
+        // branches' rows, which one set of constraints doesn't describe.
         if let (Some(constraints), [entry]) = (subsumer, entries.as_slice()) {
             if !entry.has_limit {
                 self.subsumption.insert(fingerprint, &constraints);

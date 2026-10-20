@@ -190,7 +190,9 @@ pub struct QueryConstraints {
     /// `table_constraints`) from "WHERE clause we couldn't analyze"
     /// (complete=false, empty `table_constraints`). Without this, a
     /// cached query with `WHERE id = ANY(...)` was wrongly treated as a
-    /// full scan and incorrectly subsumed unrelated queries.
+    /// full scan and incorrectly subsumed unrelated queries. ON clauses
+    /// don't count: subsumption admission rules out any join that could
+    /// drop a parent's rows.
     pub where_analysis_complete: bool,
 }
 

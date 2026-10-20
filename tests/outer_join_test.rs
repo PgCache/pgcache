@@ -16,7 +16,8 @@ use std::io::Error;
 use tokio_postgres::SimpleQueryMessage;
 
 use crate::util::{
-    TestContext, assert_cache_hit, assert_cache_miss, assert_not_subsumed, assert_row_at, rows_of,
+    TestContext, assert_cache_hit, assert_cache_miss, assert_not_subsumed, assert_row_at,
+    assert_subsume_hit, rows_of,
 };
 
 mod util;
@@ -843,6 +844,123 @@ async fn test_left_self_join_preserved_occurrence_cdc_insert() -> Result<(), Err
     let (proxied, origin) = proxy_and_origin_rows(&mut ctx, query).await?;
     assert_eq!(origin.len(), 2, "origin attaches tag 30 to node 3");
     assert_eq!(proxied, origin, "result after preserved-occurrence insert");
+
+    Ok(())
+}
+
+/// A LEFT JOIN keeps every preserved-side row its WHERE admits, whatever the
+/// ON clause says, so that table serves a single-table query, users without
+/// an order included. The child then follows CDC on its own.
+#[tokio::test]
+async fn test_left_join_preserved_parent_subsumes() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE ljps_users (id INTEGER PRIMARY KEY, name TEXT)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "CREATE TABLE ljps_orders (id INTEGER PRIMARY KEY, user_id INTEGER, total INTEGER)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO ljps_users VALUES (1, 'a'), (2, 'a'), (3, 'b')",
+        &[],
+    )
+    .await?;
+    ctx.query("INSERT INTO ljps_orders VALUES (10, 1, 5)", &[])
+        .await?;
+    ctx.cdc_decode_settle().await?;
+
+    let m = ctx.metrics().await?;
+    ctx.simple_query(
+        "SELECT u.id, u.name, o.total FROM ljps_users u LEFT JOIN ljps_orders o \
+         ON o.user_id = u.id AND o.total = u.id + 4 WHERE u.name = 'a'",
+    )
+    .await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    let child = "SELECT id, name FROM ljps_users WHERE name = 'a' ORDER BY id";
+    let (proxied, origin) = proxy_and_origin_rows(&mut ctx, child).await?;
+    assert_eq!(origin.len(), 2, "origin returns both 'a' users");
+    assert_eq!(proxied, origin, "subsumed child");
+    let m = assert_subsume_hit(&mut ctx, m).await?;
+
+    ctx.query("INSERT INTO ljps_users VALUES (4, 'a')", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+
+    let (proxied, origin) = proxy_and_origin_rows(&mut ctx, child).await?;
+    assert_eq!(origin.len(), 3, "origin returns the inserted user");
+    assert_eq!(proxied, origin, "child after CDC insert");
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+/// A join parent that didn't load a table in full can't serve it: the
+/// nullable side holds only matched rows, an inner join drops unmatched
+/// rows, and a WHERE on the nullable side drops preserved rows.
+#[tokio::test]
+async fn test_join_parent_incomplete_table_not_subsumed() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE ljpn_users (id INTEGER PRIMARY KEY, name TEXT)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "CREATE TABLE ljpn_orders (id INTEGER PRIMARY KEY, user_id INTEGER, total INTEGER)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO ljpn_users VALUES (1, 'a'), (2, 'a'), (3, 'b'), (4, 'b'), (5, 'c'), (6, 'c')",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO ljpn_orders VALUES (10, 1, 5), (11, 3, 5), (12, 5, 7), (13, 99, 1)",
+        &[],
+    )
+    .await?;
+    ctx.cdc_decode_settle().await?;
+
+    let cases = [
+        (
+            "SELECT u.id, o.total FROM ljpn_users u LEFT JOIN ljpn_orders o \
+             ON o.user_id = u.id WHERE u.name = 'a'",
+            "SELECT id, user_id, total FROM ljpn_orders WHERE user_id = 99",
+            1,
+        ),
+        (
+            "SELECT u.id, o.total FROM ljpn_users u JOIN ljpn_orders o \
+             ON o.user_id = u.id WHERE u.name = 'b'",
+            "SELECT id, name FROM ljpn_users WHERE name = 'b' ORDER BY id",
+            2,
+        ),
+        (
+            "SELECT u.id, o.total FROM ljpn_users u LEFT JOIN ljpn_orders o \
+             ON o.user_id = u.id WHERE u.name = 'c' AND o.total = 7",
+            "SELECT id, name FROM ljpn_users WHERE name = 'c' ORDER BY id",
+            2,
+        ),
+    ];
+    for (parent, child, expected) in cases {
+        let m = ctx.metrics().await?;
+        ctx.simple_query(parent).await?;
+        let m = assert_cache_miss(&mut ctx, m).await?;
+        ctx.cache_settle().await?;
+
+        let (proxied, origin) = proxy_and_origin_rows(&mut ctx, child).await?;
+        assert_eq!(origin.len(), expected, "{child}");
+        assert_eq!(proxied, origin, "{child}");
+        let _m = assert_not_subsumed(&mut ctx, m).await?;
+    }
 
     Ok(())
 }
