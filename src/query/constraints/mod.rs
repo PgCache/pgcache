@@ -214,15 +214,9 @@ impl QueryConstraints {
             .equivalences
             .iter()
             .filter(|eq| eq.is_join())
-            .filter_map(move |eq| {
-                if eq.left.table == table_name {
-                    Some(eq.left.column.as_str())
-                } else if eq.right.table == table_name {
-                    Some(eq.right.column.as_str())
-                } else {
-                    None
-                }
-            });
+            .flat_map(|eq| [&eq.left, &eq.right])
+            .filter(move |column| column.table == table_name)
+            .map(|column| column.column.as_str());
         let outer_columns = self
             .outer_equalities
             .iter()
@@ -236,11 +230,14 @@ impl QueryConstraints {
 
 /// `constraints` closed under the equalities: each equivalence carries a
 /// constraint both ways, each outer-join equality from its preserved column
-/// to its nullable one only.
+/// to its nullable one only. Nothing propagates from a `repeated_tables`
+/// column: its references share one column identity, so a constraint on one
+/// would cross an equality the other is in.
 pub(super) fn propagate_constraints(
     mut constraints: HashSet<ColumnConstraint>,
     equivalences: &HashSet<ColumnEquivalence>,
     outer_equalities: &HashSet<OuterJoinEquality>,
+    repeated_tables: &HashSet<EcoString>,
 ) -> HashSet<ColumnConstraint> {
     let edges: Vec<(&ConstraintColumn, &ConstraintColumn)> = equivalences
         .iter()
@@ -250,6 +247,7 @@ pub(super) fn propagate_constraints(
                 .iter()
                 .map(|equality| (&equality.preserved, &equality.nullable)),
         )
+        .filter(|(from, _)| !repeated_tables.contains(&from.table))
         .collect();
     // Fixpoint iteration: propagate until no changes
     loop {
@@ -272,16 +270,29 @@ pub(super) fn propagate_constraints(
     }
 }
 
+/// `repeated_tables` are names more than one reference binds: their
+/// constraints are keyed by name, so they hold for no single reference and
+/// are left out, which marks the analysis incomplete.
 pub(super) fn query_constraints_build(
     constraints: HashSet<ColumnConstraint>,
     equivalences: HashSet<ColumnEquivalence>,
     outer_equalities: HashSet<OuterJoinEquality>,
     outer_match_columns: HashSet<ConstraintColumn>,
-    where_analysis_complete: bool,
+    repeated_tables: &HashSet<EcoString>,
+    mut where_analysis_complete: bool,
 ) -> QueryConstraints {
-    let column_constraints = propagate_constraints(constraints, &equivalences, &outer_equalities);
+    let column_constraints = propagate_constraints(
+        constraints,
+        &equivalences,
+        &outer_equalities,
+        repeated_tables,
+    );
     let mut table_constraints: HashMap<EcoString, Vec<TableConstraint>> = HashMap::new();
     for constraint in &column_constraints {
+        if repeated_tables.contains(&constraint.column().table) {
+            where_analysis_complete = false;
+            continue;
+        }
         let tc = match constraint {
             ColumnConstraint::Comparison {
                 column, op, value, ..

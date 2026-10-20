@@ -5,10 +5,12 @@ use postgres_types::Type;
 
 use super::subsume::table_constraints_subsumed;
 use super::*;
+use crate::cache::UpdateQuerySource;
 use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
 use crate::oid::{Oid, TypeOid};
 use crate::query::decorrelate::query_decorrelate;
 use crate::query::resolve::ResolvedQuery;
+use crate::query::update::select_branches_with_source;
 
 // Helper function to create test table metadata
 fn test_table_metadata(name: &str, relation_oid: Oid) -> TableMetadata {
@@ -842,25 +844,75 @@ fn test_no_propagation_with_or() {
     assert_eq!(constraints.table_constraints.len(), 0);
 }
 
+/// A table name more than one reference binds keeps no per-table
+/// constraints and propagates none, which leaves the analysis incomplete;
+/// every other table keeps its own (PGC-507).
 #[test]
-fn test_self_join() {
-    let tables = catalog(&["test"]);
+fn test_repeated_table_constraints_dropped() {
+    let mut tables = catalog(&["users", "orders"]);
+    let mut other = test_table_metadata("users", Oid::from_raw(1101));
+    other.schema = "other".into();
+    tables.insert_overwrite(other.into());
+    #[rustfmt::skip]
+    let cases: &[(&str, &[(&str, &[&str])], bool)] = &[
+        ("SELECT a.id FROM users a JOIN users b ON b.id = a.id WHERE a.name = 'x'",
+         &[], false),
+        ("SELECT a.id FROM users a JOIN users b ON b.name = a.name",
+         &[], true),
+        // a.id = 5 must not reach orders through b.id, which shares its identity.
+        ("SELECT a.id FROM users a JOIN users b ON b.id = a.name \
+          JOIN orders o ON o.id = b.id WHERE a.id = 5",
+         &[], false),
+        ("SELECT a.id FROM users a JOIN users b ON b.id = a.id \
+          JOIN orders o ON o.id = a.id WHERE o.name = 'x'",
+         &[("orders", &[r#"Comparison("name", Equal, String("x"))"#])], true),
+        ("SELECT p.id FROM public.users p JOIN other.users o ON o.id = p.id WHERE p.name = 'x'",
+         &[], false),
+        ("SELECT u.id FROM users u JOIN (SELECT id FROM orders) users ON users.id = u.id \
+          WHERE u.name = 'x'",
+         &[], false),
+        ("SELECT u.id FROM users u JOIN orders o ON o.id = u.id WHERE u.name = 'x'",
+         &[("users", &[r#"Comparison("name", Equal, String("x"))"#])], true),
+    ];
+    for (sql, expected, complete) in cases {
+        let constraints = constraints_of(sql, &tables);
+        assert_eq!(
+            table_constraint_lines(&constraints),
+            expected_lines(expected),
+            "{sql}"
+        );
+        assert_eq!(constraints.where_analysis_complete, *complete, "{sql}");
+    }
+}
 
-    let sql = "SELECT * FROM test t1 JOIN test t2 ON t1.id = t2.id WHERE t1.id = 1";
-    let resolved = resolve_sql(sql, &tables);
-
-    let constraints = analyze_query_constraints(&resolved);
-
-    // Both t1.id and t2.id reference the same column (test.id)
-    // So we get 1 unique column with constraint
-    assert_eq!(constraints.column_constraints.len(), 1);
-
-    let test_constraints = constraints.table_constraints.get("test").unwrap();
-    assert_eq!(test_constraints.len(), 1);
-    assert!(has_constraint(
-        &constraints,
-        &cmp("test", "id", BinaryOp::Equal, int(1))
-    ));
+/// A subquery branch that reads an outer table of its own table's name binds
+/// that name twice.
+#[test]
+fn test_repeated_table_through_correlation_dropped() {
+    let tables = catalog(&["users", "orders"]);
+    #[rustfmt::skip]
+    let cases: &[(&str, &[(&str, &[&str])], bool)] = &[
+        ("SELECT a.id FROM users a WHERE EXISTS \
+          (SELECT 1 FROM users b WHERE b.id = a.id AND a.name = 'x' AND b.name = 'y')",
+         &[], false),
+        ("SELECT a.id FROM users a WHERE EXISTS \
+          (SELECT 1 FROM orders o WHERE o.id = a.id AND o.name = 'y')",
+         &[("orders", &[r#"Comparison("name", Equal, String("y"))"#])], true),
+    ];
+    for (sql, expected, complete) in cases {
+        let bound = resolve_sql(sql, &tables);
+        let (subquery, _) = select_branches_with_source(bound.tree().root())
+            .into_iter()
+            .find(|(_, source)| *source != UpdateQuerySource::FromClause)
+            .expect("a subquery branch");
+        let constraints = query_constraints_analyze(&bound, subquery);
+        assert_eq!(
+            table_constraint_lines(&constraints),
+            expected_lines(expected),
+            "{sql}"
+        );
+        assert_eq!(constraints.where_analysis_complete, *complete, "{sql}");
+    }
 }
 
 #[test]
@@ -1237,6 +1289,19 @@ fn test_outer_join_match_columns() {
     assert_eq!(users, ["id", "name"]);
     let orders: Vec<&str> = constraints.table_join_columns("orders").collect();
     assert_eq!(orders, ["id"]);
+}
+
+/// Both columns of a self-join's equality are join columns of the table.
+#[test]
+fn test_self_join_join_columns() {
+    let tables = catalog(&["users"]);
+    let constraints = constraints_of(
+        "SELECT e.id FROM users e JOIN users m ON m.id = e.name",
+        &tables,
+    );
+    let mut columns: Vec<&str> = constraints.table_join_columns("users").collect();
+    columns.sort();
+    assert_eq!(columns, ["id", "name"]);
 }
 
 /// A decorrelated NOT EXISTS is a LEFT JOIN: the subquery's literal on its

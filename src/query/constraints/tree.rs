@@ -2,7 +2,9 @@
 //! read from the rope and its bindings.
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+use ecow::EcoString;
 
 use super::query_constraints_build;
 use super::range::{
@@ -34,6 +36,10 @@ struct Collector<'a> {
     /// The nullable side's slots while an outer join's ON clause is
     /// analyzed; a column outside them is on the preserved side.
     nullable_slots: Option<HashSet<SlotId>>,
+    /// The slots each table name binds, over the FROM entries and every
+    /// column a predicate reads. A name bound twice keys one constraint set
+    /// for two references, which holds for neither.
+    table_slots: HashMap<EcoString, HashSet<SlotId>>,
     complete: bool,
 }
 
@@ -47,6 +53,7 @@ pub fn query_constraints_analyze(bound: &ResolvedQuery, select: Select<'_>) -> Q
         outer_match_columns: HashSet::new(),
         matched_slots: HashSet::new(),
         nullable_slots: None,
+        table_slots: HashMap::new(),
         complete: true,
     };
     // WHERE first, then joins outermost first, so `matched_slots` holds every
@@ -57,11 +64,13 @@ pub fn query_constraints_analyze(bound: &ResolvedQuery, select: Select<'_>) -> Q
     for source in select.from() {
         collector.join_source_analyze(source);
     }
+    let repeated_tables = collector.repeated_tables(select);
     query_constraints_build(
         collector.constraints,
         collector.equivalences,
         collector.outer_equalities,
         collector.outer_match_columns,
+        &repeated_tables,
         collector.complete,
     )
 }
@@ -101,6 +110,36 @@ impl Collector<'_> {
         Some((constraint_column, binding.slot))
     }
 
+    fn table_slot_record(&mut self, slot: SlotId, column: &ConstraintColumn) {
+        self.table_slots
+            .entry(column.table.clone())
+            .or_default()
+            .insert(slot);
+    }
+
+    /// Table names bound by more than one slot of `select`'s FROM entries
+    /// and predicate columns.
+    fn repeated_tables(&mut self, select: Select<'_>) -> HashSet<EcoString> {
+        let bindings = self.bound.bindings();
+        let mut from_slots = HashSet::new();
+        for source in select.from() {
+            source_slots_collect(bindings, source, &mut from_slots);
+        }
+        for slot in from_slots {
+            if let Some(table_slot) = bindings.slot(slot) {
+                self.table_slots
+                    .entry(table_slot.table().name.clone())
+                    .or_default()
+                    .insert(slot);
+            }
+        }
+        std::mem::take(&mut self.table_slots)
+            .into_iter()
+            .filter(|(_, slots)| slots.len() > 1)
+            .map(|(table, _)| table)
+            .collect()
+    }
+
     fn slot_preserved(&self, slot: SlotId) -> bool {
         self.nullable_slots
             .as_ref()
@@ -110,6 +149,7 @@ impl Collector<'_> {
     /// A constraint on a preserved-side column of an outer join's ON clause
     /// filters no row, so it is kept only as a join column.
     fn constraint_insert(&mut self, slot: SlotId, constraint: ColumnConstraint) {
+        self.table_slot_record(slot, constraint.column());
         if self.slot_preserved(slot) {
             self.outer_match_columns.insert(constraint.column().clone());
             return;
@@ -123,6 +163,8 @@ impl Collector<'_> {
         (left, left_slot): (ConstraintColumn, SlotId),
         (right, right_slot): (ConstraintColumn, SlotId),
     ) {
+        self.table_slot_record(left_slot, &left);
+        self.table_slot_record(right_slot, &right);
         match (
             self.slot_preserved(left_slot),
             self.slot_preserved(right_slot),

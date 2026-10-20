@@ -718,3 +718,136 @@ async fn test_cache_self_join_is_not_a_subsumption_parent() -> Result<(), Error>
 
     Ok(())
 }
+
+/// A WHERE literal on one occurrence of a self-join does not filter rows
+/// standing in for the other: an inserted manager outside the filter still
+/// attaches to an employee the join had dropped.
+#[tokio::test]
+async fn test_cache_self_join_other_occurrence_cdc_insert() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "create table emp_ins (id int primary key, manager_id int, dept text)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "insert into emp_ins values (1, null, 'exec'), (2, 1, 'x'), (3, 5, 'x')",
+        &[],
+    )
+    .await?;
+    ctx.cdc_decode_settle().await?;
+
+    let query = "\
+        select e.id as e_id, m.id as m_id from emp_ins e \
+        join emp_ins m on m.id = e.manager_id where e.dept = 'x' order by e.id";
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 3, "self-join returns employee 2");
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 3, "cached self-join returns employee 2");
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    ctx.query("insert into emp_ins values (5, null, 'exec')", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+
+    let res = ctx.simple_query(query).await?;
+    assert_row_at(&res, 2, &[("e_id", "3"), ("m_id", "5")])?;
+    assert_eq!(res.len(), 4, "the new manager attaches employee 3");
+
+    Ok(())
+}
+
+/// A WHERE literal on one occurrence of a self-join does not hold for the
+/// other: an employee moved to an uncached manager meeting the literal must
+/// invalidate rather than drop out of the result.
+#[tokio::test]
+async fn test_cache_self_join_cached_update_uncached_partner() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "create table emp_upd (id int primary key, manager_id int, dept text)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "insert into emp_upd values (1, null, 'exec'), (2, 1, 'x'), (4, null, 'exec')",
+        &[],
+    )
+    .await?;
+    ctx.cdc_decode_settle().await?;
+
+    let query = "\
+        select e.id as e_id, m.id as m_id from emp_upd e \
+        join emp_upd m on m.id = e.manager_id where m.dept = 'exec' order by e.id";
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 3, "self-join returns employee 2");
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 3, "cached self-join returns employee 2");
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    ctx.query("update emp_upd set manager_id = 4 where id = 2", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+
+    let res = ctx.simple_query(query).await?;
+    assert_row_at(&res, 1, &[("e_id", "2"), ("m_id", "4")])?;
+    assert_eq!(res.len(), 3, "employee 2 reports to manager 4");
+
+    Ok(())
+}
+
+/// Two tables of one name in different schemas are separate relations: a
+/// literal on one must not filter CDC rows of the other.
+#[tokio::test]
+async fn test_cache_same_name_other_schema_cdc_insert() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query("create schema other_items", &[]).await?;
+    ctx.query(
+        "create table items_dup (id int primary key, kind text)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "create table other_items.items_dup (id int primary key, kind text)",
+        &[],
+    )
+    .await?;
+    ctx.query("insert into items_dup values (1, 'x'), (2, 'x')", &[])
+        .await?;
+    ctx.query("insert into other_items.items_dup values (1, 'y')", &[])
+        .await?;
+    ctx.cdc_decode_settle().await?;
+
+    let query = "\
+        select p.id as p_id, o.id as o_id from public.items_dup p \
+        join other_items.items_dup o on o.id = p.id where p.kind = 'x' order by p.id";
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 3, "join returns id 1");
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 3, "cached join returns id 1");
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    ctx.query("insert into other_items.items_dup values (2, 'y')", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+
+    let res = ctx.simple_query(query).await?;
+    assert_row_at(&res, 2, &[("p_id", "2"), ("o_id", "2")])?;
+    assert_eq!(res.len(), 4, "the other schema's row joins id 2");
+
+    Ok(())
+}
