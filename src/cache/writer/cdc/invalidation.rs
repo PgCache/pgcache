@@ -208,7 +208,7 @@ fn row_cached_invalidates(
     if limit_window_move_invalidates(update_query, table_metadata, row_data, row_changes) {
         return true;
     }
-    join_columns_changed(update_query, table_metadata, row_changes)
+    link_columns_changed(update_query, row_changes)
         && row_constraints_match(&update_query.constraints, table_metadata, row_data)
 }
 
@@ -243,25 +243,18 @@ fn limit_window_move_invalidates(
         && !window_move_is_promotion(update_query, table_metadata, row_data, row_changes)
 }
 
-fn join_columns_changed(
-    update_query: &UpdateQuery,
-    table_metadata: &TableMetadata,
-    row_changes: &RowChanges,
-) -> bool {
-    update_query
-        .constraints
-        .table_join_columns(&table_metadata.name)
-        .any(|column| {
-            // Missing column would mean query constraints reference a column
-            // that wasn't projected — a builder invariant violation. Default
-            // to changed (→ invalidate): the safe direction, since assuming
-            // unchanged could skip a required invalidation and serve stale data.
-            debug_assert!(
-                row_changes.contains_key(column),
-                "constraint column {column} missing from row_changes projection"
-            );
-            row_changes.get(column).is_none_or(|cc| cc.changed)
-        })
+fn link_columns_changed(update_query: &UpdateQuery, row_changes: &RowChanges) -> bool {
+    update_query.link_columns.iter().any(|column| {
+        // Missing column would mean the query links on a column that wasn't
+        // projected — a builder invariant violation. Default to changed
+        // (→ invalidate): the safe direction, since assuming unchanged could
+        // skip a required invalidation and serve stale data.
+        debug_assert!(
+            row_changes.contains_key(column.as_str()),
+            "link column {column} missing from row_changes projection"
+        );
+        row_changes.get(column.as_str()).is_none_or(|cc| cc.changed)
+    })
 }
 
 /// Whether a query must be invalidated on the toast-fallback path without

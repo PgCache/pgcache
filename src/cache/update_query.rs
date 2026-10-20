@@ -144,6 +144,9 @@ pub struct UpdateQuery {
     pub source: UpdateQuerySource,
     /// WHERE clause constraints for CDC invalidation filtering
     pub constraints: QueryConstraints,
+    /// This relation's columns whose change can alter which partner rows its
+    /// rows meet, over every reference to it in the branch.
+    pub link_columns: Vec<EcoString>,
     /// Whether the parent cached query has a LIMIT (max_limit.is_some()).
     /// Used by CDC to determine if DELETE should trigger invalidation.
     pub has_limit: bool,
@@ -163,8 +166,7 @@ pub struct UpdateQuery {
     /// Whether a CDC UPDATE for this query can ever invalidate. When `false`,
     /// `handle_update` skips the `query_row_changes` SELECT and the invalidation
     /// check entirely (PGC-227). Set at registration from
-    /// `update_invalidation_possible` (the single source of truth — needs the
-    /// relation's table name).
+    /// `update_invalidation_possible` (the single source of truth).
     pub change_dependent: bool,
     /// Whether this query's PgEval membership can be evaluated for many CDC
     /// rows in one multi-row VALUES statement (PGC-241). Requires per-row
@@ -225,7 +227,7 @@ impl UpdateQuery {
     /// mirrors a check branch and the two must stay in lockstep — the
     /// `debug_assert` in `update_queries_check_invalidate` enforces it at
     /// runtime by failing if a check ever invalidates while this returns false.
-    pub fn update_invalidation_possible(&self, table_name: &str) -> bool {
+    pub fn update_invalidation_possible(&self) -> bool {
         // Cached path: Subquery / non-terminal outer join always invalidate.
         matches!(
             self.source,
@@ -236,8 +238,8 @@ impl UpdateQuery {
         || (matches!(self.source, UpdateQuerySource::FromClause)
             && self.has_limit
             && !self.limit_window_columns.is_empty())
-        // Cached path: a join column on this table changing can invalidate.
-        || self.constraints.table_join_columns(table_name).next().is_some()
+        // Cached path: a link column on this table changing can invalidate.
+        || !self.link_columns.is_empty()
         // Uncached path: any multi-table FromClause query invalidates on a row
         // that newly satisfies the join — the partner side may not be cached,
         // so in-place maintenance can't materialize it. Independent of whether
@@ -533,7 +535,7 @@ impl UpdateQueries {
     /// Set whether `fingerprint`'s parent query has a LIMIT, re-deriving what
     /// depends on it: the carve-outs, `change_dependent`, and its place in
     /// the subsumption index, which holds only unlimited parents.
-    pub fn has_limit_set(&mut self, fingerprint: Fingerprint, has_limit: bool, table_name: &str) {
+    pub fn has_limit_set(&mut self, fingerprint: Fingerprint, has_limit: bool) {
         let Some(mut entries) = self.queries.remove(&fingerprint) else {
             return;
         };
@@ -542,7 +544,7 @@ impl UpdateQueries {
         for entry in &mut entries {
             self.change_dependent_account(entry.change_dependent, false);
             entry.has_limit = has_limit;
-            entry.change_dependent = entry.update_invalidation_possible(table_name);
+            entry.change_dependent = entry.update_invalidation_possible();
             self.change_dependent_account(entry.change_dependent, true);
         }
         self.carveout_account(fingerprint, &entries, true);
@@ -742,11 +744,11 @@ mod tests {
         assert!(queries.has_limit_from.contains(&FINGERPRINT));
         assert!(!subsumer(&queries));
 
-        queries.has_limit_set(FINGERPRINT, false, "items");
+        queries.has_limit_set(FINGERPRINT, false);
         assert!(queries.has_limit_from.is_empty());
         assert!(subsumer(&queries));
 
-        queries.has_limit_set(FINGERPRINT, true, "items");
+        queries.has_limit_set(FINGERPRINT, true);
         assert!(queries.has_limit_from.contains(&FINGERPRINT));
         assert!(!subsumer(&queries));
     }
@@ -757,8 +759,8 @@ mod tests {
     fn test_update_queries_several_never_subsumer() {
         let mut queries = registered(UNION, false);
         assert!(!subsumer(&queries));
-        queries.has_limit_set(FINGERPRINT, true, "items");
-        queries.has_limit_set(FINGERPRINT, false, "items");
+        queries.has_limit_set(FINGERPRINT, true);
+        queries.has_limit_set(FINGERPRINT, false);
         assert!(!subsumer(&queries));
     }
 

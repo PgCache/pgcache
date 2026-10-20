@@ -669,6 +669,22 @@ mod tests {
         assert_eq!(filters("a2"), ["y Equal Integer(2)"]);
     }
 
+    /// Each reference of a self-join links on its own side of the equality.
+    #[test]
+    fn test_self_join_link_columns_per_reference() {
+        let bound = resolve("SELECT * FROM a e JOIN a m ON m.id = e.x");
+        let branch = root_predicates(&bound);
+        let links = |name: &str| {
+            let slot = slot_of(&bound, &branch, name);
+            branch
+                .relation_predicates(bound.bindings(), slot)
+                .expect("relation predicates")
+                .link_columns
+        };
+        assert_eq!(links("e"), ["x"]);
+        assert_eq!(links("m"), ["id"]);
+    }
+
     /// The SELECTs under the root, by position.
     fn nested_select_ids(bound: &ResolvedQuery) -> Vec<NodeId> {
         bound
@@ -714,67 +730,56 @@ mod tests {
         assert!(!relation.exact);
     }
 
-    /// Per table, link columns the collector doesn't report.
-    type ExtraLinks = &'static [(&'static str, &'static [&'static str])];
-
-    /// The model's filters equal the collector's per-table constraints, and
-    /// its link columns cover the collector's join columns, over queries
-    /// that name each relation once. `extra_links` lists, per table, the
-    /// link columns the collector misses.
+    /// The model's filters equal the collector's per-table constraints over
+    /// queries that name each relation once.
     #[test]
     fn test_agreement_with_constraint_collector() {
         #[rustfmt::skip]
-        let corpus: &[(&str, ExtraLinks)] = &[
-            ("SELECT * FROM a WHERE x = 1", &[]),
-            ("SELECT * FROM a WHERE x = 1 AND y > 2", &[]),
-            ("SELECT * FROM a WHERE x IN (3, 1, 2) AND y NOT IN (4, 5)", &[]),
-            ("SELECT * FROM a WHERE x BETWEEN 1 AND 5", &[]),
-            ("SELECT * FROM a WHERE x BETWEEN SYMMETRIC 5 AND 1", &[]),
-            ("SELECT * FROM a WHERE x BETWEEN 1 AND y", &[]),
-            ("SELECT * FROM a WHERE x NOT IN (1, y, 2)", &[]),
-            ("SELECT * FROM a WHERE x = ANY (ARRAY[1, 2])", &[]),
-            ("SELECT * FROM a WHERE x::text = '1'", &[]),
-            ("SELECT * FROM a WHERE x = 1 OR y = 2", &[]),
-            ("SELECT * FROM a WHERE x = y", &[]),
-            ("SELECT * FROM a WHERE NOT (x = 1)", &[]),
-            ("SELECT * FROM a WHERE x IN (SELECT id FROM b)", &[("a", &["x"])]),
-            ("SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.id = a.id)", &[]),
-            ("SELECT * FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.id = a.id AND b.id = 5)",
-             &[]),
-            ("SELECT * FROM a JOIN b ON a.id = b.id AND b.x = 1 WHERE a.y = 2", &[]),
-            ("SELECT * FROM a JOIN b USING (id) WHERE id = 1", &[]),
-            ("SELECT * FROM a NATURAL JOIN b JOIN c ON c.id = b.id", &[]),
-            ("SELECT * FROM a LEFT JOIN b ON a.id = b.id CROSS JOIN c", &[]),
-            ("SELECT * FROM a LEFT JOIN b ON a.id = b.id AND a.x = 1", &[]),
-            ("SELECT * FROM a LEFT JOIN b ON a.id = b.id AND b.x = 5", &[]),
-            ("SELECT * FROM a LEFT JOIN b ON a.id = b.id WHERE a.id = 5", &[]),
-            ("SELECT * FROM a LEFT JOIN b USING (id) WHERE a.id = 5", &[]),
-            ("SELECT * FROM b RIGHT JOIN a ON a.id = b.id AND a.x = 1 AND b.id = 5", &[]),
-            ("SELECT * FROM a LEFT JOIN b ON a.id = b.id LEFT JOIN c ON b.id = c.id AND a.x = 1",
-             &[]),
-            ("SELECT * FROM a LEFT JOIN b ON a.id = b.id WHERE b.id = 5", &[]),
-            ("SELECT * FROM a LEFT JOIN b ON a.id = b.id AND a.x = 1 WHERE b.x = 2", &[]),
-            ("SELECT * FROM a LEFT JOIN b ON a.id = b.id AND b.id = 5 WHERE b.x IS NULL", &[]),
-            ("SELECT * FROM a LEFT JOIN (b LEFT JOIN c ON b.id = c.id) ON a.id = b.id \
-              WHERE c.id = 7", &[]),
-            ("SELECT * FROM a LEFT JOIN (b LEFT JOIN c ON b.id = c.id) ON a.id = b.id \
-              AND c.id = 3", &[]),
-            ("SELECT * FROM a LEFT JOIN b ON a.id = b.id JOIN c ON b.id = c.id AND c.id = 2", &[]),
-            ("SELECT * FROM a RIGHT JOIN b ON a.id = b.id WHERE b.x = 1", &[]),
-            ("SELECT * FROM a, b WHERE a.id = b.id AND a.x = 1", &[]),
-            ("SELECT * FROM a, b, c WHERE a.id = b.id AND b.id = c.id AND c.x = 3", &[]),
-            ("SELECT d.id FROM (SELECT id FROM a WHERE id = 1) d WHERE d.id = 2", &[]),
-            ("SELECT * FROM a JOIN b ON a.id = b.id WHERE a.x::text = '3'", &[]),
-            ("SELECT * FROM a JOIN b ON a.id = b.id JOIN c ON b.x = c.x WHERE a.id IN (1, 2)",
-             &[]),
-            ("SELECT * FROM a JOIN b ON a.id = b.id AND a.x = b.x WHERE b.x = 4", &[]),
-            // The collector drops conjuncts it can't read; their columns link.
-            ("SELECT * FROM a JOIN b ON b.id = a.x + 1 WHERE a.y = 1",
-             &[("a", &["x"]), ("b", &["id"])]),
-            ("SELECT * FROM a JOIN b ON b.id = a.id WHERE a.x < b.y",
-             &[("a", &["x"]), ("b", &["y"])]),
+        let corpus: &[&str] = &[
+            "SELECT * FROM a WHERE x = 1",
+            "SELECT * FROM a WHERE x = 1 AND y > 2",
+            "SELECT * FROM a WHERE x IN (3, 1, 2) AND y NOT IN (4, 5)",
+            "SELECT * FROM a WHERE x BETWEEN 1 AND 5",
+            "SELECT * FROM a WHERE x BETWEEN SYMMETRIC 5 AND 1",
+            "SELECT * FROM a WHERE x BETWEEN 1 AND y",
+            "SELECT * FROM a WHERE x NOT IN (1, y, 2)",
+            "SELECT * FROM a WHERE x = ANY (ARRAY[1, 2])",
+            "SELECT * FROM a WHERE x::text = '1'",
+            "SELECT * FROM a WHERE x = 1 OR y = 2",
+            "SELECT * FROM a WHERE x = y",
+            "SELECT * FROM a WHERE NOT (x = 1)",
+            "SELECT * FROM a WHERE x IN (SELECT id FROM b)",
+            "SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.id = a.id)",
+            "SELECT * FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.id = a.id AND b.id = 5)",
+            "SELECT * FROM a JOIN b ON a.id = b.id AND b.x = 1 WHERE a.y = 2",
+            "SELECT * FROM a JOIN b USING (id) WHERE id = 1",
+            "SELECT * FROM a NATURAL JOIN b JOIN c ON c.id = b.id",
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.id CROSS JOIN c",
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.id AND a.x = 1",
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.id AND b.x = 5",
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.id WHERE a.id = 5",
+            "SELECT * FROM a LEFT JOIN b USING (id) WHERE a.id = 5",
+            "SELECT * FROM b RIGHT JOIN a ON a.id = b.id AND a.x = 1 AND b.id = 5",
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.id LEFT JOIN c ON b.id = c.id AND a.x = 1",
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.id WHERE b.id = 5",
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.id AND a.x = 1 WHERE b.x = 2",
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.id AND b.id = 5 WHERE b.x IS NULL",
+            "SELECT * FROM a LEFT JOIN (b LEFT JOIN c ON b.id = c.id) ON a.id = b.id \
+              WHERE c.id = 7",
+            "SELECT * FROM a LEFT JOIN (b LEFT JOIN c ON b.id = c.id) ON a.id = b.id \
+              AND c.id = 3",
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.id JOIN c ON b.id = c.id AND c.id = 2",
+            "SELECT * FROM a RIGHT JOIN b ON a.id = b.id WHERE b.x = 1",
+            "SELECT * FROM a, b WHERE a.id = b.id AND a.x = 1",
+            "SELECT * FROM a, b, c WHERE a.id = b.id AND b.id = c.id AND c.x = 3",
+            "SELECT d.id FROM (SELECT id FROM a WHERE id = 1) d WHERE d.id = 2",
+            "SELECT * FROM a JOIN b ON a.id = b.id WHERE a.x::text = '3'",
+            "SELECT * FROM a JOIN b ON a.id = b.id JOIN c ON b.x = c.x WHERE a.id IN (1, 2)",
+            "SELECT * FROM a JOIN b ON a.id = b.id AND a.x = b.x WHERE b.x = 4",
+            "SELECT * FROM a JOIN b ON b.id = a.x + 1 WHERE a.y = 1",
+            "SELECT * FROM a JOIN b ON b.id = a.id WHERE a.x < b.y",
         ];
-        for (sql, extra_links) in corpus {
+        for sql in corpus {
             let bound = resolve(sql);
             let select = bound.select().expect("a SELECT");
             let branch = query_branch_predicates_build(&bound, select);
@@ -803,30 +808,6 @@ mod tests {
                     .collect();
                 today.sort();
                 assert_eq!(model, today, "{sql}: filters of {name}");
-
-                let today_links: HashSet<&str> = collected.table_join_columns(&name).collect();
-                let model_links: HashSet<&str> = relation
-                    .link_columns
-                    .iter()
-                    .map(|column| column.as_str())
-                    .collect();
-                let extra: HashSet<&str> = extra_links
-                    .iter()
-                    .filter(|(table, _)| *table == name.as_str())
-                    .flat_map(|(_, columns)| columns.iter().copied())
-                    .collect();
-                assert!(
-                    today_links.is_subset(&model_links),
-                    "{sql}: links of {name}"
-                );
-                assert_eq!(
-                    model_links
-                        .difference(&today_links)
-                        .copied()
-                        .collect::<HashSet<_>>(),
-                    extra,
-                    "{sql}: extra links of {name}"
-                );
             }
             for table in collected.table_constraints.keys() {
                 assert!(names.contains(table), "{sql}: {table} is no reference");

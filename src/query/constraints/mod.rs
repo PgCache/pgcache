@@ -177,11 +177,6 @@ pub struct QueryConstraints {
     /// Preserved-to-nullable equalities from outer-join ON clauses.
     pub outer_equalities: HashSet<OuterJoinEquality>,
 
-    /// Preserved-side columns an outer join's ON clause references outside
-    /// `outer_equalities`. They filter no preserved row, but a change to one
-    /// can attach a nullable-side row, so they count as join columns.
-    pub outer_match_columns: HashSet<ConstraintColumn>,
-
     /// Constraints organized by table for quick lookup
     pub table_constraints: HashMap<EcoString, Vec<TableConstraint>>,
 
@@ -205,31 +200,9 @@ impl Default for QueryConstraints {
             column_constraints: HashSet::new(),
             equivalences: HashSet::new(),
             outer_equalities: HashSet::new(),
-            outer_match_columns: HashSet::new(),
             table_constraints: HashMap::new(),
             where_analysis_complete: true,
         }
-    }
-}
-
-impl QueryConstraints {
-    /// Returns column names involved in join conditions for the given table
-    pub fn table_join_columns<'a>(&'a self, table_name: &'a str) -> impl Iterator<Item = &'a str> {
-        let equivalence_columns = self
-            .equivalences
-            .iter()
-            .filter(|eq| eq.is_join())
-            .flat_map(|eq| [&eq.left, &eq.right])
-            .filter(move |column| column.table == table_name)
-            .map(|column| column.column.as_str());
-        let outer_columns = self
-            .outer_equalities
-            .iter()
-            .flat_map(|eq| [&eq.preserved, &eq.nullable])
-            .chain(&self.outer_match_columns)
-            .filter(move |column| column.table == table_name)
-            .map(|column| column.column.as_str());
-        equivalence_columns.chain(outer_columns)
     }
 }
 
@@ -282,7 +255,6 @@ pub(super) fn query_constraints_build(
     constraints: HashSet<ColumnConstraint>,
     equivalences: HashSet<ColumnEquivalence>,
     outer_equalities: HashSet<OuterJoinEquality>,
-    outer_match_columns: HashSet<ConstraintColumn>,
     repeated_tables: &HashSet<EcoString>,
     mut where_analysis_complete: bool,
 ) -> QueryConstraints {
@@ -327,7 +299,6 @@ pub(super) fn query_constraints_build(
         column_constraints,
         equivalences,
         outer_equalities,
-        outer_match_columns,
         table_constraints,
         where_analysis_complete,
     }

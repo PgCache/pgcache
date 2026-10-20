@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use postgres_types::ToSql;
 use tokio_postgres::{Client, Config, NoTls, Row, SimpleQueryMessage, Statement, ToStatement};
 
+use super::assertions::result_rows;
 use super::http::http_get;
 
 use super::metrics::MetricsSnapshot;
@@ -306,6 +307,22 @@ impl TestContext {
         query: &str,
     ) -> Result<Vec<SimpleQueryMessage>, Error> {
         self.cache.simple_query(query).await.map_err(Error::other)
+    }
+
+    /// `query` through pgcache and directly on origin.
+    pub(crate) async fn proxy_and_origin_rows(
+        &mut self,
+        query: &str,
+    ) -> Result<(Vec<Vec<Option<String>>>, Vec<Vec<Option<String>>>), Error> {
+        let proxied = result_rows(&self.simple_query(query).await?);
+        let origin = result_rows(
+            &self
+                .origin
+                .simple_query(query)
+                .await
+                .map_err(Error::other)?,
+        );
+        Ok((proxied, origin))
     }
 
     /// Get metrics from pgcache HTTP endpoint

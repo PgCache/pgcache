@@ -13,11 +13,9 @@
 
 use std::io::Error;
 
-use tokio_postgres::SimpleQueryMessage;
-
 use crate::util::{
     TestContext, assert_cache_hit, assert_cache_miss, assert_not_subsumed, assert_row_at,
-    assert_subsume_hit, rows_of,
+    assert_subsume_hit,
 };
 
 mod util;
@@ -562,28 +560,6 @@ async fn test_left_join_cdc_insert_preserved_side() -> Result<(), Error> {
 // Literal predicates in an outer join's ON clause
 // =============================================================================
 
-/// Every row of a simple-query result as its column values, in order.
-fn result_rows(messages: &[SimpleQueryMessage]) -> Vec<Vec<Option<String>>> {
-    rows_of(messages)
-        .iter()
-        .map(|row| {
-            (0..row.len())
-                .map(|i| row.get(i).map(str::to_owned))
-                .collect()
-        })
-        .collect()
-}
-
-/// Run `query` through pgcache and directly on origin.
-async fn proxy_and_origin_rows(
-    ctx: &mut TestContext,
-    query: &str,
-) -> Result<(Vec<Vec<Option<String>>>, Vec<Vec<Option<String>>>), Error> {
-    let proxied = result_rows(&ctx.simple_query(query).await?);
-    let origin = result_rows(&ctx.origin.simple_query(query).await.map_err(Error::other)?);
-    Ok((proxied, origin))
-}
-
 /// A literal on the preserved side in a LEFT JOIN's ON clause filters
 /// nothing: every order is returned, matched or NULL-padded. A preserved-side
 /// INSERT that fails the ON literal must still appear after CDC.
@@ -616,12 +592,12 @@ async fn test_left_join_on_preserved_literal_cdc_insert() -> Result<(), Error> {
                  ORDER BY o.id";
 
     let m = ctx.metrics().await?;
-    let (proxied, origin) = proxy_and_origin_rows(&mut ctx, query).await?;
+    let (proxied, origin) = ctx.proxy_and_origin_rows(query).await?;
     assert_eq!(proxied, origin, "initial result");
     let m = assert_cache_miss(&mut ctx, m).await?;
     ctx.cache_settle().await?;
 
-    let (proxied, origin) = proxy_and_origin_rows(&mut ctx, query).await?;
+    let (proxied, origin) = ctx.proxy_and_origin_rows(query).await?;
     assert_eq!(proxied, origin, "cached result");
     let _m = assert_cache_hit(&mut ctx, m).await?;
 
@@ -629,7 +605,7 @@ async fn test_left_join_on_preserved_literal_cdc_insert() -> Result<(), Error> {
         .await?;
     ctx.cdc_apply_settle().await?;
 
-    let (proxied, origin) = proxy_and_origin_rows(&mut ctx, query).await?;
+    let (proxied, origin) = ctx.proxy_and_origin_rows(query).await?;
     assert_eq!(origin.len(), 3, "origin returns every order");
     assert_eq!(proxied, origin, "result after preserved-side insert");
 
@@ -671,12 +647,12 @@ async fn test_left_join_on_nullable_literal_cdc_insert() -> Result<(), Error> {
                  ORDER BY o.id";
 
     let m = ctx.metrics().await?;
-    let (proxied, origin) = proxy_and_origin_rows(&mut ctx, query).await?;
+    let (proxied, origin) = ctx.proxy_and_origin_rows(query).await?;
     assert_eq!(proxied, origin, "initial result");
     let m = assert_cache_miss(&mut ctx, m).await?;
     ctx.cache_settle().await?;
 
-    let (proxied, origin) = proxy_and_origin_rows(&mut ctx, query).await?;
+    let (proxied, origin) = ctx.proxy_and_origin_rows(query).await?;
     assert_eq!(proxied, origin, "cached result");
     let _m = assert_cache_hit(&mut ctx, m).await?;
 
@@ -684,7 +660,7 @@ async fn test_left_join_on_nullable_literal_cdc_insert() -> Result<(), Error> {
         .await?;
     ctx.cdc_apply_settle().await?;
 
-    let (proxied, origin) = proxy_and_origin_rows(&mut ctx, query).await?;
+    let (proxied, origin) = ctx.proxy_and_origin_rows(query).await?;
     assert_eq!(origin.len(), 3, "origin returns every order");
     assert_eq!(proxied, origin, "result after preserved-side insert");
 
@@ -732,7 +708,7 @@ async fn test_left_join_on_preserved_literal_not_subsumed() -> Result<(), Error>
                  FROM lons_orders o LEFT JOIN lons_customers c \
                  ON o.customer_id = c.id AND o.status = 'x' \
                  ORDER BY o.id";
-    let (proxied, origin) = proxy_and_origin_rows(&mut ctx, query).await?;
+    let (proxied, origin) = ctx.proxy_and_origin_rows(query).await?;
     assert_eq!(origin.len(), 2, "origin returns every order");
     assert_eq!(proxied, origin, "join result");
     let _m = assert_not_subsumed(&mut ctx, m).await?;
@@ -775,12 +751,12 @@ async fn test_left_join_on_preserved_literal_cdc_update() -> Result<(), Error> {
                  ORDER BY o.id";
 
     let m = ctx.metrics().await?;
-    let (proxied, origin) = proxy_and_origin_rows(&mut ctx, query).await?;
+    let (proxied, origin) = ctx.proxy_and_origin_rows(query).await?;
     assert_eq!(proxied, origin, "initial result");
     let m = assert_cache_miss(&mut ctx, m).await?;
     ctx.cache_settle().await?;
 
-    let (proxied, origin) = proxy_and_origin_rows(&mut ctx, query).await?;
+    let (proxied, origin) = ctx.proxy_and_origin_rows(query).await?;
     assert_eq!(proxied, origin, "cached result");
     let _m = assert_cache_hit(&mut ctx, m).await?;
 
@@ -788,7 +764,7 @@ async fn test_left_join_on_preserved_literal_cdc_update() -> Result<(), Error> {
         .await?;
     ctx.cdc_apply_settle().await?;
 
-    let (proxied, origin) = proxy_and_origin_rows(&mut ctx, query).await?;
+    let (proxied, origin) = ctx.proxy_and_origin_rows(query).await?;
     assert_eq!(
         origin.get(1).and_then(|row| row.get(2)).cloned().flatten(),
         Some("Globex".to_owned()),
@@ -828,12 +804,12 @@ async fn test_left_self_join_preserved_occurrence_cdc_insert() -> Result<(), Err
                  ORDER BY a.id, b.id";
 
     let m = ctx.metrics().await?;
-    let (proxied, origin) = proxy_and_origin_rows(&mut ctx, query).await?;
+    let (proxied, origin) = ctx.proxy_and_origin_rows(query).await?;
     assert_eq!(proxied, origin, "initial result");
     let m = assert_cache_miss(&mut ctx, m).await?;
     ctx.cache_settle().await?;
 
-    let (proxied, origin) = proxy_and_origin_rows(&mut ctx, query).await?;
+    let (proxied, origin) = ctx.proxy_and_origin_rows(query).await?;
     assert_eq!(proxied, origin, "cached result");
     let _m = assert_cache_hit(&mut ctx, m).await?;
 
@@ -841,7 +817,7 @@ async fn test_left_self_join_preserved_occurrence_cdc_insert() -> Result<(), Err
         .await?;
     ctx.cdc_apply_settle().await?;
 
-    let (proxied, origin) = proxy_and_origin_rows(&mut ctx, query).await?;
+    let (proxied, origin) = ctx.proxy_and_origin_rows(query).await?;
     assert_eq!(origin.len(), 2, "origin attaches tag 30 to node 3");
     assert_eq!(proxied, origin, "result after preserved-occurrence insert");
 
@@ -884,7 +860,7 @@ async fn test_left_join_preserved_parent_subsumes() -> Result<(), Error> {
     ctx.cache_settle().await?;
 
     let child = "SELECT id, name FROM ljps_users WHERE name = 'a' ORDER BY id";
-    let (proxied, origin) = proxy_and_origin_rows(&mut ctx, child).await?;
+    let (proxied, origin) = ctx.proxy_and_origin_rows(child).await?;
     assert_eq!(origin.len(), 2, "origin returns both 'a' users");
     assert_eq!(proxied, origin, "subsumed child");
     let m = assert_subsume_hit(&mut ctx, m).await?;
@@ -893,7 +869,7 @@ async fn test_left_join_preserved_parent_subsumes() -> Result<(), Error> {
         .await?;
     ctx.cdc_apply_settle().await?;
 
-    let (proxied, origin) = proxy_and_origin_rows(&mut ctx, child).await?;
+    let (proxied, origin) = ctx.proxy_and_origin_rows(child).await?;
     assert_eq!(origin.len(), 3, "origin returns the inserted user");
     assert_eq!(proxied, origin, "child after CDC insert");
     let _m = assert_cache_hit(&mut ctx, m).await?;
@@ -956,7 +932,7 @@ async fn test_join_parent_incomplete_table_not_subsumed() -> Result<(), Error> {
         let m = assert_cache_miss(&mut ctx, m).await?;
         ctx.cache_settle().await?;
 
-        let (proxied, origin) = proxy_and_origin_rows(&mut ctx, child).await?;
+        let (proxied, origin) = ctx.proxy_and_origin_rows(child).await?;
         assert_eq!(origin.len(), expected, "{child}");
         assert_eq!(proxied, origin, "{child}");
         let _m = assert_not_subsumed(&mut ctx, m).await?;

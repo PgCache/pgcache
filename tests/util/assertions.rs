@@ -14,6 +14,18 @@ pub(crate) fn rows_of(messages: &[SimpleQueryMessage]) -> Vec<&tokio_postgres::S
         .collect()
 }
 
+/// Every row of a simple-query result as its column values, in order.
+pub(crate) fn result_rows(messages: &[SimpleQueryMessage]) -> Vec<Vec<Option<String>>> {
+    rows_of(messages)
+        .iter()
+        .map(|row| {
+            (0..row.len())
+                .map(|i| row.get(i).map(str::to_owned))
+                .collect()
+        })
+        .collect()
+}
+
 /// Extract a row from SimpleQueryMessage results at the specified index.
 /// Returns an error with context if the message at that index is not a Row.
 pub(crate) fn extract_row(

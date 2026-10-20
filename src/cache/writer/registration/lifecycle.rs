@@ -25,11 +25,8 @@ fn update_queries_limit_set(
     has_limit: bool,
 ) {
     for oid in relation_oids {
-        let Some(table_name) = core.cache.tables.get1(oid).map(|t| t.name.clone()) else {
-            continue;
-        };
         if let Some(mut queries) = core.cache.update_queries.get_mut(oid) {
-            queries.has_limit_set(fingerprint, has_limit, &table_name);
+            queries.has_limit_set(fingerprint, has_limit);
         }
     }
 }

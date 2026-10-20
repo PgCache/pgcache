@@ -920,3 +920,135 @@ async fn test_cross_join_uncached_update_invalidates() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// Caches `query`, runs `update` and returns the rows through the proxy and
+/// on origin once CDC has applied it.
+async fn rows_after_update(
+    ctx: &mut TestContext,
+    query: &str,
+    update: &str,
+) -> Result<(Vec<Vec<Option<String>>>, Vec<Vec<Option<String>>>), Error> {
+    ctx.cdc_decode_settle().await?;
+    let m = ctx.metrics().await?;
+    ctx.simple_query(query).await?;
+    let _m = assert_cache_miss(ctx, m).await?;
+    ctx.cache_settle().await?;
+    ctx.query(update, &[]).await?;
+    ctx.cdc_apply_settle().await?;
+    ctx.proxy_and_origin_rows(query).await
+}
+
+/// An UPDATE to a column an expression ON compares moves the cached row to
+/// partners that were never loaded, so it must invalidate (PGC-515).
+#[tokio::test]
+async fn test_expression_join_cached_update_invalidates() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    ctx.query(
+        "CREATE TABLE ej_a (id INTEGER PRIMARY KEY, email TEXT)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "CREATE TABLE ej_b (id INTEGER PRIMARY KEY, email TEXT)",
+        &[],
+    )
+    .await?;
+    ctx.query("INSERT INTO ej_a VALUES (1, 'X')", &[]).await?;
+    ctx.query("INSERT INTO ej_b VALUES (10, 'x'), (11, 'y')", &[])
+        .await?;
+    let (proxied, origin) = rows_after_update(
+        &mut ctx,
+        "SELECT a.id, b.id FROM ej_a a JOIN ej_b b ON lower(a.email) = lower(b.email)",
+        "UPDATE ej_a SET email = 'Y' WHERE id = 1",
+    )
+    .await?;
+    assert_eq!(origin.len(), 1, "origin joins the new partner");
+    assert_eq!(proxied, origin);
+    Ok(())
+}
+
+/// An UPDATE to a column under arithmetic in an ON equality must
+/// invalidate (PGC-515).
+#[tokio::test]
+async fn test_arithmetic_join_cached_update_invalidates() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    ctx.query(
+        "CREATE TABLE aj_a (id INTEGER PRIMARY KEY, ref INTEGER)",
+        &[],
+    )
+    .await?;
+    ctx.query("CREATE TABLE aj_b (id INTEGER PRIMARY KEY)", &[])
+        .await?;
+    ctx.query("INSERT INTO aj_a VALUES (1, 9)", &[]).await?;
+    ctx.query("INSERT INTO aj_b VALUES (10), (20)", &[]).await?;
+    let (proxied, origin) = rows_after_update(
+        &mut ctx,
+        "SELECT a.id, b.id FROM aj_a a JOIN aj_b b ON b.id = a.ref + 1",
+        "UPDATE aj_a SET ref = 19 WHERE id = 1",
+    )
+    .await?;
+    assert_eq!(origin.len(), 1, "origin joins the new partner");
+    assert_eq!(proxied, origin);
+    Ok(())
+}
+
+/// An UPDATE to a column a WHERE comparison reads across tables admits
+/// partner rows that were never loaded, so it must invalidate (PGC-515).
+#[tokio::test]
+async fn test_cross_table_where_comparison_cached_update_invalidates() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    ctx.query(
+        "CREATE TABLE cw_acct (id INTEGER PRIMARY KEY, lim INTEGER)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "CREATE TABLE cw_txn (id INTEGER PRIMARY KEY, acct_id INTEGER, amount INTEGER)",
+        &[],
+    )
+    .await?;
+    ctx.query("INSERT INTO cw_acct VALUES (1, 100)", &[])
+        .await?;
+    ctx.query("INSERT INTO cw_txn VALUES (10, 1, 150), (11, 1, 50)", &[])
+        .await?;
+    let (proxied, origin) = rows_after_update(
+        &mut ctx,
+        "SELECT a.id, t.id FROM cw_acct a JOIN cw_txn t ON t.acct_id = a.id \
+         WHERE t.amount > a.lim ORDER BY t.id",
+        "UPDATE cw_acct SET lim = 10 WHERE id = 1",
+    )
+    .await?;
+    assert_eq!(origin.len(), 2, "origin returns both transactions");
+    assert_eq!(proxied, origin);
+    Ok(())
+}
+
+/// An UPDATE to an uncached row's column that an expression ON compares can
+/// join it to a partner that isn't cached either, even when every
+/// recognized join column is the PK (PGC-515).
+#[tokio::test]
+async fn test_expression_join_with_pk_equality_uncached_update_invalidates() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    ctx.query(
+        "CREATE TABLE eu_a (id INTEGER PRIMARY KEY, email TEXT)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "CREATE TABLE eu_b (id INTEGER PRIMARY KEY, email TEXT)",
+        &[],
+    )
+    .await?;
+    ctx.query("INSERT INTO eu_a VALUES (1, 'x')", &[]).await?;
+    ctx.query("INSERT INTO eu_b VALUES (1, 'y')", &[]).await?;
+    let (proxied, origin) = rows_after_update(
+        &mut ctx,
+        "SELECT a.id, b.id FROM eu_a a JOIN eu_b b \
+         ON b.id = a.id AND lower(a.email) = lower(b.email)",
+        "UPDATE eu_a SET email = 'y' WHERE id = 1",
+    )
+    .await?;
+    assert_eq!(origin.len(), 1, "origin joins the updated row");
+    assert_eq!(proxied, origin);
+    Ok(())
+}

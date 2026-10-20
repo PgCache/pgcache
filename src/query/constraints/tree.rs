@@ -21,7 +21,6 @@ struct Collector<'a> {
     constraints: HashSet<ColumnConstraint>,
     equivalences: HashSet<ColumnEquivalence>,
     outer_equalities: HashSet<OuterJoinEquality>,
-    outer_match_columns: HashSet<ConstraintColumn>,
     /// Slots a constraint or equality has proven non-NULL. Every extracted
     /// predicate rejects NULL, so an outer join whose nullable side holds one
     /// of these filters out its NULL-padded rows and acts as an inner join.
@@ -43,7 +42,6 @@ pub fn query_constraints_analyze(bound: &ResolvedQuery, select: Select<'_>) -> Q
         constraints: HashSet::new(),
         equivalences: HashSet::new(),
         outer_equalities: HashSet::new(),
-        outer_match_columns: HashSet::new(),
         matched_slots: HashSet::new(),
         nullable_slots: None,
         table_slots: HashMap::new(),
@@ -63,7 +61,6 @@ pub fn query_constraints_analyze(bound: &ResolvedQuery, select: Select<'_>) -> Q
         collector.constraints,
         collector.equivalences,
         collector.outer_equalities,
-        collector.outer_match_columns,
         &repeated_tables,
         where_analysis_complete,
     )
@@ -113,11 +110,10 @@ impl Collector<'_> {
     }
 
     /// A constraint on a preserved-side column of an outer join's ON clause
-    /// filters no row, so it is kept only as a join column.
+    /// filters no row.
     fn constraint_insert(&mut self, slot: SlotId, constraint: ColumnConstraint) {
         self.table_slot_record(slot, constraint.column());
         if self.slot_preserved(slot) {
-            self.outer_match_columns.insert(constraint.column().clone());
             return;
         }
         self.matched_slots.insert(slot);
@@ -153,9 +149,7 @@ impl Collector<'_> {
                     nullable: left,
                 });
             }
-            (true, true) => {
-                self.outer_match_columns.extend([left, right]);
-            }
+            (true, true) => {}
         }
     }
 

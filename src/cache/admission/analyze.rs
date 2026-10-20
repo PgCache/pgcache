@@ -16,14 +16,16 @@ use crate::cache::query::{limit_clause_of, limit_rows_needed};
 use crate::cache::update_query::{UpdateEvalStrategy, UpdateQuery, UpdateQuerySource};
 use crate::cache::{CacheError, CacheResult};
 use crate::catalog::Catalog;
+use crate::oid::Oid;
 use crate::query::Fingerprint;
 use crate::query::ast::rope::{Body, NodeKind, QueryTree, TreeBuilder, View};
 use crate::query::constraints::{QueryConstraints, query_constraints_analyze};
 use crate::query::decorrelate::query_decorrelate;
 use crate::query::literal_settings::LiteralSettings;
 use crate::query::predicate::CompiledPredicate;
+use crate::query::predicates::query_branch_predicates_build;
 use crate::query::resolve::ResolveResult;
-use crate::query::resolve::{QueryBranch, ResolvedQuery};
+use crate::query::resolve::{QueryBranch, ResolvedQuery, TableSlot};
 use crate::query::transform::{
     LiteralCanonOutcome, PgEvalTemplate, query_literals_canonicalise, query_predicate_pushdown,
 };
@@ -137,6 +139,30 @@ fn branch_constraints(bound: &ResolvedQuery, branch: QueryBranch<'_>) -> QueryCo
     query_constraints_analyze(bound, branch.select)
 }
 
+/// The link columns of every reference to `relation_oid` in `branch`: one
+/// update query covers them all.
+fn branch_link_columns(branch: QueryBranch<'_>, relation_oid: Oid) -> Vec<EcoString> {
+    let predicates = query_branch_predicates_build(branch.bound, branch.select);
+    let bindings = branch.bound.bindings();
+    let mut link_columns: Vec<EcoString> = Vec::new();
+    for reference in predicates.table_references() {
+        let is_relation = matches!(bindings.slot(reference.slot),
+            Some(TableSlot::Base { table, .. }) if table.relation_oid == relation_oid);
+        let Some(relation) = is_relation
+            .then(|| predicates.relation_predicates(bindings, reference.slot))
+            .flatten()
+        else {
+            continue;
+        };
+        for column in relation.link_columns {
+            if !link_columns.contains(&column) {
+                link_columns.push(column);
+            }
+        }
+    }
+    link_columns
+}
+
 /// Classify a query's shape for MV eligibility on its decorrelated form
 /// when it has one, so the shape classified is the shape population and
 /// rebuild see.
@@ -180,6 +206,7 @@ pub fn query_admission_analyze(
         let relation_oid = bound_update.relation_oid;
         let branch = bound_update.branch;
         let constraints = branch_constraints(update_source, branch);
+        let link_columns = branch_link_columns(branch, relation_oid);
         let eval_strategy = update_eval_strategy_classify(branch, source);
         let pg_batchable = depth == AdmissionDepth::Full
             && eval_strategy == UpdateEvalStrategy::PgEval
@@ -230,6 +257,7 @@ pub fn query_admission_analyze(
             branch: branch.select.id(),
             source,
             constraints,
+            link_columns,
             has_limit,
             eval_strategy,
             limit_window_columns,
@@ -246,7 +274,7 @@ pub fn query_admission_analyze(
         // invalidation check rather than skip them (PGC-227). Derived from
         // the single source of truth so the flag can't drift.
         if depth == AdmissionDepth::Full {
-            update_query.change_dependent = update_query.update_invalidation_possible(&table_name);
+            update_query.change_dependent = update_query.update_invalidation_possible();
         }
 
         // A relation appearing more than once (a self-join) has its
@@ -296,8 +324,6 @@ mod tests {
     use super::*;
     use crate::catalog::{ColumnMetadata, ColumnPosition, TableMetadata};
     use crate::oid::TypeOid;
-    use crate::query::predicates::query_branch_predicates_build;
-    use crate::query::resolve::TableSlot;
 
     fn catalog() -> Catalog {
         let int_column = |name: &str, position: i16| ColumnMetadata {
@@ -454,6 +480,57 @@ mod tests {
                 })
                 .collect();
             assert_eq!(reference_exact_shapes(sql), expected, "{sql}");
+        }
+    }
+
+    /// Each update query's table with its link columns.
+    type TableLinkColumns = &'static [(&'static str, &'static [&'static str])];
+
+    /// Each update query's link columns, over every reference to its
+    /// relation in the branch, whether the conjunct linking them is
+    /// recognized or not.
+    #[test]
+    fn test_update_query_link_columns() {
+        #[rustfmt::skip]
+        let cases: &[(&str, TableLinkColumns)] = &[
+            ("SELECT * FROM a WHERE x = 1", &[("a", &[])]),
+            ("SELECT * FROM a JOIN b ON b.id = a.x", &[("a", &["x"]), ("b", &["id"])]),
+            ("SELECT * FROM a JOIN b ON b.id = a.x + 1", &[("a", &["x"]), ("b", &["id"])]),
+            ("SELECT * FROM a JOIN b ON b.id = a.id WHERE a.x < b.y",
+             &[("a", &["id", "x"]), ("b", &["id", "y"])]),
+            ("SELECT * FROM a LEFT JOIN b ON b.id = a.id AND a.x = 1",
+             &[("a", &["id", "x"]), ("b", &["id"])]),
+            // One admission per reference, each with both references' links.
+            ("SELECT * FROM a e JOIN a m ON m.id = e.x",
+             &[("a", &["id", "x"]), ("a", &["id", "x"])]),
+            ("SELECT * FROM a WHERE x IN (SELECT id FROM b)", &[("a", &["x"]), ("b", &[])]),
+        ];
+        for (sql, expected) in cases {
+            let mut actual: Vec<(String, Vec<String>)> = admission_analysis(sql)
+                .tables
+                .iter()
+                .map(|admission| {
+                    let mut columns: Vec<String> = admission
+                        .update_query
+                        .link_columns
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect();
+                    columns.sort();
+                    (admission.table_name.to_string(), columns)
+                })
+                .collect();
+            actual.sort();
+            let expected: Vec<(String, Vec<String>)> = expected
+                .iter()
+                .map(|(table, columns)| {
+                    (
+                        table.to_string(),
+                        columns.iter().map(ToString::to_string).collect(),
+                    )
+                })
+                .collect();
+            assert_eq!(actual, expected, "{sql}");
         }
     }
 }

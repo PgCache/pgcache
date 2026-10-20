@@ -1378,35 +1378,6 @@ fn test_outer_join_constraints() {
     }
 }
 
-/// Preserved-side columns of an outer join's ON clause decide which
-/// nullable-side row attaches, so they count as join columns.
-#[test]
-fn test_outer_join_match_columns() {
-    let tables = catalog(&["users", "orders"]);
-    let constraints = constraints_of(
-        "SELECT u.id FROM users u LEFT JOIN orders o ON u.id = o.id AND u.name = 'x'",
-        &tables,
-    );
-    let mut users: Vec<&str> = constraints.table_join_columns("users").collect();
-    users.sort();
-    assert_eq!(users, ["id", "name"]);
-    let orders: Vec<&str> = constraints.table_join_columns("orders").collect();
-    assert_eq!(orders, ["id"]);
-}
-
-/// Both columns of a self-join's equality are join columns of the table.
-#[test]
-fn test_self_join_join_columns() {
-    let tables = catalog(&["users"]);
-    let constraints = constraints_of(
-        "SELECT e.id FROM users e JOIN users m ON m.id = e.name",
-        &tables,
-    );
-    let mut columns: Vec<&str> = constraints.table_join_columns("users").collect();
-    columns.sort();
-    assert_eq!(columns, ["id", "name"]);
-}
-
 /// A decorrelated NOT EXISTS is a LEFT JOIN: the subquery's literal on its
 /// correlated column constrains only the subquery table.
 #[test]

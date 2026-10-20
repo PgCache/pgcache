@@ -846,8 +846,10 @@ async fn test_gate_delete_join_shape() -> Result<(), Error> {
 }
 
 /// PGC-384: UPDATE across an IN-subquery shape. Updating a row out of the
-/// subquery's match set shrinks membership; the read forwards during lag and
-/// cache-hits once applied.
+/// subquery's match set shrinks membership; the read forwards during lag.
+/// The compared column links to the subquery's table, so the UPDATE
+/// invalidates and the next read repopulates (PGC-515); PGC-520 would apply it
+/// in place instead.
 #[tokio::test]
 async fn test_gate_update_subquery_shape() -> Result<(), Error> {
     let mut ctx = TestContext::setup_fault(&RAW_LAG).await?;
@@ -874,8 +876,11 @@ async fn test_gate_update_subquery_shape() -> Result<(), Error> {
     );
 
     ctx.cdc_apply_settle().await?;
-    ctx.cache_settle().await?;
     let m = ctx.metrics().await?;
+    let res = ctx.simple_query(q).await?;
+    assert_eq!(row_count(&res), 0);
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
     let res = ctx.simple_query(q).await?;
     assert_eq!(row_count(&res), 0);
     let _ = assert_cache_hit(&mut ctx, m).await?;
