@@ -209,6 +209,17 @@ fn constraints_of(sql: &str, tables: &Catalog) -> QueryConstraints {
     analyze_query_constraints(&resolve_sql(sql, tables))
 }
 
+/// The constraints on `table`, empty when it has none.
+fn table_constraints_of<'a>(
+    constraints: &'a QueryConstraints,
+    table: &str,
+) -> &'a [TableConstraint] {
+    constraints
+        .table_constraints
+        .get(table)
+        .map_or(&[], Vec::as_slice)
+}
+
 /// Whether any constraint on `table` satisfies `matches`.
 fn table_constraint_any(
     constraints: &QueryConstraints,
@@ -729,7 +740,10 @@ fn test_subsumption_cases() {
         let cached = constraints_of(cached_sql, &tables);
         let new = constraints_of(new_sql, &tables);
         assert_eq!(
-            table_constraints_subsumed(&new, &cached, "users"),
+            table_constraints_subsumed(
+                table_constraints_of(&new, "users"),
+                table_constraints_of(&cached, "users")
+            ),
             expected,
             "{label}: cached {cached_sql:?} subsumes new {new_sql:?}"
         );
@@ -1139,64 +1153,12 @@ fn test_subsumption_full_scan_still_subsumes() {
 
     assert!(cached.where_analysis_complete);
     assert!(
-        table_constraints_subsumed(&new, &cached, "users"),
+        table_constraints_subsumed(
+            table_constraints_of(&new, "users"),
+            table_constraints_of(&cached, "users")
+        ),
         "true full-scan cached query should still subsume"
     );
-}
-
-/// A cached `a = b` loaded only the rows where the two columns agree, so it
-/// is no full scan; on the new side the equality only narrows.
-#[test]
-fn test_subsumption_same_table_equality_cached() {
-    let int_column = |name: &str, position: i16| ColumnMetadata {
-        name: name.into(),
-        position: ColumnPosition::from_raw(position),
-        type_oid: TypeOid::from_raw(23),
-        data_type: Type::INT4,
-        type_name: "int4".into(),
-        cache_type_name: "int4".into(),
-        is_primary_key: position == 1,
-    };
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(
-        TableMetadata::for_test(
-            "items",
-            1001,
-            [int_column("id", 1), int_column("a", 2), int_column("b", 3)],
-        )
-        .into(),
-    );
-    let cases = [
-        (
-            "SELECT * FROM items WHERE a = b",
-            "SELECT * FROM items WHERE id = 5",
-            false,
-        ),
-        (
-            "SELECT * FROM items WHERE a = b AND id > 0",
-            "SELECT * FROM items WHERE id = 5",
-            false,
-        ),
-        (
-            "SELECT * FROM items",
-            "SELECT * FROM items WHERE a = b",
-            true,
-        ),
-        (
-            "SELECT * FROM items WHERE id > 0",
-            "SELECT * FROM items WHERE a = b AND id = 5",
-            true,
-        ),
-    ];
-    for (cached_sql, new_sql, expected) in cases {
-        let cached = constraints_of(cached_sql, &tables);
-        let new = constraints_of(new_sql, &tables);
-        assert_eq!(
-            table_constraints_subsumed(&new, &cached, "items"),
-            expected,
-            "cached {cached_sql:?} subsumes new {new_sql:?}"
-        );
-    }
 }
 
 // ------------------------------------------------------------------

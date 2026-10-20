@@ -649,3 +649,174 @@ async fn test_subsumption_non_literal_between_not_full_table() -> Result<(), Err
 
     Ok(())
 }
+
+/// The preserved reference of a same-branch LEFT self-join is loaded in full
+/// for its filters, so it parents a narrower single-table query, which CDC
+/// then keeps current on its own (PGC-516).
+#[tokio::test]
+async fn test_subsumption_self_join_preserved_reference_parent() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE test_sub_sjp (id integer PRIMARY KEY, manager_id integer, dept text)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO test_sub_sjp VALUES (1, NULL, 'exec'), (2, 1, 'x'), (3, 1, 'x'), (4, NULL, 'x')",
+        &[],
+    )
+    .await?;
+
+    let m = ctx.metrics().await?;
+    ctx.simple_query(
+        "SELECT e.id, m.id FROM test_sub_sjp e \
+         LEFT JOIN test_sub_sjp m ON m.id = e.manager_id WHERE e.dept = 'x'",
+    )
+    .await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    let child = "SELECT id FROM test_sub_sjp WHERE dept = 'x' AND id > 2 ORDER BY id";
+    let res = ctx.simple_query(child).await?;
+    assert_eq!(res.len(), 4, "rows 3 and 4");
+    assert_row_at(&res, 1, &[("id", "3")])?;
+    assert_row_at(&res, 2, &[("id", "4")])?;
+    let _m = assert_subsume_hit(&mut ctx, m).await?;
+
+    ctx.query("INSERT INTO test_sub_sjp VALUES (5, NULL, 'x')", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+    let (proxied, origin) = ctx.proxy_and_origin_rows(child).await?;
+    assert_eq!(origin.len(), 3, "rows 3, 4 and 5");
+    assert_eq!(proxied, origin);
+
+    Ok(())
+}
+
+/// Each reference of a self-joined new query is covered on its own filters,
+/// so one parent per reference covers it (PGC-516).
+#[tokio::test]
+async fn test_subsumption_self_join_child_covered_per_reference() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE test_sub_emp_ref (id integer PRIMARY KEY, name text, manager_id integer, dept text)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO test_sub_emp_ref VALUES (1, 'ceo', NULL, 'exec'), (2, 'alice', 1, 'x'), (3, 'bob', 1, 'x')",
+        &[],
+    )
+    .await?;
+
+    let m = ctx.metrics().await?;
+    ctx.simple_query("SELECT id FROM test_sub_emp_ref WHERE dept = 'x'")
+        .await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+    ctx.simple_query("SELECT id FROM test_sub_emp_ref WHERE name = 'ceo'")
+        .await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    let res = ctx
+        .simple_query(
+            "SELECT e.id FROM test_sub_emp_ref e \
+             JOIN test_sub_emp_ref m ON m.id = e.manager_id \
+             WHERE e.dept = 'x' AND m.name = 'ceo' ORDER BY e.id",
+        )
+        .await?;
+    assert_eq!(res.len(), 4, "alice and bob report to the ceo");
+    assert_row_at(&res, 1, &[("id", "2")])?;
+    assert_row_at(&res, 2, &[("id", "3")])?;
+    let _m = assert_subsume_hit(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+/// A table read in a subquery is covered on the subquery's own filters, so
+/// parents on the outer and the subquery predicates together cover the query
+/// that `test_subsumption_subquery_same_table_child_not_subsumed` refuses
+/// with the outer parent alone (PGC-516).
+#[tokio::test]
+async fn test_subsumption_subquery_reference_covered_on_own_filters() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE test_sub_node_ref (id integer PRIMARY KEY, parent_id integer, x integer, y integer)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO test_sub_node_ref VALUES (1, NULL, 0, 2), (2, 1, 1, 0), (3, 1, 1, 0)",
+        &[],
+    )
+    .await?;
+
+    let m = ctx.metrics().await?;
+    ctx.simple_query("SELECT id FROM test_sub_node_ref WHERE x = 1")
+        .await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+    ctx.simple_query("SELECT id FROM test_sub_node_ref WHERE y = 2")
+        .await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    let res = ctx
+        .simple_query(
+            "SELECT id FROM test_sub_node_ref WHERE x = 1 \
+             AND parent_id IN (SELECT id FROM test_sub_node_ref WHERE y = 2) ORDER BY id",
+        )
+        .await?;
+    assert_eq!(res.len(), 4, "rows 2 and 3 have parent 1");
+    assert_row_at(&res, 1, &[("id", "2")])?;
+    assert_row_at(&res, 2, &[("id", "3")])?;
+    let _m = assert_subsume_hit(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+/// The CTE form: the CTE body's table is covered on the body's filters
+/// (PGC-516).
+#[tokio::test]
+async fn test_subsumption_cte_reference_covered_on_own_filters() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE test_sub_node_cte_ref (id integer PRIMARY KEY, parent_id integer, x integer, y integer)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO test_sub_node_cte_ref VALUES (1, NULL, 0, 2), (2, 1, 1, 0), (3, 1, 1, 0)",
+        &[],
+    )
+    .await?;
+
+    let m = ctx.metrics().await?;
+    ctx.simple_query("SELECT id FROM test_sub_node_cte_ref WHERE x = 1")
+        .await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+    ctx.simple_query("SELECT id FROM test_sub_node_cte_ref WHERE y = 2")
+        .await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    let res = ctx
+        .simple_query(
+            "WITH c AS (SELECT id FROM test_sub_node_cte_ref WHERE y = 2) \
+             SELECT id FROM test_sub_node_cte_ref WHERE x = 1 \
+             AND parent_id IN (SELECT id FROM c) ORDER BY id",
+        )
+        .await?;
+    assert_eq!(res.len(), 4, "rows 2 and 3 have parent 1");
+    assert_row_at(&res, 1, &[("id", "2")])?;
+    assert_row_at(&res, 2, &[("id", "3")])?;
+    let _m = assert_subsume_hit(&mut ctx, m).await?;
+
+    Ok(())
+}

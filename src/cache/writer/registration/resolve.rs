@@ -17,13 +17,14 @@ use crate::cache::messages::RegisterRequest;
 use crate::cache::mv::{query_has_join, query_has_window};
 use crate::cache::mv_shape::ShapeGate;
 use crate::cache::types::SharedQueryShape;
-use crate::cache::update_query::{UpdateQueries, UpdateQueryRegistration};
+use crate::cache::update_query::{SubsumerRegion, UpdateQueries, UpdateQueryRegistration};
 use crate::cache::writer::core::WriterCore;
 use crate::cache::{CacheError, CacheResult, ReportExt};
 use crate::oid::Oid;
 use crate::query::Fingerprint;
 use crate::query::ast::rope::{Query, QueryTree};
 use crate::query::constraint_index::table_constraints_keyed;
+use crate::query::constraints::TableConstraint;
 use crate::query::keying_settings::KeyingSettings;
 use crate::query::resolve::ResolvedQuery;
 
@@ -234,16 +235,20 @@ impl WriterRegistration {
             let relation_oid = admission.relation_oid;
             // Index under each literal's key form for its column's type, so
             // the row probe and the region probe match on value (PGC-478).
-            let index_constraints = core
-                .cache
-                .tables
-                .get1(&relation_oid)
-                .map(|table| table_constraints_keyed(&admission.index_constraints, table))
-                .unwrap_or(admission.index_constraints);
+            let table = core.cache.tables.get1(&relation_oid);
+            let keyed = |constraints: &Vec<TableConstraint>| {
+                table.map_or_else(
+                    || constraints.clone(),
+                    |table| table_constraints_keyed(constraints, table),
+                )
+            };
             let registration = UpdateQueryRegistration {
+                index_constraints: keyed(&admission.index_constraints),
+                subsumer_region: admission.subsumer_region.map(|filters| SubsumerRegion {
+                    keyed: keyed(&filters),
+                    filters,
+                }),
                 update_query: admission.update_query,
-                index_constraints,
-                subsumer_shape: admission.subsumer_shape,
             };
             match registrations
                 .iter_mut()

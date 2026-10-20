@@ -1,14 +1,14 @@
 //! The per-table admission derivation, extracted verbatim from the writer's
 //! registration path (PGC-391) so pgcache-fit runs the identical analysis.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use ecow::EcoString;
 
 use super::update_classify::{
     limit_order_keys_collect, limit_window_columns_collect, pg_batchable_classify,
-    predicate_columns_collect, table_complete_classify, update_eval_strategy_classify,
+    predicate_columns_collect, update_eval_strategy_classify,
 };
 use super::{AdmissionAnalysis, TableAdmission};
 use crate::cache::mv_shape::{ShapeGate, shape_classify};
@@ -18,18 +18,18 @@ use crate::cache::{CacheError, CacheResult};
 use crate::catalog::Catalog;
 use crate::oid::Oid;
 use crate::query::Fingerprint;
-use crate::query::ast::rope::{Body, NodeKind, QueryTree, TreeBuilder, View};
-use crate::query::constraints::{QueryConstraints, query_constraints_analyze};
+use crate::query::ast::rope::{Body, NodeKind, QueryTree, Table, TreeBuilder, View};
+use crate::query::constraints::{QueryConstraints, TableConstraint, query_constraints_analyze};
 use crate::query::decorrelate::query_decorrelate;
 use crate::query::literal_settings::LiteralSettings;
 use crate::query::predicate::CompiledPredicate;
-use crate::query::predicates::query_branch_predicates_build;
+use crate::query::predicates::{QueryBranchPredicates, query_branch_predicates_build};
 use crate::query::resolve::ResolveResult;
-use crate::query::resolve::{QueryBranch, ResolvedQuery, TableSlot};
+use crate::query::resolve::{Bindings, QueryBranch, ResolvedQuery, TableSlot};
 use crate::query::transform::{
     LiteralCanonOutcome, PgEvalTemplate, query_literals_canonicalise, query_predicate_pushdown,
 };
-use crate::query::update::query_table_update_queries;
+use crate::query::update::{TableUpdateQuery, query_table_update_queries};
 use crate::result::ReportExt;
 
 /// How much of each [`TableAdmission`] to build. The writer needs the full
@@ -139,11 +139,13 @@ fn branch_constraints(bound: &ResolvedQuery, branch: QueryBranch<'_>) -> QueryCo
     query_constraints_analyze(bound, branch.select)
 }
 
-/// The link columns of every reference to `relation_oid` in `branch`: one
+/// The link columns of every reference to `relation_oid` in the branch: one
 /// update query covers them all.
-fn branch_link_columns(branch: QueryBranch<'_>, relation_oid: Oid) -> Vec<EcoString> {
-    let predicates = query_branch_predicates_build(branch.bound, branch.select);
-    let bindings = branch.bound.bindings();
+fn branch_link_columns(
+    predicates: &QueryBranchPredicates,
+    bindings: &Bindings,
+    relation_oid: Oid,
+) -> Vec<EcoString> {
     let mut link_columns: Vec<EcoString> = Vec::new();
     for reference in predicates.table_references() {
         let is_relation = matches!(bindings.slot(reference.slot),
@@ -161,6 +163,39 @@ fn branch_link_columns(branch: QueryBranch<'_>, relation_oid: Oid) -> Vec<EcoStr
         }
     }
     link_columns
+}
+
+/// The filters of the reference `table` binds when population loads every
+/// row they describe; `None` when it doesn't.
+fn reference_subsumer_region(
+    predicates: &QueryBranchPredicates,
+    bindings: &Bindings,
+    table: Table<'_>,
+) -> Option<Vec<TableConstraint>> {
+    let slot = bindings.source(table.id())?;
+    predicates
+        .table_reference_predicates(slot)?
+        .exact
+        .then(|| predicates.relation_predicates(bindings, slot))
+        .flatten()
+        .map(|relation| relation.filters)
+}
+
+/// The relations whose every reference sits in one SELECT branch. Several
+/// branches load the union of their rows, which one region doesn't describe.
+fn single_branch_relations(update_queries: &[TableUpdateQuery<'_>]) -> HashSet<Oid> {
+    let mut branches: HashMap<Oid, HashSet<usize>> = HashMap::new();
+    for update_query in update_queries {
+        branches
+            .entry(update_query.relation_oid)
+            .or_default()
+            .insert(update_query.branch.select.id().index());
+    }
+    branches
+        .into_iter()
+        .filter(|(_, branches)| branches.len() == 1)
+        .map(|(relation_oid, _)| relation_oid)
+        .collect()
 }
 
 /// Classify a query's shape for MV eligibility on its decorrelated form
@@ -200,13 +235,17 @@ pub fn query_admission_analyze(
     let update_source = decorrelated.unwrap_or(bound);
 
     let mut admissions = Vec::new();
-    for bound_update in query_table_update_queries(update_source) {
+    let update_queries = query_table_update_queries(update_source);
+    let single_branch = single_branch_relations(&update_queries);
+    for bound_update in update_queries {
         let table_node = bound_update.table;
         let source = bound_update.source;
         let relation_oid = bound_update.relation_oid;
         let branch = bound_update.branch;
         let constraints = branch_constraints(update_source, branch);
-        let link_columns = branch_link_columns(branch, relation_oid);
+        let predicates = query_branch_predicates_build(update_source, branch.select);
+        let bindings = update_source.bindings();
+        let link_columns = branch_link_columns(&predicates, bindings, relation_oid);
         let eval_strategy = update_eval_strategy_classify(branch, source);
         let pg_batchable = depth == AdmissionDepth::Full
             && eval_strategy == UpdateEvalStrategy::PgEval
@@ -280,9 +319,7 @@ pub fn query_admission_analyze(
         // A relation appearing more than once (a self-join) has its
         // constraints extracted per occurrence but keyed by table *name*, so
         // they collapse into one set that only holds for one arm (PGC-256).
-        // Index it as *unconstrained* — the broadest candidate class — and
-        // keep it out of subsumption, where "no constraints" means the
-        // opposite (the parent loaded every row).
+        // Index it as *unconstrained* — the broadest candidate class.
         let self_joined = update_query.bound.relation_occurrences(relation_oid) > 1;
         let index_constraints = if self_joined {
             Vec::new()
@@ -294,18 +331,17 @@ pub fn query_admission_analyze(
                 .cloned()
                 .unwrap_or_default()
         };
-        // !where_analysis_complete: the WHERE couldn't be fully analyzed, so
-        // coverage isn't reasonable (PGC-106). A LIMIT also excludes a parent.
-        let subsumer_shape = !self_joined
-            && update_query.constraints.where_analysis_complete
-            && table_complete_classify(branch, table_node);
+        let subsumer_region = single_branch
+            .contains(&relation_oid)
+            .then(|| reference_subsumer_region(&predicates, bindings, table_node))
+            .flatten();
 
         admissions.push(TableAdmission {
             relation_oid,
             table_name,
             update_query,
-            subsumer_shape,
-            subsumer_eligible: subsumer_shape && !has_limit,
+            subsumer_eligible: subsumer_region.is_some() && !has_limit,
+            subsumer_region,
             index_constraints,
         });
     }
@@ -322,8 +358,10 @@ mod tests {
     use postgres_types::Type;
 
     use super::*;
+    use crate::cache::admission::subsumption_references;
     use crate::catalog::{ColumnMetadata, ColumnPosition, TableMetadata};
     use crate::oid::TypeOid;
+    use crate::query::constraints::table_constraints_subsumed;
 
     fn catalog() -> Catalog {
         let int_column = |name: &str, position: i16| ColumnMetadata {
@@ -376,35 +414,11 @@ mod tests {
         let mut shapes: Vec<(String, bool)> = admission_analysis(sql)
             .tables
             .iter()
-            .map(|admission| (admission.table_name.to_string(), admission.subsumer_shape))
-            .collect();
-        shapes.sort();
-        shapes
-    }
-
-    /// Each update query's table with whether the predicate model calls its
-    /// reference exact, sorted.
-    fn reference_exact_shapes(sql: &str) -> Vec<(String, bool)> {
-        let mut shapes: Vec<(String, bool)> = admission_analysis(sql)
-            .tables
-            .iter()
             .map(|admission| {
-                let update_query = &admission.update_query;
-                let branch = QueryBranch::find(&update_query.bound, update_query.branch)
-                    .expect("the update query's branch");
-                let predicates = query_branch_predicates_build(branch.bound, branch.select);
-                let bindings = branch.bound.bindings();
-                let exact = predicates
-                    .table_references()
-                    .iter()
-                    .find(|reference| {
-                        matches!(bindings.slot(reference.slot),
-                            Some(TableSlot::Base { table, .. }) if table.name == admission.table_name)
-                    })
-                    .and_then(|reference| predicates.table_reference_predicates(reference.slot))
-                    .expect("the table's reference")
-                    .exact;
-                (admission.table_name.to_string(), exact)
+                (
+                    admission.table_name.to_string(),
+                    admission.subsumer_region.is_some(),
+                )
             })
             .collect();
         shapes.sort();
@@ -434,8 +448,11 @@ mod tests {
         ("SELECT * FROM a LEFT JOIN b ON b.id = a.id WHERE b.x IS NULL",
          &[("a", false), ("b", false)]),
         ("SELECT * FROM a WHERE x = 1 OR y = 2", &[("a", false)]),
-        // Indexed, but `table_constraints_subsumed` refuses it as a parent.
-        ("SELECT * FROM a WHERE x = y", &[("a", true)]),
+        // A same-reference equality filters rows no region describes.
+        ("SELECT * FROM a WHERE x = y", &[("a", false)]),
+        // The preserved reference of a self-join is loaded in full.
+        ("SELECT * FROM a a1 LEFT JOIN a a2 ON a2.id = a1.x WHERE a1.y = 1",
+         &[("a", false), ("a", true)]),
         ("SELECT * FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.id = a.id)",
          &[("a", false), ("b", false)]),
         // A derived table's table is judged in its own branch.
@@ -458,28 +475,6 @@ mod tests {
                 .map(|(table, shape)| (table.to_string(), *shape))
                 .collect();
             assert_eq!(subsumer_shapes(sql), expected, "{sql}");
-        }
-    }
-
-    /// The predicate model's `exact` agrees with the subsumer shape for
-    /// queries naming each relation once, except where it also refuses a
-    /// same-reference equality.
-    #[test]
-    fn test_reference_exact_agrees_with_subsumer_shape() {
-        let differences: &[(&str, &str)] = &[("SELECT * FROM a WHERE x = y", "a")];
-        for (sql, expected) in SUBSUMER_SHAPE_CASES {
-            let names: HashSet<&str> = expected.iter().map(|(table, _)| *table).collect();
-            if names.len() < expected.len() {
-                continue;
-            }
-            let expected: Vec<(String, bool)> = subsumer_shapes(sql)
-                .into_iter()
-                .map(|(table, shape)| {
-                    let differs = differences.contains(&(*sql, table.as_str()));
-                    (table, shape != differs)
-                })
-                .collect();
-            assert_eq!(reference_exact_shapes(sql), expected, "{sql}");
         }
     }
 
@@ -531,6 +526,53 @@ mod tests {
                 })
                 .collect();
             assert_eq!(actual, expected, "{sql}");
+        }
+    }
+
+    /// Whether `cached`'s region on `a` holds every row `new`'s one
+    /// reference to `a` reads.
+    fn parent_covers(cached: &str, new: &str) -> bool {
+        let region = admission_analysis(cached)
+            .tables
+            .into_iter()
+            .find_map(|admission| admission.subsumer_region);
+        let tables = catalog();
+        let bound = ResolvedQuery::parse_resolve(new, &tables, &["public"]).expect("resolve");
+        let references = subsumption_references(&bound).expect("references");
+        let [(_, filters)] = references.as_slice() else {
+            panic!("one reference in {new}");
+        };
+        region.is_some_and(|region| table_constraints_subsumed(filters, &region))
+    }
+
+    /// A cached `x = y` loaded only the rows where the two columns agree, so
+    /// it is no parent; on the new side the equality only narrows (PGC-509).
+    #[test]
+    fn test_same_reference_equality_parent() {
+        let cases = [
+            (
+                "SELECT * FROM a WHERE x = y",
+                "SELECT * FROM a WHERE id = 5",
+                false,
+            ),
+            (
+                "SELECT * FROM a WHERE x = y AND id > 0",
+                "SELECT * FROM a WHERE id = 5",
+                false,
+            ),
+            ("SELECT * FROM a", "SELECT * FROM a WHERE x = y", true),
+            (
+                "SELECT * FROM a WHERE id > 0",
+                "SELECT * FROM a WHERE x = y AND id = 5",
+                true,
+            ),
+        ];
+        for (cached, new, expected) in cases {
+            assert_eq!(
+                parent_covers(cached, new),
+                expected,
+                "cached {cached:?} covers new {new:?}"
+            );
         }
     }
 }

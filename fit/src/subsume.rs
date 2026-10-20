@@ -10,7 +10,7 @@ use pgcache_lib::cache::admission::{SubsumerCandidate, SubsumerSource, subsumpti
 use pgcache_lib::oid::Oid;
 use pgcache_lib::query::Fingerprint;
 use pgcache_lib::query::constraint_index::ConstraintIndex;
-use pgcache_lib::query::constraints::{QueryConstraints, TableConstraint};
+use pgcache_lib::query::constraints::TableConstraint;
 
 use crate::classify::CacheableAnalysis;
 
@@ -25,7 +25,7 @@ struct RelationSubsumers {
 }
 
 struct AdmittedSubsumer {
-    constraints: std::rc::Rc<QueryConstraints>,
+    filters: Vec<TableConstraint>,
     has_limit: bool,
 }
 
@@ -48,20 +48,19 @@ impl SubsumerRegistry {
     /// the remaining gates run per lookup in `subsumption_covered`.
     pub fn subsumer_register(&mut self, analysis: &CacheableAnalysis) {
         for admission in &analysis.admissions {
-            if !admission.subsumer_eligible {
+            let (true, Some(filters)) = (admission.subsumer_eligible, &admission.subsumer_region)
+            else {
                 continue;
-            }
+            };
             let relation = self
                 .by_relation
                 .entry(admission.relation_oid)
                 .or_insert_with(RelationSubsumers::new);
-            relation
-                .index
-                .insert(analysis.fingerprint, &admission.index_constraints);
+            relation.index.insert(analysis.fingerprint, filters);
             relation.admitted.insert(
                 analysis.fingerprint,
                 AdmittedSubsumer {
-                    constraints: std::rc::Rc::clone(&admission.constraints),
+                    filters: filters.clone(),
                     has_limit: analysis.has_limit,
                 },
             );
@@ -71,15 +70,10 @@ impl SubsumerRegistry {
     /// Whether every relation the query references is covered by some
     /// registered subsumer — the writer's `subsumption_check`, offline.
     pub fn query_subsumed(&self, analysis: &CacheableAnalysis) -> bool {
-        let Some(new_constraints) = &analysis.constraints else {
-            return false;
-        };
-        let relations: Vec<(Oid, &str)> = analysis
-            .relations
-            .iter()
-            .map(|(oid, name)| (*oid, name.as_str()))
-            .collect();
-        subsumption_covered(new_constraints, &relations, self)
+        analysis
+            .references
+            .as_ref()
+            .is_some_and(|references| subsumption_covered(references, self))
     }
 }
 
@@ -102,7 +96,7 @@ impl SubsumerSource for SubsumerRegistry {
                             .admitted
                             .get(&fingerprint)
                             .map(|subsumer| SubsumerCandidate {
-                                constraints: &subsumer.constraints,
+                                filters: &subsumer.filters,
                                 has_limit: subsumer.has_limit,
                                 ready: true,
                             })
@@ -168,6 +162,19 @@ mod tests {
         let mut registry = SubsumerRegistry::new();
         registry.subsumer_register(&analyses[0]);
         assert!(registry.query_subsumed(&analyses[1]));
+    }
+
+    /// Two branches on one relation load the union of their rows, which no
+    /// one region describes, so neither is admitted, as in the writer.
+    #[test]
+    fn test_relation_in_two_branches_not_admitted() {
+        let analyses = corpus_analyze(&[
+            "SELECT id FROM users WHERE id = 1 UNION SELECT id FROM users WHERE id = 2",
+            "SELECT * FROM users WHERE id = 1",
+        ]);
+        let mut registry = SubsumerRegistry::new();
+        registry.subsumer_register(&analyses[0]);
+        assert!(!registry.query_subsumed(&analyses[1]));
     }
 
     #[test]

@@ -134,14 +134,6 @@ pub struct ColumnEquivalence {
     pub right: ConstraintColumn,
 }
 
-impl ColumnEquivalence {
-    /// Returns true if this equivalence represents a join condition:
-    /// columns from different tables, or same table with different aliases (self-join)
-    pub fn is_join(&self) -> bool {
-        self.left.table != self.right.table || self.left.alias != self.right.alias
-    }
-}
-
 /// An equality in an outer join's ON clause between a preserved-side and a
 /// nullable-side column. Every preserved row survives the join, so a
 /// constraint crosses it from the preserved side only.

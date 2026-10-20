@@ -7,65 +7,65 @@ use std::collections::HashSet;
 
 use super::{SubsumerCandidate, SubsumerSource};
 use crate::oid::Oid;
-use crate::query::ast::rope::Select;
-use crate::query::constraints::{
-    QueryConstraints, TableConstraint, query_constraints_analyze, table_constraints_subsumed,
-};
-use crate::query::resolve::ResolvedQuery;
+use crate::query::constraints::{TableConstraint, table_constraints_subsumed};
+use crate::query::predicates::query_branch_predicates_build;
+use crate::query::resolve::{ResolvedQuery, TableSlot};
+use crate::query::update::select_branches_with_source;
 
-/// The new query's constraints as subsumption may read them: those of
-/// `select`, minus every table name that more than one FROM entry binds
-/// (self-join, a table repeated in a subquery or CTE, one name across
-/// schemas). Constraints are keyed by name, so a repeated name's set need not
-/// hold for each occurrence; dropping it leaves only a full-table parent able
-/// to cover that table (PGC-493).
-pub fn subsumption_constraints(bound: &ResolvedQuery, select: Select<'_>) -> QueryConstraints {
-    let mut constraints = query_constraints_analyze(bound, select);
-    let mut names = HashSet::new();
-    for slot in bound.bindings().slots() {
-        let name = slot.table().name.as_str();
-        if !names.insert(name) {
-            constraints.table_constraints.remove(name);
+/// One table reference of a new query: its relation and the filters every
+/// row it reads satisfies.
+pub type SubsumptionReference = (Oid, Vec<TableConstraint>);
+
+/// Every base table reference of `bound` across its SELECT branches (root,
+/// subqueries, derived tables, CTE bodies), each with its own branch's
+/// filters. `None` for a set operation, or when a table the query reads is
+/// no branch's reference, so coverage can't skip one.
+pub fn subsumption_references(bound: &ResolvedQuery) -> Option<Vec<SubsumptionReference>> {
+    bound.select()?;
+    let bindings = bound.bindings();
+    let mut references = Vec::new();
+    let mut seen = HashSet::new();
+    for (select, _) in select_branches_with_source(bound.tree().root()) {
+        let predicates = query_branch_predicates_build(bound, select);
+        for reference in predicates.table_references() {
+            let Some(TableSlot::Base { table, .. }) = bindings.slot(reference.slot) else {
+                continue;
+            };
+            // A CTE body is a branch once per reference to it.
+            if !seen.insert(reference.slot) {
+                continue;
+            }
+            let relation = predicates.relation_predicates(bindings, reference.slot)?;
+            references.push((table.relation_oid, relation.filters));
         }
     }
-    constraints
+    let base_slots = bindings
+        .slots()
+        .iter()
+        .filter(|slot| matches!(slot, TableSlot::Base { .. }))
+        .count();
+    (seen.len() == base_slots).then_some(references)
 }
 
-/// Whether every relation of the new query is covered by some registered
-/// candidate whose constraints are implied by the new query's. Candidate
-/// gates: no LIMIT, parent Ready.
-///
-/// `relations` are the new query's `(relation_oid, table_name)` pairs; an
-/// empty list is never covered. The new query's constraints must come from a
-/// plain SELECT — set operations require per-branch analysis and are
-/// rejected by the caller.
+/// Whether every reference of the new query is covered by some registered
+/// candidate on its relation whose region holds every row the reference's
+/// filters admit. Candidate gates: no LIMIT, parent Ready. An empty list is
+/// never covered.
 pub fn subsumption_covered(
-    new_constraints: &QueryConstraints,
-    relations: &[(Oid, &str)],
+    references: &[SubsumptionReference],
     source: &impl SubsumerSource,
 ) -> bool {
-    if relations.is_empty() {
-        return false;
-    }
-    let empty: Vec<TableConstraint> = Vec::new();
-    relations.iter().all(|(relation_oid, table_name)| {
-        let new_table_constraints = new_constraints
-            .table_constraints
-            .get(*table_name)
-            .unwrap_or(&empty);
-        source
-            .candidates(*relation_oid, new_table_constraints)
-            .any(|candidate| {
+    !references.is_empty()
+        && references.iter().all(|(relation_oid, filters)| {
+            source.candidates(*relation_oid, filters).any(|candidate| {
                 let SubsumerCandidate {
-                    constraints,
+                    filters: region,
                     has_limit,
                     ready,
                 } = candidate;
-                !has_limit
-                    && ready
-                    && table_constraints_subsumed(new_constraints, constraints, table_name)
+                !has_limit && ready && table_constraints_subsumed(filters, region)
             })
-    })
+        })
 }
 
 #[cfg(test)]
@@ -110,53 +110,77 @@ mod tests {
         tables
     }
 
-    /// The table names whose constraints subsumption may read.
-    fn constrained_tables(sql: &str) -> Vec<String> {
+    /// Each reference's relation oid with its filters, sorted.
+    fn reference_lines(sql: &str) -> Vec<String> {
         let tables = catalog();
         let bound = ResolvedQuery::parse_resolve(sql, &tables, &["public"]).expect("resolve");
-        let constraints = subsumption_constraints(&bound, bound.select().expect("a SELECT"));
-        let mut names: Vec<String> = constraints
-            .table_constraints
-            .keys()
-            .map(|name| name.to_string())
+        let mut lines: Vec<String> = subsumption_references(&bound)
+            .expect("references")
+            .iter()
+            .map(|(oid, filters)| format!("{oid:?} {filters:?}"))
             .collect();
-        names.sort();
-        names
+        lines.sort();
+        lines
     }
 
-    /// A table name bound more than once keeps no constraints; every other
-    /// table keeps its own (PGC-493).
+    /// Every reference keeps its own branch's filters, a repeated table
+    /// included (PGC-493).
     #[test]
-    fn test_subsumption_constraints_drop_repeated_table_names() {
-        let cases: &[(&str, &[&str])] = &[
-            ("SELECT id FROM t WHERE name = 'x'", &["t"]),
+    fn test_subsumption_references_per_branch() {
+        let t = format!("{:?}", Oid::from_raw(1001));
+        let u = format!("{:?}", Oid::from_raw(1002));
+        let other_t = format!("{:?}", Oid::from_raw(1003));
+        let name = |value: &str| format!(r#"[Comparison("name", Equal, String("{value}"))]"#);
+        let cases: Vec<(&str, Vec<String>)> = vec![
+            (
+                "SELECT id FROM t WHERE name = 'x'",
+                vec![format!("{t} {}", name("x"))],
+            ),
             (
                 "SELECT a.id FROM t a JOIN t b ON b.id = a.id WHERE a.name = 'x'",
-                &[],
+                vec![format!("{t} []"), format!("{t} {}", name("x"))],
             ),
             (
                 "SELECT id FROM t WHERE name = 'x' \
                  AND id IN (SELECT id FROM t WHERE name = 'y')",
-                &[],
+                vec![format!("{t} {}", name("x")), format!("{t} {}", name("y"))],
             ),
             (
                 "WITH c AS (SELECT id FROM t WHERE name = 'y') \
                  SELECT id FROM t WHERE name = 'x' AND id IN (SELECT id FROM c)",
-                &[],
+                vec![format!("{t} {}", name("x")), format!("{t} {}", name("y"))],
             ),
             (
                 "SELECT a.id FROM public.t a JOIN other.t b ON b.id = a.id \
                  WHERE a.name = 'x'",
-                &[],
+                vec![format!("{other_t} []"), format!("{t} {}", name("x"))],
             ),
             (
                 "SELECT a.id FROM t a JOIN t b ON b.id = a.id \
                  JOIN u ON u.id = a.id WHERE a.name = 'x' AND u.name = 'z'",
-                &["u"],
+                vec![
+                    format!("{t} []"),
+                    format!("{t} {}", name("x")),
+                    format!("{u} {}", name("z")),
+                ],
             ),
         ];
-        for (sql, expected) in cases {
-            assert_eq!(constrained_tables(sql), *expected, "{sql}");
+        for (sql, mut expected) in cases {
+            expected.sort();
+            assert_eq!(reference_lines(sql), expected, "{sql}");
         }
+    }
+
+    /// A set operation is left to the caller to reject.
+    #[test]
+    fn test_subsumption_references_set_operation_none() {
+        let tables = catalog();
+        let bound = ResolvedQuery::parse_resolve(
+            "SELECT id FROM t UNION SELECT id FROM u",
+            &tables,
+            &["public"],
+        )
+        .expect("resolve");
+        assert!(subsumption_references(&bound).is_none());
     }
 }

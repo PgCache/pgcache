@@ -14,7 +14,7 @@ use super::registration::{
 };
 use crate::cache::Generation;
 use crate::cache::admission::{
-    SubsumerCandidate, SubsumerSource, subsumption_constraints, subsumption_covered,
+    SubsumerCandidate, SubsumerSource, subsumption_covered, subsumption_references,
 };
 use crate::cache::types::{Cache, SharedQueryShape, SharedResolvedQuery};
 use crate::cache::{CacheError, CacheResult, MapIntoReport};
@@ -54,13 +54,14 @@ impl SubsumerSource for WriterSubsumerSource<'_> {
                     .subsumption_candidates(&keyed)
                     .into_iter()
                     .filter_map(move |fingerprint| {
-                        let [update_query] = update_queries.queries_of(fingerprint) else {
-                            return None;
-                        };
+                        let region = update_queries.subsumer_region(fingerprint)?;
                         let parent = self.cache.cached_queries.get1(&fingerprint);
                         Some(SubsumerCandidate {
-                            constraints: &update_query.constraints,
-                            has_limit: update_query.has_limit,
+                            filters: &region.filters,
+                            has_limit: update_queries
+                                .queries_of(fingerprint)
+                                .iter()
+                                .any(|update_query| update_query.has_limit),
                             ready: parent.is_some_and(|q| {
                                 !q.invalidated && q.registration_started_at.is_none()
                             }),
@@ -71,9 +72,8 @@ impl SubsumerSource for WriterSubsumerSource<'_> {
 }
 
 impl WriterRegistration {
-    /// Check whether all tables in the new query are covered by existing cached queries.
-    /// Returns true only if every relation_oid has at least one Ready, non-limited
-    /// UpdateQuery whose equality constraints are implied by the new query's constraints.
+    /// Whether every table reference of the new query is covered by the
+    /// region of a Ready, LIMIT-free cached query on its relation.
     pub(super) fn subsumption_check(
         &self,
         core: &WriterCore,
@@ -83,27 +83,11 @@ impl WriterRegistration {
             return false;
         }
 
-        // Set operations (UNION/INTERSECT/EXCEPT) require per-branch constraint
-        // analysis which isn't implemented yet. Reject unconditionally for now.
-        let Some(select) = resolution.bound.select() else {
+        // Set operations (UNION/INTERSECT/EXCEPT) are rejected for now.
+        let Some(references) = subsumption_references(&resolution.bound) else {
             return false;
         };
-
-        let new_constraints = subsumption_constraints(&resolution.bound, select);
-
-        let mut relations = Vec::with_capacity(resolution.relation_oids.len());
-        for &oid in &resolution.relation_oids {
-            let Some(table_meta) = core.cache.tables.get1(&oid) else {
-                return false;
-            };
-            relations.push((oid, table_meta.name.as_str()));
-        }
-
-        subsumption_covered(
-            &new_constraints,
-            &relations,
-            &WriterSubsumerSource { cache: &core.cache },
-        )
+        subsumption_covered(&references, &WriterSubsumerSource { cache: &core.cache })
     }
 
     /// Handle a subsumed query: assign generation, stamp rows in cache DB, mark Ready.

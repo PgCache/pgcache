@@ -9,7 +9,7 @@ use ecow::EcoString;
 
 use super::update_query::UpdateQuery;
 use crate::oid::Oid;
-use crate::query::constraints::{QueryConstraints, TableConstraint};
+use crate::query::constraints::TableConstraint;
 
 mod analyze;
 mod subsume;
@@ -20,7 +20,7 @@ pub use analyze::{
     query_admission_analyze, query_decorrelate_checked, query_pushdown, query_resolve_canonical,
     shape_gate_classify,
 };
-pub use subsume::{subsumption_constraints, subsumption_covered};
+pub use subsume::{SubsumptionReference, subsumption_covered, subsumption_references};
 
 /// Everything the writer stores (and pgcache-fit simulates) for one table of
 /// an admitted query.
@@ -31,9 +31,10 @@ pub struct TableAdmission {
     /// CDC-eval caches (`compiled_where`, `pg_eval_template`,
     /// `pg_batchable`, `change_dependent`) are left unset.
     pub update_query: UpdateQuery,
-    /// Eligible for the subsumption index but for a LIMIT, which a limit
-    /// bump can change after registration.
-    pub subsumer_shape: bool,
+    /// The rows population loads in full, as the reference's filters, when
+    /// it can be a subsumption parent but for a LIMIT, which a limit bump
+    /// can change after registration.
+    pub subsumer_region: Option<Vec<TableConstraint>>,
     /// Mirrors the writer's `can_subsume`: eligible for the subsumption
     /// index. Parent readiness is checked per lookup in
     /// [`subsumption_covered`].
@@ -51,8 +52,8 @@ pub struct AdmissionAnalysis {
 
 /// One registered subsumption candidate as seen at lookup time.
 pub struct SubsumerCandidate<'a> {
-    /// The candidate update query's constraints (per-table, per-branch).
-    pub constraints: &'a QueryConstraints,
+    /// The parent's region: it holds every row these filters describe.
+    pub filters: &'a [TableConstraint],
     pub has_limit: bool,
     /// The parent is Ready: populated, not invalidated. Always true for
     /// pgcache-fit's infinite-cache model.

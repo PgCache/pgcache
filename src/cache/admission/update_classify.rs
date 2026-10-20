@@ -10,13 +10,11 @@ use crate::cache::update_query::{OrderByKey, UpdateEvalStrategy, UpdateQuerySour
 use crate::oid::Oid;
 use crate::query::ast::rope::{
     Column, JoinQualKind, NodeKind, NodeRef, OrderBy, Scalar, ScalarKind, Select, SelectItem,
-    Source, Table, View,
+    Source, View,
 };
-use crate::query::ast::{JoinType, NodeId, NullOrder, OrderDirection};
+use crate::query::ast::{NodeId, NullOrder, OrderDirection};
 use crate::query::evaluate::where_expr_supported;
-use crate::query::resolve::{
-    Bindings, ColumnBinding, ColumnTarget, QueryBranch, ResolvedQuery, SlotId,
-};
+use crate::query::resolve::{ColumnBinding, ColumnTarget, QueryBranch, ResolvedQuery};
 
 /// How CDC decides a changed row's membership in a branch: locally, when
 /// the branch reads one table and its WHERE is one the compiled predicate
@@ -49,49 +47,6 @@ pub(super) fn update_eval_strategy_classify(
 fn select_is_single_table(select: Select<'_>) -> bool {
     let mut from = select.from();
     matches!((from.next(), from.next()), (Some(Source::Table(_)), None))
-}
-
-/// Whether population loads every row of `table` its branch constraints
-/// describe: no join on the way to it can drop one of its rows, and WHERE
-/// reads no other table.
-pub(super) fn table_complete_classify(branch: QueryBranch<'_>, table: Table<'_>) -> bool {
-    let bindings = branch.bound.bindings();
-    let Some(slot) = bindings.source(table.id()) else {
-        return false;
-    };
-    let mut from = branch.select.from();
-    let (Some(root), None) = (from.next(), from.next()) else {
-        return false;
-    };
-    if preserved_leaf_slot(bindings, root) != Some(slot) {
-        return false;
-    }
-    branch.select.where_clause().is_none_or(|where_clause| {
-        where_clause
-            .node_ref()
-            .subtree()
-            .filter(|position| matches!(position.kind(), NodeKind::Column { .. }))
-            .all(|position| {
-                branch
-                    .bound
-                    .column_binding_at(position.id())
-                    .is_some_and(|binding| binding.slot == slot)
-            })
-    })
-}
-
-/// The table whose every row `source` keeps: down the left of LEFT joins and
-/// the right of RIGHT joins. An inner join keeps a row only with a partner.
-fn preserved_leaf_slot(bindings: &Bindings, source: Source<'_>) -> Option<SlotId> {
-    match source {
-        Source::Table(table) => bindings.source(table.id()),
-        Source::Join(join) => match join.join_type() {
-            JoinType::Left => preserved_leaf_slot(bindings, join.left()),
-            JoinType::Right => preserved_leaf_slot(bindings, join.right()),
-            JoinType::Inner | JoinType::Full => None,
-        },
-        Source::Subquery(_) | Source::CteRef(_) => None,
-    }
 }
 
 /// Whether many CDC rows can be evaluated against the branch in one

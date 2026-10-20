@@ -249,14 +249,23 @@ impl UpdateQuery {
     }
 }
 
+/// The rows a subsumption parent holds in full on the relation.
+#[derive(Debug, Clone)]
+pub struct SubsumerRegion {
+    /// As the parent's filters read, for the precise coverage check.
+    pub filters: Vec<TableConstraint>,
+    /// In their key forms, for the candidate index (PGC-478).
+    pub keyed: Vec<TableConstraint>,
+}
+
 /// An update query to register, with what the relation's indexes take.
 pub struct UpdateQueryRegistration {
     pub update_query: UpdateQuery,
     /// Constraints to index under, in their key forms.
     pub index_constraints: Vec<TableConstraint>,
-    /// Eligible as a subsumption parent but for a LIMIT, which can change
-    /// after registration.
-    pub subsumer_shape: bool,
+    /// Its region when it could parent a subsumption but for a LIMIT, which
+    /// can change after registration.
+    pub subsumer_region: Option<SubsumerRegion>,
 }
 
 /// Collection of update queries for a specific relation.
@@ -269,13 +278,12 @@ pub struct UpdateQueryRegistration {
 pub struct UpdateQueries {
     pub relation_oid: Oid,
     queries: FingerprintMap<Vec<UpdateQuery>>,
-    /// Typed index over subsumption parents' WHERE-clause constraints, for
-    /// sub-linear candidate lookup (PGC-119). Holds the `subsumer_constraints`
-    /// fingerprints without a LIMIT.
+    /// Typed index over subsumption parents' regions, for sub-linear
+    /// candidate lookup (PGC-119). Holds the `subsumer_regions` fingerprints
+    /// without a LIMIT.
     subsumption: ConstraintIndex<Fingerprint>,
-    /// Index constraints of each fingerprint that could parent a subsumption:
-    /// one update query on the relation, of subsumer shape.
-    subsumer_constraints: FingerprintMap<Vec<TableConstraint>>,
+    /// The region of each fingerprint that could parent a subsumption.
+    subsumer_regions: FingerprintMap<SubsumerRegion>,
     /// Per-table constraint index over the *full* update-query population of
     /// this relation — LocalEval and PgEval alike (PGC-292). Probed point-wise
     /// (`eval_candidates_into`) to narrow CDC per-row work: the upsert matcher
@@ -322,7 +330,7 @@ impl UpdateQueries {
             relation_oid,
             queries: HashMap::default(),
             subsumption: ConstraintIndex::new(),
-            subsumer_constraints: HashMap::default(),
+            subsumer_regions: HashMap::default(),
             eval_index: ConstraintIndex::new(),
             always_check: FingerprintSet::default(),
             has_limit_from: FingerprintSet::default(),
@@ -376,6 +384,12 @@ impl UpdateQueries {
     /// query's constraints in their key forms.
     pub fn subsumption_candidates(&self, keyed: &[TableConstraint]) -> FingerprintSet {
         self.subsumption.candidates(keyed).into_iter().collect()
+    }
+
+    /// The region `fingerprint` holds in full, when it can parent a
+    /// subsumption on this relation.
+    pub fn subsumer_region(&self, fingerprint: Fingerprint) -> Option<&SubsumerRegion> {
+        self.subsumer_regions.get(&fingerprint)
     }
 
     /// Carve-out membership for a query: `(always_check, has_limit_fromclause)`.
@@ -489,6 +503,10 @@ impl UpdateQueries {
         let mut entries: Vec<UpdateQuery> = Vec::with_capacity(registrations.len());
         let mut subsumer = None;
         for registration in registrations {
+            // A duplicate's reference is loaded too, so its region holds.
+            if subsumer.is_none() {
+                subsumer = registration.subsumer_region;
+            }
             let mut update_query = registration.update_query;
             if entries.iter().any(|entry| entry.duplicates(&update_query)) {
                 continue;
@@ -498,18 +516,13 @@ impl UpdateQueries {
             self.eval_index
                 .insert(update_query.key(), &registration.index_constraints);
             self.change_dependent_account(update_query.change_dependent, true);
-            if registration.subsumer_shape {
-                subsumer = Some(registration.index_constraints);
-            }
             entries.push(update_query);
         }
-        // Several update queries on the relation load the union of their
-        // branches' rows, which one set of constraints doesn't describe.
-        if let (Some(constraints), [entry]) = (subsumer, entries.as_slice()) {
-            if !entry.has_limit {
-                self.subsumption.insert(fingerprint, &constraints);
+        if let Some(region) = subsumer {
+            if entries.iter().all(|entry| !entry.has_limit) {
+                self.subsumption.insert(fingerprint, &region.keyed);
             }
-            self.subsumer_constraints.insert(fingerprint, constraints);
+            self.subsumer_regions.insert(fingerprint, region);
         }
         self.carveout_account(fingerprint, &entries, true);
         self.queries.insert(fingerprint, entries);
@@ -519,7 +532,7 @@ impl UpdateQueries {
     /// index entries. Returns whether it had any.
     pub fn fingerprint_remove(&mut self, fingerprint: Fingerprint) -> bool {
         self.subsumption.remove(fingerprint);
-        self.subsumer_constraints.remove(&fingerprint);
+        self.subsumer_regions.remove(&fingerprint);
         let Some(entries) = self.queries.remove(&fingerprint) else {
             return false;
         };
@@ -550,8 +563,8 @@ impl UpdateQueries {
         self.carveout_account(fingerprint, &entries, true);
         self.queries.insert(fingerprint, entries);
         self.subsumption.remove(fingerprint);
-        if !has_limit && let Some(constraints) = self.subsumer_constraints.get(&fingerprint) {
-            self.subsumption.insert(fingerprint, constraints);
+        if !has_limit && let Some(region) = self.subsumer_regions.get(&fingerprint) {
+            self.subsumption.insert(fingerprint, &region.keyed);
         }
     }
 
@@ -649,7 +662,10 @@ mod tests {
             .map(|admission| UpdateQueryRegistration {
                 index_constraints: table_constraints_keyed(&admission.index_constraints, &items()),
                 update_query: admission.update_query,
-                subsumer_shape: admission.subsumer_shape,
+                subsumer_region: admission.subsumer_region.map(|filters| SubsumerRegion {
+                    keyed: table_constraints_keyed(&filters, &items()),
+                    filters,
+                }),
             })
             .collect()
     }
