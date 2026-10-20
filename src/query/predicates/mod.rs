@@ -2,7 +2,7 @@
 //! references, keyed by slot so names and aliases never enter it.
 //!
 //! * [`conjunct`] — splits a predicate into AND-ed conjuncts and recognizes
-//!   each one's form; the constraint collector shares it.
+//!   each one's form.
 //! * [`branch`] — walks one branch's FROM tree and predicates into a
 //!   [`QueryBranchPredicates`].
 //! * [`derive`] — the per-reference facts read off that model: necessary
@@ -19,10 +19,10 @@ use crate::query::resolve::{ColumnBinding, SlotId};
 mod branch;
 mod conjunct;
 mod derive;
+#[cfg(test)]
+mod tests;
 
 pub use branch::query_branch_predicates_build;
-
-pub(crate) use conjunct::conjunct_parts_collect;
 
 /// Index of a join in [`QueryBranchPredicates::joins`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -98,7 +98,7 @@ pub struct Conjunct {
 pub enum ConjunctForm {
     /// A single-column constraint: a comparison, `IN` / `= ANY`, one bound
     /// of a `BETWEEN`, one element of a `NOT IN`, or a supported cast.
-    Constraint(BoundColumnConstraint),
+    Constraint(ColumnConstraint),
     /// `column = column`.
     Equality(ColumnBinding, ColumnBinding),
     /// Anything else: kept for its columns, never for its meaning.
@@ -107,7 +107,7 @@ pub enum ConjunctForm {
 
 /// A constraint on one column of one reference.
 #[derive(Debug, Clone, PartialEq)]
-pub struct BoundColumnConstraint {
+pub struct ColumnConstraint {
     pub column: ColumnBinding,
     pub kind: ColumnConstraintKind,
 }
@@ -143,7 +143,7 @@ pub enum OuterJoinRole {
 #[derive(Debug, Clone)]
 pub struct TableReferencePredicates {
     /// Necessary condition: every row of it in the result satisfies these.
-    pub filters: Vec<BoundColumnConstraint>,
+    pub filters: Vec<ColumnConstraint>,
     /// Exact description: population loads every row satisfying `filters`.
     pub exact: bool,
     /// Dependency footprint: columns whose change can alter the result

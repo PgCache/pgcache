@@ -3,7 +3,7 @@
 //! reference's rows must answer to.
 
 use super::{
-    BoundColumnConstraint, ColumnConstraintKind, Conjunct, ConjunctForm, ConjunctScope, FromJoin,
+    ColumnConstraint, ColumnConstraintKind, Conjunct, ConjunctForm, ConjunctScope, FromJoin,
     JoinId, JoinKind, JoinPathStep, JoinSide, OuterJoinRole, QueryBranchPredicates,
     RelationPredicates, TableReference, TableReferencePredicates,
 };
@@ -73,7 +73,7 @@ impl Conjunct {
     }
 }
 
-impl BoundColumnConstraint {
+impl ColumnConstraint {
     /// This constraint restated on `other`, a column equal to its own. A
     /// cast comparison stays put: `x::int = 5 AND x = y` says nothing of
     /// `y::int` unless `y` casts alike.
@@ -146,6 +146,14 @@ impl QueryBranchPredicates {
             filters,
             link_columns,
             exact: predicates.exact,
+        })
+    }
+
+    /// Whether every WHERE conjunct was recognized as a constraint or an
+    /// equality.
+    pub fn where_recognized(&self) -> bool {
+        self.conjuncts.iter().all(|conjunct| {
+            conjunct.scope != ConjunctScope::Where || conjunct.form != ConjunctForm::Opaque
         })
     }
 
@@ -257,7 +265,7 @@ impl QueryBranchPredicates {
     /// Each reference's constraints from the conjuncts that filter it,
     /// closed under the equalities: an equality carries a constraint to a
     /// column whose reference it filters.
-    fn filters_derive(&self) -> Vec<Vec<BoundColumnConstraint>> {
+    fn filters_derive(&self) -> Vec<Vec<ColumnConstraint>> {
         let mut filters = vec![Vec::new(); self.table_references.len()];
         let mut edges = Vec::new();
         for conjunct in self.conjuncts.iter().filter(|conjunct| !conjunct.external) {
@@ -279,7 +287,7 @@ impl QueryBranchPredicates {
             }
         }
         loop {
-            let carried: Vec<BoundColumnConstraint> = edges
+            let carried: Vec<ColumnConstraint> = edges
                 .iter()
                 .flat_map(|&(from, to)| {
                     self.reference_index(from.slot)
@@ -384,8 +392,8 @@ fn path_step(path: &[JoinPathStep], id: JoinId) -> Option<(usize, &JoinPathStep)
 /// Adds `constraint` to its reference's filters; whether it was new.
 fn filter_insert(
     branch: &QueryBranchPredicates,
-    filters: &mut [Vec<BoundColumnConstraint>],
-    constraint: BoundColumnConstraint,
+    filters: &mut [Vec<ColumnConstraint>],
+    constraint: ColumnConstraint,
 ) -> bool {
     let Some(list) = branch
         .reference_index(constraint.column.slot)
@@ -412,7 +420,6 @@ mod tests {
     use crate::oid::TypeOid;
     use crate::query::ast::NodeId;
     use crate::query::ast::rope::{NodeKind, View};
-    use crate::query::constraints::query_constraints_analyze;
     use crate::query::decorrelate::query_decorrelate;
     use crate::query::predicates::query_branch_predicates_build;
     use crate::query::resolve::ResolvedQuery;
@@ -728,90 +735,5 @@ mod tests {
         assert_eq!(filters, ["x Equal Integer(1)"]);
         assert_eq!(relation.link_columns, ["id"]);
         assert!(!relation.exact);
-    }
-
-    /// The model's filters equal the collector's per-table constraints over
-    /// queries that name each relation once.
-    #[test]
-    fn test_agreement_with_constraint_collector() {
-        #[rustfmt::skip]
-        let corpus: &[&str] = &[
-            "SELECT * FROM a WHERE x = 1",
-            "SELECT * FROM a WHERE x = 1 AND y > 2",
-            "SELECT * FROM a WHERE x IN (3, 1, 2) AND y NOT IN (4, 5)",
-            "SELECT * FROM a WHERE x BETWEEN 1 AND 5",
-            "SELECT * FROM a WHERE x BETWEEN SYMMETRIC 5 AND 1",
-            "SELECT * FROM a WHERE x BETWEEN 1 AND y",
-            "SELECT * FROM a WHERE x NOT IN (1, y, 2)",
-            "SELECT * FROM a WHERE x = ANY (ARRAY[1, 2])",
-            "SELECT * FROM a WHERE x::text = '1'",
-            "SELECT * FROM a WHERE x = 1 OR y = 2",
-            "SELECT * FROM a WHERE x = y",
-            "SELECT * FROM a WHERE NOT (x = 1)",
-            "SELECT * FROM a WHERE x IN (SELECT id FROM b)",
-            "SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.id = a.id)",
-            "SELECT * FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.id = a.id AND b.id = 5)",
-            "SELECT * FROM a JOIN b ON a.id = b.id AND b.x = 1 WHERE a.y = 2",
-            "SELECT * FROM a JOIN b USING (id) WHERE id = 1",
-            "SELECT * FROM a NATURAL JOIN b JOIN c ON c.id = b.id",
-            "SELECT * FROM a LEFT JOIN b ON a.id = b.id CROSS JOIN c",
-            "SELECT * FROM a LEFT JOIN b ON a.id = b.id AND a.x = 1",
-            "SELECT * FROM a LEFT JOIN b ON a.id = b.id AND b.x = 5",
-            "SELECT * FROM a LEFT JOIN b ON a.id = b.id WHERE a.id = 5",
-            "SELECT * FROM a LEFT JOIN b USING (id) WHERE a.id = 5",
-            "SELECT * FROM b RIGHT JOIN a ON a.id = b.id AND a.x = 1 AND b.id = 5",
-            "SELECT * FROM a LEFT JOIN b ON a.id = b.id LEFT JOIN c ON b.id = c.id AND a.x = 1",
-            "SELECT * FROM a LEFT JOIN b ON a.id = b.id WHERE b.id = 5",
-            "SELECT * FROM a LEFT JOIN b ON a.id = b.id AND a.x = 1 WHERE b.x = 2",
-            "SELECT * FROM a LEFT JOIN b ON a.id = b.id AND b.id = 5 WHERE b.x IS NULL",
-            "SELECT * FROM a LEFT JOIN (b LEFT JOIN c ON b.id = c.id) ON a.id = b.id \
-              WHERE c.id = 7",
-            "SELECT * FROM a LEFT JOIN (b LEFT JOIN c ON b.id = c.id) ON a.id = b.id \
-              AND c.id = 3",
-            "SELECT * FROM a LEFT JOIN b ON a.id = b.id JOIN c ON b.id = c.id AND c.id = 2",
-            "SELECT * FROM a RIGHT JOIN b ON a.id = b.id WHERE b.x = 1",
-            "SELECT * FROM a, b WHERE a.id = b.id AND a.x = 1",
-            "SELECT * FROM a, b, c WHERE a.id = b.id AND b.id = c.id AND c.x = 3",
-            "SELECT d.id FROM (SELECT id FROM a WHERE id = 1) d WHERE d.id = 2",
-            "SELECT * FROM a JOIN b ON a.id = b.id WHERE a.x::text = '3'",
-            "SELECT * FROM a JOIN b ON a.id = b.id JOIN c ON b.x = c.x WHERE a.id IN (1, 2)",
-            "SELECT * FROM a JOIN b ON a.id = b.id AND a.x = b.x WHERE b.x = 4",
-            "SELECT * FROM a JOIN b ON b.id = a.x + 1 WHERE a.y = 1",
-            "SELECT * FROM a JOIN b ON b.id = a.id WHERE a.x < b.y",
-        ];
-        for sql in corpus {
-            let bound = resolve(sql);
-            let select = bound.select().expect("a SELECT");
-            let branch = query_branch_predicates_build(&bound, select);
-            let collected = query_constraints_analyze(&bound, select);
-            let bindings = bound.bindings();
-            let mut names = HashSet::new();
-            for reference in branch.table_references() {
-                let name = bindings
-                    .slot(reference.slot)
-                    .expect("slot")
-                    .table()
-                    .name
-                    .clone();
-                assert!(names.insert(name.clone()), "{sql}: {name} named twice");
-                let relation = branch
-                    .relation_predicates(bindings, reference.slot)
-                    .expect("relation predicates");
-                let mut model: Vec<String> = relation.filters.iter().map(constraint_text).collect();
-                model.sort();
-                let mut today: Vec<String> = collected
-                    .table_constraints
-                    .get(&name)
-                    .into_iter()
-                    .flatten()
-                    .map(constraint_text)
-                    .collect();
-                today.sort();
-                assert_eq!(model, today, "{sql}: filters of {name}");
-            }
-            for table in collected.table_constraints.keys() {
-                assert!(names.contains(table), "{sql}: {table} is no reference");
-            }
-        }
     }
 }

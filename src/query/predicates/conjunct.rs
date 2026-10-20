@@ -5,7 +5,7 @@ use std::cmp::Ordering;
 
 use smallvec::{SmallVec, smallvec};
 
-use super::{BoundColumnConstraint, ColumnConstraintKind, ConjunctForm};
+use super::{ColumnConstraint, ColumnConstraintKind, ConjunctForm};
 use crate::query::ast::rope::{
     Binary, Column, Literal, Multi, NodeRef, Run, Scalar, ScalarKind, View, Where, WhereKind,
 };
@@ -18,9 +18,9 @@ use crate::query::resolve::{ColumnBinding, ResolvedQuery};
 
 /// One AND-ed part of a predicate: its form and the operand subtrees it
 /// reads. A `BETWEEN` or `NOT IN` is several parts over shared operands.
-pub(crate) struct ConjunctPart<'t> {
-    pub(crate) form: ConjunctForm,
-    pub(crate) operands: SmallVec<[NodeRef<'t>; 2]>,
+pub(super) struct ConjunctPart<'t> {
+    pub(super) form: ConjunctForm,
+    pub(super) operands: SmallVec<[NodeRef<'t>; 2]>,
 }
 
 impl<'t> ConjunctPart<'t> {
@@ -33,7 +33,7 @@ impl<'t> ConjunctPart<'t> {
 }
 
 /// The parts of `expr`, left to right.
-pub(crate) fn conjunct_parts_collect<'t>(
+pub(super) fn conjunct_parts_collect<'t>(
     bound: &ResolvedQuery,
     expr: Where<'t>,
     parts: &mut Vec<ConjunctPart<'t>>,
@@ -89,7 +89,7 @@ fn column_constraint_form(
     kind: ColumnConstraintKind,
 ) -> ConjunctForm {
     match bound.column_binding_at(column.id()) {
-        Some(column) => ConjunctForm::Constraint(BoundColumnConstraint { column, kind }),
+        Some(column) => ConjunctForm::Constraint(ColumnConstraint { column, kind }),
         None => ConjunctForm::Opaque,
     }
 }
@@ -173,7 +173,7 @@ fn multi_parts_collect<'t>(
 fn any_of_form(column: ColumnBinding, mut values: Vec<LiteralValue>) -> ConjunctForm {
     values.sort_by(literal_value_canonical_order);
     values.dedup();
-    ConjunctForm::Constraint(BoundColumnConstraint {
+    ConjunctForm::Constraint(ColumnConstraint {
         column,
         kind: ColumnConstraintKind::AnyOf(values),
     })

@@ -8,12 +8,12 @@ use std::collections::{HashMap, HashSet};
 
 use ecow::EcoString;
 
+use super::TableConstraint;
 use super::range::{
     BoundSide, ColumnRange, RangeBound, RangeView, column_range_build,
     literal_value_is_incomparable, literal_value_order,
 };
 use super::subsume::constraints_group_by_column;
-use super::{QueryConstraints, TableConstraint};
 use crate::query::ast::{BinaryOp, LiteralValue};
 
 /// Reduce a set of bare-column `column op literal` comparisons (from a raw-tree
@@ -44,20 +44,14 @@ pub(crate) fn column_ranges_from_comparisons(
         .collect()
 }
 
-/// Reduce a query's constraints on `table` to a per-column [`ColumnRange`], for
+/// Reduce a reference's filters to a per-column [`ColumnRange`], for
 /// the read side of read-after-write disjointness (PGC-124). Only bare-column
 /// comparisons are kept — a cast comparison (`col::date = …`) constrains a
 /// derived value, not the raw column the inserted row supplies, so it can't
 /// prove disjointness against a raw inserted value. A column absent from the
 /// result is unconstrained by the read (and so can't exclude any insert).
-pub(crate) fn table_column_ranges(
-    constraints: &QueryConstraints,
-    table: &str,
-) -> HashMap<EcoString, ColumnRange> {
-    let Some(table_cs) = constraints.table_constraints.get(table) else {
-        return HashMap::new();
-    };
-    constraints_group_by_column(table_cs)
+pub(crate) fn table_column_ranges(filters: &[TableConstraint]) -> HashMap<EcoString, ColumnRange> {
+    constraints_group_by_column(filters)
         .into_iter()
         .filter(|((_, cast), _)| cast.is_none())
         .map(|((col, _), cs)| (EcoString::from(col), column_range_build(cs.as_slice())))

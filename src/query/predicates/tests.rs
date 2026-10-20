@@ -3,13 +3,22 @@
 use iddqd::BiHashMap;
 use postgres_types::Type;
 
-use super::subsume::table_constraints_subsumed;
+use std::collections::{HashMap, HashSet};
+
+use ecow::EcoString;
+
 use super::*;
 use crate::cache::UpdateQuerySource;
 use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
 use crate::oid::{Oid, TypeOid};
+use crate::query::ast::rope::Select;
+use crate::query::ast::{BinaryOp, LiteralValue};
+use crate::query::cast::CastTarget;
+use crate::query::constraints::{
+    ColumnRange, TableConstraint, column_range_build, table_constraints_subsumed,
+};
 use crate::query::decorrelate::query_decorrelate;
-use crate::query::resolve::ResolvedQuery;
+use crate::query::resolve::{ResolvedQuery, TableSlot};
 use crate::query::update::select_branches_with_source;
 
 // Helper function to create test table metadata
@@ -52,15 +61,53 @@ fn resolve_sql(sql: &str, tables: &Catalog) -> ResolvedQuery {
     ResolvedQuery::parse_resolve(sql, tables, &["public"]).expect("resolve")
 }
 
-/// The constraints of a bound SELECT.
-fn analyze_query_constraints(bound: &ResolvedQuery) -> QueryConstraints {
-    query_constraints_analyze(bound, bound.select().expect("a SELECT"))
+/// What a SELECT's predicates say per table name: the filters of every
+/// reference that has any, and whether every WHERE conjunct was recognized.
+/// Only a test view, so a name may carry filters from one reference only.
+struct TableFilters {
+    table_constraints: HashMap<EcoString, Vec<TableConstraint>>,
+    where_recognized: bool,
 }
 
-/// The constraints of `sql`.
-/// `table_constraints` in a comparable order: the walks visit a hash set,
-/// so their per-table lists come out in any order.
-fn table_constraints_sorted(constraints: &QueryConstraints) -> Vec<(ecow::EcoString, Vec<String>)> {
+impl TableFilters {
+    fn filter_count(&self) -> usize {
+        self.table_constraints.values().map(Vec::len).sum()
+    }
+}
+
+fn select_table_filters(bound: &ResolvedQuery, select: Select<'_>) -> TableFilters {
+    let predicates = query_branch_predicates_build(bound, select);
+    let bindings = bound.bindings();
+    let mut table_constraints = HashMap::new();
+    for reference in predicates.table_references() {
+        let relation = predicates
+            .relation_predicates(bindings, reference.slot)
+            .expect("relation predicates");
+        if relation.filters.is_empty() {
+            continue;
+        }
+        let name = bindings
+            .slot(reference.slot)
+            .expect("slot")
+            .table()
+            .name
+            .clone();
+        let previous = table_constraints.insert(name.clone(), relation.filters);
+        assert!(previous.is_none(), "{name} filtered by two references");
+    }
+    TableFilters {
+        table_constraints,
+        where_recognized: predicates.where_recognized(),
+    }
+}
+
+/// The filters of a bound query's root SELECT.
+fn analyze_query_constraints(bound: &ResolvedQuery) -> TableFilters {
+    select_table_filters(bound, bound.select().expect("a SELECT"))
+}
+
+/// `table_constraints` in a comparable order.
+fn table_constraints_sorted(constraints: &TableFilters) -> Vec<(ecow::EcoString, Vec<String>)> {
     let mut tables: Vec<(ecow::EcoString, Vec<String>)> = constraints
         .table_constraints
         .iter()
@@ -74,146 +121,94 @@ fn table_constraints_sorted(constraints: &QueryConstraints) -> Vec<(ecow::EcoStr
     tables
 }
 
-/// What the walk extracts from each shape: the column constraints and
-/// equivalences (each as its sorted debug lines), the per-table lists and
-/// whether the WHERE was analyzed completely.
+/// What each shape yields: the per-table filters and whether every WHERE
+/// conjunct was recognized.
 #[rustfmt::skip]
-const CONSTRAINTS_EXPECTED: &[(&str, &[&str], &[&str], &str, bool)] = &[
+const CONSTRAINTS_EXPECTED: &[(&str, &str, bool)] = &[
     ("SELECT id FROM users WHERE id = 1",
-     &[r#"Comparison { column: ConstraintColumn { schema: "public", table: "users", alias: None, column: "id" }, op: Equal, value: Integer(1) }"#],
-     &[],
      r#"[("users", ["Comparison(\"id\", Equal, Integer(1))"])]"#,
      true),
     ("SELECT id FROM users WHERE 1 = id AND name = 'a'",
-     &[r#"Comparison { column: ConstraintColumn { schema: "public", table: "users", alias: None, column: "id" }, op: Equal, value: Integer(1) }"#, r#"Comparison { column: ConstraintColumn { schema: "public", table: "users", alias: None, column: "name" }, op: Equal, value: String("a") }"#],
-     &[],
      r#"[("users", ["Comparison(\"id\", Equal, Integer(1))", "Comparison(\"name\", Equal, String(\"a\"))"])]"#,
      true),
     ("SELECT id FROM users WHERE id > 1 AND id <= 9 AND name <> 'x'",
-     &[r#"Comparison { column: ConstraintColumn { schema: "public", table: "users", alias: None, column: "id" }, op: GreaterThan, value: Integer(1) }"#, r#"Comparison { column: ConstraintColumn { schema: "public", table: "users", alias: None, column: "id" }, op: LessThanOrEqual, value: Integer(9) }"#, r#"Comparison { column: ConstraintColumn { schema: "public", table: "users", alias: None, column: "name" }, op: NotEqual, value: String("x") }"#],
-     &[],
      r#"[("users", ["Comparison(\"id\", GreaterThan, Integer(1))", "Comparison(\"id\", LessThanOrEqual, Integer(9))", "Comparison(\"name\", NotEqual, String(\"x\"))"])]"#,
      true),
     ("SELECT id FROM users WHERE id IN (3, 1, 2, 1) AND name NOT IN ('a', 'b')",
-     &[r#"Comparison { column: ConstraintColumn { schema: "public", table: "users", alias: None, column: "name" }, op: NotEqual, value: String("a") }"#, r#"Comparison { column: ConstraintColumn { schema: "public", table: "users", alias: None, column: "name" }, op: NotEqual, value: String("b") }"#, r#"InSet { column: ConstraintColumn { schema: "public", table: "users", alias: None, column: "id" }, values: [Integer(1), Integer(2), Integer(3)] }"#],
-     &[],
      r#"[("users", ["AnyOf(\"id\", [Integer(1), Integer(2), Integer(3)])", "Comparison(\"name\", NotEqual, String(\"a\"))", "Comparison(\"name\", NotEqual, String(\"b\"))"])]"#,
      true),
     ("SELECT id FROM users WHERE id BETWEEN 1 AND 5 AND name BETWEEN SYMMETRIC 'z' AND 'a'",
-     &[r#"Comparison { column: ConstraintColumn { schema: "public", table: "users", alias: None, column: "id" }, op: GreaterThanOrEqual, value: Integer(1) }"#, r#"Comparison { column: ConstraintColumn { schema: "public", table: "users", alias: None, column: "id" }, op: LessThanOrEqual, value: Integer(5) }"#],
-     &[],
      r#"[("users", ["Comparison(\"id\", GreaterThanOrEqual, Integer(1))", "Comparison(\"id\", LessThanOrEqual, Integer(5))"])]"#,
      false),
     ("SELECT id FROM users WHERE id = ANY (ARRAY[1, 2]) AND name = ANY ('{a,b}'::text[])",
-     &[r#"InSet { column: ConstraintColumn { schema: "public", table: "users", alias: None, column: "id" }, values: [Integer(1), Integer(2)] }"#],
-     &[],
      r#"[("users", ["AnyOf(\"id\", [Integer(1), Integer(2)])"])]"#,
      false),
     ("SELECT id FROM users WHERE id = ANY (ARRAY[id, 2])",
-     &[],
-     &[],
      "[]",
      false),
     ("SELECT id FROM users WHERE id::text = '1' AND name::int4 = 2 AND id::date = '2020-01-01'",
-     &[r#"CastComparison { column: ConstraintColumn { schema: "public", table: "users", alias: None, column: "name" }, cast: Int4, op: Equal, value: Integer(2) }"#, r#"Comparison { column: ConstraintColumn { schema: "public", table: "users", alias: None, column: "id" }, op: Equal, value: String("1") }"#],
-     &[],
      r#"[("users", ["CastComparison(\"name\", Int4, Equal, Integer(2))", "Comparison(\"id\", Equal, String(\"1\"))"])]"#,
      false),
     ("SELECT id FROM users WHERE id = 1 OR name = 'a'",
-     &[],
-     &[],
      "[]",
      false),
     ("SELECT id FROM users WHERE NOT (id = 1)",
-     &[],
-     &[],
      "[]",
      false),
     ("SELECT id FROM users WHERE id IN (SELECT id FROM orders)",
-     &[],
-     &[],
      "[]",
      false),
     ("SELECT u.id FROM users u JOIN orders o ON u.id = o.id AND o.name = 'x' WHERE u.name = 'y'",
-     &[r#"Comparison { column: ConstraintColumn { schema: "public", table: "orders", alias: Some("o"), column: "name" }, op: Equal, value: String("x") }"#, r#"Comparison { column: ConstraintColumn { schema: "public", table: "users", alias: Some("u"), column: "name" }, op: Equal, value: String("y") }"#],
-     &[r#"ColumnEquivalence { left: ConstraintColumn { schema: "public", table: "users", alias: Some("u"), column: "id" }, right: ConstraintColumn { schema: "public", table: "orders", alias: Some("o"), column: "id" } }"#],
      r#"[("orders", ["Comparison(\"name\", Equal, String(\"x\"))"]), ("users", ["Comparison(\"name\", Equal, String(\"y\"))"])]"#,
      true),
     ("SELECT u.id FROM users u JOIN orders o USING (id) WHERE id = 1",
-     &[r#"Comparison { column: ConstraintColumn { schema: "public", table: "orders", alias: Some("o"), column: "id" }, op: Equal, value: Integer(1) }"#, r#"Comparison { column: ConstraintColumn { schema: "public", table: "users", alias: Some("u"), column: "id" }, op: Equal, value: Integer(1) }"#],
-     &[r#"ColumnEquivalence { left: ConstraintColumn { schema: "public", table: "users", alias: Some("u"), column: "id" }, right: ConstraintColumn { schema: "public", table: "orders", alias: Some("o"), column: "id" } }"#],
      r#"[("orders", ["Comparison(\"id\", Equal, Integer(1))"]), ("users", ["Comparison(\"id\", Equal, Integer(1))"])]"#,
      true),
     ("SELECT u.id FROM users u NATURAL JOIN orders o JOIN items i ON i.id = o.id",
-     &[],
-     &[r#"ColumnEquivalence { left: ConstraintColumn { schema: "public", table: "items", alias: Some("i"), column: "id" }, right: ConstraintColumn { schema: "public", table: "orders", alias: Some("o"), column: "id" } }"#, r#"ColumnEquivalence { left: ConstraintColumn { schema: "public", table: "users", alias: Some("u"), column: "id" }, right: ConstraintColumn { schema: "public", table: "orders", alias: Some("o"), column: "id" } }"#, r#"ColumnEquivalence { left: ConstraintColumn { schema: "public", table: "users", alias: Some("u"), column: "name" }, right: ConstraintColumn { schema: "public", table: "orders", alias: Some("o"), column: "name" } }"#],
      "[]",
      true),
     ("SELECT u.id FROM users u LEFT JOIN orders o ON u.id = o.id CROSS JOIN items",
-     &[],
-     &[],
      "[]",
      true),
     ("SELECT id FROM users WHERE id NOT IN (1, name, 2)",
-     &[r#"Comparison { column: ConstraintColumn { schema: "public", table: "users", alias: None, column: "id" }, op: NotEqual, value: Integer(1) }"#, r#"Comparison { column: ConstraintColumn { schema: "public", table: "users", alias: None, column: "id" }, op: NotEqual, value: Integer(2) }"#],
-     &[],
      r#"[("users", ["Comparison(\"id\", NotEqual, Integer(1))", "Comparison(\"id\", NotEqual, Integer(2))"])]"#,
      false),
     ("SELECT id FROM users WHERE id IN (1, name)",
-     &[],
-     &[],
      "[]",
      false),
     ("SELECT id FROM users WHERE id NOT BETWEEN 1 AND 2 AND name LIKE 'a%'",
-     &[],
-     &[],
      "[]",
      false),
     ("SELECT id FROM users WHERE id = name",
-     &[],
-     &[r#"ColumnEquivalence { left: ConstraintColumn { schema: "public", table: "users", alias: None, column: "id" }, right: ConstraintColumn { schema: "public", table: "users", alias: None, column: "name" } }"#],
      "[]",
      true),
     ("SELECT v.id FROM (SELECT id FROM users WHERE id = 1) v WHERE v.id = 2",
-     &[r#"Comparison { column: ConstraintColumn { schema: "", table: "v", alias: Some("v"), column: "id" }, op: Equal, value: Integer(2) }"#],
-     &[],
      r#"[("v", ["Comparison(\"id\", Equal, Integer(2))"])]"#,
      true),
 ];
-
-fn sorted_debug<T: std::fmt::Debug>(items: impl IntoIterator<Item = T>) -> Vec<String> {
-    let mut out: Vec<String> = items.into_iter().map(|item| format!("{item:?}")).collect();
-    out.sort();
-    out
-}
 
 /// Every shape the extractors handle, and the ones they give up on,
 /// analyzes to its expected constraints.
 #[test]
 fn test_constraints_expectations() {
     let tables = catalog(&["users", "orders", "items"]);
-    for (sql, columns, equivalences, per_table, complete) in CONSTRAINTS_EXPECTED {
+    for (sql, per_table, complete) in CONSTRAINTS_EXPECTED {
         let actual = analyze_query_constraints(&resolve_sql(sql, &tables));
-        assert_eq!(sorted_debug(&actual.column_constraints), *columns, "{sql}");
-        assert_eq!(sorted_debug(&actual.equivalences), *equivalences, "{sql}");
         assert_eq!(
             format!("{:?}", table_constraints_sorted(&actual)),
             *per_table,
             "{sql}"
         );
-        assert_eq!(actual.where_analysis_complete, *complete, "{sql}");
+        assert_eq!(actual.where_recognized, *complete, "{sql}");
     }
 }
 
-fn constraints_of(sql: &str, tables: &Catalog) -> QueryConstraints {
+fn constraints_of(sql: &str, tables: &Catalog) -> TableFilters {
     analyze_query_constraints(&resolve_sql(sql, tables))
 }
 
 /// The constraints on `table`, empty when it has none.
-fn table_constraints_of<'a>(
-    constraints: &'a QueryConstraints,
-    table: &str,
-) -> &'a [TableConstraint] {
+fn table_constraints_of<'a>(constraints: &'a TableFilters, table: &str) -> &'a [TableConstraint] {
     constraints
         .table_constraints
         .get(table)
@@ -222,7 +217,7 @@ fn table_constraints_of<'a>(
 
 /// Whether any constraint on `table` satisfies `matches`.
 fn table_constraint_any(
-    constraints: &QueryConstraints,
+    constraints: &TableFilters,
     table: &str,
     matches: impl Fn(&TableConstraint) -> bool,
 ) -> bool {
@@ -234,19 +229,19 @@ fn table_constraint_any(
 
 /// Whether `table` carries exactly `expected`.
 fn has_table_constraint(
-    constraints: &QueryConstraints,
+    constraints: &TableFilters,
     table: &str,
     expected: &TableConstraint,
 ) -> bool {
     table_constraint_any(constraints, table, |tc| tc == expected)
 }
 
-fn has_constraint(constraints: &QueryConstraints, spec: &ComparisonSpec) -> bool {
+fn has_constraint(constraints: &TableFilters, spec: &ComparisonSpec) -> bool {
     let expected = TableConstraint::Comparison(spec.column.into(), spec.op, spec.value.clone());
     has_table_constraint(constraints, spec.table, &expected)
 }
 
-fn has_in_constraint(constraints: &QueryConstraints, spec: &InSetSpec) -> bool {
+fn has_in_constraint(constraints: &TableFilters, spec: &InSetSpec) -> bool {
     table_constraint_any(constraints, spec.table, |tc| {
         matches!(tc, TableConstraint::AnyOf(c, vs)
             if c == spec.column
@@ -334,10 +329,10 @@ fn has(constraint: impl Into<Expectation>) -> Expectation {
 }
 
 impl Expectation {
-    fn check(&self, constraints: &QueryConstraints, context: &str) {
+    fn check(&self, constraints: &TableFilters, context: &str) {
         match self {
             Expectation::Count(n) => assert_eq!(
-                constraints.column_constraints.len(),
+                constraints.filter_count(),
                 *n,
                 "{context}: column constraint count"
             ),
@@ -762,7 +757,7 @@ fn test_join_propagation() {
     let constraints = analyze_query_constraints(&resolved);
 
     // Should propagate: t.id = 1 -> tm.id = 1
-    assert_eq!(constraints.column_constraints.len(), 2);
+    assert_eq!(constraints.filter_count(), 2);
 
     let test_constraints = constraints.table_constraints.get("test").unwrap();
     assert_eq!(test_constraints.len(), 1);
@@ -777,8 +772,6 @@ fn test_join_propagation() {
         &constraints,
         &cmp("test_map", "id", BinaryOp::Equal, int(1))
     ));
-
-    assert_eq!(constraints.equivalences.len(), 1);
 }
 
 #[test]
@@ -808,7 +801,7 @@ fn test_transitive_propagation() {
     let constraints = analyze_query_constraints(&resolved);
 
     // Should propagate through: a.id = 1 -> b.id = 1 -> c.id = 1
-    assert_eq!(constraints.column_constraints.len(), 3);
+    assert_eq!(constraints.filter_count(), 3);
 
     assert!(has_constraint(
         &constraints,
@@ -833,7 +826,7 @@ fn test_multiple_constraints() {
 
     let constraints = analyze_query_constraints(&resolved);
 
-    assert_eq!(constraints.column_constraints.len(), 2);
+    assert_eq!(constraints.filter_count(), 2);
 
     let user_constraints = constraints.table_constraints.get("users").unwrap();
     assert_eq!(user_constraints.len(), 2);
@@ -857,78 +850,110 @@ fn test_no_propagation_with_or() {
 
     let constraints = analyze_query_constraints(&resolved);
 
-    assert_eq!(constraints.column_constraints.len(), 0);
+    assert_eq!(constraints.filter_count(), 0);
     assert_eq!(constraints.table_constraints.len(), 0);
 }
 
-/// A table name more than one reference binds keeps no per-table
-/// constraints and propagates none, which leaves the analysis incomplete;
-/// every other table keeps its own (PGC-507).
+/// Each reference's filters by its qualifier, in FROM order.
+fn reference_filter_lines(bound: &ResolvedQuery, select: Select<'_>) -> Vec<(String, Vec<String>)> {
+    let predicates = query_branch_predicates_build(bound, select);
+    let bindings = bound.bindings();
+    predicates
+        .table_references()
+        .iter()
+        .filter(|reference| matches!(bindings.slot(reference.slot), Some(TableSlot::Base { .. })))
+        .map(|reference| {
+            let relation = predicates
+                .relation_predicates(bindings, reference.slot)
+                .expect("relation predicates");
+            let mut filters: Vec<String> =
+                relation.filters.iter().map(|c| format!("{c:?}")).collect();
+            filters.sort();
+            let qualifier = bindings.slot(reference.slot).expect("slot").qualifier();
+            (qualifier.to_owned(), filters)
+        })
+        .collect()
+}
+
+/// A table name more than one reference binds keeps each reference's own
+/// filters; nothing crosses an equality from one reference to another unless
+/// the equality filters the target (PGC-507, PGC-517).
 #[test]
-fn test_repeated_table_constraints_dropped() {
+fn test_repeated_table_filters_per_reference() {
     let mut tables = catalog(&["users", "orders"]);
     let mut other = test_table_metadata("users", Oid::from_raw(1101));
     other.schema = "other".into();
     tables.insert_overwrite(other.into());
+    let name_x = r#"Comparison("name", Equal, String("x"))"#;
+    let id_5 = r#"Comparison("id", Equal, Integer(5))"#;
     #[rustfmt::skip]
-    let cases: &[(&str, &[(&str, &[&str])], bool)] = &[
+    let cases: &[(&str, &[(&str, &[&str])])] = &[
         ("SELECT a.id FROM users a JOIN users b ON b.id = a.id WHERE a.name = 'x'",
-         &[], false),
+         &[("a", &[name_x]), ("b", &[])]),
         ("SELECT a.id FROM users a JOIN users b ON b.name = a.name",
-         &[], true),
-        // a.id = 5 must not reach orders through b.id, which shares its identity.
+         &[("a", &[]), ("b", &[])]),
+        // a.id = 5 reaches only a's own equality partners.
         ("SELECT a.id FROM users a JOIN users b ON b.id = a.name \
           JOIN orders o ON o.id = b.id WHERE a.id = 5",
-         &[], false),
+         &[("a", &[id_5]), ("b", &[]), ("o", &[])]),
         ("SELECT a.id FROM users a JOIN users b ON b.id = a.id \
           JOIN orders o ON o.id = a.id WHERE o.name = 'x'",
-         &[("orders", &[r#"Comparison("name", Equal, String("x"))"#])], true),
+         &[("a", &[]), ("b", &[]), ("o", &[name_x])]),
         ("SELECT p.id FROM public.users p JOIN other.users o ON o.id = p.id WHERE p.name = 'x'",
-         &[], false),
-        ("SELECT u.id FROM users u JOIN (SELECT id FROM orders) users ON users.id = u.id \
-          WHERE u.name = 'x'",
-         &[], false),
+         &[("p", &[name_x]), ("o", &[])]),
         ("SELECT u.id FROM users u JOIN orders o ON o.id = u.id WHERE u.name = 'x'",
-         &[("users", &[r#"Comparison("name", Equal, String("x"))"#])], true),
+         &[("u", &[name_x]), ("o", &[])]),
     ];
-    for (sql, expected, complete) in cases {
-        let constraints = constraints_of(sql, &tables);
+    for (sql, expected) in cases {
+        let bound = resolve_sql(sql, &tables);
+        let expected: Vec<(String, Vec<String>)> = expected
+            .iter()
+            .map(|(qualifier, filters)| {
+                (
+                    qualifier.to_string(),
+                    filters.iter().map(ToString::to_string).collect(),
+                )
+            })
+            .collect();
         assert_eq!(
-            table_constraint_lines(&constraints),
-            expected_lines(expected),
+            reference_filter_lines(&bound, bound.select().expect("a SELECT")),
+            expected,
             "{sql}"
         );
-        assert_eq!(constraints.where_analysis_complete, *complete, "{sql}");
     }
 }
 
-/// A subquery branch that reads an outer table of its own table's name binds
-/// that name twice.
+/// In a correlated subquery, a conjunct on the outer reference filters
+/// nothing in the subquery's branch, whatever its table's name (PGC-517).
 #[test]
-fn test_repeated_table_through_correlation_dropped() {
+fn test_correlated_outer_conjunct_filters_nothing() {
     let tables = catalog(&["users", "orders"]);
+    let name_y = r#"Comparison("name", Equal, String("y"))"#;
     #[rustfmt::skip]
-    let cases: &[(&str, &[(&str, &[&str])], bool)] = &[
+    let cases: &[(&str, &[(&str, &[&str])])] = &[
         ("SELECT a.id FROM users a WHERE EXISTS \
           (SELECT 1 FROM users b WHERE b.id = a.id AND a.name = 'x' AND b.name = 'y')",
-         &[], false),
+         &[("b", &[name_y])]),
         ("SELECT a.id FROM users a WHERE EXISTS \
           (SELECT 1 FROM orders o WHERE o.id = a.id AND o.name = 'y')",
-         &[("orders", &[r#"Comparison("name", Equal, String("y"))"#])], true),
+         &[("o", &[name_y])]),
     ];
-    for (sql, expected, complete) in cases {
+    for (sql, expected) in cases {
         let bound = resolve_sql(sql, &tables);
         let (subquery, _) = select_branches_with_source(bound.tree().root())
             .into_iter()
             .find(|(_, source)| *source != UpdateQuerySource::FromClause)
             .expect("a subquery branch");
-        let constraints = query_constraints_analyze(&bound, subquery);
-        assert_eq!(
-            table_constraint_lines(&constraints),
-            expected_lines(expected),
-            "{sql}"
-        );
-        assert_eq!(constraints.where_analysis_complete, *complete, "{sql}");
+        let expected: Vec<(String, Vec<String>)> = expected
+            .iter()
+            .map(|(qualifier, filters)| {
+                (
+                    qualifier.to_string(),
+                    filters.iter().map(ToString::to_string).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(reference_filter_lines(&bound, subquery), expected, "{sql}");
     }
 }
 
@@ -942,7 +967,7 @@ fn test_derived_table_no_outer_constraints() {
     let constraints = analyze_query_constraints(&resolved);
 
     assert!(
-        constraints.column_constraints.is_empty(),
+        constraints.table_constraints.is_empty(),
         "Derived table with no outer WHERE should have no constraints"
     );
 }
@@ -1022,36 +1047,36 @@ fn test_in_set_narrowing_cases() {
 }
 
 #[test]
-fn test_no_where_clause_is_complete() {
+fn test_no_where_clause_is_recognized() {
     let tables = catalog(&["users"]);
     let resolved = resolve_sql("SELECT * FROM users", &tables);
 
     let constraints = analyze_query_constraints(&resolved);
 
     assert!(
-        constraints.where_analysis_complete,
+        constraints.where_recognized,
         "no WHERE clause is trivially complete (full table scan)"
     );
 }
 
 #[test]
-fn test_simple_equality_is_complete() {
+fn test_simple_equality_is_recognized() {
     let tables = catalog(&["users"]);
     let resolved = resolve_sql("SELECT * FROM users WHERE id = 1", &tables);
 
     let constraints = analyze_query_constraints(&resolved);
 
-    assert!(constraints.where_analysis_complete);
+    assert!(constraints.where_recognized);
 }
 
 #[test]
-fn test_in_clause_is_complete() {
+fn test_in_clause_is_recognized() {
     let tables = catalog(&["users"]);
     let resolved = resolve_sql("SELECT * FROM users WHERE id IN (1, 2, 3)", &tables);
 
     let constraints = analyze_query_constraints(&resolved);
 
-    assert!(constraints.where_analysis_complete);
+    assert!(constraints.where_recognized);
 }
 
 #[test]
@@ -1068,7 +1093,7 @@ fn test_any_eq_clause_extracts_inset() {
     let constraints = analyze_query_constraints(&resolved);
 
     assert!(
-        constraints.where_analysis_complete,
+        constraints.where_recognized,
         "ANY = is now extractable, analysis is complete"
     );
     let users_cs = constraints
@@ -1093,13 +1118,13 @@ fn test_or_clause_marks_incomplete() {
 
     let constraints = analyze_query_constraints(&resolved);
 
-    assert!(!constraints.where_analysis_complete);
+    assert!(!constraints.where_recognized);
 }
 
 /// Only the WHERE decides completeness: an ON the extractor can't read
 /// leaves it complete.
 #[test]
-fn test_where_analysis_complete_ignores_on() {
+fn test_where_recognized_ignores_on() {
     let tables = catalog(&["users", "orders"]);
     let cases = [
         (
@@ -1117,14 +1142,14 @@ fn test_where_analysis_complete_ignores_on() {
     ];
     for (sql, complete) in cases {
         let constraints = constraints_of(sql, &tables);
-        assert_eq!(constraints.where_analysis_complete, complete, "{sql}");
+        assert_eq!(constraints.where_recognized, complete, "{sql}");
     }
 }
 
 /// A BETWEEN, IN or NOT IN with an operand that isn't a literal filters
 /// rows no extracted constraint describes.
 #[test]
-fn test_where_analysis_incomplete_for_non_literal_operand() {
+fn test_where_unrecognized_for_non_literal_operand() {
     let tables = catalog(&["users"]);
     let cases = [
         ("SELECT * FROM users WHERE id BETWEEN 1 AND 5", true),
@@ -1137,7 +1162,7 @@ fn test_where_analysis_incomplete_for_non_literal_operand() {
     ];
     for (sql, complete) in cases {
         let constraints = constraints_of(sql, &tables);
-        assert_eq!(constraints.where_analysis_complete, complete, "{sql}");
+        assert_eq!(constraints.where_recognized, complete, "{sql}");
     }
 }
 
@@ -1151,7 +1176,7 @@ fn test_subsumption_full_scan_still_subsumes() {
     let cached = analyze_query_constraints(&resolve_sql("SELECT * FROM users", &tables));
     let new = analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id = 5", &tables));
 
-    assert!(cached.where_analysis_complete);
+    assert!(cached.where_recognized);
     assert!(
         table_constraints_subsumed(
             table_constraints_of(&new, "users"),
@@ -1193,7 +1218,7 @@ fn test_cast_extraction_cases() {
     for (label, sql, complete, expected) in cases {
         let constraints = constraints_of(sql, &catalog(&["users"]));
         assert_eq!(
-            constraints.where_analysis_complete, complete,
+            constraints.where_recognized, complete,
             "{label}: completeness"
         );
         if let Some(expected) = expected {
@@ -1232,30 +1257,8 @@ fn test_cast_comparison_does_not_propagate_through_equivalence() {
     ));
 }
 
-/// Two spellings of one column through different aliases are the same
-/// constraint column, by equality and by hash.
-#[test]
-fn test_constraint_column_identity_ignores_alias() {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let column = |alias: &str| ConstraintColumn {
-        schema: "public".into(),
-        table: "users".into(),
-        alias: Some(alias.into()),
-        column: "id".into(),
-    };
-    let (u, u2) = (column("u"), column("u2"));
-    assert_eq!(u, u2);
-    let hash = |c: &ConstraintColumn| {
-        let mut hasher = DefaultHasher::new();
-        c.hash(&mut hasher);
-        hasher.finish()
-    };
-    assert_eq!(hash(&u), hash(&u2));
-}
-
 /// Per-table constraints, each as its debug line, in a comparable order.
-fn table_constraint_lines(constraints: &QueryConstraints) -> Vec<(String, Vec<String>)> {
+fn table_constraint_lines(constraints: &TableFilters) -> Vec<(String, Vec<String>)> {
     table_constraints_sorted(constraints)
         .into_iter()
         .map(|(table, list)| (table.to_string(), list))

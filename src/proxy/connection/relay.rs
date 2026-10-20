@@ -39,10 +39,12 @@ use crate::proxy::session_settings::SessionSettings;
 use crate::proxy::{ConnectionError, ConnectionResult, ProxyMode, ProxyStatus};
 use crate::query::SessionKey;
 use crate::query::ast::rope::QueryTree;
-use crate::query::constraints::{ColumnRange, query_constraints_analyze, table_column_ranges};
+use crate::query::constraints::{ColumnRange, table_column_ranges};
 use crate::query::guc::Guc;
 use crate::query::keying_settings::KeyingSettings;
+use crate::query::predicates::query_branch_predicates_build;
 use crate::query::resolve::ColumnsByTable;
+use crate::query::resolve::{ResolvedQuery, TableSlot};
 use crate::query::write::StatementEffects;
 use crate::result::ReportExt;
 use crate::{
@@ -595,16 +597,31 @@ fn read_shape(
     let Some(form) = dispatch_handle.cached_query_read_form(key) else {
         return none;
     };
-    let ranges = single_table(query).and_then(|table| {
-        let constraints = query_constraints_analyze(&form.bound, form.bound.select()?);
-        constraints
-            .where_analysis_complete
-            .then(|| table_column_ranges(&constraints, table))
-    });
+    let ranges = single_table(query).and_then(|table| read_ranges(&form.bound, table));
     ReadShape {
         ranges,
         columns: Some(form.columns),
     }
+}
+
+/// The per-column ranges of the read's root reference to `table`, when every
+/// WHERE conjunct is recognized; none when the root reads it only through a
+/// derived table.
+fn read_ranges(bound: &ResolvedQuery, table: &str) -> Option<HashMap<EcoString, ColumnRange>> {
+    let predicates = query_branch_predicates_build(bound, bound.select()?);
+    if !predicates.where_recognized() {
+        return None;
+    }
+    let bindings = bound.bindings();
+    let reference = predicates.table_references().iter().find(|reference| {
+        matches!(bindings.slot(reference.slot),
+            Some(TableSlot::Base { table: metadata, .. }) if metadata.name == table)
+    });
+    let Some(reference) = reference else {
+        return Some(HashMap::new());
+    };
+    let relation = predicates.relation_predicates(bindings, reference.slot)?;
+    Some(table_column_ranges(&relation.filters))
 }
 
 /// The single table a read references, or `None` if it references zero or more
@@ -1350,5 +1367,62 @@ impl ConnectionState {
         };
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use iddqd::BiHashMap;
+    use postgres_types::Type;
+
+    use super::*;
+    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
+    use crate::oid::TypeOid;
+
+    fn catalog() -> Catalog {
+        let int_column = |name: &str, position: i16| ColumnMetadata {
+            name: name.into(),
+            position: ColumnPosition::from_raw(position),
+            type_oid: TypeOid::from_raw(23),
+            data_type: Type::INT4,
+            type_name: "int4".into(),
+            cache_type_name: "int4".into(),
+            is_primary_key: position == 1,
+        };
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(
+            TableMetadata::for_test("t", 1001, [int_column("id", 1), int_column("x", 2)]).into(),
+        );
+        tables
+    }
+
+    fn ranges_of(sql: &str) -> Option<Vec<(String, String)>> {
+        let bound = ResolvedQuery::parse_resolve(sql, &catalog(), &["public"]).expect("resolve");
+        read_ranges(&bound, "t").map(|ranges| {
+            let mut ranges: Vec<(String, String)> = ranges
+                .iter()
+                .map(|(column, range)| (column.to_string(), format!("{range:?}")))
+                .collect();
+            ranges.sort();
+            ranges
+        })
+    }
+
+    /// A read's ranges come from its reference's filters when every WHERE
+    /// conjunct is recognized; a read through a derived table proves nothing.
+    #[test]
+    fn test_read_ranges() {
+        assert_eq!(
+            ranges_of("SELECT * FROM t WHERE id = 5"),
+            Some(vec![("id".to_owned(), "Equal(Integer(5))".to_owned())])
+        );
+        assert_eq!(
+            ranges_of("SELECT * FROM t WHERE id = 5 AND x + 1 = 2"),
+            None
+        );
+        assert_eq!(
+            ranges_of("SELECT * FROM (SELECT * FROM t WHERE id = 1) d"),
+            Some(Vec::new())
+        );
     }
 }

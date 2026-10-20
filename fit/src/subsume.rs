@@ -219,7 +219,7 @@ mod tests {
 
     #[test]
     fn test_incomplete_where_parent_not_admitted() {
-        // OR breaks constraint extraction → where_analysis_complete = false.
+        // An OR is an opaque conjunct, so the reference is not exact.
         let analyses = corpus_analyze(&[
             "SELECT * FROM users WHERE id = 1 OR name = 'a'",
             "SELECT * FROM users WHERE id = 1",
