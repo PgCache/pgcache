@@ -352,14 +352,17 @@ impl Collector<'_> {
         let (Some(first), Some(second), Some(third), None) =
             (exprs.next(), exprs.next(), exprs.next(), exprs.next())
         else {
+            self.complete = false;
             return;
         };
         let (Operand::Column(column), Operand::Literal(low), Operand::Literal(high)) =
             (operand(first), operand(second), operand(third))
         else {
+            self.complete = false;
             return;
         };
         let Some((column, slot)) = self.column_resolve(column) else {
+            self.complete = false;
             return;
         };
         let (low, high) = (low.value(), high.value());
@@ -367,7 +370,10 @@ impl Collector<'_> {
             match literal_value_order(low, high) {
                 Some(Ordering::Greater) => (high, low),
                 Some(_) => (low, high),
-                None => return,
+                None => {
+                    self.complete = false;
+                    return;
+                }
             }
         } else {
             (low, high)
@@ -415,6 +421,7 @@ impl Collector<'_> {
 
     fn in_extract<'t>(&mut self, exprs: Run<'t, Where<'t>>) {
         let Some((column, slot, mut values)) = self.column_and_literals(exprs) else {
+            self.complete = false;
             return;
         };
         values.sort_by(literal_value_canonical_order);
@@ -453,16 +460,20 @@ impl Collector<'_> {
     /// literal.
     fn not_in_extract<'t>(&mut self, mut exprs: Run<'t, Where<'t>>) {
         let Some(Operand::Column(column)) = exprs.next().map(operand) else {
+            self.complete = false;
             return;
         };
         let Some((column, slot)) = self.column_resolve(column) else {
+            self.complete = false;
             return;
         };
         for expr in exprs {
             let Operand::Literal(literal) = operand(expr) else {
+                self.complete = false;
                 return;
             };
             if literal_value_is_incomparable(literal.value()) {
+                self.complete = false;
                 return;
             }
             self.constraint_insert(

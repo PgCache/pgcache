@@ -617,3 +617,35 @@ async fn test_subsumption_same_table_equality_not_full_table() -> Result<(), Err
 
     Ok(())
 }
+
+/// A cached `x BETWEEN 1 AND y` holds only the rows inside each row's own
+/// bound, so a query on `x` alone must not be served from it.
+#[tokio::test]
+async fn test_subsumption_non_literal_between_not_full_table() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE sub_nlo (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER)",
+        &[],
+    )
+    .await?;
+    ctx.query("INSERT INTO sub_nlo VALUES (1, 5, 9), (2, 5, 3)", &[])
+        .await?;
+    ctx.cdc_decode_settle().await?;
+
+    let m = ctx.metrics().await?;
+    ctx.simple_query("SELECT id, x, y FROM sub_nlo WHERE x BETWEEN 1 AND y")
+        .await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    let res = ctx
+        .simple_query("SELECT id, x, y FROM sub_nlo WHERE x = 5 ORDER BY id")
+        .await?;
+    assert_eq!(res.len(), 4); // 2 rows
+    assert_row_at(&res, 1, &[("id", "1"), ("x", "5"), ("y", "9")])?;
+    assert_row_at(&res, 2, &[("id", "2"), ("x", "5"), ("y", "3")])?;
+    let _m = assert_not_subsumed(&mut ctx, m).await?;
+
+    Ok(())
+}

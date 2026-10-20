@@ -103,7 +103,7 @@ const CONSTRAINTS_EXPECTED: &[(&str, &[&str], &[&str], &str, bool)] = &[
      &[r#"Comparison { column: ConstraintColumn { schema: "public", table: "users", alias: None, column: "id" }, op: GreaterThanOrEqual, value: Integer(1) }"#, r#"Comparison { column: ConstraintColumn { schema: "public", table: "users", alias: None, column: "id" }, op: LessThanOrEqual, value: Integer(5) }"#],
      &[],
      r#"[("users", ["Comparison(\"id\", GreaterThanOrEqual, Integer(1))", "Comparison(\"id\", LessThanOrEqual, Integer(5))"])]"#,
-     true),
+     false),
     ("SELECT id FROM users WHERE id = ANY (ARRAY[1, 2]) AND name = ANY ('{a,b}'::text[])",
      &[r#"InSet { column: ConstraintColumn { schema: "public", table: "users", alias: None, column: "id" }, values: [Integer(1), Integer(2)] }"#],
      &[],
@@ -158,12 +158,12 @@ const CONSTRAINTS_EXPECTED: &[(&str, &[&str], &[&str], &str, bool)] = &[
      &[r#"Comparison { column: ConstraintColumn { schema: "public", table: "users", alias: None, column: "id" }, op: NotEqual, value: Integer(1) }"#],
      &[],
      r#"[("users", ["Comparison(\"id\", NotEqual, Integer(1))"])]"#,
-     true),
+     false),
     ("SELECT id FROM users WHERE id IN (1, name)",
      &[],
      &[],
      "[]",
-     true),
+     false),
     ("SELECT id FROM users WHERE id NOT BETWEEN 1 AND 2 AND name LIKE 'a%'",
      &[],
      &[],
@@ -1097,6 +1097,26 @@ fn test_where_analysis_complete_ignores_on() {
             "SELECT * FROM users u JOIN orders o ON o.id = u.id WHERE u.name = lower(o.name)",
             false,
         ),
+    ];
+    for (sql, complete) in cases {
+        let constraints = constraints_of(sql, &tables);
+        assert_eq!(constraints.where_analysis_complete, complete, "{sql}");
+    }
+}
+
+/// A BETWEEN, IN or NOT IN with an operand that isn't a literal filters
+/// rows no extracted constraint describes.
+#[test]
+fn test_where_analysis_incomplete_for_non_literal_operand() {
+    let tables = catalog(&["users"]);
+    let cases = [
+        ("SELECT * FROM users WHERE id BETWEEN 1 AND 5", true),
+        ("SELECT * FROM users WHERE id BETWEEN 1 AND id", false),
+        ("SELECT * FROM users WHERE id IN (1, 2)", true),
+        ("SELECT * FROM users WHERE id IN (1, id)", false),
+        ("SELECT * FROM users WHERE id NOT IN (1, 2)", true),
+        ("SELECT * FROM users WHERE id NOT IN (id, 1)", false),
+        ("SELECT * FROM users WHERE id NOT IN (1, id)", false),
     ];
     for (sql, complete) in cases {
         let constraints = constraints_of(sql, &tables);
