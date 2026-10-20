@@ -252,6 +252,9 @@ impl Synthesizer {
             tables.insert_overwrite(
                 TableMetadata {
                     replica_identity_full: false,
+                    partitions: Vec::new(),
+                    ancestors: Vec::new(),
+                    write_aliases: Vec::new(),
                     relation_oid: Oid::from_raw(100_000 + u32::try_from(index).unwrap_or(0)),
                     name: key.1.clone(),
                     schema: key.0.clone(),
