@@ -296,6 +296,8 @@ mod tests {
     use super::*;
     use crate::catalog::{ColumnMetadata, ColumnPosition, TableMetadata};
     use crate::oid::TypeOid;
+    use crate::query::predicates::query_branch_predicates_build;
+    use crate::query::resolve::TableSlot;
 
     fn catalog() -> Catalog {
         let int_column = |name: &str, position: i16| ColumnMetadata {
@@ -321,8 +323,7 @@ mod tests {
         tables
     }
 
-    /// Each update query's table with its subsumer shape, sorted.
-    fn subsumer_shapes(sql: &str) -> Vec<(String, bool)> {
+    fn admission_analysis(sql: &str) -> AdmissionAnalysis {
         let tables = catalog();
         let bound =
             Arc::new(ResolvedQuery::parse_resolve(sql, &tables, &["public"]).expect("resolve"));
@@ -330,7 +331,7 @@ mod tests {
         let decorrelated = query_decorrelate_checked(&bound, &aggregate_functions)
             .expect("decorrelate")
             .map(Arc::new);
-        let analysis = query_admission_analyze(
+        query_admission_analyze(
             AdmissionQuery {
                 bound: &bound,
                 decorrelated: decorrelated.as_ref(),
@@ -341,8 +342,12 @@ mod tests {
             &tables,
             AdmissionDepth::DecisionOnly,
         )
-        .expect("analyze");
-        let mut shapes: Vec<(String, bool)> = analysis
+        .expect("analyze")
+    }
+
+    /// Each update query's table with its subsumer shape, sorted.
+    fn subsumer_shapes(sql: &str) -> Vec<(String, bool)> {
+        let mut shapes: Vec<(String, bool)> = admission_analysis(sql)
             .tables
             .iter()
             .map(|admission| (admission.table_name.to_string(), admission.subsumer_shape))
@@ -351,51 +356,104 @@ mod tests {
         shapes
     }
 
+    /// Each update query's table with whether the predicate model calls its
+    /// reference exact, sorted.
+    fn reference_exact_shapes(sql: &str) -> Vec<(String, bool)> {
+        let mut shapes: Vec<(String, bool)> = admission_analysis(sql)
+            .tables
+            .iter()
+            .map(|admission| {
+                let update_query = &admission.update_query;
+                let branch = QueryBranch::find(&update_query.bound, update_query.branch)
+                    .expect("the update query's branch");
+                let predicates = query_branch_predicates_build(branch.bound, branch.select);
+                let bindings = branch.bound.bindings();
+                let exact = predicates
+                    .table_references()
+                    .iter()
+                    .find(|reference| {
+                        matches!(bindings.slot(reference.slot),
+                            Some(TableSlot::Base { table, .. }) if table.name == admission.table_name)
+                    })
+                    .and_then(|reference| predicates.table_reference_predicates(reference.slot))
+                    .expect("the table's reference")
+                    .exact;
+                (admission.table_name.to_string(), exact)
+            })
+            .collect();
+        shapes.sort();
+        shapes
+    }
+
+    /// Queries with the subsumer shape of each update query's table.
+    #[rustfmt::skip]
+    const SUBSUMER_SHAPE_CASES: &[(&str, &[(&str, bool)])] = &[
+        ("SELECT * FROM a WHERE x = 1", &[("a", true)]),
+        ("SELECT * FROM a LEFT JOIN b ON b.id = a.id WHERE a.x = 1",
+         &[("a", true), ("b", false)]),
+        ("SELECT * FROM a RIGHT JOIN b ON b.id = a.id WHERE b.x = 1",
+         &[("a", false), ("b", true)]),
+        ("SELECT * FROM a LEFT JOIN (b JOIN c ON c.id = b.id) ON b.id = a.id",
+         &[("a", true), ("b", false), ("c", false)]),
+        ("SELECT * FROM (a LEFT JOIN b ON b.id = a.id) JOIN c ON c.id = a.id",
+         &[("a", false), ("b", false), ("c", false)]),
+        ("SELECT * FROM a, b WHERE a.x = 1",
+         &[("a", false), ("b", false)]),
+        // An ON the extractor can't read drops no preserved row.
+        ("SELECT * FROM a LEFT JOIN b ON b.id = a.id AND b.y = a.x + 1",
+         &[("a", true), ("b", false)]),
+        // A WHERE on the nullable side drops unmatched or matched rows.
+        ("SELECT * FROM a LEFT JOIN b ON b.id = a.id WHERE b.x = 1",
+         &[("a", false), ("b", false)]),
+        ("SELECT * FROM a LEFT JOIN b ON b.id = a.id WHERE b.x IS NULL",
+         &[("a", false), ("b", false)]),
+        ("SELECT * FROM a WHERE x = 1 OR y = 2", &[("a", false)]),
+        // Indexed, but `table_constraints_subsumed` refuses it as a parent.
+        ("SELECT * FROM a WHERE x = y", &[("a", true)]),
+        ("SELECT * FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.id = a.id)",
+         &[("a", false), ("b", false)]),
+        // A derived table's table is judged in its own branch.
+        ("SELECT * FROM a JOIN (SELECT * FROM b WHERE x = 1) d ON d.id = a.id",
+         &[("a", false), ("b", true)]),
+        ("SELECT id FROM a WHERE x = 1 UNION SELECT id FROM b WHERE x = 2",
+         &[("a", true), ("b", true)]),
+        ("SELECT id FROM a WHERE x = 1 UNION SELECT id FROM a WHERE x = 2",
+         &[("a", false), ("a", false)]),
+    ];
+
     /// A table is a subsumer only where population loads every row its
     /// constraints describe: no join on its path can drop one, and WHERE
     /// reads it alone.
     #[test]
     fn test_subsumer_shape_table_complete() {
-        #[rustfmt::skip]
-        let cases: &[(&str, &[(&str, bool)])] = &[
-            ("SELECT * FROM a WHERE x = 1", &[("a", true)]),
-            ("SELECT * FROM a LEFT JOIN b ON b.id = a.id WHERE a.x = 1",
-             &[("a", true), ("b", false)]),
-            ("SELECT * FROM a RIGHT JOIN b ON b.id = a.id WHERE b.x = 1",
-             &[("a", false), ("b", true)]),
-            ("SELECT * FROM a LEFT JOIN (b JOIN c ON c.id = b.id) ON b.id = a.id",
-             &[("a", true), ("b", false), ("c", false)]),
-            ("SELECT * FROM (a LEFT JOIN b ON b.id = a.id) JOIN c ON c.id = a.id",
-             &[("a", false), ("b", false), ("c", false)]),
-            ("SELECT * FROM a, b WHERE a.x = 1",
-             &[("a", false), ("b", false)]),
-            // An ON the extractor can't read drops no preserved row.
-            ("SELECT * FROM a LEFT JOIN b ON b.id = a.id AND b.y = a.x + 1",
-             &[("a", true), ("b", false)]),
-            // A WHERE on the nullable side drops unmatched or matched rows.
-            ("SELECT * FROM a LEFT JOIN b ON b.id = a.id WHERE b.x = 1",
-             &[("a", false), ("b", false)]),
-            ("SELECT * FROM a LEFT JOIN b ON b.id = a.id WHERE b.x IS NULL",
-             &[("a", false), ("b", false)]),
-            ("SELECT * FROM a WHERE x = 1 OR y = 2", &[("a", false)]),
-            // Indexed, but `table_constraints_subsumed` refuses it as a parent.
-            ("SELECT * FROM a WHERE x = y", &[("a", true)]),
-            ("SELECT * FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.id = a.id)",
-             &[("a", false), ("b", false)]),
-            // A derived table's table is judged in its own branch.
-            ("SELECT * FROM a JOIN (SELECT * FROM b WHERE x = 1) d ON d.id = a.id",
-             &[("a", false), ("b", true)]),
-            ("SELECT id FROM a WHERE x = 1 UNION SELECT id FROM b WHERE x = 2",
-             &[("a", true), ("b", true)]),
-            ("SELECT id FROM a WHERE x = 1 UNION SELECT id FROM a WHERE x = 2",
-             &[("a", false), ("a", false)]),
-        ];
-        for (sql, expected) in cases {
+        for (sql, expected) in SUBSUMER_SHAPE_CASES {
             let expected: Vec<(String, bool)> = expected
                 .iter()
                 .map(|(table, shape)| (table.to_string(), *shape))
                 .collect();
             assert_eq!(subsumer_shapes(sql), expected, "{sql}");
+        }
+    }
+
+    /// The predicate model's `exact` agrees with the subsumer shape for
+    /// queries naming each relation once, except where it also refuses a
+    /// same-reference equality.
+    #[test]
+    fn test_reference_exact_agrees_with_subsumer_shape() {
+        let differences: &[(&str, &str)] = &[("SELECT * FROM a WHERE x = y", "a")];
+        for (sql, expected) in SUBSUMER_SHAPE_CASES {
+            let names: HashSet<&str> = expected.iter().map(|(table, _)| *table).collect();
+            if names.len() < expected.len() {
+                continue;
+            }
+            let expected: Vec<(String, bool)> = subsumer_shapes(sql)
+                .into_iter()
+                .map(|(table, shape)| {
+                    let differs = differences.contains(&(*sql, table.as_str()));
+                    (table, shape != differs)
+                })
+                .collect();
+            assert_eq!(reference_exact_shapes(sql), expected, "{sql}");
         }
     }
 }

@@ -9,6 +9,7 @@ pub mod guc;
 pub mod keying_settings;
 pub mod literal_settings;
 pub mod predicate;
+pub mod predicates;
 pub mod resolve;
 pub mod shape;
 pub mod transform;

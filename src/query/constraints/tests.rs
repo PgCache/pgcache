@@ -155,9 +155,9 @@ const CONSTRAINTS_EXPECTED: &[(&str, &[&str], &[&str], &str, bool)] = &[
      "[]",
      true),
     ("SELECT id FROM users WHERE id NOT IN (1, name, 2)",
-     &[r#"Comparison { column: ConstraintColumn { schema: "public", table: "users", alias: None, column: "id" }, op: NotEqual, value: Integer(1) }"#],
+     &[r#"Comparison { column: ConstraintColumn { schema: "public", table: "users", alias: None, column: "id" }, op: NotEqual, value: Integer(1) }"#, r#"Comparison { column: ConstraintColumn { schema: "public", table: "users", alias: None, column: "id" }, op: NotEqual, value: Integer(2) }"#],
      &[],
-     r#"[("users", ["Comparison(\"id\", NotEqual, Integer(1))"])]"#,
+     r#"[("users", ["Comparison(\"id\", NotEqual, Integer(1))", "Comparison(\"id\", NotEqual, Integer(2))"])]"#,
      false),
     ("SELECT id FROM users WHERE id IN (1, name)",
      &[],
@@ -569,12 +569,15 @@ fn test_between_symmetric_extraction_cases() {
             sql: "SELECT * FROM users WHERE id NOT BETWEEN SYMMETRIC 500 AND 100",
             expectations: vec![count(0)],
         },
-        // Non-literal bound (column reference) — skip extraction
+        // A non-literal bound leaves only the literal one
         ExtractionCase {
             label: "between with non literal bounds",
             tables: &["users"],
             sql: "SELECT * FROM users WHERE id BETWEEN name AND 10",
-            expectations: vec![count(0)],
+            expectations: vec![
+                count(1),
+                has(cmp("users", "id", BinaryOp::LessThanOrEqual, int(10))),
+            ],
         },
     ]);
 }

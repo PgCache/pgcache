@@ -1,27 +1,20 @@
 //! The column constraints and equivalences a SELECT's predicates imply,
 //! read from the rope and its bindings.
 
-use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use ecow::EcoString;
 
 use super::query_constraints_build;
-use super::range::{
-    literal_value_canonical_order, literal_value_is_incomparable, literal_value_order,
-};
 use super::{
     ColumnConstraint, ColumnEquivalence, ConstraintColumn, OuterJoinEquality, QueryConstraints,
 };
-use crate::query::ast::rope::{
-    Binary, Column, Join, JoinQual, Literal, Multi, Run, Scalar, ScalarKind, Select, Source, Where,
-    WhereKind,
+use crate::query::ast::JoinType;
+use crate::query::ast::rope::{Join, JoinQual, Select, Source, Where};
+use crate::query::predicates::{
+    BoundColumnConstraint, ColumnConstraintKind, ConjunctForm, conjunct_parts_collect,
 };
-use crate::query::ast::{BinaryOp, JoinType, LiteralValue, MultiOp};
-use crate::query::cast::{
-    CastTarget, cast_target_is_coercion_supported, comparison_canonicalize, scalar_leaf,
-};
-use crate::query::resolve::{Bindings, ResolvedQuery, SlotId};
+use crate::query::resolve::{Bindings, ColumnBinding, ResolvedQuery, SlotId};
 
 struct Collector<'a> {
     bound: &'a ResolvedQuery,
@@ -76,37 +69,9 @@ pub fn query_constraints_analyze(bound: &ResolvedQuery, select: Select<'_>) -> Q
     )
 }
 
-/// The column and literal of `exprs[index]` when it is a bare column or
-/// literal, as the extractors pattern-match the operand list.
-enum Operand<'t> {
-    Column(Column<'t>),
-    Literal(Literal<'t>),
-    Other,
-}
-
-fn operand(expr: Where<'_>) -> Operand<'_> {
-    match expr.kind() {
-        WhereKind::Scalar(scalar) => match scalar.kind() {
-            ScalarKind::Column(column) => Operand::Column(column),
-            ScalarKind::Literal(literal) => Operand::Literal(literal),
-            ScalarKind::Function(_)
-            | ScalarKind::Case(_)
-            | ScalarKind::Arithmetic(_)
-            | ScalarKind::Subquery(_)
-            | ScalarKind::Array(_)
-            | ScalarKind::TypeCast(_) => Operand::Other,
-        },
-        WhereKind::Unary(_)
-        | WhereKind::Binary(_)
-        | WhereKind::Multi(_)
-        | WhereKind::Subquery(_) => Operand::Other,
-    }
-}
-
 impl Collector<'_> {
-    /// The column a reference stands for, with the slot it binds to.
-    fn column_resolve(&self, column: Column<'_>) -> Option<(ConstraintColumn, SlotId)> {
-        let binding = self.bound.column_binding_at(column.id())?;
+    /// The column a binding stands for, with its slot.
+    fn column_resolve(&self, binding: ColumnBinding) -> Option<(ConstraintColumn, SlotId)> {
         let constraint_column = ConstraintColumn::of_binding(self.bound.bindings(), binding)?;
         Some((constraint_column, binding.slot))
     }
@@ -195,105 +160,30 @@ impl Collector<'_> {
     }
 
     fn where_analyze(&mut self, expr: Where<'_>) {
-        match expr.kind() {
-            WhereKind::Binary(binary) if binary.op().is_comparison() => {
-                self.comparison_analyze(binary);
-            }
-            WhereKind::Binary(binary) if binary.op() == BinaryOp::And => {
-                self.where_analyze(binary.lexpr());
-                self.where_analyze(binary.rexpr());
-            }
-            WhereKind::Multi(multi) => self.multi_analyze(multi),
-            WhereKind::Scalar(_)
-            | WhereKind::Unary(_)
-            | WhereKind::Binary(_)
-            | WhereKind::Subquery(_) => self.complete = false,
+        let mut parts = Vec::new();
+        conjunct_parts_collect(self.bound, expr, &mut parts);
+        for part in parts {
+            self.form_insert(&part.form);
         }
     }
 
-    fn comparison_analyze(&mut self, binary: Binary<'_>) {
-        if let Some((column, target, op, value)) = comparison_canonicalize(self.bound, binary) {
-            self.canonical_insert(column, target, op, value);
-        } else if let Some((left, right)) = self.column_pair(binary) {
-            self.equality_insert(left, right);
-        } else {
-            self.complete = false;
-        }
-    }
-
-    /// `column op value`, or `column::cast op value` under a supported
-    /// coercion; any other cast leaves the analysis incomplete.
-    fn canonical_insert(
-        &mut self,
-        column: Column<'_>,
-        target: Option<&CastTarget>,
-        op: BinaryOp,
-        value: &LiteralValue,
-    ) {
-        let (Some((constraint_column, slot)), Some(base)) = (
-            self.column_resolve(column),
-            self.bound.column_type_at(column.id()),
-        ) else {
-            self.complete = false;
-            return;
-        };
-        match target {
-            None => {
-                self.constraint_insert(
-                    slot,
-                    ColumnConstraint::Comparison {
-                        column: constraint_column,
-                        op,
-                        value: value.clone(),
-                    },
-                );
+    fn form_insert(&mut self, form: &ConjunctForm) {
+        match form {
+            ConjunctForm::Constraint(constraint) => {
+                match column_constraint_build(self.bound.bindings(), constraint) {
+                    Some(column_constraint) => {
+                        self.constraint_insert(constraint.column.slot, column_constraint);
+                    }
+                    None => self.complete = false,
+                }
             }
-            Some(cast) if cast_target_is_coercion_supported(cast, base) => {
-                self.constraint_insert(
-                    slot,
-                    ColumnConstraint::CastComparison {
-                        column: constraint_column,
-                        cast: cast.clone(),
-                        op,
-                        value: value.clone(),
-                    },
-                );
+            ConjunctForm::Equality(left, right) => {
+                match (self.column_resolve(*left), self.column_resolve(*right)) {
+                    (Some(left), Some(right)) => self.equality_insert(left, right),
+                    _ => self.complete = false,
+                }
             }
-            Some(_) => self.complete = false,
-        }
-    }
-
-    /// The two columns of a `column = column` equality.
-    fn column_pair(
-        &self,
-        binary: Binary<'_>,
-    ) -> Option<((ConstraintColumn, SlotId), (ConstraintColumn, SlotId))> {
-        if binary.op() != BinaryOp::Equal {
-            return None;
-        }
-        let left = scalar_leaf(self.bound, binary.lexpr())?;
-        let right = scalar_leaf(self.bound, binary.rexpr())?;
-        let (ScalarKind::Column(left), ScalarKind::Column(right)) = (left.kind(), right.kind())
-        else {
-            return None;
-        };
-        Some((self.column_resolve(left)?, self.column_resolve(right)?))
-    }
-
-    fn multi_analyze(&mut self, multi: Multi<'_>) {
-        match multi.op() {
-            MultiOp::Between | MultiOp::BetweenSymmetric => self.between_extract(multi),
-            MultiOp::In => self.in_extract(multi.exprs()),
-            MultiOp::NotIn => self.not_in_extract(multi.exprs()),
-            // `col = ANY(<array literal>)` is `col IN (<elements>)` for set
-            // membership (PGC-106); other comparisons under ANY are not.
-            MultiOp::Any {
-                comparison: BinaryOp::Equal,
-            } => self.any_eq_array_extract(multi.exprs()),
-            MultiOp::NotBetween
-            | MultiOp::NotBetweenSymmetric
-            | MultiOp::Any { .. }
-            | MultiOp::All { .. } => self.complete = false,
+            ConjunctForm::Opaque => self.complete = false,
         }
     }
 
@@ -346,146 +236,6 @@ impl Collector<'_> {
             None
         }
     }
-
-    fn between_extract(&mut self, multi: Multi<'_>) {
-        let mut exprs = multi.exprs();
-        let (Some(first), Some(second), Some(third), None) =
-            (exprs.next(), exprs.next(), exprs.next(), exprs.next())
-        else {
-            self.complete = false;
-            return;
-        };
-        let (Operand::Column(column), Operand::Literal(low), Operand::Literal(high)) =
-            (operand(first), operand(second), operand(third))
-        else {
-            self.complete = false;
-            return;
-        };
-        let Some((column, slot)) = self.column_resolve(column) else {
-            self.complete = false;
-            return;
-        };
-        let (low, high) = (low.value(), high.value());
-        let (low, high) = if multi.op() == MultiOp::BetweenSymmetric {
-            match literal_value_order(low, high) {
-                Some(Ordering::Greater) => (high, low),
-                Some(_) => (low, high),
-                None => {
-                    self.complete = false;
-                    return;
-                }
-            }
-        } else {
-            (low, high)
-        };
-        self.constraint_insert(
-            slot,
-            ColumnConstraint::Comparison {
-                column: column.clone(),
-                op: BinaryOp::GreaterThanOrEqual,
-                value: low.clone(),
-            },
-        );
-        self.constraint_insert(
-            slot,
-            ColumnConstraint::Comparison {
-                column,
-                op: BinaryOp::LessThanOrEqual,
-                value: high.clone(),
-            },
-        );
-    }
-
-    /// The subject column and the literal values after it, when the
-    /// operands are exactly that; `None` otherwise.
-    fn column_and_literals<'t>(
-        &self,
-        mut exprs: Run<'t, Where<'t>>,
-    ) -> Option<(ConstraintColumn, SlotId, Vec<LiteralValue>)> {
-        let Some(Operand::Column(column)) = exprs.next().map(operand) else {
-            return None;
-        };
-        let (column, slot) = self.column_resolve(column)?;
-        let mut values = Vec::new();
-        for expr in exprs {
-            let Operand::Literal(literal) = operand(expr) else {
-                return None;
-            };
-            if literal_value_is_incomparable(literal.value()) {
-                return None;
-            }
-            values.push(literal.value().clone());
-        }
-        Some((column, slot, values))
-    }
-
-    fn in_extract<'t>(&mut self, exprs: Run<'t, Where<'t>>) {
-        let Some((column, slot, mut values)) = self.column_and_literals(exprs) else {
-            self.complete = false;
-            return;
-        };
-        values.sort_by(literal_value_canonical_order);
-        values.dedup();
-        self.constraint_insert(slot, ColumnConstraint::InSet { column, values });
-    }
-
-    fn any_eq_array_extract<'t>(&mut self, mut exprs: Run<'t, Where<'t>>) {
-        let (Some(first), Some(second), None) = (exprs.next(), exprs.next(), exprs.next()) else {
-            self.complete = false;
-            return;
-        };
-        let (Operand::Column(column), WhereKind::Scalar(rhs)) = (operand(first), second.kind())
-        else {
-            self.complete = false;
-            return;
-        };
-        let Some(mut values) = array_literal_values(rhs) else {
-            self.complete = false;
-            return;
-        };
-        if values.iter().any(literal_value_is_incomparable) {
-            self.complete = false;
-            return;
-        }
-        let Some((column, slot)) = self.column_resolve(column) else {
-            self.complete = false;
-            return;
-        };
-        values.sort_by(literal_value_canonical_order);
-        values.dedup();
-        self.constraint_insert(slot, ColumnConstraint::InSet { column, values });
-    }
-
-    /// Each `col <> value` up to the first operand that is not a comparable
-    /// literal.
-    fn not_in_extract<'t>(&mut self, mut exprs: Run<'t, Where<'t>>) {
-        let Some(Operand::Column(column)) = exprs.next().map(operand) else {
-            self.complete = false;
-            return;
-        };
-        let Some((column, slot)) = self.column_resolve(column) else {
-            self.complete = false;
-            return;
-        };
-        for expr in exprs {
-            let Operand::Literal(literal) = operand(expr) else {
-                self.complete = false;
-                return;
-            };
-            if literal_value_is_incomparable(literal.value()) {
-                self.complete = false;
-                return;
-            }
-            self.constraint_insert(
-                slot,
-                ColumnConstraint::Comparison {
-                    column: column.clone(),
-                    op: BinaryOp::NotEqual,
-                    value: literal.value().clone(),
-                },
-            );
-        }
-    }
 }
 
 /// The slot of every table, derived table and CTE reference under `source`.
@@ -503,35 +253,29 @@ fn source_slots_collect(bindings: &Bindings, source: Source<'_>, slots: &mut Has
     slots.extend(bindings.source(id));
 }
 
-/// The elements of an array literal or an `ARRAY[...]` of literals.
-fn array_literal_values(rhs: Scalar<'_>) -> Option<Vec<LiteralValue>> {
-    match rhs.kind() {
-        ScalarKind::Literal(literal) => match literal.value() {
-            LiteralValue::Array(values, _) => Some(values.clone()),
-            LiteralValue::String(_)
-            | LiteralValue::StringWithCast(..)
-            | LiteralValue::Integer(_)
-            | LiteralValue::Float(_)
-            | LiteralValue::Boolean(_)
-            | LiteralValue::Null
-            | LiteralValue::NullWithCast(_)
-            | LiteralValue::Parameter(_) => None,
+/// `constraint` keyed by the column's table name.
+fn column_constraint_build(
+    bindings: &Bindings,
+    constraint: &BoundColumnConstraint,
+) -> Option<ColumnConstraint> {
+    let column = ConstraintColumn::of_binding(bindings, constraint.column)?;
+    Some(match &constraint.kind {
+        ColumnConstraintKind::Comparison { op, value } => ColumnConstraint::Comparison {
+            column,
+            op: *op,
+            value: value.clone(),
         },
-        ScalarKind::Array(array) => {
-            let mut out = Vec::with_capacity(array.elements().len());
-            for element in array.elements() {
-                let ScalarKind::Literal(literal) = element.kind() else {
-                    return None;
-                };
-                out.push(literal.value().clone());
+        ColumnConstraintKind::AnyOf(values) => ColumnConstraint::InSet {
+            column,
+            values: values.clone(),
+        },
+        ColumnConstraintKind::CastComparison { cast, op, value } => {
+            ColumnConstraint::CastComparison {
+                column,
+                cast: cast.clone(),
+                op: *op,
+                value: value.clone(),
             }
-            Some(out)
         }
-        ScalarKind::Column(_)
-        | ScalarKind::Function(_)
-        | ScalarKind::Case(_)
-        | ScalarKind::Arithmetic(_)
-        | ScalarKind::Subquery(_)
-        | ScalarKind::TypeCast(_) => None,
-    }
+    })
 }

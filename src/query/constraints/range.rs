@@ -41,7 +41,7 @@ pub(crate) enum ColumnRange {
 }
 
 /// Returns true if the value is incomparable for range analysis (Parameter, Null, NullWithCast).
-pub(super) fn literal_value_is_incomparable(v: &LiteralValue) -> bool {
+pub(crate) fn literal_value_is_incomparable(v: &LiteralValue) -> bool {
     matches!(
         v,
         LiteralValue::Parameter(_) | LiteralValue::Null | LiteralValue::NullWithCast(_)
@@ -469,7 +469,7 @@ pub(super) fn column_range_subsumes(cached: &ColumnRange, new: &ColumnRange) -> 
 /// 'B'` in bytes but `'a' < 'B'` under en_US), so an ordering claim over text
 /// could prove a false exclusion and serve stale data (PGC-446). String
 /// *equality* is decided by `range_overlap::literal_value_eq` instead.
-pub(super) fn literal_value_order(
+pub(crate) fn literal_value_order(
     a: &LiteralValue,
     b: &LiteralValue,
 ) -> Option<std::cmp::Ordering> {
@@ -484,7 +484,7 @@ pub(super) fn literal_value_order(
 /// dedup) — never a PostgreSQL-semantic claim, so byte order on strings is
 /// fine here. Incomparable pairs order as equal, matching the previous
 /// `unwrap_or(Equal)` at the sort sites.
-pub(super) fn literal_value_canonical_order(a: &LiteralValue, b: &LiteralValue) -> Ordering {
+pub(crate) fn literal_value_canonical_order(a: &LiteralValue, b: &LiteralValue) -> Ordering {
     match (a, b) {
         (LiteralValue::Integer(a), LiteralValue::Integer(b)) => a.cmp(b),
         (LiteralValue::Float(a), LiteralValue::Float(b)) => a.cmp(b),

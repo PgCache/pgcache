@@ -32,7 +32,10 @@ mod tree;
 pub use subsume::table_constraints_subsumed;
 pub use tree::query_constraints_analyze;
 
-pub(crate) use range::{ColumnRange, column_range_build};
+pub(crate) use range::{
+    ColumnRange, column_range_build, literal_value_canonical_order, literal_value_is_incomparable,
+    literal_value_order,
+};
 #[cfg(feature = "proxy")]
 pub(crate) use range_overlap::{
     column_range_contains, column_ranges_disjoint, column_ranges_from_comparisons,

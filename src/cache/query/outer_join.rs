@@ -137,6 +137,7 @@ mod tests {
     use super::*;
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
     use crate::oid::{Oid, TypeOid};
+    use crate::query::predicates::{OuterJoinRole, query_branch_predicates_build};
     use crate::query::resolve::ResolvedQuery;
 
     /// Create test table metadata with given column names.
@@ -312,5 +313,60 @@ mod tests {
             outer_join_optional_tables(&bound, bound.select().expect("a SELECT"));
         assert!(terminal.is_empty());
         assert!(non_terminal.is_empty());
+    }
+
+    /// The predicate model's outer-join role agrees with terminality,
+    /// except that it keeps a table whose outer join a NULL-rejecting
+    /// conjunct above reduces, where terminality still calls it optional.
+    #[test]
+    fn test_outer_join_role_agrees_with_terminality() {
+        #[rustfmt::skip]
+        let cases: &[(&str, &[&str])] = &[
+            ("SELECT a.id, b.name FROM a LEFT JOIN b ON a.id = b.a_id WHERE a.id = 1", &[]),
+            ("SELECT * FROM a LEFT JOIN b ON a.id = b.a_id WHERE b.status = 'active'", &["b"]),
+            ("SELECT * FROM a LEFT JOIN b ON a.id = b.a_id JOIN c ON b.val = c.val", &["b"]),
+            ("SELECT * FROM a LEFT JOIN b ON a.id = b.a_id LEFT JOIN c ON b.x = c.x", &[]),
+            ("SELECT * FROM a RIGHT JOIN b ON a.id = b.a_id WHERE b.id = 1", &[]),
+            ("SELECT * FROM a RIGHT JOIN b ON a.id = b.a_id WHERE a.status = 'active'", &["a"]),
+            ("SELECT * FROM a JOIN b ON a.id = b.id WHERE b.x = 1", &[]),
+            ("SELECT a.id, t.name FROM a LEFT JOIN b t ON a.id = t.a_id WHERE a.id = 1", &[]),
+            ("SELECT * FROM a LEFT JOIN b t ON a.id = t.a_id WHERE t.status = 'active'", &["b"]),
+            ("SELECT * FROM a JOIN b ON a.id = b.a_id LEFT JOIN c ON b.id = c.b_id WHERE a.id = 1",
+             &[]),
+            ("SELECT * FROM a LEFT JOIN b ON a.id = b.a_id WHERE b.status IS NULL", &[]),
+        ];
+        for (sql, reduced) in cases {
+            let bound = bind(sql, &terminality_test_tables());
+            let select = bound.select().expect("a SELECT");
+            let (terminal, non_terminal) = outer_join_optional_tables(&bound, select);
+            let predicates = query_branch_predicates_build(&bound, select);
+            for reference in predicates.table_references() {
+                let table = bound
+                    .bindings()
+                    .slot(reference.slot)
+                    .expect("slot")
+                    .table()
+                    .name
+                    .clone();
+                let expected = if reduced.contains(&table.as_str()) {
+                    assert!(
+                        non_terminal.contains(&table),
+                        "{sql}: {table} optional today"
+                    );
+                    OuterJoinRole::Kept
+                } else if terminal.contains(&table) {
+                    OuterJoinRole::Terminal
+                } else if non_terminal.contains(&table) {
+                    OuterJoinRole::Optional
+                } else {
+                    OuterJoinRole::Kept
+                };
+                let role = predicates
+                    .table_reference_predicates(reference.slot)
+                    .expect("reference predicates")
+                    .outer_join_role;
+                assert_eq!(role, expected, "{sql}: {table}");
+            }
+        }
     }
 }
