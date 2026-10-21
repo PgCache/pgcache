@@ -1,6 +1,9 @@
 use std::io::Error;
 
-use crate::util::{TestContext, assert_cache_hit, assert_cache_miss, assert_row_at};
+use crate::util::{
+    TestContext, assert_cache_hit, assert_cache_miss, assert_proxy_rows_match_origin,
+    assert_row_at, query_warm,
+};
 
 mod util;
 
@@ -1081,5 +1084,49 @@ async fn test_unrecognized_where_conjunct_uncached_update_invalidates() -> Resul
     .await?;
     assert_eq!(origin.len(), 2, "user 2 now passes with order 20");
     assert_eq!(proxied, origin);
+    Ok(())
+}
+
+/// Contrast to PGC-520's in-place cases: an inner-join partner is loaded only
+/// through its join with the changing row. An order moving to an EU customer
+/// that had no orders needs that customer, which was never loaded, so the
+/// UPDATE must invalidate.
+#[tokio::test]
+async fn test_inner_join_partner_never_loaded_update_invalidates() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    ctx.query(
+        "CREATE TABLE customers (id INTEGER PRIMARY KEY, region TEXT)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO customers (id, region) VALUES (1, 'EU'), (2, 'EU'), (3, 'US'), (4, 'EU')",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO orders (id, customer_id) VALUES (10, 1), (11, 3), (12, 2)",
+        &[],
+    )
+    .await?;
+    ctx.cdc_decode_settle().await?;
+
+    let query = "SELECT o.id FROM orders o JOIN customers c ON c.id = o.customer_id \
+                 WHERE c.region = 'EU' ORDER BY o.id";
+    let m = query_warm(&mut ctx, query).await?;
+
+    ctx.origin_query("UPDATE orders SET customer_id = 4 WHERE id = 11", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+    assert_proxy_rows_match_origin(&mut ctx, query).await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+    assert_proxy_rows_match_origin(&mut ctx, query).await?;
+    assert_cache_hit(&mut ctx, m).await?;
     Ok(())
 }

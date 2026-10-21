@@ -416,12 +416,16 @@ mod tests {
             ("SELECT * FROM a JOIN b ON b.id = a.x + 1", &[("a", &["x"]), ("b", &["id"])]),
             ("SELECT * FROM a JOIN b ON b.id = a.id WHERE a.x < b.y",
              &[("a", &["id", "x"]), ("b", &["id", "y"])]),
+            // A terminal reference has no links; the preserved side keeps its ON's.
             ("SELECT * FROM a LEFT JOIN b ON b.id = a.id AND a.x = 1",
-             &[("a", &["id", "x"]), ("b", &["id"])]),
+             &[("a", &["id", "x"]), ("b", &[])]),
             // One update query per reference, each with its own links.
             ("SELECT * FROM a e JOIN a m ON m.id = e.x",
              &[("a", &["id"]), ("a", &["x"])]),
-            ("SELECT * FROM a WHERE x IN (SELECT id FROM b)", &[("a", &["x"]), ("b", &[])]),
+            // An uncorrelated subquery's own read loads its rows, so it links nothing.
+            ("SELECT * FROM a WHERE x IN (SELECT id FROM b)", &[("a", &[]), ("b", &[])]),
+            ("SELECT * FROM a WHERE x NOT IN (SELECT id FROM b WHERE y > 1)",
+             &[("a", &[]), ("b", &[])]),
         ];
         for (sql, expected) in cases {
             let mut actual: Vec<(String, Vec<String>)> = admission_analysis(sql)

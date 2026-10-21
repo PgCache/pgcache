@@ -24,7 +24,7 @@ pub(crate) use context::{TestContext, cache_settle_at, lsn_parse};
 pub(crate) use http::{http_get, http_post, http_put};
 pub(crate) use metrics::{
     MetricsSnapshot, assert_cache_hit, assert_cache_miss, assert_not_subsumed, assert_subsume_hit,
-    metrics_after_outcomes, metrics_delta, metrics_http_get,
+    metrics_after_outcomes, metrics_delta, metrics_http_get, query_warm,
 };
 pub(crate) use pgproto::pgproto_run;
 pub(crate) use process::{

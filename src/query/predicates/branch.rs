@@ -200,6 +200,7 @@ fn conjuncts_from_join(
                     form: ConjunctForm::Equality(merged.left, merged.right),
                     columns: vec![merged.left, merged.right],
                     external: false,
+                    correlated: false,
                 });
             }
         }
@@ -219,16 +220,27 @@ fn conjunct_build(
     let bindings = bound.bindings();
     let mut columns = Vec::new();
     let mut nested_slots = HashSet::new();
+    let mut nested_queries = Vec::new();
+    let mut nested_columns = Vec::new();
     for operand in &part.operands {
         for position in operand.subtree() {
             let kind = position.kind();
+            let index = position.id().index();
             if matches!(kind, NodeKind::Column { .. }) {
                 let target = bindings.column_by_id(position.id());
                 for binding in column_bindings(branch, bindings, target) {
+                    if nested_queries
+                        .iter()
+                        .any(|&(start, end)| (start..end).contains(&index))
+                    {
+                        nested_columns.push(binding);
+                    }
                     if !columns.contains(&binding) {
                         columns.push(binding);
                     }
                 }
+            } else if matches!(kind, NodeKind::Query { .. }) {
+                nested_queries.push((index, position.end() as usize));
             } else if matches!(
                 kind,
                 NodeKind::Table { .. } | NodeKind::Subquery { .. } | NodeKind::CteRef { .. }
@@ -240,11 +252,15 @@ fn conjunct_build(
     let external = columns.iter().any(|binding| {
         !nested_slots.contains(&binding.slot) && branch.reference_index(binding.slot).is_none()
     });
+    let correlated = nested_columns
+        .iter()
+        .any(|binding| !nested_slots.contains(&binding.slot));
     Conjunct {
         scope,
         form: part.form,
         columns,
         external,
+        correlated,
     }
 }
 

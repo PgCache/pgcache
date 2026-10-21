@@ -2,7 +2,7 @@ use std::io::Error;
 
 use crate::util::{
     TestContext, assert_cache_hit, assert_cache_miss, assert_limit_order_decides,
-    assert_proxy_rows_match_origin, assert_row_at,
+    assert_proxy_rows_match_origin, assert_row_at, query_warm,
 };
 
 mod util;
@@ -815,20 +815,6 @@ async fn setup_posts_table(ctx: &mut TestContext, rows: &str) -> Result<(), Erro
     Ok(())
 }
 
-/// Warm `query` into cache: miss → settle → a hit serving origin's rows.
-/// Returns the metrics baseline.
-async fn warm_query(
-    ctx: &mut TestContext,
-    query: &str,
-) -> Result<crate::util::MetricsSnapshot, Error> {
-    let m = ctx.metrics().await?;
-    ctx.simple_query(query).await?;
-    let m = assert_cache_miss(ctx, m).await?;
-    ctx.cache_settle().await?;
-    assert_proxy_rows_match_origin(ctx, query).await?;
-    assert_cache_hit(ctx, m).await
-}
-
 /// A sort-key rise under DESC is a promotion: the row can only push
 /// already-cached rows down, so the window is maintained in place — cache hit,
 /// re-sorted result, no invalidation (PGC-334).
@@ -839,7 +825,7 @@ async fn test_limit_cdc_promotion_desc_keeps_cache() -> Result<(), Error> {
 
     let query = "SELECT id, score FROM posts WHERE owner = 10 ORDER BY score DESC LIMIT 2";
     assert_limit_order_decides(&ctx, query).await?;
-    let m = warm_query(&mut ctx, query).await?;
+    let m = query_warm(&mut ctx, query).await?;
 
     ctx.origin_query("UPDATE posts SET score = 100 WHERE id = 2", &[])
         .await?;
@@ -863,7 +849,7 @@ async fn test_limit_cdc_direction_asc() -> Result<(), Error> {
 
     let query = "SELECT id, score FROM posts WHERE owner = 10 ORDER BY score ASC LIMIT 2";
     assert_limit_order_decides(&ctx, query).await?;
-    let m = warm_query(&mut ctx, query).await?;
+    let m = query_warm(&mut ctx, query).await?;
 
     // Promotion (ASC: value falls): in place, cache hit, re-sorted.
     ctx.origin_query("UPDATE posts SET score = 5 WHERE id = 2", &[])
@@ -897,7 +883,7 @@ async fn test_limit_cdc_null_transitions_nulls_last() -> Result<(), Error> {
 
     let query =
         "SELECT id, score FROM posts WHERE owner = 10 ORDER BY score DESC NULLS LAST LIMIT 3";
-    let m = warm_query(&mut ctx, query).await?;
+    let m = query_warm(&mut ctx, query).await?;
 
     // NULL → value with NULLS LAST: the row leaves the trailing NULL region —
     // promotion, maintained in place.
@@ -944,7 +930,7 @@ async fn test_limit_cdc_multi_key_tiebreak_direction() -> Result<(), Error> {
     let query = "SELECT id, tiebreak FROM posts WHERE owner = 10 \
                  ORDER BY score DESC, tiebreak ASC LIMIT 2";
     assert_limit_order_decides(&ctx, query).await?;
-    let m = warm_query(&mut ctx, query).await?;
+    let m = query_warm(&mut ctx, query).await?;
 
     // Tiebreak falls (ASC key): promotion — post 2 overtakes post 1 in place.
     ctx.origin_query("UPDATE posts SET tiebreak = 4 WHERE id = 2", &[])
@@ -976,7 +962,7 @@ async fn test_limit_cdc_alias_sort_key_promotion() -> Result<(), Error> {
 
     let query = "SELECT id, score AS s FROM posts WHERE owner = 10 ORDER BY s DESC LIMIT 2";
     assert_limit_order_decides(&ctx, query).await?;
-    let m = warm_query(&mut ctx, query).await?;
+    let m = query_warm(&mut ctx, query).await?;
 
     ctx.origin_query("UPDATE posts SET score = 100 WHERE id = 2", &[])
         .await?;
@@ -1000,7 +986,7 @@ async fn test_limit_cdc_expression_sort_key_stays_conservative() -> Result<(), E
 
     let query = "SELECT id, score FROM posts WHERE owner = 10 ORDER BY score + 0 DESC LIMIT 2";
     assert_limit_order_decides(&ctx, query).await?;
-    let m = warm_query(&mut ctx, query).await?;
+    let m = query_warm(&mut ctx, query).await?;
 
     ctx.origin_query("UPDATE posts SET score = 100 WHERE id = 2", &[])
         .await?;

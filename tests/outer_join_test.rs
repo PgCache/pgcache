@@ -14,8 +14,8 @@
 use std::io::Error;
 
 use crate::util::{
-    TestContext, assert_cache_hit, assert_cache_miss, assert_not_subsumed, assert_row_at,
-    assert_subsume_hit,
+    MetricsSnapshot, TestContext, assert_cache_hit, assert_cache_miss, assert_not_subsumed,
+    assert_proxy_rows_match_origin, assert_row_at, assert_subsume_hit, query_warm,
 };
 
 mod util;
@@ -1055,4 +1055,258 @@ async fn test_nested_null_side_partner_cdc_insert() -> Result<(), Error> {
         assert_eq!(proxied, origin, "{label}: b 6 attaches c 7");
     }
     Ok(())
+}
+
+// =============================================================================
+// Terminal and optional link columns (PGC-520)
+// =============================================================================
+
+/// `authors` 1 and 2 (NZ) and 3 (AU); `bios` 100 (author 1) and 101
+/// (author 2).
+async fn setup_authors_bios(ctx: &mut TestContext) -> Result<(), Error> {
+    ctx.query(
+        "CREATE TABLE authors (id INTEGER PRIMARY KEY, country TEXT)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "CREATE TABLE bios (id INTEGER PRIMARY KEY, author_id INTEGER, note TEXT)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO authors (id, country) VALUES (1, 'NZ'), (2, 'NZ'), (3, 'AU')",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO bios (id, author_id, note) VALUES (100, 1, 'first'), (101, 2, 'second')",
+        &[],
+    )
+    .await?;
+    ctx.cdc_decode_settle().await
+}
+
+/// Applies `update` on origin, then asserts the next read serves origin's
+/// rows from cache. Returns the metrics after that hit.
+async fn update_applied_in_place(
+    ctx: &mut TestContext,
+    m: MetricsSnapshot,
+    update: &str,
+    query: &str,
+) -> Result<MetricsSnapshot, Error> {
+    ctx.origin_query(update, &[]).await?;
+    ctx.cdc_apply_settle().await?;
+    assert_proxy_rows_match_origin(ctx, query).await?;
+    assert_cache_hit(ctx, m).await
+}
+
+/// Applies `update` on origin, then asserts it invalidated: the next read
+/// misses, and once repopulated a hit serves origin's rows.
+async fn update_invalidates(
+    ctx: &mut TestContext,
+    m: MetricsSnapshot,
+    update: &str,
+    query: &str,
+) -> Result<(), Error> {
+    ctx.origin_query(update, &[]).await?;
+    ctx.cdc_apply_settle().await?;
+    assert_proxy_rows_match_origin(ctx, query).await?;
+    let m = assert_cache_miss(ctx, m).await?;
+    ctx.cache_settle().await?;
+    assert_proxy_rows_match_origin(ctx, query).await?;
+    assert_cache_hit(ctx, m).await?;
+    Ok(())
+}
+
+/// A terminal side's join column moves its row to another preserved row in
+/// place: every preserved row is in the result, so it's cached (PGC-520).
+#[tokio::test]
+async fn test_terminal_join_column_update_applied_in_place() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_authors_bios(&mut ctx).await?;
+
+    let query = "SELECT a.id, b.id AS bio FROM authors a \
+                 LEFT JOIN bios b ON b.author_id = a.id ORDER BY a.id";
+    let m = query_warm(&mut ctx, query).await?;
+    update_applied_in_place(
+        &mut ctx,
+        m,
+        "UPDATE bios SET author_id = 3 WHERE id = 101",
+        query,
+    )
+    .await?;
+    Ok(())
+}
+
+/// The same through an expression ON, which the model can't read as an
+/// equality (PGC-520).
+#[tokio::test]
+async fn test_terminal_expression_join_update_applied_in_place() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    ctx.query(
+        "CREATE TABLE people (id INTEGER PRIMARY KEY, email TEXT)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "CREATE TABLE profiles (id INTEGER PRIMARY KEY, email TEXT)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO people (id, email) VALUES (1, 'ann@x'), (2, 'bob@x'), (3, 'cy@x')",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO profiles (id, email) VALUES (100, 'ANN@x')",
+        &[],
+    )
+    .await?;
+    ctx.cdc_decode_settle().await?;
+
+    let query = "SELECT p.id, f.id AS profile FROM people p \
+                 LEFT JOIN profiles f ON lower(f.email) = lower(p.email) ORDER BY p.id";
+    let m = query_warm(&mut ctx, query).await?;
+    update_applied_in_place(
+        &mut ctx,
+        m,
+        "UPDATE profiles SET email = 'CY@x' WHERE id = 100",
+        query,
+    )
+    .await?;
+    Ok(())
+}
+
+/// A terminal row moving to a preserved row the WHERE excludes needs nothing
+/// uncached: that row is out of the result whatever the terminal side does
+/// (PGC-520).
+#[tokio::test]
+async fn test_terminal_update_to_filtered_preserved_row_applied_in_place() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_authors_bios(&mut ctx).await?;
+
+    let query = "SELECT a.id, b.id AS bio FROM authors a \
+                 LEFT JOIN bios b ON b.author_id = a.id WHERE a.country = 'NZ' ORDER BY a.id";
+    let m = query_warm(&mut ctx, query).await?;
+    update_applied_in_place(
+        &mut ctx,
+        m,
+        "UPDATE bios SET author_id = 3 WHERE id = 101",
+        query,
+    )
+    .await?;
+    Ok(())
+}
+
+/// A terminal side whose preserved partner is inner-joined, so not exact,
+/// still re-attaches in place: the preserved rows in the result are cached,
+/// and one the inner join drops adds no row (PGC-520).
+#[tokio::test]
+async fn test_terminal_update_with_inner_joined_partner_applied_in_place() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    ctx.query("CREATE TABLE members (id INTEGER PRIMARY KEY)", &[])
+        .await?;
+    ctx.query(
+        "CREATE TABLE posts (id INTEGER PRIMARY KEY, member_id INTEGER)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "CREATE TABLE likes (id INTEGER PRIMARY KEY, post_id INTEGER, member_id INTEGER)",
+        &[],
+    )
+    .await?;
+    ctx.query("INSERT INTO members (id) VALUES (1), (2)", &[])
+        .await?;
+    // Post 12's member doesn't exist, so the inner join drops it.
+    ctx.query(
+        "INSERT INTO posts (id, member_id) VALUES (10, 1), (11, 2), (12, 9)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO likes (id, post_id, member_id) VALUES (100, 10, 1)",
+        &[],
+    )
+    .await?;
+    ctx.cdc_decode_settle().await?;
+
+    let query = "SELECT p.id, l.id AS like_id FROM posts p JOIN members m ON m.id = p.member_id \
+                 LEFT JOIN likes l ON l.post_id = p.id AND l.member_id = m.id ORDER BY p.id";
+    let mut m = query_warm(&mut ctx, query).await?;
+    for update in [
+        "UPDATE likes SET post_id = 11, member_id = 2 WHERE id = 100",
+        "UPDATE likes SET post_id = 12, member_id = 9 WHERE id = 100",
+    ] {
+        m = update_applied_in_place(&mut ctx, m, update, query).await?;
+    }
+    Ok(())
+}
+
+/// Contrast: an anti-join's WHERE mentions the outer side, so it is optional.
+/// Moving a bio exposes an author that was never loaded, and the UPDATE must
+/// invalidate.
+#[tokio::test]
+async fn test_anti_join_optional_side_update_invalidates() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_authors_bios(&mut ctx).await?;
+
+    let query = "SELECT a.id FROM authors a \
+                 LEFT JOIN bios b ON b.author_id = a.id WHERE b.id IS NULL ORDER BY a.id";
+    let m = query_warm(&mut ctx, query).await?;
+    update_invalidates(
+        &mut ctx,
+        m,
+        "UPDATE bios SET author_id = 3 WHERE id = 101",
+        query,
+    )
+    .await
+}
+
+/// Contrast: a NULL-filled side with a partner beside it is optional. Moving a
+/// bio to a photo no result row used needs that photo, which was never loaded,
+/// and the UPDATE must invalidate.
+#[tokio::test]
+async fn test_null_side_with_partner_update_invalidates() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    ctx.query("CREATE TABLE writers (id INTEGER PRIMARY KEY)", &[])
+        .await?;
+    ctx.query(
+        "CREATE TABLE profiles (id INTEGER PRIMARY KEY, writer_id INTEGER, photo_id INTEGER)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "CREATE TABLE photos (id INTEGER PRIMARY KEY, url TEXT)",
+        &[],
+    )
+    .await?;
+    ctx.query("INSERT INTO writers (id) VALUES (1), (2)", &[])
+        .await?;
+    // Profile 101's writer doesn't exist, so photo 501 is in no result row.
+    ctx.query(
+        "INSERT INTO profiles (id, writer_id, photo_id) VALUES (100, 1, 500), (101, 9, 501)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO photos (id, url) VALUES (500, 'a.png'), (501, 'b.png')",
+        &[],
+    )
+    .await?;
+    ctx.cdc_decode_settle().await?;
+
+    let query = "SELECT w.id, ph.url FROM writers w \
+                 LEFT JOIN (profiles p JOIN photos ph ON ph.id = p.photo_id) ON p.writer_id = w.id \
+                 ORDER BY w.id";
+    let m = query_warm(&mut ctx, query).await?;
+    update_invalidates(
+        &mut ctx,
+        m,
+        "UPDATE profiles SET photo_id = 501 WHERE id = 100",
+        query,
+    )
+    .await
 }

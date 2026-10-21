@@ -18,7 +18,10 @@
 
 use std::io::Error;
 
-use crate::util::{TestContext, assert_cache_hit, assert_cache_miss, assert_row_at};
+use crate::util::{
+    TestContext, assert_cache_hit, assert_cache_miss, assert_proxy_rows_match_origin,
+    assert_row_at, query_warm,
+};
 
 mod util;
 
@@ -1175,5 +1178,80 @@ async fn test_quantified_any_comparison_forwards() -> Result<(), Error> {
     assert_row_at(&served, 1, &[("id", "3")])?;
     let _m = assert_cache_hit(&mut ctx, m).await?;
 
+    Ok(())
+}
+
+// =============================================================================
+// Outer column compared against an uncorrelated subquery (PGC-520)
+// =============================================================================
+
+/// `orders` and `vip` for the compared-column tests: VIP customers 1 and 2;
+/// orders 10 (customer 1), 11 (customer 3) and 12 (customer 2).
+async fn setup_orders_vip(ctx: &mut TestContext) -> Result<(), Error> {
+    ctx.query(
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER)",
+        &[],
+    )
+    .await?;
+    ctx.query("CREATE TABLE vip (id INTEGER PRIMARY KEY)", &[])
+        .await?;
+    ctx.query("INSERT INTO vip (id) VALUES (1), (2)", &[])
+        .await?;
+    ctx.query(
+        "INSERT INTO orders (id, customer_id) VALUES (10, 1), (11, 3), (12, 2)",
+        &[],
+    )
+    .await?;
+    ctx.cdc_decode_settle().await
+}
+
+/// An UPDATE to the column an `IN` subquery is compared against applies in
+/// place: the subquery's own read loaded every `vip` row, so no new value
+/// can need one that isn't cached (PGC-520). Both moves are of a cached row;
+/// a row that leaves the result is dropped from the cache, so its return is
+/// the uncached path.
+#[tokio::test]
+async fn test_subquery_in_compared_column_update_applied_in_place() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_orders_vip(&mut ctx).await?;
+
+    let query = "SELECT id FROM orders WHERE customer_id IN (SELECT id FROM vip) ORDER BY id";
+    let mut m = query_warm(&mut ctx, query).await?;
+
+    // Order 10 moves to another VIP customer, then out of the VIP set.
+    for customer in [2, 3] {
+        ctx.origin_query(
+            &format!("UPDATE orders SET customer_id = {customer} WHERE id = 10"),
+            &[],
+        )
+        .await?;
+        ctx.cdc_apply_settle().await?;
+        assert_proxy_rows_match_origin(&mut ctx, query).await?;
+        m = assert_cache_hit(&mut ctx, m).await?;
+    }
+    Ok(())
+}
+
+/// The `NOT IN` form: an UPDATE to the compared column of a cached row
+/// applies in place (PGC-520).
+#[tokio::test]
+async fn test_subquery_not_in_compared_column_update_applied_in_place() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_orders_vip(&mut ctx).await?;
+
+    let query = "SELECT id FROM orders WHERE customer_id NOT IN (SELECT id FROM vip) ORDER BY id";
+    let mut m = query_warm(&mut ctx, query).await?;
+
+    // Order 11 moves to another non-VIP customer, then into the VIP set.
+    for customer in [4, 1] {
+        ctx.origin_query(
+            &format!("UPDATE orders SET customer_id = {customer} WHERE id = 11"),
+            &[],
+        )
+        .await?;
+        ctx.cdc_apply_settle().await?;
+        assert_proxy_rows_match_origin(&mut ctx, query).await?;
+        m = assert_cache_hit(&mut ctx, m).await?;
+    }
     Ok(())
 }

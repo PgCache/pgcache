@@ -16,7 +16,7 @@ The consumers need three different contracts, which one structure served poorly:
 |---|---|---|---|
 | Necessary condition | every row of the reference in the result satisfies it | weaker is sound | CDC row matching, eval index, subsumption's new query, read-after-write ranges |
 | Exact description | population loads every row satisfying it | refuse when unsure | subsumption parents |
-| Dependency footprint | columns whose change can alter the result | must not depend on recognition | link columns, change dependence |
+| Dependency footprint | columns whose change can make the result need rows the cache may not hold | an unrecognized conjunct never removes one | link columns, change dependence |
 
 ## Decision
 Every SELECT branch is described by a `QueryBranchPredicates` (`query/predicates/`). It is keyed by table reference (`SlotId`) and column binding, never by name.
@@ -38,7 +38,9 @@ Every SELECT branch is described by a `QueryBranchPredicates` (`query/predicates
 **Per-reference views:**
 * `filters`: the recognized constraints that filter R, closed under equalities that filter the target. A cast comparison doesn't cross an equality.
 * `exact`: R is a base table, every join on its path preserves it, every WHERE conjunct is a constraint on R alone, and nothing from an enclosing SELECT restricts it.
-* `link_columns`: R's columns in any conjunct that mentions another reference (a nested subquery's tables count), or that reaches an enclosing SELECT. Also R's columns in the ON of an unreduced outer join that preserves R.
+* `link_columns`: R's columns in any conjunct that mentions another reference, or that reaches an enclosing SELECT. Also R's columns in the ON of an unreduced outer join that preserves R.
+  * A nested subquery's tables count only when it is correlated, i.e. it mentions a column from outside itself at any depth. An uncorrelated subquery's own read loads its rows whatever R's rows are (PGC-520).
+  * A `Terminal` reference has none. It only re-attaches to preserved rows, and whether those are in the result never depends on it, so every one the result can need is cached (PGC-520).
 * `unrecognized`: an `Opaque` conjunct mentions R, so empty `filters` don't mean nothing restricts it. CDC treats any change to such a row as relevant rather than reading empty filters as "no restriction".
 * `outer_join_role`:
   * `Kept` when no unreduced outer join NULL-fills R;
@@ -50,7 +52,7 @@ Every SELECT branch is described by a `QueryBranchPredicates` (`query/predicates
 * Membership substitutes only the entry's own occurrence.
 
 ## Rationale
-* **Recognition affects precision, never soundness.** `filters` only weakens when a conjunct is unrecognized, `exact` refuses, and `link_columns` ignores recognition entirely. A new recognizer, such as OR or `IS NULL`, adds precision without new soundness obligations.
+* **Recognition affects precision, never soundness.** `filters` only weakens when a conjunct is unrecognized, and `exact` refuses. `link_columns` never shrinks for an unrecognized conjunct: correlation is structural, and `Terminal` turns on which references a conjunct mentions, so an unrecognized NULL-rejecting conjunct that mentions R makes it `Optional`. A new recognizer, such as OR or `IS NULL`, adds precision without new soundness obligations.
 * **Slots instead of names** dissolve the self-join and repeated-reference special cases rather than guarding each consumer against them.
 * **One derivation of join semantics.** Reach and reduction drive filters, exactness, links and terminality alike, so the four can't disagree.
 * **Per-reference update queries** let a self-join's references keep distinct filters, links and roles, and let each use the prepared single-occurrence membership template.
@@ -62,6 +64,7 @@ Every SELECT branch is described by a `QueryBranchPredicates` (`query/predicates
   * expression and cast ON equalities, cross-table WHERE comparisons, and their uncached-row form;
   * a preserved reference that shared a table name with a terminal reference.
 * **Better precision:**
+  * an UPDATE to a column compared against an uncorrelated subquery, or to a terminal reference's join column, applies in place (PGC-520);
   * a self-join's references narrow the eval index on their own filters;
   * a reduced outer join is maintained as an inner join;
   * a self-join's preserved reference can be a subsumption parent;
@@ -69,7 +72,6 @@ Every SELECT branch is described by a `QueryBranchPredicates` (`query/predicates
 * **Removed code.** The name-keyed collector, `ConstraintColumn`, `repeated_tables`, the `self_joined` guards and the terminality walk are gone.
 
 ### Negative
-* **Extra invalidations through subqueries.** A conjunct with an uncorrelated subquery makes the compared column a link column, so an UPDATE to it invalidates even though the subquery's tables are cached in full. Linking only through incompletely cached partners is PGC-520.
 * **More entries for self-joins.** A self-join registers one update query per reference, which costs more index entries and membership evaluations per row. Batched evaluation still skips them (PGC-521).
 * **The model is built more than once.** It is built per branch at registration and again for subsumption and read-after-write lookups.
 

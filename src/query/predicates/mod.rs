@@ -92,6 +92,9 @@ pub struct Conjunct {
     pub columns: Vec<ColumnBinding>,
     /// Mentions a column of an enclosing SELECT.
     pub external: bool,
+    /// A nested subquery mentions a column from outside itself, so its rows
+    /// depend on the rows it is compared against.
+    pub correlated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+use super::assertions::assert_proxy_rows_match_origin;
 use super::context::TestContext;
 
 /// Point-in-time snapshot of metrics for test assertions.
@@ -282,6 +283,20 @@ pub(crate) async fn assert_cache_hit(
     assert_eq!(delta.queries_cache_hit, 1, "expected cache hit");
     assert_eq!(delta.queries_cache_miss, 0, "unexpected cache miss");
     Ok(after)
+}
+
+/// Warm `query` into cache: a miss, settle, then a hit serving origin's
+/// rows. Returns the metrics after the hit.
+pub(crate) async fn query_warm(
+    ctx: &mut TestContext,
+    query: &str,
+) -> Result<MetricsSnapshot, Error> {
+    let m = ctx.metrics().await?;
+    ctx.simple_query(query).await?;
+    let m = assert_cache_miss(ctx, m).await?;
+    ctx.cache_settle().await?;
+    assert_proxy_rows_match_origin(ctx, query).await?;
+    assert_cache_hit(ctx, m).await
 }
 
 /// Assert that the last query was subsumed (cache hit via subsumption).
