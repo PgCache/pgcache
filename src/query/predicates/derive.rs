@@ -812,9 +812,7 @@ mod tests {
             .subtree()
             .filter(|position| {
                 matches!(position.kind(), NodeKind::Select { .. })
-                    && bound
-                        .select()
-                        .is_none_or(|root| root.id().index() != position.id().index())
+                    && bound.select().is_none_or(|root| root.id() != position.id())
             })
             .map(|position| position.id())
             .collect()

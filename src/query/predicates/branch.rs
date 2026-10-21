@@ -193,7 +193,7 @@ fn conjuncts_from_join(
                 .bindings()
                 .merged_columns()
                 .iter()
-                .filter(|merged| merged.join.index() == join_node.index())
+                .filter(|merged| merged.join == join_node)
             {
                 conjuncts.push(Conjunct {
                     scope,
@@ -281,10 +281,7 @@ fn column_bindings(
             let kind = branch
                 .joins
                 .iter()
-                .find(|join| {
-                    join.node
-                        .is_some_and(|node| node.index() == merged.join.index())
-                })
+                .find(|join| join.node == Some(merged.join))
                 .map(|join| join.kind);
             match kind {
                 Some(JoinKind::Inner | JoinKind::Cross | JoinKind::Left) => vec![merged.left],

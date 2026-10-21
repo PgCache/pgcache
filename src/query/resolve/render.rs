@@ -406,7 +406,7 @@ impl DeparseContext for Bound<'_> {
             self.bindings
                 .merged_columns()
                 .iter()
-                .filter(|merged| merged.join.index() == join.index())
+                .filter(|merged| merged.join == join)
                 .map(|merged| merged.name.clone())
                 .collect(),
         )

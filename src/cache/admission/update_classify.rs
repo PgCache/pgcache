@@ -139,7 +139,7 @@ impl<'a> ReferencedColumns<'a> {
             .bindings()
             .merged_columns()
             .iter()
-            .filter(|merged| merged.join.index() == join.index())
+            .filter(|merged| merged.join == join)
             .map(|merged| (merged.left, merged.right))
             .collect();
         for (left, right) in merged {

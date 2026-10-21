@@ -1,9 +1,6 @@
-use std::hash::{Hash, Hasher};
-
-/// A node's pre-order position in its tree (ADR-057). Identity
-/// metadata only: it hashes to nothing and compares equal to any other id,
-/// so a node's derived `Hash` and `PartialEq` stay structural.
-#[derive(Debug, Clone, Copy)]
+/// A node's pre-order position in its tree (ADR-057). Two ids are equal
+/// when they name the same position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeId(u32);
 
 impl NodeId {
@@ -24,36 +21,21 @@ impl NodeId {
     }
 }
 
-impl Hash for NodeId {
-    fn hash<H: Hasher>(&self, _state: &mut H) {}
-}
-
-impl PartialEq for NodeId {
-    fn eq(&self, _other: &Self) -> bool {
-        true
-    }
-}
-
-impl Eq for NodeId {}
-
 #[cfg(test)]
 mod tests {
-    use std::collections::hash_map::DefaultHasher;
+    use std::collections::HashSet;
 
     use super::*;
 
+    /// Ids compare and hash by position.
     #[test]
-    fn test_node_id_is_identity_metadata_not_structure() {
+    fn test_node_id_compares_by_position() {
         let first = NodeId::from_index(1);
         let second = NodeId::from_index(2);
-        assert_eq!(first, second);
-
-        let mut hasher = DefaultHasher::new();
-        first.hash(&mut hasher);
-        let hashed_first = hasher.finish();
-        let mut hasher = DefaultHasher::new();
-        second.hash(&mut hasher);
-        assert_eq!(hashed_first, hasher.finish());
+        assert_ne!(first, second);
+        assert_eq!(first, NodeId::from_index(1));
+        let ids: HashSet<NodeId> = [first, second, NodeId::from_index(1)].into_iter().collect();
+        assert_eq!(ids.len(), 2);
 
         assert!(NodeId::PENDING.is_pending());
         assert!(!first.is_pending());

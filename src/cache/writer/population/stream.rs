@@ -149,8 +149,7 @@ fn population_reads(population: &ResolvedQuery, max_limit: Option<u64>) -> Vec<P
     let mut reads = Vec::new();
     for (branch, _) in select_branches_with_source(population.tree().root()) {
         // A LIMIT bounds the result's rows, never a subquery's.
-        let limit =
-            max_limit.filter(|_| root.is_some_and(|root| root.id().index() == branch.id().index()));
+        let limit = max_limit.filter(|_| root.is_some_and(|root| root.id() == branch.id()));
         for table_node in branch.direct_tables() {
             let select = population_select_build(population, table_node, branch, limit);
             if issued.insert((table_relation_oid(population, table_node), select.clone())) {

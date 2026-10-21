@@ -281,7 +281,7 @@ impl BindingsBuilder {
     pub(crate) fn correlated_remove(&mut self, node: NodeId) {
         self.bindings
             .correlated
-            .retain(|candidate| candidate.index() != node.index());
+            .retain(|candidate| *candidate != node);
     }
 
     /// The catalog column a binding names; slots are complete as soon as

@@ -307,9 +307,7 @@ impl<'a, 't> Emit<'a, 't> {
     }
 
     fn move_for(&self, select: Select<'t>) -> Option<&'a Move<'t>> {
-        self.moves
-            .iter()
-            .find(|m| m.select.id().index() == select.id().index())
+        self.moves.iter().find(|m| m.select.id() == select.id())
     }
 
     fn query_emit(&mut self, query: Query<'t>) {
@@ -418,7 +416,7 @@ impl<'a, 't> Emit<'a, 't> {
                 let branch = m
                     .branches
                     .iter()
-                    .find(|branch| branch.select.id().index() == select.id().index());
+                    .find(|branch| branch.select.id() == select.id());
                 match branch {
                     Some(branch) => self.branch_emit(branch, m),
                     None => {
