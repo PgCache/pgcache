@@ -35,7 +35,7 @@ pub(super) struct RelationFetchSpec {
     /// booleans come from the per-row fallback, old images stay wildcard.
     pub(super) reserved_columns: bool,
     /// Eval-index columns whose `::text` rendering is wire-canonical
-    /// (`old_image_text_stable`) — the only ones rung 2 may fetch. Excluded
+    /// (`old_image_fetchable`) — the only ones rung 2 may fetch. Excluded
     /// columns stay `None` in the expanded image → `Unknown` wildcard.
     pub(super) fetch_columns: Vec<EcoString>,
     index_positions: Vec<usize>,
@@ -65,7 +65,7 @@ impl RelationFetchSpec {
                 .filter(|c| {
                     t.columns
                         .get(c.as_str())
-                        .is_some_and(|m| old_image_text_stable(&m.cache_type_name))
+                        .is_some_and(|m| old_image_fetchable(&m.cache_type_name))
                 })
                 .cloned()
                 .collect();
@@ -92,14 +92,15 @@ impl RelationFetchSpec {
     }
 }
 
-/// Whether a column type's `::text` cast renders byte-identically to its
-/// pgoutput wire text under any GUC settings — the precondition for probing a
-/// rung-2-fetched value against the eval index, whose equality keys carry
-/// wire/query-literal spellings. `bool` qualifies via parse-time
-/// normalization ('true'/'false' → 't'/'f'); date/time types are DateStyle/
-/// TimeZone-sensitive and floats are extra_float_digits-sensitive, so they
-/// are excluded (their probe positions degrade to the wildcard).
-fn old_image_text_stable(cache_type_name: &str) -> bool {
+/// Whether a column type's `::text` cast on the cache renders the value as
+/// pgoutput's wire text does — the precondition for probing a rung-2-fetched
+/// value against the eval index alongside wire-text rows. The lookup session
+/// and the replication session share the reference pin (`TimeZone`, ISO
+/// `DateStyle`, `IntervalStyle`, `extra_float_digits`), so date-time and
+/// float output match; `bool` qualifies via parse-time normalization
+/// ('true'/'false' → 't'/'f'). Any other type (`bytea` follows the unpinned
+/// `bytea_output`, for one) degrades its probe position to the wildcard.
+fn old_image_fetchable(cache_type_name: &str) -> bool {
     matches!(
         cache_type_name,
         "int2"
@@ -107,11 +108,19 @@ fn old_image_text_stable(cache_type_name: &str) -> bool {
             | "int8"
             | "oid"
             | "numeric"
+            | "float4"
+            | "float8"
             | "text"
             | "varchar"
             | "bpchar"
             | "uuid"
             | "bool"
+            | "date"
+            | "time"
+            | "timetz"
+            | "timestamp"
+            | "timestamptz"
+            | "interval"
     )
 }
 
@@ -422,5 +431,34 @@ impl<'a, 'c> OldImagePrepass<'a, 'c> {
 
     fn lookup_queue(&mut self, relation_oid: Oid, row: LookupRow<'a>) {
         self.lookups.entry(relation_oid).or_default().push(row);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The reference pin makes date-time and float text match the wire, so
+    /// rung 2 fetches them; an unpinned rendering stays unfetched (PGC-529).
+    #[test]
+    fn test_old_image_fetchable() {
+        for type_name in [
+            "int4",
+            "text",
+            "bool",
+            "float8",
+            "float4",
+            "date",
+            "timestamptz",
+            "timestamp",
+            "time",
+            "timetz",
+            "interval",
+        ] {
+            assert!(old_image_fetchable(type_name), "{type_name}");
+        }
+        for type_name in ["bytea", "json", "money"] {
+            assert!(!old_image_fetchable(type_name), "{type_name}");
+        }
     }
 }

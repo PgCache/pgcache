@@ -5,7 +5,9 @@
 //! builders', the CDC writer's and the replication session that renders
 //! pgoutput text — is pinned to them, so population, PgEval and CDC text all
 //! agree with each other. `DateStyle` output is forced to ISO so the typed
-//! comparator's wire-text parsers hold; its input order is origin's.
+//! comparator's wire-text parsers hold; its input order is origin's. Floats
+//! render round-trip exact (`extra_float_digits = 3`), never rounded by a
+//! server default.
 
 use std::sync::{Arc, LazyLock};
 
@@ -108,11 +110,12 @@ impl ReferenceSettings {
     }
 
     /// The statements that pin a session to the reference: the date-time
-    /// settings, and the locales a `money` or `to_char` text is rendered and
-    /// parsed under on either side of population and pgoutput.
+    /// settings, exact float text, and the locales a `money` or `to_char` text
+    /// is rendered and parsed under on either side of population and pgoutput.
     pub(crate) fn pin_sql(&self) -> String {
         let mut sql = format!(
-            "SET TimeZone = '{}'; SET DateStyle = 'ISO, {}'; SET IntervalStyle = '{}'",
+            "SET TimeZone = '{}'; SET DateStyle = 'ISO, {}'; SET IntervalStyle = '{}'; \
+             SET extra_float_digits = 3",
             quote(&self.timezone),
             self.literals.date_order.as_str(),
             quote(&self.intervalstyle),
@@ -194,8 +197,8 @@ mod tests {
         assert_eq!(
             reference.pin_sql(),
             "SET TimeZone = 'America/New_York'; SET DateStyle = 'ISO, DMY'; \
-             SET IntervalStyle = 'sql_standard'; SET lc_monetary = 'C'; \
-             SET lc_numeric = 'C'; SET lc_time = 'C'"
+             SET IntervalStyle = 'sql_standard'; SET extra_float_digits = 3; \
+             SET lc_monetary = 'C'; SET lc_numeric = 'C'; SET lc_time = 'C'"
         );
         let odd = ReferenceSettings {
             timezone: "it's".into(),

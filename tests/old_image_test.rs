@@ -472,3 +472,80 @@ async fn test_old_image_reserved_prefix_columns_stay_conservative() -> Result<()
 
     Ok(())
 }
+
+/// Date, timestamptz and float filter columns recover their real old values
+/// under an origin whose role defaults spell them unlike the cache's own
+/// defaults: an unrelated row's update keeps each memo, and the matching
+/// row's update evicts it and serves fresh (PGC-529).
+#[tokio::test]
+async fn test_old_image_date_time_float_precision() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_before_start(|origin| async move {
+        for sql in [
+            "ALTER ROLE postgres SET DateStyle = 'SQL, DMY'",
+            "ALTER ROLE postgres SET TimeZone = 'Asia/Kolkata'",
+            "ALTER ROLE postgres SET extra_float_digits = 0",
+            "CREATE TABLE events (id INT PRIMARY KEY, day DATE, at TIMESTAMPTZ, \
+             score FLOAT8, val INT)",
+            "INSERT INTO events VALUES \
+             (1, '2024-01-15', '2024-01-15 10:00:00+00', 0.1, 5), \
+             (2, '2024-01-16', '2024-01-16 10:00:00+00', 0.2, 7)",
+        ] {
+            origin.batch_execute(sql).await.map_err(Error::other)?;
+        }
+        Ok(origin)
+    })
+    .await?;
+    ctx.cdc_decode_settle().await?;
+
+    let matching = [
+        "SELECT val FROM events WHERE day = '2024-01-15'",
+        "SELECT val FROM events WHERE at = '2024-01-15 10:00:00+00'",
+        "SELECT val FROM events WHERE score = 0.1",
+    ];
+    let others = [
+        "SELECT val FROM events WHERE day = '2024-01-16'",
+        "SELECT val FROM events WHERE at = '2024-01-16 10:00:00+00'",
+        "SELECT val FROM events WHERE score = 0.2",
+    ];
+    // Every query cached, so both rows are in the cache table for the lookup.
+    for query in matching.iter().chain(&others) {
+        ctx.simple_query(query).await?;
+    }
+    ctx.cache_settle().await?;
+    for query in matching {
+        warm_until_memoized(&mut ctx, query).await?;
+    }
+
+    let evictions_before = ctx.metrics().await?.cache_memo_evictions;
+    ctx.origin_query("UPDATE events SET val = 8 WHERE id = 2", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+    // A memo stays live only if the recovered old image ruled its query out.
+    for query in matching {
+        let hits_before = ctx.metrics().await?.cache_memo_hits;
+        let res = ctx.simple_query(query).await?;
+        assert_row_at(&res, 1, &[("val", "5")])?;
+        assert!(
+            ctx.metrics().await?.cache_memo_hits > hits_before,
+            "an update outside the filter must keep the memo: {query}"
+        );
+    }
+    assert_eq!(
+        ctx.metrics().await?.cache_memo_evictions,
+        evictions_before,
+        "an update outside each filter must not evict its memo"
+    );
+
+    ctx.origin_query("UPDATE events SET val = 6 WHERE id = 1", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+    for query in matching {
+        let res = ctx.simple_query(query).await?;
+        assert_row_at(&res, 1, &[("val", "6")])?;
+    }
+    assert!(
+        ctx.metrics().await?.cache_memo_evictions > evictions_before,
+        "an update inside the filters must evict their memos"
+    );
+    Ok(())
+}
