@@ -171,25 +171,16 @@ impl<'a> Bound<'a> {
         }
     }
 
-    /// One star-expanded output: its rendered expression and its name.
-    pub(super) fn star_item_output(&self, item: &StarItem) -> Output {
-        let mut text = String::new();
-        let name = match item {
-            StarItem::Column(binding) => {
-                self.column_binding_deparse(binding, &mut text);
-                self.bindings
-                    .binding_column(binding)
-                    .map(|c| c.name.clone())
-            }
+    /// One star-expanded output's rendered expression.
+    fn star_item_into(&self, item: &StarItem, buf: &mut String) {
+        match item {
+            StarItem::Column(binding) => self.column_binding_deparse(binding, buf),
             StarItem::Merged(id) => {
-                let merged = self.bindings.merged(*id);
-                if let Some(merged) = merged {
-                    self.merged_deparse(merged, &mut text);
+                if let Some(merged) = self.bindings.merged(*id) {
+                    self.merged_deparse(merged, buf);
                 }
-                merged.map(|merged| merged.name.clone())
             }
-        };
-        Output { text, name }
+        }
     }
 
     fn literals_take(self) -> Vec<LiteralValue> {
@@ -453,13 +444,6 @@ fn source_columns_render(bindings: &Bindings, source: NodeId, qualified: bool, b
     }
 }
 
-/// One select-list output after star expansion: its rendered expression and
-/// its output name (the alias, else the column name of a column reference).
-pub(super) struct Output {
-    pub(super) text: String,
-    pub(super) name: Option<EcoString>,
-}
-
 impl ResolvedQuery {
     /// The context that renders this query's nodes as the cache serves
     /// them, for a caller composing its own SQL around parts of the tree.
@@ -556,30 +540,27 @@ impl ResolvedQuery {
     }
 
     /// The 1-based select-list position an ORDER BY item of `select` names,
-    /// stars expanded: by output name when the item names an output, else
-    /// by the rendered expression. `None` when no output matches.
+    /// stars expanded: the output an output name or position names, else the
+    /// one its expression renders as. `None` when no output matches.
     pub fn order_by_position(&self, select: Select<'_>, clause: OrderBy<'_>) -> Option<usize> {
-        let outputs = self.select_outputs(select);
-        let expr = clause.expr();
-        let found = if let ScalarKind::Column(column) = expr.kind()
-            && matches!(
-                self.column_target_at(column.id()),
-                Some(ColumnTarget::Output)
-            ) {
-            outputs
-                .iter()
-                .position(|output| output.name.as_ref() == Some(column.column()))
-        } else {
-            let mut text = String::new();
-            scalar_deparse_with(expr, &mut Bound::text(self.bindings()), &mut text);
-            outputs.iter().position(|output| output.text == text)
-        };
-        found.map(|index| index + 1)
+        match self.order_by_resolve(select, clause) {
+            OrderByResolution::Output { position, .. } => Some(position + 1),
+            OrderByResolution::Own(expr) => {
+                let mut text = String::new();
+                scalar_deparse_with(expr, &mut Bound::text(self.bindings()), &mut text);
+                self.select_output_texts(select)
+                    .iter()
+                    .position(|output| *output == text)
+                    .map(|index| index + 1)
+            }
+            OrderByResolution::Unresolved => None,
+        }
     }
 
-    fn select_outputs(&self, select: Select<'_>) -> Vec<Output> {
+    /// Each select-list output's rendered expression, stars expanded.
+    fn select_output_texts(&self, select: Select<'_>) -> Vec<String> {
         let bindings = self.bindings();
-        let cx = Bound::text(bindings);
+        let mut cx = Bound::text(bindings);
         let Some(items) = select.items() else {
             return Vec::new();
         };
@@ -588,16 +569,14 @@ impl ResolvedQuery {
             match item {
                 SelectItem::Expr(expr) => {
                     let mut text = String::new();
-                    scalar_deparse_with(expr.expr(), &mut Bound::text(bindings), &mut text);
-                    let name = expr
-                        .alias()
-                        .cloned()
-                        .or_else(|| self.column_output_name(expr.expr()));
-                    outputs.push(Output { text, name });
+                    scalar_deparse_with(expr.expr(), &mut cx, &mut text);
+                    outputs.push(text);
                 }
                 SelectItem::Star(star) => {
                     for item in bindings.star_by_id(star.id()).unwrap_or(&[]) {
-                        outputs.push(cx.star_item_output(item));
+                        let mut text = String::new();
+                        cx.star_item_into(item, &mut text);
+                        outputs.push(text);
                     }
                 }
             }
@@ -618,6 +597,20 @@ impl ResolvedQuery {
         select: Select<'a>,
         clause: OrderBy<'a>,
     ) -> Option<OrderBySource<'a>> {
+        match self.order_by_resolve(select, clause) {
+            OrderByResolution::Own(expr) => Some(OrderBySource::Expr(expr)),
+            OrderByResolution::Output { source, .. } => Some(source),
+            OrderByResolution::Unresolved => None,
+        }
+    }
+
+    /// The one resolution of an ORDER BY item behind [`Self::order_by_source`]
+    /// and [`Self::order_by_position`].
+    fn order_by_resolve<'a>(
+        &'a self,
+        select: Select<'a>,
+        clause: OrderBy<'a>,
+    ) -> OrderByResolution<'a> {
         let expr = clause.expr();
         let wanted = match expr.kind() {
             ScalarKind::Column(column)
@@ -630,9 +623,15 @@ impl ResolvedQuery {
             }
             ScalarKind::Literal(literal) => {
                 let LiteralValue::Integer(position) = literal.value() else {
-                    return None;
+                    return OrderByResolution::Unresolved;
                 };
-                OutputWanted::At(usize::try_from(*position).ok()?.checked_sub(1)?)
+                let Some(index) = usize::try_from(*position)
+                    .ok()
+                    .and_then(|position| position.checked_sub(1))
+                else {
+                    return OrderByResolution::Unresolved;
+                };
+                OutputWanted::At(index)
             }
             ScalarKind::Column(_)
             | ScalarKind::Function(_)
@@ -640,10 +639,10 @@ impl ResolvedQuery {
             | ScalarKind::Arithmetic(_)
             | ScalarKind::Subquery(_)
             | ScalarKind::Array(_)
-            | ScalarKind::TypeCast(_) => return Some(OrderBySource::Expr(expr)),
+            | ScalarKind::TypeCast(_) => return OrderByResolution::Own(expr),
         };
         let bindings = self.bindings();
-        let mut index = 0;
+        let mut position = 0;
         for item in select.items().into_iter().flatten() {
             match item {
                 SelectItem::Expr(item_expr) => {
@@ -651,10 +650,13 @@ impl ResolvedQuery {
                         .alias()
                         .cloned()
                         .or_else(|| self.column_output_name(item_expr.expr()));
-                    if wanted.matches(index, name.as_ref()) {
-                        return Some(OrderBySource::Expr(item_expr.expr()));
+                    if wanted.matches(position, name.as_ref()) {
+                        return OrderByResolution::Output {
+                            position,
+                            source: OrderBySource::Expr(item_expr.expr()),
+                        };
                     }
-                    index += 1;
+                    position += 1;
                 }
                 SelectItem::Star(star) => {
                     for star_item in bindings.star_by_id(star.id()).unwrap_or(&[]) {
@@ -664,15 +666,18 @@ impl ResolvedQuery {
                             }
                             StarItem::Merged(id) => bindings.merged(*id).map(|merged| &merged.name),
                         };
-                        if wanted.matches(index, name) {
-                            return Some(OrderBySource::Star(star_item));
+                        if wanted.matches(position, name) {
+                            return OrderByResolution::Output {
+                                position,
+                                source: OrderBySource::Star(star_item),
+                            };
                         }
-                        index += 1;
+                        position += 1;
                     }
                 }
             }
         }
-        None
+        OrderByResolution::Unresolved
     }
 
     /// An ORDER BY item of `select` rendered over its FROM's columns, for a
@@ -691,7 +696,7 @@ impl ResolvedQuery {
         let mut cx = Bound::text(self.bindings());
         match source {
             OrderBySource::Expr(expr) => scalar_deparse_with(expr, &mut cx, buf),
-            OrderBySource::Star(item) => buf.push_str(&cx.star_item_output(item).text),
+            OrderBySource::Star(item) => cx.star_item_into(item, buf),
         }
         buf.push(' ');
         clause.direction().deparse(buf);
@@ -708,6 +713,19 @@ pub(crate) enum OrderBySource<'a> {
     Expr(Scalar<'a>),
     /// A star-expanded output an output name or position names.
     Star(&'a StarItem),
+}
+
+/// How an ORDER BY item resolves against its SELECT's outputs.
+enum OrderByResolution<'a> {
+    /// It names no output: its own expression over the FROM.
+    Own(Scalar<'a>),
+    /// It names an output by name or position; zero-based, stars expanded.
+    Output {
+        position: usize,
+        source: OrderBySource<'a>,
+    },
+    /// A position or name no output has.
+    Unresolved,
 }
 
 /// The select-list output an ORDER BY item names.

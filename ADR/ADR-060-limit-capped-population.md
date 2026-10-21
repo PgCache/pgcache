@@ -73,6 +73,6 @@ Nothing said what a capped population must load. Two wrong-result bugs followed:
 ## Implementation Notes
 * **The cap:** `base_query_prepare` and `population_max_limit` (`cache/admission/analyze.rs`). The writer and pgcache-fit both use it.
 * **The reads:** `population_reads` and `population_select_build` (`cache/writer/population/stream.rs`), with `ResolvedQuery::order_by_source_into`.
-* **ORDER BY resolution:** `ResolvedQuery::order_by_source` (`query/resolve/render.rs`), shared by the capped read and `limit_window_columns_collect` / `limit_order_keys_collect`.
+* **ORDER BY resolution:** one resolver in `query/resolve/render.rs`, behind `order_by_source` (the capped read, `limit_window_columns_collect`, `limit_order_keys_collect`) and `order_by_position` (MV ORDER BY serving).
 * **The window:** `limit_window_move_invalidates`, the DELETE rule in `from_clause_uncached_invalidates`, and the subquery rule in `row_uncached_invalidates` (`cache/writer/cdc/invalidation.rs`).
 * **The bump:** `limit_bump_handle` (`cache/writer/registration/lifecycle.rs`).

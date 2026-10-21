@@ -663,6 +663,19 @@ mod tests {
         assert_eq!(out, "SELECT * FROM pgcache_mv.q_42 ORDER BY 2 DESC, 1 ASC");
     }
 
+    /// A positional ORDER BY names its output by position, not by matching
+    /// the rendered literal against the select list.
+    #[test]
+    fn test_mv_serve_sql_positional_order_by_by_position() {
+        let out =
+            build_serve_sql("SELECT status, count(*) FROM orders GROUP BY status ORDER BY 2 DESC");
+        assert_eq!(out, "SELECT * FROM pgcache_mv.q_42 ORDER BY 2 DESC");
+        let out = build_serve_sql(
+            "SELECT 2 AS a, 1 AS b, count(*) FROM orders GROUP BY status ORDER BY 1",
+        );
+        assert_eq!(out, "SELECT * FROM pgcache_mv.q_42 ORDER BY 1 ASC");
+    }
+
     // ==================== SetOp body serve SQL ====================
 
     #[test]

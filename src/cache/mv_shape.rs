@@ -453,6 +453,15 @@ pub(super) mod tests {
         );
     }
 
+    /// A positional ORDER BY is servable: it names its output by position.
+    #[test]
+    fn test_classify_grouped_positional_order_by_is_gated() {
+        assert_eq!(
+            classify("SELECT status, count(*) FROM orders GROUP BY status ORDER BY 2 DESC"),
+            ShapeGate::Gated
+        );
+    }
+
     #[test]
     fn test_classify_gated_window_order_by_not_in_select_downgrades_to_skip() {
         // Window functions are Gated, but ORDER BY must still resolve
