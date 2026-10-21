@@ -143,9 +143,11 @@ fn row_uncached_invalidates(
         UpdateQuerySource::FromClause => {
             from_clause_uncached_invalidates(update_query, table_metadata, event)
         }
+        // A capped query also invalidates on a shrink: a row leaving its top N
+        // needs the next row, which was never loaded (ADR-060).
         UpdateQuerySource::Subquery(kind) => {
             row_relevant(update_query, table_metadata, event)
-                && subquery_change_expands(kind, event.operation)
+                && (update_query.has_limit || subquery_change_expands(kind, event.operation))
         }
         // Terminal optional side of an outer join. Changes here only affect
         // NULL-padded columns — the preserved side already has the row. No

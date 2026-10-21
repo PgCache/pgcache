@@ -93,7 +93,7 @@ impl ColumnConstraint {
 impl RelationPredicates {
     /// The weakest claim about a table nothing could be derived for: no
     /// filter, not exact, and every column a link column.
-    pub fn unknown(table: &TableMetadata) -> Self {
+    pub(crate) fn unknown(table: &TableMetadata) -> Self {
         Self {
             filters: Vec::new(),
             link_columns: table

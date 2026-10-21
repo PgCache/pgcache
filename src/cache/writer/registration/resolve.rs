@@ -2,6 +2,7 @@
 //! it, render its serve shape, classify its shape and limits, and register
 //! its per-table update queries.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -9,22 +10,19 @@ use ecow::EcoString;
 
 use super::{QueryResolution, WriterRegistration};
 use crate::cache::admission::{
-    AdmissionDepth, AdmissionQuery, CanonicalResolution, base_query_prepare,
+    AdmissionDepth, AdmissionQuery, CanonicalResolution, base_query_prepare, population_max_limit,
     query_admission_analyze, query_decorrelate_checked, query_pushdown, query_resolve_canonical,
     shape_gate_classify,
 };
 use crate::cache::messages::RegisterRequest;
 use crate::cache::mv::{query_has_join, query_has_window};
-use crate::cache::mv_shape::ShapeGate;
 use crate::cache::types::SharedQueryShape;
-use crate::cache::update_query::{SubsumerRegion, UpdateQueries, UpdateQueryRegistration};
+use crate::cache::update_query::{UpdateQueries, UpdateQueryRegistration};
 use crate::cache::writer::core::WriterCore;
 use crate::cache::{CacheError, CacheResult, ReportExt};
 use crate::oid::Oid;
 use crate::query::Fingerprint;
 use crate::query::ast::rope::{Query, QueryTree};
-use crate::query::constraint_index::table_constraints_keyed;
-use crate::query::constraints::TableConstraint;
 use crate::query::keying_settings::KeyingSettings;
 use crate::query::resolve::ResolvedQuery;
 
@@ -104,12 +102,8 @@ fn serve_shape_render(bound: &ResolvedQuery) -> SharedQueryShape {
     shape
 }
 
-/// `(max_limit, mv_limit)` for a resolved query.
-///
-/// Reducer shapes transform row cardinality — applying the user's LIMIT to
-/// source-row population truncates the input and breaks re-evaluation (e.g.
-/// `SELECT count(*) FROM t LIMIT 3` cached with 3 source rows returns 3, not
-/// the real count). Force unbounded population for those shapes.
+/// `(max_limit, mv_limit)` for a resolved query: the population cap of
+/// [`population_max_limit`], and the MV cap.
 ///
 /// `mv_limit` caps the MV body to a top-N, independent of the population cap.
 /// Only joins benefit (other reducers already collapse their input), and never
@@ -117,14 +111,11 @@ fn serve_shape_render(bound: &ResolvedQuery) -> SharedQueryShape {
 /// window depends on the whole partition.
 fn resolution_limits(
     query: Query<'_>,
-    shape_gate: ShapeGate,
+    population: &ResolvedQuery,
+    aggregate_functions: &HashSet<EcoString>,
     user_max_limit: Option<u64>,
 ) -> (Option<u64>, Option<u64>) {
-    let max_limit = if shape_gate.is_reducer() {
-        None
-    } else {
-        user_max_limit
-    };
+    let max_limit = population_max_limit(population, aggregate_functions, user_max_limit);
     let mv_limit = if query_has_join(query) && !query_has_window(query) {
         user_max_limit
     } else {
@@ -176,8 +167,12 @@ impl WriterRegistration {
             query_decorrelate_checked(&bound, &self.aggregate_functions)?.map(Arc::new);
         let shape_gate =
             shape_gate_classify(&bound, decorrelated.as_deref(), &self.aggregate_functions);
-        let (max_limit, mv_limit) =
-            resolution_limits(bound.tree().root(), shape_gate, user_max_limit);
+        let (max_limit, mv_limit) = resolution_limits(
+            bound.tree().root(),
+            decorrelated.as_deref().unwrap_or(&bound),
+            &self.aggregate_functions,
+            user_max_limit,
+        );
 
         let uq_start = Instant::now();
         let relation_oids = self.update_queries_register(
@@ -235,21 +230,11 @@ impl WriterRegistration {
             let relation_oid = admission.relation_oid;
             // Index under each literal's key form for its column's type, so
             // the row probe and the region probe match on value (PGC-478).
-            let table = core.cache.tables.get1(&relation_oid);
-            let keyed = |constraints: &Vec<TableConstraint>| {
-                table.map_or_else(
-                    || constraints.clone(),
-                    |table| table_constraints_keyed(constraints, table),
-                )
-            };
-            let registration = UpdateQueryRegistration {
-                index_constraints: keyed(&admission.update_query.predicates.filters),
-                subsumer_region: admission.subsumer_shape.then(|| SubsumerRegion {
-                    keyed: keyed(&admission.update_query.predicates.filters),
-                    filters: admission.update_query.predicates.filters.clone(),
-                }),
-                update_query: admission.update_query,
-            };
+            let registration = UpdateQueryRegistration::new(
+                admission.update_query,
+                admission.subsumer_shape,
+                core.cache.tables.get1(&relation_oid).map(|table| &**table),
+            );
             match registrations
                 .iter_mut()
                 .find(|(oid, _)| *oid == relation_oid)

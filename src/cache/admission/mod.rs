@@ -16,7 +16,7 @@ mod subsume;
 mod update_classify;
 
 pub use analyze::{
-    AdmissionDepth, AdmissionQuery, CanonicalResolution, base_query_prepare,
+    AdmissionDepth, AdmissionQuery, CanonicalResolution, base_query_prepare, population_max_limit,
     query_admission_analyze, query_decorrelate_checked, query_pushdown, query_resolve_canonical,
     shape_gate_classify,
 };

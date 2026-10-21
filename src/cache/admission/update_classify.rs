@@ -8,12 +8,11 @@ use ecow::EcoString;
 
 use crate::cache::update_query::{OrderByKey, UpdateEvalStrategy, UpdateQuerySource};
 use crate::query::ast::rope::{
-    Column, JoinQualKind, NodeKind, NodeRef, OrderBy, Scalar, ScalarKind, Select, SelectItem,
-    Source, View,
+    Column, JoinQualKind, NodeKind, NodeRef, OrderBy, ScalarKind, Select, SelectItem, Source, View,
 };
 use crate::query::ast::{NodeId, NullOrder, OrderDirection};
 use crate::query::evaluate::where_expr_supported;
-use crate::query::resolve::{ColumnBinding, ColumnTarget, QueryBranch, ResolvedQuery};
+use crate::query::resolve::{ColumnBinding, OrderBySource, QueryBranch, ResolvedQuery, StarItem};
 
 /// How CDC decides a changed row's membership in a branch: locally, when
 /// the branch reads one table and its WHERE is one the compiled predicate
@@ -118,6 +117,21 @@ impl<'a> ReferencedColumns<'a> {
         }
     }
 
+    /// A star-expanded output's column, both sides of a merged one.
+    fn star_item_add(&mut self, item: &StarItem) {
+        match item {
+            StarItem::Column(binding) => self.add_binding(binding),
+            StarItem::Merged(id) => {
+                let Some(merged) = self.bound.bindings().merged(*id) else {
+                    return;
+                };
+                let (left, right) = (merged.left, merged.right);
+                self.add_binding(&left);
+                self.add_binding(&right);
+            }
+        }
+    }
+
     /// Both sides of a `USING`/`NATURAL` join's merged columns.
     fn merged_join_add(&mut self, join: NodeId) {
         let merged: Vec<(ColumnBinding, ColumnBinding)> = self
@@ -135,42 +149,8 @@ impl<'a> ReferencedColumns<'a> {
     }
 }
 
-/// The select-list expressions whose output name is `name`.
-fn alias_exprs<'s>(
-    bound: &'s ResolvedQuery,
-    select: Select<'s>,
-    name: &'s EcoString,
-) -> impl Iterator<Item = Scalar<'s>> {
-    select
-        .items()
-        .into_iter()
-        .flatten()
-        .filter_map(move |item| match item {
-            SelectItem::Expr(expr) => {
-                let output = expr
-                    .alias()
-                    .cloned()
-                    .or_else(|| bound.column_output_name(expr.expr()));
-                (output.as_ref() == Some(name)).then(|| expr.expr())
-            }
-            SelectItem::Star(_) => None,
-        })
-}
-
-/// The output name an ORDER BY item names, when it names one.
-fn order_by_output<'s>(bound: &ResolvedQuery, clause: OrderBy<'s>) -> Option<&'s EcoString> {
-    let ScalarKind::Column(column) = clause.expr().kind() else {
-        return None;
-    };
-    matches!(
-        bound.column_target_at(column.id()),
-        Some(ColumnTarget::Output)
-    )
-    .then(|| column.column())
-}
-
 /// The columns of `table_name` that decide a LIMIT window: ORDER BY keys
-/// (through output aliases), WHERE and HAVING.
+/// (through output names and positions), WHERE and HAVING.
 pub(super) fn limit_window_columns_collect(
     bound: &ResolvedQuery,
     table_name: &str,
@@ -180,12 +160,10 @@ pub(super) fn limit_window_columns_collect(
     let select = bound.select();
     for clause in query.order_by() {
         cols.add_refs(clause.expr().node_ref());
-        if let Some(name) = order_by_output(bound, clause)
-            && let Some(select) = select
-        {
-            for expr in alias_exprs(bound, select, name) {
-                cols.add_refs(expr.node_ref());
-            }
+        match select.and_then(|select| bound.order_by_source(select, clause)) {
+            Some(OrderBySource::Expr(expr)) => cols.add_refs(expr.node_ref()),
+            Some(OrderBySource::Star(item)) => cols.star_item_add(item),
+            None => {}
         }
     }
     if let Some(select) = select {
@@ -212,12 +190,16 @@ pub(super) fn limit_order_keys_collect(
     }
     let order_by = query.order_by();
     let mut keys = Vec::with_capacity(order_by.len());
+    let bindings = bound.bindings();
     for clause in order_by {
-        let column = order_key(bound, clause, select)?;
-        if bound.column_table_at(column.id())?.name.as_str() != table_name {
+        let binding = order_key(bound, clause, select)?;
+        if bindings.slot(binding.slot)?.table().name.as_str() != table_name {
             return None;
         }
-        keys.push(order_key_build(bound.column_name_at(column.id())?, clause));
+        keys.push(order_key_build(
+            &bindings.binding_column(&binding)?.name,
+            clause,
+        ));
     }
     Some(keys.into())
 }
@@ -229,20 +211,25 @@ fn window_is_row_level(select: Select<'_>) -> bool {
     !reshaped && select.node_ref().tree().root().order_by().len() > 0
 }
 
-/// The column an ORDER BY item ranks by, through an output alias.
+/// The column an ORDER BY item ranks by, through an output name or position.
 fn order_key<'s>(
     bound: &'s ResolvedQuery,
     clause: OrderBy<'s>,
     select: Select<'s>,
-) -> Option<Column<'s>> {
-    let target = match order_by_output(bound, clause) {
-        Some(name) => alias_exprs(bound, select, name).next()?,
-        None => clause.expr(),
-    };
-    if let ScalarKind::Column(column) = target.kind() {
-        Some(column)
-    } else {
-        None
+) -> Option<ColumnBinding> {
+    match bound.order_by_source(select, clause)? {
+        OrderBySource::Expr(expr) => match expr.kind() {
+            ScalarKind::Column(column) => bound.column_binding_at(column.id()),
+            ScalarKind::Literal(_)
+            | ScalarKind::Function(_)
+            | ScalarKind::Case(_)
+            | ScalarKind::Arithmetic(_)
+            | ScalarKind::Subquery(_)
+            | ScalarKind::Array(_)
+            | ScalarKind::TypeCast(_) => None,
+        },
+        OrderBySource::Star(StarItem::Column(binding)) => Some(*binding),
+        OrderBySource::Star(StarItem::Merged(_)) => None,
     }
 }
 
@@ -335,6 +322,69 @@ mod classify_tests {
         );
         let bound = resolve(sql, &tables);
         update_eval_strategy_classify(branch(&bound), UpdateQuerySource::FromClause)
+    }
+
+    /// A LIMIT window's sort keys resolve through output names and positions,
+    /// stars expanded, to the table's columns; an expression key has no plain
+    /// column to rank by (PGC-527).
+    #[test]
+    fn test_limit_window_columns_and_order_keys() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(
+            make_table("t", Oid::from_raw(1), &["id", "name", "status", "age"]).into(),
+        );
+        for (sql, window, keys) in [
+            (
+                "SELECT name, age FROM t ORDER BY 2 DESC LIMIT 3",
+                &["age"][..],
+                Some(&["age desc"][..]),
+            ),
+            (
+                "SELECT * FROM t ORDER BY 4 LIMIT 3",
+                &["age"],
+                Some(&["age asc"][..]),
+            ),
+            (
+                "SELECT name AS n FROM t ORDER BY n LIMIT 3",
+                &["name"],
+                Some(&["name asc"][..]),
+            ),
+            (
+                "SELECT name FROM t WHERE status = 'x' ORDER BY age LIMIT 3",
+                &["age", "status"],
+                Some(&["age asc"][..]),
+            ),
+            (
+                "SELECT name FROM t ORDER BY age + 1 LIMIT 3",
+                &["age"],
+                None,
+            ),
+        ] {
+            let bound = resolve(sql, &tables);
+            let mut actual: Vec<String> = limit_window_columns_collect(&bound, "t")
+                .into_iter()
+                .map(|column| column.to_string())
+                .collect();
+            actual.sort();
+            assert_eq!(actual, window, "{sql}");
+            let actual_keys: Option<Vec<String>> =
+                limit_order_keys_collect(&bound, "t").map(|keys| {
+                    keys.iter()
+                        .map(|key| {
+                            format!(
+                                "{} {}",
+                                key.column,
+                                if key.descending { "desc" } else { "asc" }
+                            )
+                        })
+                        .collect()
+                });
+            assert_eq!(
+                actual_keys,
+                keys.map(|keys| keys.iter().map(ToString::to_string).collect()),
+                "{sql}"
+            );
+        }
     }
 
     /// A relation's other references don't stop its rows batching: each entry

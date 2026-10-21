@@ -7,8 +7,8 @@ use std::sync::Arc;
 use ecow::EcoString;
 use pgcache_lib::cache::admission::{
     AdmissionDepth, AdmissionQuery, CanonicalResolution, SubsumptionReference, base_query_prepare,
-    query_admission_analyze, query_decorrelate_checked, query_pushdown, query_resolve_canonical,
-    shape_gate_classify, subsumption_references,
+    population_max_limit, query_admission_analyze, query_decorrelate_checked, query_pushdown,
+    query_resolve_canonical, subsumption_references,
 };
 use pgcache_lib::cache::query::{limit_clause_of, limit_rows_needed};
 use pgcache_lib::cache::{CacheabilityError, CacheableQuery};
@@ -320,12 +320,11 @@ pub fn statement_classify(
         };
     };
     let decorrelated = decorrelated.map(Arc::new);
-    let shape_gate = shape_gate_classify(&bound, decorrelated.as_deref(), &builtins.aggregates);
-    let max_limit = if shape_gate.is_reducer() {
-        None
-    } else {
-        user_max_limit
-    };
+    let max_limit = population_max_limit(
+        decorrelated.as_deref().unwrap_or(&bound),
+        &builtins.aggregates,
+        user_max_limit,
+    );
     let has_limit = max_limit.is_some();
     let analysis = match query_admission_analyze(
         AdmissionQuery {

@@ -299,6 +299,38 @@ pub(crate) async fn query_warm(
     assert_cache_hit(ctx, m).await
 }
 
+/// Applies `change` on origin, then asserts the next read of `query` serves
+/// origin's rows from cache. Returns the metrics after that hit.
+pub(crate) async fn origin_change_applied_in_place(
+    ctx: &mut TestContext,
+    m: MetricsSnapshot,
+    change: &str,
+    query: &str,
+) -> Result<MetricsSnapshot, Error> {
+    ctx.origin_query(change, &[]).await?;
+    ctx.cdc_apply_settle().await?;
+    assert_proxy_rows_match_origin(ctx, query).await?;
+    assert_cache_hit(ctx, m).await
+}
+
+/// Applies `change` on origin, then asserts it invalidated `query`: the next
+/// read misses, and once repopulated a hit serves origin's rows.
+pub(crate) async fn origin_change_invalidates(
+    ctx: &mut TestContext,
+    m: MetricsSnapshot,
+    change: &str,
+    query: &str,
+) -> Result<(), Error> {
+    ctx.origin_query(change, &[]).await?;
+    ctx.cdc_apply_settle().await?;
+    assert_proxy_rows_match_origin(ctx, query).await?;
+    let m = assert_cache_miss(ctx, m).await?;
+    ctx.cache_settle().await?;
+    assert_proxy_rows_match_origin(ctx, query).await?;
+    assert_cache_hit(ctx, m).await?;
+    Ok(())
+}
+
 /// Assert that the last query was subsumed (cache hit via subsumption).
 /// Returns updated metrics snapshot for chaining.
 pub(crate) async fn assert_subsume_hit(

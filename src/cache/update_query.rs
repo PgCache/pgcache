@@ -8,6 +8,8 @@ use rootcause::Report;
 
 use crate::cache::{CacheError, CacheResult};
 #[cfg(feature = "proxy")]
+use crate::catalog::TableMetadata;
+#[cfg(feature = "proxy")]
 use crate::id_hash::BuildIdHasher;
 use crate::id_hash::impl_id_hashable;
 use crate::oid::Oid;
@@ -16,6 +18,8 @@ use crate::query::compiled_predicate::CompiledPredicate;
 #[cfg(feature = "proxy")]
 use crate::query::constraint_index::ColumnForms;
 use crate::query::constraint_index::ConstraintIndex;
+#[cfg(feature = "proxy")]
+use crate::query::constraint_index::table_constraints_keyed;
 use crate::query::constraints::TableConstraint;
 use crate::query::predicates::RelationPredicates;
 use crate::query::resolve::{QueryBranch, ResolvedQuery};
@@ -262,6 +266,32 @@ pub struct UpdateQueryRegistration {
     /// Its region when it could parent a subsumption but for a LIMIT, which
     /// can change after registration.
     pub subsumer_region: Option<SubsumerRegion>,
+}
+
+#[cfg(feature = "proxy")]
+impl UpdateQueryRegistration {
+    /// `update_query`'s registration, its filters keyed once for `table`'s
+    /// column types (PGC-478) and shared by both indexes.
+    pub(crate) fn new(
+        update_query: UpdateQuery,
+        subsumer_shape: bool,
+        table: Option<&TableMetadata>,
+    ) -> Self {
+        let filters = &update_query.predicates.filters;
+        let index_constraints = table.map_or_else(
+            || filters.clone(),
+            |table| table_constraints_keyed(filters, table),
+        );
+        let subsumer_region = subsumer_shape.then(|| SubsumerRegion {
+            keyed: index_constraints.clone(),
+            filters: filters.clone(),
+        });
+        Self {
+            update_query,
+            index_constraints,
+            subsumer_region,
+        }
+    }
 }
 
 /// Collection of update queries for a specific relation.
@@ -597,7 +627,7 @@ mod tests {
     use crate::id_hash::BuildIdHasher;
     use crate::oid::TypeOid;
     use crate::pg::protocol::ByteString;
-    use crate::query::constraint_index::{row_value_forms, table_constraints_keyed};
+    use crate::query::constraint_index::row_value_forms;
 
     const FINGERPRINT: Fingerprint = Fingerprint::from_raw(0x5eed);
     const ITEMS_OID: u32 = 1001;
@@ -651,19 +681,12 @@ mod tests {
         analysis
             .tables
             .into_iter()
-            .map(|admission| UpdateQueryRegistration {
-                index_constraints: table_constraints_keyed(
-                    &admission.update_query.predicates.filters,
-                    &items(),
-                ),
-                subsumer_region: admission.subsumer_shape.then(|| SubsumerRegion {
-                    keyed: table_constraints_keyed(
-                        &admission.update_query.predicates.filters,
-                        &items(),
-                    ),
-                    filters: admission.update_query.predicates.filters.clone(),
-                }),
-                update_query: admission.update_query,
+            .map(|admission| {
+                UpdateQueryRegistration::new(
+                    admission.update_query,
+                    admission.subsumer_shape,
+                    Some(&items()),
+                )
             })
             .collect()
     }

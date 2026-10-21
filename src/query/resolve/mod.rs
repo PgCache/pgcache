@@ -76,4 +76,5 @@ pub use bindings::{
 };
 pub use branch::QueryBranch;
 pub use entry::query_tree_resolve;
+pub(crate) use render::OrderBySource;
 pub use render::SourceOverride;

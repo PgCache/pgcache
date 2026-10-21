@@ -11,7 +11,7 @@ use super::update_classify::{
     predicate_columns_collect, update_eval_strategy_classify,
 };
 use super::{AdmissionAnalysis, TableAdmission};
-use crate::cache::mv_shape::{ShapeGate, shape_classify};
+use crate::cache::mv_shape::{ShapeGate, select_computes, shape_classify};
 use crate::cache::query::{limit_clause_of, limit_rows_needed};
 use crate::cache::update_query::{UpdateEvalStrategy, UpdateQuery, UpdateQuerySource};
 use crate::cache::{CacheError, CacheResult};
@@ -49,6 +49,21 @@ pub fn base_query_prepare(query: &QueryTree) -> (QueryTree, Option<u64>) {
         Body::Select(_) | Body::Values(_) => limit_rows_needed(&limit_clause_of(root)),
     };
     (query_tree_without_limit(query), max_limit)
+}
+
+/// The population cap: the root's LIMIT plus OFFSET when the population form
+/// (decorrelated when it has one) is a plain projection. A shape that
+/// computes its result gets none, whether or not its ORDER BY can be served:
+/// its rows map to no bounded set of source rows (ADR-060).
+pub fn population_max_limit(
+    population: &ResolvedQuery,
+    aggregate_functions: &HashSet<EcoString>,
+    user_max_limit: Option<u64>,
+) -> Option<u64> {
+    population
+        .select()
+        .filter(|select| !select_computes(*select, aggregate_functions))
+        .and(user_max_limit)
 }
 
 /// `query` with its root LIMIT/OFFSET dropped: the root re-emitted without

@@ -14,8 +14,8 @@
 use std::io::Error;
 
 use crate::util::{
-    MetricsSnapshot, TestContext, assert_cache_hit, assert_cache_miss, assert_not_subsumed,
-    assert_proxy_rows_match_origin, assert_row_at, assert_subsume_hit, query_warm,
+    TestContext, assert_cache_hit, assert_cache_miss, assert_not_subsumed, assert_row_at,
+    assert_subsume_hit, origin_change_applied_in_place, origin_change_invalidates, query_warm,
 };
 
 mod util;
@@ -1087,49 +1087,17 @@ async fn setup_authors_bios(ctx: &mut TestContext) -> Result<(), Error> {
     ctx.cdc_decode_settle().await
 }
 
-/// Applies `update` on origin, then asserts the next read serves origin's
-/// rows from cache. Returns the metrics after that hit.
-async fn update_applied_in_place(
-    ctx: &mut TestContext,
-    m: MetricsSnapshot,
-    update: &str,
-    query: &str,
-) -> Result<MetricsSnapshot, Error> {
-    ctx.origin_query(update, &[]).await?;
-    ctx.cdc_apply_settle().await?;
-    assert_proxy_rows_match_origin(ctx, query).await?;
-    assert_cache_hit(ctx, m).await
-}
-
-/// Applies `update` on origin, then asserts it invalidated: the next read
-/// misses, and once repopulated a hit serves origin's rows.
-async fn update_invalidates(
-    ctx: &mut TestContext,
-    m: MetricsSnapshot,
-    update: &str,
-    query: &str,
-) -> Result<(), Error> {
-    ctx.origin_query(update, &[]).await?;
-    ctx.cdc_apply_settle().await?;
-    assert_proxy_rows_match_origin(ctx, query).await?;
-    let m = assert_cache_miss(ctx, m).await?;
-    ctx.cache_settle().await?;
-    assert_proxy_rows_match_origin(ctx, query).await?;
-    assert_cache_hit(ctx, m).await?;
-    Ok(())
-}
-
 /// A terminal side's join column moves its row to another preserved row in
 /// place: every preserved row is in the result, so it's cached (PGC-520).
 #[tokio::test]
-async fn test_terminal_join_column_update_applied_in_place() -> Result<(), Error> {
+async fn test_terminal_join_column_origin_change_applied_in_place() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
     setup_authors_bios(&mut ctx).await?;
 
     let query = "SELECT a.id, b.id AS bio FROM authors a \
                  LEFT JOIN bios b ON b.author_id = a.id ORDER BY a.id";
     let m = query_warm(&mut ctx, query).await?;
-    update_applied_in_place(
+    origin_change_applied_in_place(
         &mut ctx,
         m,
         "UPDATE bios SET author_id = 3 WHERE id = 101",
@@ -1142,7 +1110,7 @@ async fn test_terminal_join_column_update_applied_in_place() -> Result<(), Error
 /// The same through an expression ON, which the model can't read as an
 /// equality (PGC-520).
 #[tokio::test]
-async fn test_terminal_expression_join_update_applied_in_place() -> Result<(), Error> {
+async fn test_terminal_expression_join_origin_change_applied_in_place() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
     ctx.query(
         "CREATE TABLE people (id INTEGER PRIMARY KEY, email TEXT)",
@@ -1169,7 +1137,7 @@ async fn test_terminal_expression_join_update_applied_in_place() -> Result<(), E
     let query = "SELECT p.id, f.id AS profile FROM people p \
                  LEFT JOIN profiles f ON lower(f.email) = lower(p.email) ORDER BY p.id";
     let m = query_warm(&mut ctx, query).await?;
-    update_applied_in_place(
+    origin_change_applied_in_place(
         &mut ctx,
         m,
         "UPDATE profiles SET email = 'CY@x' WHERE id = 100",
@@ -1190,7 +1158,7 @@ async fn test_terminal_update_to_filtered_preserved_row_applied_in_place() -> Re
     let query = "SELECT a.id, b.id AS bio FROM authors a \
                  LEFT JOIN bios b ON b.author_id = a.id WHERE a.country = 'NZ' ORDER BY a.id";
     let m = query_warm(&mut ctx, query).await?;
-    update_applied_in_place(
+    origin_change_applied_in_place(
         &mut ctx,
         m,
         "UPDATE bios SET author_id = 3 WHERE id = 101",
@@ -1240,7 +1208,7 @@ async fn test_terminal_update_with_inner_joined_partner_applied_in_place() -> Re
         "UPDATE likes SET post_id = 11, member_id = 2 WHERE id = 100",
         "UPDATE likes SET post_id = 12, member_id = 9 WHERE id = 100",
     ] {
-        m = update_applied_in_place(&mut ctx, m, update, query).await?;
+        m = origin_change_applied_in_place(&mut ctx, m, update, query).await?;
     }
     Ok(())
 }
@@ -1249,14 +1217,14 @@ async fn test_terminal_update_with_inner_joined_partner_applied_in_place() -> Re
 /// Moving a bio exposes an author that was never loaded, and the UPDATE must
 /// invalidate.
 #[tokio::test]
-async fn test_anti_join_optional_side_update_invalidates() -> Result<(), Error> {
+async fn test_anti_join_optional_side_origin_change_invalidates() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
     setup_authors_bios(&mut ctx).await?;
 
     let query = "SELECT a.id FROM authors a \
                  LEFT JOIN bios b ON b.author_id = a.id WHERE b.id IS NULL ORDER BY a.id";
     let m = query_warm(&mut ctx, query).await?;
-    update_invalidates(
+    origin_change_invalidates(
         &mut ctx,
         m,
         "UPDATE bios SET author_id = 3 WHERE id = 101",
@@ -1269,7 +1237,7 @@ async fn test_anti_join_optional_side_update_invalidates() -> Result<(), Error> 
 /// bio to a photo no result row used needs that photo, which was never loaded,
 /// and the UPDATE must invalidate.
 #[tokio::test]
-async fn test_null_side_with_partner_update_invalidates() -> Result<(), Error> {
+async fn test_null_side_with_partner_origin_change_invalidates() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
     ctx.query("CREATE TABLE writers (id INTEGER PRIMARY KEY)", &[])
         .await?;
@@ -1302,7 +1270,7 @@ async fn test_null_side_with_partner_update_invalidates() -> Result<(), Error> {
                  LEFT JOIN (profiles p JOIN photos ph ON ph.id = p.photo_id) ON p.writer_id = w.id \
                  ORDER BY w.id";
     let m = query_warm(&mut ctx, query).await?;
-    update_invalidates(
+    origin_change_invalidates(
         &mut ctx,
         m,
         "UPDATE profiles SET photo_id = 501 WHERE id = 100",

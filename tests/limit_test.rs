@@ -2,7 +2,7 @@ use std::io::Error;
 
 use crate::util::{
     TestContext, assert_cache_hit, assert_cache_miss, assert_limit_order_decides,
-    assert_proxy_rows_match_origin, assert_row_at, query_warm,
+    assert_proxy_rows_match_origin, assert_row_at, origin_change_invalidates, query_warm,
 };
 
 mod util;
@@ -1024,13 +1024,7 @@ async fn setup_population_cap_tables(ctx: &mut TestContext) -> Result<(), Error>
 
 /// Populates `query` from a miss, then asserts a hit serves origin's rows.
 async fn cached_rows_match_origin(ctx: &mut TestContext, query: &str) -> Result<(), Error> {
-    let m = ctx.metrics().await?;
-    ctx.simple_query(query).await?;
-    let m = assert_cache_miss(ctx, m).await?;
-    ctx.cache_settle().await?;
-    assert_proxy_rows_match_origin(ctx, query).await?;
-    assert_cache_hit(ctx, m).await?;
-    Ok(())
+    query_warm(ctx, query).await.map(drop)
 }
 
 /// A capped population loads the query's top rows, not the first rows
@@ -1075,4 +1069,90 @@ async fn test_limit_population_leaves_not_in_subquery_whole() -> Result<(), Erro
         "SELECT id FROM pa WHERE x NOT IN (SELECT id FROM pb WHERE id <= 100) ORDER BY id LIMIT 3",
     )
     .await
+}
+
+/// A shape that computes its result populates whole even when its ORDER BY
+/// names no output, which demotes its MV gate: a cap would compute over N
+/// source rows (PGC-527).
+#[tokio::test]
+async fn test_limit_computed_shapes_populate_whole() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_population_cap_tables(&mut ctx).await?;
+    ctx.query("CREATE TABLE pg (id INTEGER PRIMARY KEY, status TEXT)", &[])
+        .await?;
+    ctx.query(
+        "INSERT INTO pg SELECT g, CASE WHEN g % 2 = 0 THEN 'a' ELSE 'b' END \
+         FROM generate_series(1, 10) g",
+        &[],
+    )
+    .await?;
+    ctx.cdc_decode_settle().await?;
+
+    for query in [
+        "SELECT count(*) FROM pg GROUP BY status ORDER BY status LIMIT 2",
+        "SELECT id, row_number() OVER (ORDER BY x) AS rank FROM pa ORDER BY x DESC LIMIT 3",
+        "SELECT pa.id FROM pa JOIN pb ON pb.id = pa.x ORDER BY pb.id DESC LIMIT 3",
+    ] {
+        cached_rows_match_origin(&mut ctx, query).await?;
+    }
+    Ok(())
+}
+
+/// A subquery change that shrinks a capped query's result invalidates it:
+/// the row that takes the vacated place was never loaded. An `IN` set losing
+/// a row, and a `NOT IN` set gaining one (PGC-527).
+#[tokio::test]
+async fn test_limit_subquery_shrink_invalidates() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_population_cap_tables(&mut ctx).await?;
+    ctx.query("CREATE TABLE pc (id INTEGER PRIMARY KEY)", &[])
+        .await?;
+    ctx.query("INSERT INTO pc (id) VALUES (100)", &[]).await?;
+    ctx.cdc_decode_settle().await?;
+
+    let query = "SELECT id FROM pa WHERE x IN (SELECT id FROM pb) ORDER BY id LIMIT 2";
+    let m = query_warm(&mut ctx, query).await?;
+    origin_change_invalidates(&mut ctx, m, "DELETE FROM pb WHERE id = 1", query).await?;
+
+    let query = "SELECT id FROM pa WHERE x NOT IN (SELECT id FROM pc) ORDER BY id LIMIT 2";
+    let m = query_warm(&mut ctx, query).await?;
+    origin_change_invalidates(&mut ctx, m, "INSERT INTO pc (id) VALUES (1)", query).await
+}
+
+/// A positional sort key is a window column: demoting the top row out of an
+/// `ORDER BY 1` or star-positional window invalidates (PGC-527).
+#[tokio::test]
+async fn test_limit_positional_sort_key_demotion_invalidates() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    for table in ["totals", "totals_star"] {
+        ctx.query(
+            &format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, total INTEGER)"),
+            &[],
+        )
+        .await?;
+        ctx.query(
+            &format!(
+                "INSERT INTO {table} (id, total) VALUES (5, 60), (4, 70), (3, 80), (2, 90), (1, 100)"
+            ),
+            &[],
+        )
+        .await?;
+    }
+    ctx.cdc_decode_settle().await?;
+
+    for (query, demotion) in [
+        (
+            "SELECT total, id FROM totals ORDER BY 1 DESC LIMIT 4",
+            "UPDATE totals SET total = 10 WHERE id = 1",
+        ),
+        (
+            "SELECT * FROM totals_star ORDER BY 2 DESC LIMIT 4",
+            "UPDATE totals_star SET total = 10 WHERE id = 1",
+        ),
+    ] {
+        assert_limit_order_decides(&ctx, query).await?;
+        let m = query_warm(&mut ctx, query).await?;
+        origin_change_invalidates(&mut ctx, m, demotion, query).await?;
+    }
+    Ok(())
 }

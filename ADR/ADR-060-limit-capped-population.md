@@ -21,8 +21,8 @@ Nothing said what a capped population must load. Two wrong-result bugs followed:
 
 **Which queries are capped.**
 * The cap is the root's LIMIT plus OFFSET.
-* Only a plain-projection SELECT gets one. These populate in full:
-  * shapes that compute their result: aggregates, GROUP BY, HAVING, DISTINCT, window functions and joins;
+* Only a plain-projection SELECT gets one, judged on the population form (decorrelated when it has one). These populate in full:
+  * shapes that compute their result: aggregates, GROUP BY, HAVING, DISTINCT, window functions and joins. This holds even when their ORDER BY can't be served, which demotes their MV gate to `Skip` (PGC-527);
   * set operations;
   * an OFFSET with no LIMIT count.
 * The LIMIT is not part of the query's identity or serve shape (ADR-040), so one entry serves every LIMIT its cap covers.
@@ -30,7 +30,7 @@ Nothing said what a capped population must load. Two wrong-result bugs followed:
 **What a capped read loads.**
 * Only the root SELECT's own table is capped. Subquery, derived-table and CTE reads load whole.
 * The capped read is the root's FROM and WHERE, sorted by the query's ORDER BY, with `LIMIT N` and no DISTINCT.
-  * Each ORDER BY item is rendered as an expression over the table: an output name or a position becomes its select-list expression.
+  * Each ORDER BY item is rendered as an expression over the table: an output name or a position becomes its select-list expression, with stars expanded. CDC's window columns and sort keys resolve items the same way, through one resolver.
   * If an item can't be resolved, the read is uncapped.
 
 **More rows.** A request that needs more than the cap forwards to origin. It then re-populates the query under the larger cap, in a new generation. ADR-026 applies the same check when draining coalesced requests.
@@ -42,6 +42,7 @@ Nothing said what a capped population must load. Two wrong-result bugs followed:
   * or the sort key moved in a way that isn't provably a promotion. The check knows sort direction (PGC-334), and an expression sort key stays conservative.
 * A row that fails the query's WHERE can't enter its window, so it never invalidates (PGC-336).
 * A DELETE invalidates every capped query on the relation (ADR-045).
+* A relevant change to a capped query's subquery table invalidates it, including a shrink. An `IN` set losing a row, or a `NOT IN` set gaining one, can vacate a top-N row whose replacement was never loaded (PGC-527).
 
 **Subsumption.** A capped query is never a subsumption parent (ADR-024): it doesn't hold every row its filters describe.
 
@@ -70,7 +71,8 @@ Nothing said what a capped population must load. Two wrong-result bugs followed:
 * A test can't tell a correct capped read from an unordered one unless its rows sit in a different physical order from the sort. `assert_limit_order_decides` checks this.
 
 ## Implementation Notes
-* **The cap:** `base_query_prepare` (`cache/admission/analyze.rs`) and `resolution_limits` (`cache/writer/registration/resolve.rs`).
+* **The cap:** `base_query_prepare` and `population_max_limit` (`cache/admission/analyze.rs`). The writer and pgcache-fit both use it.
 * **The reads:** `population_reads` and `population_select_build` (`cache/writer/population/stream.rs`), with `ResolvedQuery::order_by_source_into`.
-* **The window:** `limit_window_move_invalidates`, plus the DELETE rule in `from_clause_uncached_invalidates` (`cache/writer/cdc/invalidation.rs`).
+* **ORDER BY resolution:** `ResolvedQuery::order_by_source` (`query/resolve/render.rs`), shared by the capped read and `limit_window_columns_collect` / `limit_order_keys_collect`.
+* **The window:** `limit_window_move_invalidates`, the DELETE rule in `from_clause_uncached_invalidates`, and the subquery rule in `row_uncached_invalidates` (`cache/writer/cdc/invalidation.rs`).
 * **The bump:** `limit_bump_handle` (`cache/writer/registration/lifecycle.rs`).

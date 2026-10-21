@@ -27,22 +27,6 @@ pub enum ShapeGate {
     Skip,
 }
 
-impl ShapeGate {
-    /// True when the shape transforms row cardinality — the query's result-row
-    /// count is not the source-row count (aggregate reduces to groups, window
-    /// annotates but preserves rows yet depends on the full partition, etc).
-    ///
-    /// Used by the source-row caching layer to force `max_limit = None`: a
-    /// user LIMIT bounds result rows, so applying it to source-row population
-    /// would truncate the input and produce wrong results on re-evaluation
-    /// (e.g. `SELECT count(*) FROM t LIMIT 3` cached with 3 source rows
-    /// returns 3, not the real count). Plain projection (`Skip`) is safe
-    /// because result rows = source rows, so LIMIT translates one-to-one.
-    pub fn is_reducer(self) -> bool {
-        matches!(self, ShapeGate::Gated)
-    }
-}
-
 /// Whether every ORDER BY item of the query can be served: an ORDER BY of
 /// a SELECT names a select-list position, and one of a set operation
 /// names an output of its leftmost branch.
@@ -119,13 +103,7 @@ pub fn shape_classify(
             ShapeGate::Gated
         }
         Body::Select(select) => {
-            let computes = items_any(select, &|e| e.has_window())
-                || select.distinct()
-                || select.group_by().len() > 0
-                || select.having().is_some()
-                || items_any(select, &|e| e.has_aggregate(aggregate_functions))
-                || select_has_join(select);
-            if computes {
+            if select_computes(select, aggregate_functions) {
                 ShapeGate::Gated
             } else {
                 return ShapeGate::Skip;
@@ -136,6 +114,22 @@ pub fn shape_classify(
         return ShapeGate::Skip;
     }
     shape
+}
+
+/// Whether a SELECT computes its result from its source rows rather than
+/// projecting them one for one: a window, DISTINCT, GROUP BY, HAVING,
+/// aggregate or join. Its result rows don't map to a bounded set of source
+/// rows, so a LIMIT can't cap its population (ADR-060).
+pub(crate) fn select_computes(
+    select: Select<'_>,
+    aggregate_functions: &HashSet<EcoString>,
+) -> bool {
+    items_any(select, &|e| e.has_window())
+        || select.distinct()
+        || select.group_by().len() > 0
+        || select.having().is_some()
+        || items_any(select, &|e| e.has_aggregate(aggregate_functions))
+        || select_has_join(select)
 }
 
 fn select_has_join(select: Select<'_>) -> bool {
@@ -166,12 +160,6 @@ pub(super) mod tests {
     use super::*;
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
     use crate::oid::{Oid, TypeOid};
-
-    #[test]
-    fn test_is_reducer_matches_non_projection_shapes() {
-        assert!(ShapeGate::Gated.is_reducer());
-        assert!(!ShapeGate::Skip.is_reducer());
-    }
 
     // ==================== Classifier tests ====================
 
@@ -219,6 +207,44 @@ pub(super) mod tests {
         let tables = test_tables();
         let bound = ResolvedQuery::parse_resolve(sql, &tables, &["public"]).expect("resolve query");
         shape_classify(&bound, &test_aggregate_functions())
+    }
+
+    /// A computed shape computes whether or not its ORDER BY can be served,
+    /// which demotes its MV gate to `Skip` (PGC-527).
+    #[test]
+    fn test_select_computes_independent_of_order_by() {
+        let tables = test_tables();
+        for (sql, computes) in [
+            (
+                "SELECT id, status FROM orders ORDER BY total LIMIT 2",
+                false,
+            ),
+            (
+                "SELECT count(*) FROM orders GROUP BY status ORDER BY status LIMIT 2",
+                true,
+            ),
+            (
+                "SELECT id, row_number() OVER (ORDER BY total) FROM orders ORDER BY total DESC LIMIT 3",
+                true,
+            ),
+            (
+                "SELECT u.name FROM users u JOIN orders o ON o.id = u.id ORDER BY o.total DESC LIMIT 5",
+                true,
+            ),
+            (
+                "SELECT DISTINCT status FROM orders ORDER BY status LIMIT 2",
+                true,
+            ),
+        ] {
+            let bound =
+                ResolvedQuery::parse_resolve(sql, &tables, &["public"]).expect("resolve query");
+            let select = bound.select().expect("a SELECT");
+            assert_eq!(
+                select_computes(select, &test_aggregate_functions()),
+                computes,
+                "{sql}"
+            );
+        }
     }
 
     #[test]

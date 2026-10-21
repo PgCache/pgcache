@@ -22,7 +22,7 @@ use crate::query::ast::rope::deparse::{
     table_plain_deparse,
 };
 use crate::query::ast::rope::{
-    Column, CteRef, DeparseContext, Function, Join, OrderBy, QueryTree, ScalarKind, Select,
+    Column, CteRef, DeparseContext, Function, Join, OrderBy, QueryTree, Scalar, ScalarKind, Select,
     SelectItem, Star, Table,
 };
 use crate::query::ast::{Clause, Deparse, LiteralValue, NodeId, separated_deparse};
@@ -610,38 +610,29 @@ impl ResolvedQuery {
         order_by_deparse_with(clause, &mut Bound::text(self.bindings()), buf);
     }
 
-    /// An ORDER BY item of `select` rendered over its FROM's columns, for a
-    /// read with another select list: an output name or a position renders
-    /// that output's expression. False, leaving `buf` alone, when neither
-    /// names an output.
-    pub fn order_by_source_into(
-        &self,
-        select: Select<'_>,
-        clause: OrderBy<'_>,
-        buf: &mut String,
-    ) -> bool {
+    /// What `clause`, an ORDER BY item of `select`, sorts by: an output name
+    /// or a position resolves to that output, any other item is its own
+    /// expression. `None` when it names no output.
+    pub(crate) fn order_by_source<'a>(
+        &'a self,
+        select: Select<'a>,
+        clause: OrderBy<'a>,
+    ) -> Option<OrderBySource<'a>> {
         let expr = clause.expr();
-        let output = match expr.kind() {
+        let wanted = match expr.kind() {
             ScalarKind::Column(column)
                 if matches!(
                     self.column_target_at(column.id()),
                     Some(ColumnTarget::Output)
                 ) =>
             {
-                self.select_outputs(select)
-                    .into_iter()
-                    .find(|output| output.name.as_ref() == Some(column.column()))
-                    .map(|output| output.text)
+                OutputWanted::Named(column.column())
             }
             ScalarKind::Literal(literal) => {
                 let LiteralValue::Integer(position) = literal.value() else {
-                    return false;
+                    return None;
                 };
-                usize::try_from(*position)
-                    .ok()
-                    .and_then(|position| position.checked_sub(1))
-                    .and_then(|index| self.select_outputs(select).into_iter().nth(index))
-                    .map(|output| output.text)
+                OutputWanted::At(usize::try_from(*position).ok()?.checked_sub(1)?)
             }
             ScalarKind::Column(_)
             | ScalarKind::Function(_)
@@ -649,20 +640,90 @@ impl ResolvedQuery {
             | ScalarKind::Arithmetic(_)
             | ScalarKind::Subquery(_)
             | ScalarKind::Array(_)
-            | ScalarKind::TypeCast(_) => {
-                let mut text = String::new();
-                scalar_deparse_with(expr, &mut Bound::text(self.bindings()), &mut text);
-                Some(text)
-            }
+            | ScalarKind::TypeCast(_) => return Some(OrderBySource::Expr(expr)),
         };
-        let Some(text) = output else {
+        let bindings = self.bindings();
+        let mut index = 0;
+        for item in select.items().into_iter().flatten() {
+            match item {
+                SelectItem::Expr(item_expr) => {
+                    let name = item_expr
+                        .alias()
+                        .cloned()
+                        .or_else(|| self.column_output_name(item_expr.expr()));
+                    if wanted.matches(index, name.as_ref()) {
+                        return Some(OrderBySource::Expr(item_expr.expr()));
+                    }
+                    index += 1;
+                }
+                SelectItem::Star(star) => {
+                    for star_item in bindings.star_by_id(star.id()).unwrap_or(&[]) {
+                        let name = match star_item {
+                            StarItem::Column(binding) => {
+                                bindings.binding_column(binding).map(|column| &column.name)
+                            }
+                            StarItem::Merged(id) => bindings.merged(*id).map(|merged| &merged.name),
+                        };
+                        if wanted.matches(index, name) {
+                            return Some(OrderBySource::Star(star_item));
+                        }
+                        index += 1;
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// An ORDER BY item of `select` rendered over its FROM's columns, for a
+    /// read with another select list. False, leaving `buf` alone, when it
+    /// names no output.
+    #[cfg(feature = "proxy")]
+    pub(crate) fn order_by_source_into(
+        &self,
+        select: Select<'_>,
+        clause: OrderBy<'_>,
+        buf: &mut String,
+    ) -> bool {
+        let Some(source) = self.order_by_source(select, clause) else {
             return false;
         };
-        buf.push_str(&text);
+        let mut cx = Bound::text(self.bindings());
+        match source {
+            OrderBySource::Expr(expr) => scalar_deparse_with(expr, &mut cx, buf),
+            OrderBySource::Star(item) => buf.push_str(&cx.star_item_output(item).text),
+        }
         buf.push(' ');
         clause.direction().deparse(buf);
         clause.null_order().deparse(buf);
         true
+    }
+}
+
+/// What an ORDER BY item of a SELECT sorts by.
+#[derive(Clone, Copy)]
+pub(crate) enum OrderBySource<'a> {
+    /// An expression over the FROM: the item's own, or the select-list
+    /// expression an output name or position names.
+    Expr(Scalar<'a>),
+    /// A star-expanded output an output name or position names.
+    Star(&'a StarItem),
+}
+
+/// The select-list output an ORDER BY item names.
+#[derive(Clone, Copy)]
+enum OutputWanted<'a> {
+    Named(&'a EcoString),
+    /// Zero-based, stars expanded.
+    At(usize),
+}
+
+impl OutputWanted<'_> {
+    fn matches(self, index: usize, name: Option<&EcoString>) -> bool {
+        match self {
+            OutputWanted::Named(wanted) => name == Some(wanted),
+            OutputWanted::At(at) => at == index,
+        }
     }
 }
 
