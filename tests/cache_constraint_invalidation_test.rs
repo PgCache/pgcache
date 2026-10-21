@@ -1052,3 +1052,35 @@ async fn test_expression_join_with_pk_equality_uncached_update_invalidates() -> 
     assert_eq!(proxied, origin);
     Ok(())
 }
+
+/// A conjunct the analyzer can't read still restricts its reference: an
+/// UPDATE to an uncached row can make it pass, with partners that were never
+/// loaded, even when every link column is the PK.
+#[tokio::test]
+async fn test_unrecognized_where_conjunct_uncached_update_invalidates() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    ctx.query(
+        "CREATE TABLE uw_users (id INTEGER PRIMARY KEY, email TEXT)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "CREATE TABLE uw_orders (id INTEGER PRIMARY KEY, user_id INTEGER)",
+        &[],
+    )
+    .await?;
+    ctx.query("INSERT INTO uw_users VALUES (1, 'x'), (2, 'y')", &[])
+        .await?;
+    ctx.query("INSERT INTO uw_orders VALUES (10, 1), (20, 2)", &[])
+        .await?;
+    let (proxied, origin) = rows_after_update(
+        &mut ctx,
+        "SELECT o.id, u.id FROM uw_orders o JOIN uw_users u ON u.id = o.user_id \
+         WHERE lower(u.email) = 'x' ORDER BY o.id",
+        "UPDATE uw_users SET email = 'X' WHERE id = 2",
+    )
+    .await?;
+    assert_eq!(origin.len(), 2, "user 2 now passes with order 20");
+    assert_eq!(proxied, origin);
+    Ok(())
+}

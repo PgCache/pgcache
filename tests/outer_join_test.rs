@@ -1013,3 +1013,46 @@ async fn test_left_self_join_cdc_insert_applied_in_place() -> Result<(), Error> 
 
     Ok(())
 }
+
+/// A reference sharing the NULL-filled side of an outer join with another is
+/// no leaf: an INSERT there can attach a partner that was never loaded, so it
+/// must not be applied as terminal.
+#[tokio::test]
+async fn test_nested_null_side_partner_cdc_insert() -> Result<(), Error> {
+    for (label, inner_join) in [("left", "LEFT JOIN"), ("inner", "JOIN")] {
+        let mut ctx = TestContext::setup().await?;
+        ctx.query("CREATE TABLE nn_a (id INTEGER PRIMARY KEY)", &[])
+            .await?;
+        ctx.query(
+            "CREATE TABLE nn_b (id INTEGER PRIMARY KEY, aid INTEGER)",
+            &[],
+        )
+        .await?;
+        ctx.query(
+            "CREATE TABLE nn_c (id INTEGER PRIMARY KEY, bid INTEGER)",
+            &[],
+        )
+        .await?;
+        ctx.query("INSERT INTO nn_a VALUES (1)", &[]).await?;
+        ctx.query("INSERT INTO nn_c VALUES (7, 6)", &[]).await?;
+        ctx.cdc_decode_settle().await?;
+
+        let query = format!(
+            "SELECT a.id, b.id, c.id FROM nn_a a \
+             LEFT JOIN (nn_b b {inner_join} nn_c c ON c.bid = b.id) ON b.aid = a.id \
+             ORDER BY a.id"
+        );
+        let m = ctx.metrics().await?;
+        ctx.simple_query(&query).await?;
+        let _m = assert_cache_miss(&mut ctx, m).await?;
+        ctx.cache_settle().await?;
+
+        ctx.query("INSERT INTO nn_b VALUES (6, 1)", &[]).await?;
+        ctx.cdc_apply_settle().await?;
+
+        let (proxied, origin) = ctx.proxy_and_origin_rows(&query).await?;
+        assert_eq!(origin.len(), 1, "{label}: one row");
+        assert_eq!(proxied, origin, "{label}: b 6 attaches c 7");
+    }
+    Ok(())
+}

@@ -985,6 +985,9 @@ mod tests {
             // another reference to `a` is.
             ("SELECT * FROM a JOIN b ON b.id = a.val LEFT JOIN a a2 ON a2.id = a.tenant_id",
              &[FromClause, FromClause, OuterJoinTerminal]),
+            // A partner beside it on the NULL-filled side keeps b from being a leaf.
+            ("SELECT * FROM a LEFT JOIN (b JOIN c ON c.id = b.id) ON b.a_id = a.id",
+             &[FromClause, OuterJoinOptional, OuterJoinOptional]),
         ];
         for (sql, expected) in cases {
             let sources: Vec<UpdateQuerySource> = update_queries(sql)

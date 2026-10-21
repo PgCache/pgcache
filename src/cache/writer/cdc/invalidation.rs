@@ -96,20 +96,19 @@ pub(super) fn memo_frame_accumulate(
 }
 
 /// Whether the row is relevant to the query's view of this table: it matches
-/// the table's WHERE constraints, or — with none — its join membership may
-/// have changed. Membership is unchanged when the PK didn't change (empty
-/// `key_data`) and every join column is a PK column.
+/// the reference's filters, or a conjunct nobody could read restricts it, or
+/// its join membership may have changed. Membership is unchanged when the PK
+/// didn't change (empty `key_data`) and every link column is a PK column.
 fn row_relevant(
     update_query: &UpdateQuery,
     table_metadata: &TableMetadata,
     event: &RowEvent,
 ) -> bool {
-    if !update_query.predicates.filters.is_empty() {
-        row_constraints_match(
-            &update_query.predicates.filters,
-            table_metadata,
-            event.row_data,
-        )
+    let predicates = &update_query.predicates;
+    if !predicates.filters.is_empty() {
+        row_constraints_match(&predicates.filters, table_metadata, event.row_data)
+    } else if predicates.unrecognized {
+        true
     } else {
         !join_membership_unchanged(update_query, table_metadata, event.key_data)
     }

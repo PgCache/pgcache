@@ -145,6 +145,7 @@ impl QueryBranchPredicates {
         Some(RelationPredicates {
             filters,
             link_columns,
+            unrecognized: predicates.unrecognized,
             exact: predicates.exact,
         })
     }
@@ -257,6 +258,9 @@ impl QueryBranchPredicates {
                 filters,
                 exact: self.reference_exact(bindings, reference),
                 link_columns: self.link_columns_derive(reference),
+                unrecognized: self.conjuncts.iter().any(|conjunct| {
+                    conjunct.form == ConjunctForm::Opaque && conjunct.mentions(reference.slot)
+                }),
                 outer_join_role: self.outer_join_role_derive(reference),
             })
             .collect()
@@ -360,13 +364,23 @@ impl QueryBranchPredicates {
 
     /// `Optional` when a conjunct above an unreduced outer join that
     /// NULL-fills the reference mentions it; the join's own ON doesn't
-    /// count, an enclosing join's does.
+    /// count, an enclosing join's does. `Terminal` also needs the reference
+    /// alone on its innermost NULL-filled side: a partner beside it there
+    /// may never have been loaded.
     fn outer_join_role_derive(&self, reference: &TableReference) -> OuterJoinRole {
         let mut role = OuterJoinRole::Kept;
+        let mut alone = true;
         for (position, step) in reference.path.iter().enumerate() {
             if !self.step_null_fills(step) {
                 continue;
             }
+            alone = self.join(step.join).is_some_and(|join| {
+                let side = match step.side {
+                    JoinSide::Left => &join.left,
+                    JoinSide::Right => &join.right,
+                };
+                side.as_slice() == [reference.slot]
+            });
             let above = reference.path.get(..position).unwrap_or_default();
             let mentioned = self.conjuncts.iter().any(|conjunct| {
                 conjunct.mentions(reference.slot)
@@ -379,6 +393,9 @@ impl QueryBranchPredicates {
                 return OuterJoinRole::Optional;
             }
             role = OuterJoinRole::Terminal;
+        }
+        if role == OuterJoinRole::Terminal && !alone {
+            return OuterJoinRole::Optional;
         }
         role
     }
@@ -622,6 +639,16 @@ mod tests {
              &["a exact=true role=Kept filters=[] links=[id]",
                "b exact=false role=Optional filters=[] links=[id, x]",
                "c exact=false role=Terminal filters=[] links=[x]"]),
+            // A reference beside another on a NULL-filled side is no leaf;
+            // one alone on its innermost NULL-filled side is.
+            ("SELECT * FROM a LEFT JOIN (b LEFT JOIN c ON c.id = b.id) ON b.id = a.id",
+             &["a exact=true role=Kept filters=[] links=[id]",
+               "b exact=false role=Optional filters=[] links=[id]",
+               "c exact=false role=Terminal filters=[] links=[id]"]),
+            ("SELECT * FROM a LEFT JOIN (b JOIN c ON c.id = b.id) ON b.id = a.id",
+             &["a exact=true role=Kept filters=[] links=[id]",
+               "b exact=false role=Optional filters=[] links=[id]",
+               "c exact=false role=Optional filters=[] links=[id]"]),
             // Expression ON and cross-table WHERE columns are link columns.
             ("SELECT * FROM a JOIN b ON b.id = a.x + 1 WHERE a.y = 1",
              &["a exact=false role=Kept filters=[y Equal Integer(1)] links=[x]",
@@ -653,6 +680,22 @@ mod tests {
         for (sql, expected) in cases {
             assert_eq!(reference_lines(sql), *expected, "{sql}");
         }
+    }
+
+    /// A reference an unreadable conjunct mentions is flagged, so CDC never
+    /// takes its empty filters for no restriction.
+    #[test]
+    fn test_unrecognized_conjunct_flagged() {
+        let bound = resolve("SELECT * FROM a JOIN b ON b.id = a.id WHERE a.x + 1 = 2 AND b.y = 3");
+        let branch = root_predicates(&bound);
+        let unrecognized = |name: &str| {
+            branch
+                .relation_predicates(bound.bindings(), slot_of(&bound, &branch, name))
+                .expect("relation predicates")
+                .unrecognized
+        };
+        assert!(unrecognized("a"));
+        assert!(!unrecognized("b"));
     }
 
     /// Each reference of a self-join keeps its own filters.

@@ -39,9 +39,11 @@ Every SELECT branch is described by a `QueryBranchPredicates` (`query/predicates
 * `filters`: the recognized constraints that filter R, closed under equalities that filter the target. A cast comparison doesn't cross an equality.
 * `exact`: R is a base table, every join on its path preserves it, every WHERE conjunct is a constraint on R alone, and nothing from an enclosing SELECT restricts it.
 * `link_columns`: R's columns in any conjunct that mentions another reference (a nested subquery's tables count), or that reaches an enclosing SELECT. Also R's columns in the ON of an unreduced outer join that preserves R.
+* `unrecognized`: an `Opaque` conjunct mentions R, so empty `filters` don't mean nothing restricts it. CDC treats any change to such a row as relevant rather than reading empty filters as "no restriction".
 * `outer_join_role`:
   * `Kept` when no unreduced outer join NULL-fills R;
-  * otherwise `Terminal` or `Optional`, depending on whether a conjunct above that join mentions R.
+  * `Terminal` when R sits alone on the NULL-filled side of its innermost such join and no conjunct above it mentions R;
+  * `Optional` otherwise. A reference beside another on a NULL-filled side can attach partners that were never loaded.
 
 **One update query per table reference.** Each carries its reference's projection to column names (`RelationPredicates`).
 * Consumers OR over a fingerprint's entries, so a row is kept or invalidated if it can stand in for any reference.

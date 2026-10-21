@@ -149,6 +149,9 @@ pub struct TableReferencePredicates {
     /// Dependency footprint: columns whose change can alter the result
     /// other than through `filters`.
     pub link_columns: Vec<ColumnPosition>,
+    /// A conjunct the model couldn't read mentions it, so `filters` may not
+    /// be all that restricts its rows.
+    pub unrecognized: bool,
     pub outer_join_role: OuterJoinRole,
 }
 
@@ -157,6 +160,7 @@ pub struct TableReferencePredicates {
 pub struct RelationPredicates {
     pub filters: Vec<TableConstraint>,
     pub link_columns: Vec<EcoString>,
+    pub unrecognized: bool,
     pub exact: bool,
 }
 
