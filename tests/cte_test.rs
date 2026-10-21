@@ -12,7 +12,7 @@
 
 use std::io::Error;
 
-use crate::util::{TestContext, assert_cache_hit, assert_cache_miss, assert_row_at};
+use crate::util::{TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, http_get};
 
 mod util;
 
@@ -352,6 +352,55 @@ async fn test_cte_materialized() -> Result<(), Error> {
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 4);
     let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+/// A CTE referenced twice populates its rows once: each reference carries its
+/// own copy of the body, and identical origin reads are skipped (PGC-522).
+#[tokio::test]
+async fn test_cte_referenced_twice_populates_once() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE cte_twice (id INTEGER PRIMARY KEY, name TEXT)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO cte_twice (id, name) VALUES (1, 'one'), (2, 'two'), (3, 'three'), (20, 'twenty')",
+        &[],
+    )
+    .await?;
+    ctx.cdc_decode_settle().await?;
+
+    let query = "WITH small AS (SELECT id, name FROM cte_twice WHERE id < 10) \
+                 SELECT a.name FROM small a JOIN small b ON a.id = b.id ORDER BY a.id";
+
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 5);
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 5);
+    assert_row_at(&res, 1, &[("name", "one")])?;
+    assert_row_at(&res, 2, &[("name", "two")])?;
+    assert_row_at(&res, 3, &[("name", "three")])?;
+    assert_cache_hit(&mut ctx, m).await?;
+
+    let (status, body) = http_get(ctx.metrics_port, "/status").await?;
+    assert_eq!(status, 200, "status body: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| Error::other(format!("invalid JSON: {e}\nbody: {body}")))?;
+    let queries = json["queries"].as_array().expect("queries array");
+    assert_eq!(queries.len(), 1, "one cached query: {body}");
+    assert_eq!(
+        queries[0]["population_row_count"].as_u64(),
+        Some(3),
+        "each CTE row populated once: {body}"
+    );
 
     Ok(())
 }

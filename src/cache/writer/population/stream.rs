@@ -98,24 +98,21 @@ pub(super) async fn population_task(
         .map_into_report::<CacheError>()
         .attach_loc("reading the population's origin snapshot")?;
 
-    for (branch, _) in select_branches_with_source(work.population.tree().root()) {
-        for table_node in branch.direct_tables() {
-            let table = table_metadata_find(&work.table_metadata, &work.population, table_node)?;
-            let (staging, needs_create) = staging_table_find(&work.staging, table)?;
-            let fresh = reset.insert(table.relation_oid);
-            if fresh && needs_create {
-                staging_table_create(&connections.cache, table, &staging).await?;
-            }
-            let select =
-                population_select_build(&work.population, table_node, branch, work.max_limit);
-            let copy_out = population_copy_out_sql(&select, table);
-            let copy_in = staging_copy_in_sql(&work.population, table_node, &staging);
-            let (bytes, rows) = population_stream(connections, &copy_out, &copy_in, table).await?;
-            cached_bytes += bytes;
-            row_count += rows;
-            if fresh {
-                staged.push((table.relation_oid, staging));
-            }
+    for PopulationRead { table_node, select } in population_reads(&work.population, work.max_limit)
+    {
+        let table = table_metadata_find(&work.table_metadata, &work.population, table_node)?;
+        let (staging, needs_create) = staging_table_find(&work.staging, table)?;
+        let fresh = reset.insert(table.relation_oid);
+        if fresh && needs_create {
+            staging_table_create(&connections.cache, table, &staging).await?;
+        }
+        let copy_out = population_copy_out_sql(&select, table);
+        let copy_in = staging_copy_in_sql(&work.population, table_node, &staging);
+        let (bytes, rows) = population_stream(connections, &copy_out, &copy_in, table).await?;
+        cached_bytes += bytes;
+        row_count += rows;
+        if fresh {
+            staged.push((table.relation_oid, staging));
         }
     }
 
@@ -137,16 +134,43 @@ pub(super) async fn population_task(
     })
 }
 
+/// One origin read of a population: a table of a branch and its select.
+struct PopulationRead<'a> {
+    table_node: Table<'a>,
+    select: String,
+}
+
+/// Every (branch, table) read of the population in order, skipping a read
+/// another already issued. Each reference to a CTE carries its own copy of
+/// the body, and all reads share one origin snapshot.
+fn population_reads(population: &ResolvedQuery, max_limit: Option<u64>) -> Vec<PopulationRead<'_>> {
+    let mut issued = HashSet::new();
+    let mut reads = Vec::new();
+    for (branch, _) in select_branches_with_source(population.tree().root()) {
+        for table_node in branch.direct_tables() {
+            let select = population_select_build(population, table_node, branch, max_limit);
+            if issued.insert((table_relation_oid(population, table_node), select.clone())) {
+                reads.push(PopulationRead { table_node, select });
+            }
+        }
+    }
+    reads
+}
+
+fn table_relation_oid(population: &ResolvedQuery, table_node: Table<'_>) -> Option<Oid> {
+    let bindings = population.bindings();
+    bindings
+        .source(table_node.id())
+        .and_then(|slot| bindings.slot(slot))
+        .map(|slot| slot.table().relation_oid)
+}
+
 fn table_metadata_find<'a>(
     table_metadata: &'a [Arc<TableMetadata>],
     population: &ResolvedQuery,
     table_node: Table<'_>,
 ) -> CacheResult<&'a TableMetadata> {
-    let bindings = population.bindings();
-    let relation_oid = bindings
-        .source(table_node.id())
-        .and_then(|slot| bindings.slot(slot))
-        .map(|slot| slot.table().relation_oid);
+    let relation_oid = table_relation_oid(population, table_node);
     relation_oid
         .and_then(|oid| {
             table_metadata
@@ -397,26 +421,19 @@ mod tests {
     fn population_selects(sql: &str, max_limit: Option<u64>) -> Vec<String> {
         let catalog = population_catalog();
         let population = ResolvedQuery::parse_resolve(sql, &catalog, &["public"]).expect("resolve");
-        let mut selects = Vec::new();
-        for (branch, _) in select_branches_with_source(population.tree().root()) {
-            for table_node in branch.direct_tables() {
-                selects.push(population_select_build(
-                    &population,
-                    table_node,
-                    branch,
-                    max_limit,
-                ));
-            }
-        }
-        selects
+        population_reads(&population, max_limit)
+            .into_iter()
+            .map(|read| read.select)
+            .collect()
     }
 
     /// Each table of a branch is fetched with the branch's FROM and WHERE,
-    /// DISTINCT, without its grouping, ordering or projection.
+    /// DISTINCT, without its grouping, ordering or projection. A read another
+    /// already issued, as from a CTE's copy per reference, is skipped.
     #[test]
     fn test_population_select_cases() {
         #[rustfmt::skip]
-        let cases: [(&str, &str, Option<u64>, &[&str]); 5] = [
+        let cases: [(&str, &str, Option<u64>, &[&str]); 8] = [
             ("single table", "SELECT name FROM users WHERE id = 1 ORDER BY name", Some(5), &[
                 "SELECT DISTINCT public.users.id, public.users.name FROM public.users WHERE public.users.id = 1 LIMIT 5",
             ]),
@@ -434,6 +451,16 @@ mod tests {
             ("subquery branch", "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders WHERE total = 3)", None, &[
                 "SELECT DISTINCT public.users.id, public.users.name FROM public.users WHERE public.users.id IN (SELECT public.orders.user_id FROM public.orders WHERE public.orders.total = 3)",
                 "SELECT DISTINCT public.orders.id, public.orders.user_id, public.orders.total FROM public.orders WHERE public.orders.total = 3",
+            ]),
+            ("CTE referenced twice", "WITH c AS (SELECT id, name FROM users WHERE id < 10) SELECT a.name FROM c a JOIN c b ON a.id = b.id", None, &[
+                "SELECT DISTINCT public.users.id, public.users.name FROM public.users WHERE public.users.id < 10",
+            ]),
+            ("CTE in a subquery", "WITH c AS (SELECT id, name FROM users WHERE id < 10) SELECT name FROM c WHERE id IN (SELECT id FROM c WHERE name = 'x')", None, &[
+                "SELECT DISTINCT public.users.id, public.users.name FROM public.users WHERE public.users.id < 10",
+            ]),
+            ("self-join reads both references", "SELECT u.name FROM users u JOIN users v ON v.id = u.id", None, &[
+                "SELECT DISTINCT u.id, u.name FROM public.users u JOIN public.users v ON v.id = u.id",
+                "SELECT DISTINCT v.id, v.name FROM public.users u JOIN public.users v ON v.id = u.id",
             ]),
         ];
         for (label, sql, max_limit, expected) in cases {
