@@ -7,7 +7,7 @@ use super::{
     JoinId, JoinKind, JoinPathStep, JoinSide, OuterJoinRole, QueryBranchPredicates,
     RelationPredicates, TableReference, TableReferencePredicates,
 };
-use crate::catalog::ColumnPosition;
+use crate::catalog::{ColumnPosition, TableMetadata};
 use crate::query::constraints::TableConstraint;
 use crate::query::resolve::{Bindings, ColumnBinding, SlotId, TableSlot};
 
@@ -90,6 +90,23 @@ impl ColumnConstraint {
     }
 }
 
+impl RelationPredicates {
+    /// The weakest claim about a table nothing could be derived for: no
+    /// filter, not exact, and every column a link column.
+    pub fn unknown(table: &TableMetadata) -> Self {
+        Self {
+            filters: Vec::new(),
+            link_columns: table
+                .columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect(),
+            unrecognized: true,
+            exact: false,
+        }
+    }
+}
+
 impl QueryBranchPredicates {
     pub fn table_references(&self) -> &[TableReference] {
         &self.table_references
@@ -156,10 +173,6 @@ impl QueryBranchPredicates {
         self.conjuncts.iter().all(|conjunct| {
             conjunct.scope != ConjunctScope::Where || conjunct.form != ConjunctForm::Opaque
         })
-    }
-
-    pub fn join_reduced(&self, id: JoinId) -> bool {
-        self.join(id).is_some_and(|join| join.reduced)
     }
 
     /// Whether `conjunct` restricts the real rows of the reference `slot`:

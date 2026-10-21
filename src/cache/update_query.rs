@@ -652,12 +652,18 @@ mod tests {
             .tables
             .into_iter()
             .map(|admission| UpdateQueryRegistration {
-                index_constraints: table_constraints_keyed(&admission.index_constraints, &items()),
-                update_query: admission.update_query,
-                subsumer_region: admission.subsumer_region.map(|filters| SubsumerRegion {
-                    keyed: table_constraints_keyed(&filters, &items()),
-                    filters,
+                index_constraints: table_constraints_keyed(
+                    &admission.update_query.predicates.filters,
+                    &items(),
+                ),
+                subsumer_region: admission.subsumer_shape.then(|| SubsumerRegion {
+                    keyed: table_constraints_keyed(
+                        &admission.update_query.predicates.filters,
+                        &items(),
+                    ),
+                    filters: admission.update_query.predicates.filters.clone(),
                 }),
+                update_query: admission.update_query,
             })
             .collect()
     }

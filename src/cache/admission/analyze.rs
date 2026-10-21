@@ -5,7 +5,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use ecow::EcoString;
-use rootcause::Report;
 
 use super::update_classify::{
     limit_order_keys_collect, limit_window_columns_collect, pg_batchable_classify,
@@ -23,7 +22,6 @@ use crate::query::ast::rope::{Body, NodeKind, QueryTree, TreeBuilder, View};
 use crate::query::decorrelate::query_decorrelate;
 use crate::query::literal_settings::LiteralSettings;
 use crate::query::predicate::CompiledPredicate;
-use crate::query::predicates::query_branch_predicates_build;
 use crate::query::resolve::ResolveResult;
 use crate::query::resolve::ResolvedQuery;
 use crate::query::transform::{
@@ -195,20 +193,7 @@ pub fn query_admission_analyze(
         let source = bound_update.source;
         let relation_oid = bound_update.relation_oid;
         let branch = bound_update.branch;
-        let bindings = update_source.bindings();
-        let relation = bindings
-            .source(table_node.id())
-            .and_then(|slot| {
-                query_branch_predicates_build(update_source, branch.select)
-                    .relation_predicates(bindings, slot)
-            })
-            .ok_or_else(|| {
-                debug_assert!(
-                    false,
-                    "an update query's table is a reference of its branch"
-                );
-                Report::from(CacheError::InvalidQuery)
-            })?;
+        let relation = bound_update.predicates;
         let eval_strategy = update_eval_strategy_classify(branch, source);
         let pg_batchable = depth == AdmissionDepth::Full
             && eval_strategy == UpdateEvalStrategy::PgEval
@@ -279,18 +264,14 @@ pub fn query_admission_analyze(
             update_query.change_dependent = update_query.update_invalidation_possible();
         }
 
-        let index_constraints = update_query.predicates.filters.clone();
-        let subsumer_region = (single_branch.contains(&relation_oid)
-            && update_query.predicates.exact)
-            .then(|| update_query.predicates.filters.clone());
+        let subsumer_shape = single_branch.contains(&relation_oid) && update_query.predicates.exact;
 
         admissions.push(TableAdmission {
             relation_oid,
             table_name,
             update_query,
-            subsumer_eligible: subsumer_region.is_some() && !has_limit,
-            subsumer_region,
-            index_constraints,
+            subsumer_shape,
+            subsumer_eligible: subsumer_shape && !has_limit,
         });
     }
 
@@ -362,12 +343,7 @@ mod tests {
         let mut shapes: Vec<(String, bool)> = admission_analysis(sql)
             .tables
             .iter()
-            .map(|admission| {
-                (
-                    admission.table_name.to_string(),
-                    admission.subsumer_region.is_some(),
-                )
-            })
+            .map(|admission| (admission.table_name.to_string(), admission.subsumer_shape))
             .collect();
         shapes.sort();
         shapes
@@ -483,7 +459,8 @@ mod tests {
         let region = admission_analysis(cached)
             .tables
             .into_iter()
-            .find_map(|admission| admission.subsumer_region);
+            .find(|admission| admission.subsumer_shape)
+            .map(|admission| admission.update_query.predicates.filters);
         let tables = catalog();
         let bound = ResolvedQuery::parse_resolve(new, &tables, &["public"]).expect("resolve");
         let references = subsumption_references(&bound).expect("references");

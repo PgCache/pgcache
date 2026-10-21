@@ -31,7 +31,7 @@ pub struct TableOccurrence {
 
 /// Every top-level FROM occurrence of `table_metadata`'s relation. A
 /// self-join yields one per arm.
-pub fn table_occurrences_find(
+fn table_occurrences_find(
     branch: QueryBranch<'_>,
     table_metadata: &TableMetadata,
 ) -> AstTransformResult<Vec<TableOccurrence>> {
@@ -186,9 +186,10 @@ pub struct PgEvalTemplate {
 }
 
 impl PgEvalTemplate {
-    /// Build the template for one PgEval query over `table_metadata`, or `None`
-    /// if the relation does not occur exactly once or the sentinel split is
-    /// ambiguous — the caller then falls back to the per-row render.
+    /// Build the template for one PgEval query over `table_metadata`, with the
+    /// row standing in for the `Table` node at `table`, or `None` if that node
+    /// binds no occurrence or the sentinel split is ambiguous — the caller
+    /// then falls back to the per-row render.
     pub fn build(
         branch: QueryBranch<'_>,
         table_metadata: &TableMetadata,

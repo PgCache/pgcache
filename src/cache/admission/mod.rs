@@ -31,17 +31,14 @@ pub struct TableAdmission {
     /// CDC-eval caches (`compiled_where`, `pg_eval_template`,
     /// `pg_batchable`, `change_dependent`) are left unset.
     pub update_query: UpdateQuery,
-    /// The rows population loads in full, as the reference's filters, when
-    /// it can be a subsumption parent but for a LIMIT, which a limit bump
-    /// can change after registration.
-    pub subsumer_region: Option<Vec<TableConstraint>>,
+    /// Population loads every row the update query's filters describe, so
+    /// they are a subsumption region but for a LIMIT, which a limit bump can
+    /// change after registration.
+    pub subsumer_shape: bool,
     /// Mirrors the writer's `can_subsume`: eligible for the subsumption
     /// index. Parent readiness is checked per lookup in
     /// [`subsumption_covered`].
     pub subsumer_eligible: bool,
-    /// Constraints to index under (empty for self-joins — the broadest
-    /// class, so no true match is dropped).
-    pub index_constraints: Vec<TableConstraint>,
 }
 
 pub struct AdmissionAnalysis {

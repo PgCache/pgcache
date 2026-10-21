@@ -4,7 +4,7 @@ use crate::query::ast::rope::{
     Body, JoinQual, Query, Scalar, ScalarKind, Select, SelectItem, Source, Table, Where, WhereKind,
 };
 use crate::query::ast::{SubLinkType, UnaryOp};
-use crate::query::predicates::{OuterJoinRole, query_branch_predicates_build};
+use crate::query::predicates::{OuterJoinRole, RelationPredicates, query_branch_predicates_build};
 use crate::query::resolve::{QueryBranch, ResolvedQuery};
 
 /// One table's update query: the branch it sits in, as the cache
@@ -14,6 +14,8 @@ pub struct TableUpdateQuery<'a> {
     pub relation_oid: Oid,
     pub branch: QueryBranch<'a>,
     pub source: UpdateQuerySource,
+    /// What the table's reference answers to in its branch.
+    pub predicates: RelationPredicates,
 }
 
 /// Every (table, branch) pair of the query: each SELECT, the root and
@@ -26,16 +28,21 @@ pub fn query_table_update_queries(bound: &ResolvedQuery) -> Vec<TableUpdateQuery
         let branch = QueryBranch { bound, select };
         for table in select.direct_tables() {
             let slot = bindings.source(table.id());
-            let relation_oid = slot
-                .and_then(|slot| bindings.slot(slot))
-                .map(|slot| slot.table().relation_oid);
-            let (Some(slot), Some(relation_oid)) = (slot, relation_oid) else {
+            let (Some(slot), Some(table_slot)) = (slot, slot.and_then(|slot| bindings.slot(slot)))
+            else {
                 debug_assert!(false, "a direct table of a resolved query has a slot");
                 continue;
             };
+            let relation_oid = table_slot.table().relation_oid;
             let role = predicates
                 .table_reference_predicates(slot)
                 .map(|reference| reference.outer_join_role);
+            let relation = predicates
+                .relation_predicates(bindings, slot)
+                .unwrap_or_else(|| {
+                    debug_assert!(false, "a direct table is a reference of its branch");
+                    RelationPredicates::unknown(table_slot.table())
+                });
             let effective_source = match (source, role) {
                 (UpdateQuerySource::FromClause, Some(OuterJoinRole::Terminal)) => {
                     UpdateQuerySource::OuterJoinTerminal
@@ -57,6 +64,7 @@ pub fn query_table_update_queries(bound: &ResolvedQuery) -> Vec<TableUpdateQuery
                 relation_oid,
                 branch,
                 source: effective_source,
+                predicates: relation,
             });
         }
     }
@@ -290,6 +298,7 @@ mod tests {
 
     use super::*;
     use crate::cache::SubqueryKind;
+    use crate::cache::UpdateQuerySource::{FromClause, OuterJoinOptional, OuterJoinTerminal};
     use crate::cache::query::CacheableQuery;
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
     use crate::oid::TypeOid;
@@ -965,7 +974,6 @@ mod tests {
     /// role rather than its table's name.
     #[test]
     fn test_update_query_source_per_reference() {
-        use UpdateQuerySource::{FromClause, OuterJoinOptional, OuterJoinTerminal};
         #[rustfmt::skip]
         let cases: &[(&str, &[UpdateQuerySource])] = &[
             ("SELECT * FROM users WHERE id = 1", &[FromClause]),

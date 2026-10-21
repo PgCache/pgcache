@@ -243,10 +243,10 @@ impl WriterRegistration {
                 )
             };
             let registration = UpdateQueryRegistration {
-                index_constraints: keyed(&admission.index_constraints),
-                subsumer_region: admission.subsumer_region.map(|filters| SubsumerRegion {
-                    keyed: keyed(&filters),
-                    filters,
+                index_constraints: keyed(&admission.update_query.predicates.filters),
+                subsumer_region: admission.subsumer_shape.then(|| SubsumerRegion {
+                    keyed: keyed(&admission.update_query.predicates.filters),
+                    filters: admission.update_query.predicates.filters.clone(),
                 }),
                 update_query: admission.update_query,
             };

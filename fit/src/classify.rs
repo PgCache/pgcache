@@ -359,7 +359,9 @@ pub fn statement_classify(
         .into_iter()
         .map(|table| FitAdmission {
             relation_oid: table.relation_oid,
-            subsumer_region: table.subsumer_region,
+            subsumer_region: table
+                .subsumer_shape
+                .then(|| table.update_query.predicates.filters.clone()),
             subsumer_eligible: table.subsumer_eligible,
         })
         .collect();
