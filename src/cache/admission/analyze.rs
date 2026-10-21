@@ -19,9 +19,9 @@ use crate::catalog::Catalog;
 use crate::oid::Oid;
 use crate::query::Fingerprint;
 use crate::query::ast::rope::{Body, NodeKind, QueryTree, TreeBuilder, View};
+use crate::query::compiled_predicate::CompiledPredicate;
 use crate::query::decorrelate::query_decorrelate;
 use crate::query::literal_settings::LiteralSettings;
-use crate::query::predicate::CompiledPredicate;
 use crate::query::resolve::ResolveResult;
 use crate::query::resolve::ResolvedQuery;
 use crate::query::transform::{

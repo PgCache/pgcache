@@ -1,5 +1,6 @@
 pub mod ast;
 pub mod cast;
+pub mod compiled_predicate;
 pub mod constraint_index;
 pub mod constraints;
 pub mod decorrelate;
@@ -8,7 +9,6 @@ pub mod fingerprint;
 pub mod guc;
 pub mod keying_settings;
 pub mod literal_settings;
-pub mod predicate;
 pub mod predicates;
 pub mod resolve;
 pub mod shape;

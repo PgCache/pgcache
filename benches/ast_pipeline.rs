@@ -38,9 +38,9 @@ use pgcache_lib::pg::ByteString;
 use pgcache_lib::query::Fingerprint;
 use pgcache_lib::query::ast::rope::{Node, NodeKind, QueryTree};
 use pgcache_lib::query::ast::{LiteralValue, query_tree_convert_raw, query_tree_session_key};
+use pgcache_lib::query::compiled_predicate::CompiledPredicate;
 use pgcache_lib::query::decorrelate::query_decorrelate;
 use pgcache_lib::query::literal_settings::LiteralSettings;
-use pgcache_lib::query::predicate::CompiledPredicate;
 use pgcache_lib::query::resolve::{
     Bindings, ColumnBinding, ColumnTarget, ResolvedQuery, StarItem, TableSlot,
 };

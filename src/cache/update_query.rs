@@ -12,11 +12,11 @@ use crate::id_hash::BuildIdHasher;
 use crate::id_hash::impl_id_hashable;
 use crate::oid::Oid;
 use crate::query::ast::NodeId;
+use crate::query::compiled_predicate::CompiledPredicate;
 #[cfg(feature = "proxy")]
 use crate::query::constraint_index::ColumnForms;
 use crate::query::constraint_index::ConstraintIndex;
 use crate::query::constraints::TableConstraint;
-use crate::query::predicate::CompiledPredicate;
 use crate::query::predicates::RelationPredicates;
 use crate::query::resolve::{QueryBranch, ResolvedQuery};
 use crate::query::transform::PgEvalTemplate;

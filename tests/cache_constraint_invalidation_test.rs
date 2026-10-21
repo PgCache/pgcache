@@ -775,14 +775,13 @@ async fn test_update_inclusive_subquery_non_pk_column_unconstrained_table_not_in
 
 /// PGC-227 regression: an UPDATE to an uncached row that newly satisfies an
 /// inner join must invalidate, even when the join condition is an *expression*
-/// equi-join (`a.id = b.parent_id + 1`) whose equivalence the constraint
-/// analyzer does not record as a column-to-column join.
+/// equi-join (`a.id = b.parent_id + 1`) rather than a column-to-column one.
 ///
-/// The PGC-227 `change_dependent` optimization derives "this query can never
-/// have its UPDATE invalidation depend on the changed row" from
-/// `table_join_columns`, which only sees recorded `col = col` equivalences.
-/// An expression join records none, so `change_dependent` is false and
-/// `handle_update` skips the invalidation check. But the join is real: the
+/// The PGC-227 `change_dependent` optimization lets `handle_update` skip the
+/// invalidation check for a query whose UPDATE invalidation can never depend
+/// on the changed row. It once derived that from join columns recorded only
+/// for `col = col` equivalences, so an expression join looked independent
+/// and the check was skipped. But the join is real: the
 /// updated `b` row newly matches an `a` row that is NOT in the cache (it was
 /// never part of the result), so the in-place upsert cannot add it — the only
 /// correct response is invalidation. Skipping it serves a stale, under-
