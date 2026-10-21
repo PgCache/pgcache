@@ -22,7 +22,7 @@ use crate::cache::writer::core::WriterCore;
 use crate::cache::{CacheError, CacheResult, ReportExt};
 use crate::oid::Oid;
 use crate::query::Fingerprint;
-use crate::query::ast::rope::{Query, QueryTree};
+use crate::query::ast::rope::QueryTree;
 use crate::query::keying_settings::KeyingSettings;
 use crate::query::resolve::ResolvedQuery;
 
@@ -102,20 +102,21 @@ fn serve_shape_render(bound: &ResolvedQuery) -> SharedQueryShape {
     shape
 }
 
-/// `(max_limit, mv_limit)` for a resolved query: the population cap of
-/// [`population_max_limit`], and the MV cap.
+/// `(max_limit, mv_limit)` for a resolved query and its decorrelated form:
+/// the population cap of [`population_max_limit`], and the MV cap.
 ///
 /// `mv_limit` caps the MV body to a top-N, independent of the population cap.
 /// Only joins benefit (other reducers already collapse their input), and never
 /// window functions — a windowed MV must store the full result because the
 /// window depends on the whole partition.
 fn resolution_limits(
-    query: Query<'_>,
-    population: &ResolvedQuery,
+    bound: &ResolvedQuery,
+    decorrelated: Option<&ResolvedQuery>,
     aggregate_functions: &HashSet<EcoString>,
     user_max_limit: Option<u64>,
 ) -> (Option<u64>, Option<u64>) {
-    let max_limit = population_max_limit(population, aggregate_functions, user_max_limit);
+    let max_limit = population_max_limit(bound, decorrelated, aggregate_functions, user_max_limit);
+    let query = bound.tree().root();
     let mv_limit = if query_has_join(query) && !query_has_window(query) {
         user_max_limit
     } else {
@@ -168,8 +169,8 @@ impl WriterRegistration {
         let shape_gate =
             shape_gate_classify(&bound, decorrelated.as_deref(), &self.aggregate_functions);
         let (max_limit, mv_limit) = resolution_limits(
-            bound.tree().root(),
-            decorrelated.as_deref().unwrap_or(&bound),
+            &bound,
+            decorrelated.as_deref(),
             &self.aggregate_functions,
             user_max_limit,
         );

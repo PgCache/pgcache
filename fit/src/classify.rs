@@ -321,7 +321,8 @@ pub fn statement_classify(
     };
     let decorrelated = decorrelated.map(Arc::new);
     let max_limit = population_max_limit(
-        decorrelated.as_deref().unwrap_or(&bound),
+        &bound,
+        decorrelated.as_deref(),
         &builtins.aggregates,
         user_max_limit,
     );

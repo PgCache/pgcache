@@ -234,9 +234,10 @@ async fn staging_table_create(
 /// GROUP BY and HAVING are dropped because the cache holds raw rows and
 /// aggregates at retrieval.
 ///
-/// `limit` is the root's cap, which only a query reading one table has: the
-/// read is sorted as the query is, so it loads the query's top rows, and one
-/// table has no fan-out to fold. A sort it can't render reads uncapped.
+/// `limit` is the root's cap, which only a query reading one table with an
+/// ORDER BY it can render has (`population_max_limit`): the read is sorted as
+/// the query is, so it loads the query's top rows, and one table has no
+/// fan-out to fold.
 fn population_select_build(
     population: &ResolvedQuery,
     table_node: Table<'_>,
@@ -248,9 +249,11 @@ fn population_select_build(
         limit.is_none() || single_table,
         "a capped population reads one table"
     );
-    let window = limit
-        .filter(|_| single_table)
-        .and_then(|limit| Some((population_order_by(population, branch)?, limit)));
+    let window = limit.filter(|_| single_table).and_then(|limit| {
+        let order_by = population_order_by(population, branch);
+        debug_assert!(order_by.is_some(), "a capped population renders its sort");
+        Some((order_by?, limit))
+    });
     let mut buf = String::with_capacity(1024);
     let mut cx = population.deparse_context();
     buf.push_str(if window.is_some() {
@@ -468,7 +471,7 @@ mod tests {
     #[test]
     fn test_population_select_cases() {
         #[rustfmt::skip]
-        let cases: [(&str, &str, Option<u64>, &[&str]); 16] = [
+        let cases: [(&str, &str, Option<u64>, &[&str]); 15] = [
             ("single table", "SELECT name FROM users WHERE id = 1 ORDER BY name", Some(5), &[
                 "SELECT public.users.id, public.users.name FROM public.users WHERE public.users.id = 1 ORDER BY public.users.name ASC LIMIT 5",
             ]),
@@ -511,9 +514,6 @@ mod tests {
             ]),
             ("capped without order", "SELECT name FROM users", Some(2), &[
                 "SELECT public.users.id, public.users.name FROM public.users LIMIT 2",
-            ]),
-            ("unresolvable position reads uncapped", "SELECT name FROM users ORDER BY 2", Some(2), &[
-                "SELECT DISTINCT public.users.id, public.users.name FROM public.users",
             ]),
             ("subquery branch uncapped", "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders WHERE total > 1) ORDER BY id", Some(2), &[
                 "SELECT public.users.id, public.users.name FROM public.users WHERE public.users.id IN (SELECT public.orders.user_id FROM public.orders WHERE public.orders.total > 1) ORDER BY public.users.id ASC LIMIT 2",

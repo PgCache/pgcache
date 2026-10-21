@@ -159,11 +159,10 @@ pub(super) fn limit_window_columns_collect(
     let query = bound.tree().root();
     let select = bound.select();
     for clause in query.order_by() {
-        cols.add_refs(clause.expr().node_ref());
         match select.and_then(|select| bound.order_by_source(select, clause)) {
             Some(OrderBySource::Expr(expr)) => cols.add_refs(expr.node_ref()),
             Some(OrderBySource::Star(item)) => cols.star_item_add(item),
-            None => {}
+            None => cols.add_refs(clause.expr().node_ref()),
         }
     }
     if let Some(select) = select {

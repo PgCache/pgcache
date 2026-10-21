@@ -712,9 +712,10 @@ impl WriterCdc {
 
     /// Handle DELETE operation.
     ///
-    /// Deletes the row from cache tables and checks for subquery invalidations.
-    /// For Exclusion subquery tables (NOT IN, NOT EXISTS), a DELETE shrinks the
-    /// exclusion set, which grows the outer result set — requiring invalidation.
+    /// Deletes the row from cache tables and checks for invalidations. For
+    /// Exclusion subquery tables (NOT IN, NOT EXISTS), a DELETE shrinks the
+    /// exclusion set, which grows the outer result set. A capped query
+    /// invalidates on any subquery shrink and on any FromClause DELETE (ADR-060).
     // Trace level: at info/debug the fmt layer allocates per-span extensions,
     // which would put a heap allocation on every CDC event.
     #[instrument(skip_all, level = "trace")]
@@ -765,8 +766,8 @@ impl WriterCdc {
         core.mv_dirty_mark_candidates(&del_candidates);
         core.candidate_set_return(del_candidates);
 
-        // Check for subquery invalidations — removing a row can expand the
-        // final result set for Exclusion/Scalar subquery tables
+        // Removing a row can grow the result through an Exclusion or Scalar
+        // subquery, or open a gap in a capped query's window
         if core.cache.update_queries.contains_key(&relation_oid) {
             // DELETE narrowing needs no candidate probe — its set is
             // `has_limit_from ∪ always_check` (ADR-045): a delete invalidates

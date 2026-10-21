@@ -153,8 +153,10 @@ pub struct UpdateQuery {
     /// matches rows against and the link columns whose change can move a row
     /// to partners that were never loaded.
     pub predicates: RelationPredicates,
-    /// Whether the parent cached query has a LIMIT (max_limit.is_some()).
-    /// Used by CDC to determine if DELETE should trigger invalidation.
+    /// Whether the parent cached query's population is capped
+    /// (`max_limit.is_some()`). CDC then invalidates on any change that could
+    /// open a gap at the window's boundary: every DELETE on a FromClause
+    /// reference, and a shrink as well as a growth of a subquery (ADR-060).
     pub has_limit: bool,
     /// Eval strategy for this query's WHERE clause during CDC row matching.
     pub eval_strategy: UpdateEvalStrategy,

@@ -11,13 +11,16 @@ use super::update_classify::{
     predicate_columns_collect, update_eval_strategy_classify,
 };
 use super::{AdmissionAnalysis, TableAdmission};
-use crate::cache::mv_shape::{ShapeGate, select_computes, shape_classify};
+use crate::cache::mv_shape::select_computes;
+#[cfg(feature = "proxy")]
+use crate::cache::mv_shape::{ShapeGate, shape_classify};
 use crate::cache::query::{limit_clause_of, limit_rows_needed};
 use crate::cache::update_query::{UpdateEvalStrategy, UpdateQuery, UpdateQuerySource};
 use crate::cache::{CacheError, CacheResult};
 use crate::catalog::Catalog;
 use crate::oid::Oid;
 use crate::query::Fingerprint;
+use crate::query::ast::NodeId;
 use crate::query::ast::rope::{Body, NodeKind, QueryTree, TreeBuilder, View};
 use crate::query::compiled_predicate::CompiledPredicate;
 use crate::query::decorrelate::query_decorrelate;
@@ -52,17 +55,27 @@ pub fn base_query_prepare(query: &QueryTree) -> (QueryTree, Option<u64>) {
 }
 
 /// The population cap: the root's LIMIT plus OFFSET when the population form
-/// (decorrelated when it has one) is a plain projection. A shape that
-/// computes its result gets none, whether or not its ORDER BY can be served:
-/// its rows map to no bounded set of source rows (ADR-060).
+/// (`decorrelated` when there is one) is a plain projection whose ORDER BY
+/// the capped read can render. A shape that computes its result gets none,
+/// whether or not its ORDER BY can be served: its rows map to no bounded set
+/// of source rows (ADR-060).
 pub fn population_max_limit(
-    population: &ResolvedQuery,
+    bound: &ResolvedQuery,
+    decorrelated: Option<&ResolvedQuery>,
     aggregate_functions: &HashSet<EcoString>,
     user_max_limit: Option<u64>,
 ) -> Option<u64> {
+    let population = decorrelated.unwrap_or(bound);
     population
         .select()
-        .filter(|select| !select_computes(*select, aggregate_functions))
+        .filter(|select| {
+            !select_computes(*select, aggregate_functions)
+                && population
+                    .tree()
+                    .root()
+                    .order_by()
+                    .all(|clause| population.order_by_source(*select, clause).is_some())
+        })
         .and(user_max_limit)
 }
 
@@ -150,12 +163,12 @@ pub fn query_decorrelate_checked(
 /// The relations whose every reference sits in one SELECT branch. Several
 /// branches load the union of their rows, which one region doesn't describe.
 fn single_branch_relations(update_queries: &[TableUpdateQuery<'_>]) -> HashSet<Oid> {
-    let mut branches: HashMap<Oid, HashSet<usize>> = HashMap::new();
+    let mut branches: HashMap<Oid, HashSet<NodeId>> = HashMap::new();
     for update_query in update_queries {
         branches
             .entry(update_query.relation_oid)
             .or_default()
-            .insert(update_query.branch.select.id().index());
+            .insert(update_query.branch.select.id());
     }
     branches
         .into_iter()
@@ -167,7 +180,8 @@ fn single_branch_relations(update_queries: &[TableUpdateQuery<'_>]) -> HashSet<O
 /// Classify a query's shape for MV eligibility on its decorrelated form
 /// when it has one, so the shape classified is the shape population and
 /// rebuild see.
-pub fn shape_gate_classify(
+#[cfg(feature = "proxy")]
+pub(crate) fn shape_gate_classify(
     bound: &ResolvedQuery,
     decorrelated: Option<&ResolvedQuery>,
     aggregate_functions: &HashSet<EcoString>,
@@ -414,6 +428,41 @@ mod tests {
                 .map(|(table, shape)| (table.to_string(), *shape))
                 .collect();
             assert_eq!(subsumer_shapes(sql), expected, "{sql}");
+        }
+    }
+
+    /// The population cap goes to a plain projection whose ORDER BY the read
+    /// can render, judged on the decorrelated form (ADR-060).
+    #[test]
+    fn test_population_max_limit() {
+        let tables = catalog();
+        let aggregate_functions = HashSet::from([EcoString::from("count")]);
+        for (sql, capped) in [
+            ("SELECT id, x FROM a ORDER BY x DESC LIMIT 3", true),
+            ("SELECT * FROM a ORDER BY 3 LIMIT 3", true),
+            ("SELECT x FROM a ORDER BY 2 LIMIT 3", false),
+            (
+                "SELECT x, count(*) FROM a GROUP BY x ORDER BY x LIMIT 3",
+                false,
+            ),
+            (
+                "SELECT a.id FROM a JOIN b ON b.id = a.x ORDER BY b.y LIMIT 3",
+                false,
+            ),
+            (
+                "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.id = a.x) ORDER BY id LIMIT 3",
+                false,
+            ),
+        ] {
+            let bound = ResolvedQuery::parse_resolve(sql, &tables, &["public"]).expect("resolve");
+            let decorrelated =
+                query_decorrelate_checked(&bound, &aggregate_functions).expect("decorrelate");
+            assert_eq!(
+                population_max_limit(&bound, decorrelated.as_ref(), &aggregate_functions, Some(3))
+                    .is_some(),
+                capped,
+                "{sql}"
+            );
         }
     }
 

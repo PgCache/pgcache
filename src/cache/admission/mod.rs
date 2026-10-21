@@ -15,10 +15,11 @@ mod analyze;
 mod subsume;
 mod update_classify;
 
+#[cfg(feature = "proxy")]
+pub(crate) use analyze::shape_gate_classify;
 pub use analyze::{
     AdmissionDepth, AdmissionQuery, CanonicalResolution, base_query_prepare, population_max_limit,
     query_admission_analyze, query_decorrelate_checked, query_pushdown, query_resolve_canonical,
-    shape_gate_classify,
 };
 pub use subsume::{SubsumptionReference, subsumption_covered, subsumption_references};
 
