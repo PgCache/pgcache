@@ -7,7 +7,6 @@ use std::collections::HashSet;
 use ecow::EcoString;
 
 use crate::cache::update_query::{OrderByKey, UpdateEvalStrategy, UpdateQuerySource};
-use crate::oid::Oid;
 use crate::query::ast::rope::{
     Column, JoinQualKind, NodeKind, NodeRef, OrderBy, Scalar, ScalarKind, Select, SelectItem,
     Source, View,
@@ -50,18 +49,15 @@ fn select_is_single_table(select: Select<'_>) -> bool {
 }
 
 /// Whether many CDC rows can be evaluated against the branch in one
-/// multi-row VALUES (PGC-241): no GROUP BY, HAVING or aggregate, and the
-/// relation occurring once.
+/// multi-row VALUES (PGC-241): no GROUP BY, HAVING or aggregate. Only the
+/// entry's own reference is substituted, so another reference to the
+/// relation reads the cache table and each row's answer stays its own.
 pub(super) fn pg_batchable_classify(
     branch: QueryBranch<'_>,
-    relation_oid: Oid,
     aggregate_functions: &HashSet<EcoString>,
 ) -> bool {
     let select = branch.select;
     if select.group_by().len() > 0 || select.having().is_some() {
-        return false;
-    }
-    if branch.bound.relation_occurrences(relation_oid) > 1 {
         return false;
     }
     match select.items() {
@@ -298,7 +294,7 @@ mod classify_tests {
     use super::*;
     use crate::cache::query::CacheableQuery;
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
-    use crate::oid::TypeOid;
+    use crate::oid::{Oid, TypeOid};
     use crate::query::ast::query_tree_parse;
     use crate::query::resolve::ResolvedQuery;
 
@@ -339,6 +335,35 @@ mod classify_tests {
         );
         let bound = resolve(sql, &tables);
         update_eval_strategy_classify(branch(&bound), UpdateQuerySource::FromClause)
+    }
+
+    /// A relation's other references don't stop its rows batching: each entry
+    /// substitutes only its own (PGC-521). Grouping and aggregates still do.
+    #[test]
+    fn test_pg_batchable_with_repeated_relation() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(
+            make_table("t", Oid::from_raw(1), &["id", "name", "status", "age"]).into(),
+        );
+        let aggregate_functions = HashSet::from([EcoString::from("count")]);
+        for (sql, batchable) in [
+            ("SELECT * FROM t a JOIN t b ON b.id = a.id", true),
+            (
+                "SELECT * FROM t WHERE name IN (SELECT name FROM t WHERE status = 'x')",
+                true,
+            ),
+            (
+                "SELECT a.status, count(*) FROM t a JOIN t b ON b.id = a.id GROUP BY a.status",
+                false,
+            ),
+        ] {
+            let bound = resolve(sql, &tables);
+            assert_eq!(
+                pg_batchable_classify(branch(&bound), &aggregate_functions),
+                batchable,
+                "{sql}"
+            );
+        }
     }
 
     #[test]

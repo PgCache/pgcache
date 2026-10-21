@@ -197,7 +197,7 @@ pub fn query_admission_analyze(
         let eval_strategy = update_eval_strategy_classify(branch, source);
         let pg_batchable = depth == AdmissionDepth::Full
             && eval_strategy == UpdateEvalStrategy::PgEval
-            && pg_batchable_classify(branch, relation_oid, aggregate_functions);
+            && pg_batchable_classify(branch, aggregate_functions);
         // Walk the whole query: the branch has no ORDER BY.
         let limit_window_columns = if has_limit {
             limit_window_columns_collect(bound, table_node.name().as_str())

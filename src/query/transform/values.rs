@@ -29,35 +29,6 @@ pub struct TableOccurrence {
     alias: EcoString,
 }
 
-/// Every top-level FROM occurrence of `table_metadata`'s relation. A
-/// self-join yields one per arm.
-fn table_occurrences_find(
-    branch: QueryBranch<'_>,
-    table_metadata: &TableMetadata,
-) -> AstTransformResult<Vec<TableOccurrence>> {
-    let bindings = branch.bound.bindings();
-    let mut occurrences = Vec::new();
-    for table in branch.select.direct_tables() {
-        let Some(slot) = bindings.source(table.id()) else {
-            continue;
-        };
-        if let Some(TableSlot::Base {
-            table: metadata, ..
-        }) = bindings.slot(slot)
-            && metadata.relation_oid == table_metadata.relation_oid
-        {
-            occurrences.push(TableOccurrence {
-                slot,
-                alias: EcoString::from(bindings.slot(slot).map_or("", |s| s.qualifier())),
-            });
-        }
-    }
-    if occurrences.is_empty() {
-        return Err(Report::from(AstTransformError::MissingTable));
-    }
-    Ok(occurrences)
-}
-
 /// The FROM occurrence the `Table` node at `table` binds.
 pub fn table_occurrence_at(
     branch: QueryBranch<'_>,
@@ -74,26 +45,6 @@ pub fn table_occurrence_at(
         slot,
         alias: EcoString::from(table_slot.qualifier()),
     })
-}
-
-/// The relation's sole FROM occurrence. Errors when it appears more than once —
-/// the callers that use this (the batch/unnest forms and the prepared
-/// `PgEvalTemplate`) all substitute a single occurrence, which is only a
-/// complete membership test when there *is* only one (PGC-256).
-fn table_occurrence_single(
-    branch: QueryBranch<'_>,
-    table_metadata: &TableMetadata,
-) -> AstTransformResult<TableOccurrence> {
-    let mut occurrences = table_occurrences_find(branch, table_metadata)?;
-    if occurrences.len() > 1 {
-        return Err(AstTransformError::MultipleOccurrences {
-            table: EcoString::from(table_metadata.name.as_str()),
-        }
-        .into());
-    }
-    occurrences
-        .pop()
-        .ok_or_else(|| Report::from(AstTransformError::MissingTable))
 }
 
 /// One VALUES row's literals for `row_data`, in `table_metadata` column
@@ -283,8 +234,8 @@ fn membership_select_into(
     branch_select_into(&mut cx, buf, branch.select, projection);
 }
 
-/// Multi-row membership for batched evaluation (PGC-241): the relation's sole
-/// occurrence becomes a K-row `VALUES`, each row prefixed with its ordinal in
+/// Multi-row membership for batched evaluation (PGC-241): the occurrence at
+/// `table` becomes a K-row `VALUES`, each row prefixed with its ordinal in
 /// a synthetic [`BATCH_IDX_COLUMN`], projected as `<query ordinal>,
 /// <BATCH_IDX_COLUMN>` so a `UNION ALL` of per-query arms returns the
 /// matching `(query ordinal, row index)` pairs in one statement.
@@ -292,14 +243,16 @@ fn membership_select_into(
 /// Only valid for queries whose membership is per-row independent
 /// (`UpdateQuery::pg_batchable`): each VALUES row joins/filters independently,
 /// so projecting the surviving indexes is exactly the per-row `EXISTS` answer.
+/// Another occurrence of the relation reads the cache table, never the batch.
 pub fn membership_batch_into(
     buf: &mut String,
     branch: QueryBranch<'_>,
     table_metadata: &TableMetadata,
+    table: NodeId,
     rows: &[&[Option<ByteString>]],
     query_ordinal: i64,
 ) -> AstTransformResult<()> {
-    let occurrence = table_occurrence_single(branch, table_metadata)?;
+    let occurrence = table_occurrence_at(branch, table)?;
     // Batch rows are uniform full-width (the caller filters odd-arity rows
     // out), so the alias columns are the relation's full column list.
     let mut columns: Vec<EcoString> = Vec::with_capacity(table_metadata.columns.len() + 1);
@@ -324,8 +277,8 @@ pub fn membership_batch_into(
     Ok(())
 }
 
-/// Prepared-statement membership (PGC-241 stage 4): the relation's sole
-/// occurrence becomes a from-less subselect of `unnest()` calls over array
+/// Prepared-statement membership (PGC-241 stage 4): the occurrence at `table`
+/// becomes a from-less subselect of `unnest()` calls over array
 /// parameters, so the SQL shape is fixed regardless of row count and the
 /// statement can be prepared once per query and reused across frames:
 ///
@@ -344,8 +297,9 @@ pub fn membership_unnest_into(
     buf: &mut String,
     branch: QueryBranch<'_>,
     table_metadata: &TableMetadata,
+    table: NodeId,
 ) -> AstTransformResult<()> {
-    let occurrence = table_occurrence_single(branch, table_metadata)?;
+    let occurrence = table_occurrence_at(branch, table)?;
     let mut source = String::with_capacity(64 + table_metadata.columns.len() * 32);
     let _ = write!(source, "SELECT unnest($1::int4[]) AS {BATCH_IDX_COLUMN}");
     for (i, column_meta) in table_metadata.columns.iter().enumerate() {
@@ -372,6 +326,7 @@ mod tests {
     use super::*;
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition};
     use crate::oid::TypeOid;
+    use crate::query::ast::rope::Source;
     use crate::query::resolve::ResolvedQuery;
 
     fn column_metadata(name: &str, index: usize, type_name: &str) -> ColumnMetadata {
@@ -421,7 +376,18 @@ mod tests {
         values.iter().map(|v| v.map(Into::into)).collect()
     }
 
-    /// The single-occurrence membership SQL for `row_data`.
+    /// The branch's first FROM table.
+    fn first_table(bound: &ResolvedQuery) -> NodeId {
+        branch(bound)
+            .select
+            .direct_tables()
+            .first()
+            .copied()
+            .expect("a table")
+            .id()
+    }
+
+    /// The membership SQL for `row_data` standing in for the first FROM table.
     fn membership(
         sql: &str,
         table: &TableMetadata,
@@ -429,7 +395,8 @@ mod tests {
         row_data: &[Option<ByteString>],
     ) -> String {
         let bound = bound(sql, catalog);
-        let occurrence = table_occurrence_single(branch(&bound), table).expect("one occurrence");
+        let occurrence =
+            table_occurrence_at(branch(&bound), first_table(&bound)).expect("the occurrence");
         let mut buf = String::new();
         membership_values_into(&mut buf, branch(&bound), table, row_data, &occurrence);
         buf
@@ -633,7 +600,15 @@ mod tests {
         let row_b = row(&[Some("2"), None]);
         let rows: Vec<&[Option<ByteString>]> = vec![&row_a, &row_b];
         let mut buf = String::new();
-        membership_batch_into(&mut buf, branch(&bound), &users, &rows, 7).expect("render");
+        membership_batch_into(
+            &mut buf,
+            branch(&bound),
+            &users,
+            first_table(&bound),
+            &rows,
+            7,
+        )
+        .expect("render");
         assert_eq!(
             buf,
             "SELECT 7, __pgc_idx FROM (VALUES (0, '1'::int4, 'a'::text), (1, '2'::int4, NULL::text)) \
@@ -647,7 +622,8 @@ mod tests {
         let catalog = catalog(&[&users]);
         let bound = bound("SELECT name FROM users u WHERE u.id > 0", &catalog);
         let mut buf = String::new();
-        membership_unnest_into(&mut buf, branch(&bound), &users).expect("render");
+        membership_unnest_into(&mut buf, branch(&bound), &users, first_table(&bound))
+            .expect("render");
         assert_eq!(
             buf,
             "SELECT __pgc_idx FROM (SELECT unnest($1::int4[]) AS __pgc_idx, unnest($2::text[])::int4 AS id, \
@@ -655,27 +631,72 @@ mod tests {
         );
     }
 
+    /// A FROM entry that isn't a base table has no occurrence to substitute.
     #[test]
-    fn test_missing_or_repeated_occurrences_are_errors() {
+    fn test_occurrence_of_non_table_is_error() {
         let users = users();
-        let other = table_metadata("other", 101, &[("id", "int4")]);
-        let catalog = catalog(&[&users, &other]);
-        let bound = bound(
-            "SELECT a.name FROM users a JOIN users b ON a.id = b.id",
-            &catalog,
-        );
+        let catalog = catalog(&[&users]);
+        let bound = bound("SELECT d.id FROM (SELECT id FROM users) d", &catalog);
+        let Some(Source::Subquery(derived)) = branch(&bound).select.from().next() else {
+            panic!("a derived table");
+        };
         assert!(matches!(
-            table_occurrence_single(branch(&bound), &users)
-                .expect_err("two arms")
-                .current_context(),
-            AstTransformError::MultipleOccurrences { .. }
-        ));
-        assert!(matches!(
-            table_occurrences_find(branch(&bound), &other)
-                .expect_err("absent")
+            table_occurrence_at(branch(&bound), derived.id())
+                .expect_err("a derived table")
                 .current_context(),
             AstTransformError::MissingTable
         ));
+    }
+
+    /// Each arm of a self-join batches on its own: the batch and unnest forms
+    /// substitute that arm only, and the other reads the cache table (PGC-521).
+    #[test]
+    fn test_batch_forms_per_self_join_arm() {
+        let users = users();
+        let catalog = catalog(&[&users]);
+        let bound = bound(
+            "SELECT a.name FROM users a JOIN users b ON a.id = b.id WHERE b.name = 'y'",
+            &catalog,
+        );
+        let r = row(&[Some("1"), Some("x")]);
+        let rows: Vec<&[Option<ByteString>]> = vec![&r];
+        let unnest_source = "(SELECT unnest($1::int4[]) AS __pgc_idx, unnest($2::text[])::int4 AS id, \
+                             unnest($3::text[])::text AS name)";
+        let expected = [
+            (
+                "SELECT 3, __pgc_idx FROM (VALUES (0, '1'::int4, 'x'::text)) a(__pgc_idx, id, name) \
+                 JOIN public.users b ON a.id = b.id WHERE b.name = 'y'"
+                    .to_owned(),
+                format!(
+                    "SELECT __pgc_idx FROM {unnest_source} a JOIN public.users b ON a.id = b.id \
+                     WHERE b.name = 'y'"
+                ),
+            ),
+            (
+                "SELECT 3, __pgc_idx FROM public.users a JOIN (VALUES (0, '1'::int4, 'x'::text)) \
+                 b(__pgc_idx, id, name) ON a.id = b.id WHERE b.name = 'y'"
+                    .to_owned(),
+                format!(
+                    "SELECT __pgc_idx FROM public.users a JOIN {unnest_source} b ON a.id = b.id \
+                     WHERE b.name = 'y'"
+                ),
+            ),
+        ];
+        for (table, (expected_batch, expected_unnest)) in branch(&bound)
+            .select
+            .direct_tables()
+            .into_iter()
+            .zip(expected)
+        {
+            let mut batch = String::new();
+            membership_batch_into(&mut batch, branch(&bound), &users, table.id(), &rows, 3)
+                .expect("render");
+            assert_eq!(batch, expected_batch);
+            let mut unnest = String::new();
+            membership_unnest_into(&mut unnest, branch(&bound), &users, table.id())
+                .expect("render");
+            assert_eq!(unnest, expected_unnest);
+        }
     }
 
     /// PGC-343: the template's prefix/suffix render byte-identical to the
@@ -709,7 +730,7 @@ mod tests {
                 PgEvalTemplate::build(branch(&bound), &onek, table.id()).expect("template builds");
             for r in &rows {
                 let occurrence =
-                    table_occurrence_single(branch(&bound), &onek).expect("one occurrence");
+                    table_occurrence_at(branch(&bound), table.id()).expect("the occurrence");
                 let mut expected = String::new();
                 membership_values_into(&mut expected, branch(&bound), &onek, r, &occurrence);
                 let mut fast = String::new();

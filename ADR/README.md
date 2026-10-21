@@ -61,7 +61,7 @@ Conventions: files are `ADR-XXX-brief-title.md` with the next sequential number;
 - [ADR-018](ADR-018-dynamic-publication-management.md) — Dynamic publication management (filter CDC at source via ALTER PUBLICATION)
 - [ADR-027](ADR-027-cdc-local-eval-fast-path.md) — CDC local-eval fast path (LocalEval in Rust vs PgEval)
 - [ADR-035](ADR-035-population-cdc-merge-consistency.md) — Population/CDC merge consistency (staging, merge watermark gate, deleted-key set)
-- [ADR-039](ADR-039-cdc-apply-batching.md) — CDC apply batching + prepared membership-eval
+- [ADR-039](ADR-039-cdc-apply-batching.md) — CDC apply batching + prepared membership-eval *(amended: batches per table reference, ADR-059)*
 - [ADR-045](ADR-045-candidate-narrowed-cdc-bookkeeping.md) — Candidate-narrowed CDC invalidation + memo eviction *(extends ADR-037's shared probe to the invalidation/memo passes)*
 - [ADR-058](ADR-058-schema-change-signal-via-event-triggers.md) — Origin schema-change signal: event triggers emit DDL/drops as transactional logical messages; writer evicts and forgets the relation *(amends ADR-018's never-removed metadata; supersedes the PGC-233 control table)*
 

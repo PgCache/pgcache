@@ -1,9 +1,9 @@
 use std::io::Error;
 
 use crate::util::{
-    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, cache_settle_at,
-    connect_cache_db, connect_pgcache_tls, metrics_after_outcomes, metrics_http_get,
-    start_databases,
+    TestContext, assert_cache_hit, assert_cache_miss, assert_proxy_rows_match_origin,
+    assert_row_at, cache_settle_at, connect_cache_db, connect_pgcache_tls, metrics_after_outcomes,
+    metrics_delta, metrics_http_get, query_warm, start_databases,
 };
 
 mod util;
@@ -948,5 +948,48 @@ async fn test_cache_self_join_filters_per_reference_cdc() -> Result<(), Error> {
     assert_eq!(origin.len(), 1, "(3, 4)");
     assert_eq!(proxied, origin);
 
+    Ok(())
+}
+
+/// A multi-row transaction into a self-joined relation is batch-evaluated per
+/// reference: rows matching only the employee side or only the manager side
+/// both stay cached, and each reference costs one evaluation, not one per row
+/// (PGC-521).
+#[tokio::test]
+async fn test_self_join_rows_batch_per_reference() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    ctx.query(
+        "CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, dept TEXT, manager_id INTEGER)",
+        &[],
+    )
+    .await?;
+    // Managers 1 and 5 sit outside dept x, so they match only the manager
+    // reference; 2, 3, 4 and 6 match only the employee reference.
+    ctx.query(
+        "INSERT INTO emp (id, name, dept, manager_id) VALUES \
+         (1, 'bob', 'y', NULL), (5, 'eve', 'y', NULL), \
+         (2, 'ann', 'x', 1), (3, 'cat', 'x', 1), (4, 'dan', 'x', 1), (6, 'fay', 'x', 5)",
+        &[],
+    )
+    .await?;
+    ctx.cdc_decode_settle().await?;
+
+    let query = "SELECT e.id, e.name, m.name AS manager FROM emp e \
+                 JOIN emp m ON m.id = e.manager_id WHERE e.dept = 'x' ORDER BY e.id";
+    query_warm(&mut ctx, query).await?;
+
+    let before = ctx.metrics().await?;
+    ctx.origin_query("UPDATE emp SET name = name || '2'", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+    let after = ctx.metrics().await?;
+    let evaluations = metrics_delta(&before, &after).cache_cdc_pg_eval_hits;
+    assert!(
+        (1..=2).contains(&evaluations),
+        "six rows batch into one evaluation per reference, got {evaluations}"
+    );
+
+    assert_proxy_rows_match_origin(&mut ctx, query).await?;
+    assert_cache_hit(&mut ctx, after).await?;
     Ok(())
 }

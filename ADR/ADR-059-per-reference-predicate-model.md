@@ -72,7 +72,7 @@ Every SELECT branch is described by a `QueryBranchPredicates` (`query/predicates
 * **Removed code.** The name-keyed collector, `ConstraintColumn`, `repeated_tables`, the `self_joined` guards and the terminality walk are gone.
 
 ### Negative
-* **More entries for self-joins.** A self-join registers one update query per reference, which costs more index entries and membership evaluations per row. Batched evaluation still skips them (PGC-521).
+* **More entries for self-joins.** A self-join registers one update query per reference, which costs more index entries and membership evaluations per row. Each entry batches on its own (PGC-521).
 * **The model is built more than once.** It is built per branch at registration and again for subsumption and read-after-write lookups.
 
 ## Implementation Notes

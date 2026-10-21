@@ -235,6 +235,7 @@ impl WriterCdc {
             &mut self.pg_eval_buf,
             update_query.branch()?,
             table_metadata,
+            update_query.table,
         )
         .map_err(|e| e.context_transform(CacheError::from))?;
         let statement = self
@@ -344,6 +345,7 @@ impl WriterCdc {
                     &mut self.pg_eval_buf,
                     update_query.branch()?,
                     table_metadata,
+                    update_query.table,
                     &chunk_rows,
                     ordinal as i64,
                 )

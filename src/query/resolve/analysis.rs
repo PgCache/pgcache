@@ -10,7 +10,6 @@ use postgres_types::Type;
 
 use super::bindings::{Bindings, ColumnBinding, ColumnTarget, ResolvedQuery, StarItem, TableSlot};
 use crate::catalog::TableMetadata;
-use crate::oid::Oid;
 use crate::query::ast::NodeId;
 use crate::query::ast::rope::{
     Body, NodeKind, Query, Scalar, ScalarKind, Select, SelectItem, View,
@@ -57,16 +56,6 @@ impl ResolvedQuery {
 
     pub fn column_type_at(&self, id: NodeId) -> Option<&Type> {
         binding_type(self.bindings(), self.column_binding_at(id)?)
-    }
-
-    /// How many FROM entries of the query are `relation_oid`, subqueries
-    /// included: a self-join references the relation twice.
-    pub fn relation_occurrences(&self, relation_oid: Oid) -> usize {
-        self.bindings()
-            .slots()
-            .iter()
-            .filter(|slot| matches!(slot, TableSlot::Base { table, .. } if table.relation_oid == relation_oid))
-            .count()
     }
 
     /// Which columns of each table the query reads anywhere: select list,

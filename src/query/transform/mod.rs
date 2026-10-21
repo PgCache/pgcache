@@ -5,7 +5,6 @@ pub(crate) mod predicate_pushdown;
 mod substitute;
 mod values;
 
-use ecow::EcoString;
 use error_set::error_set;
 use rootcause::Report;
 
@@ -24,8 +23,6 @@ error_set! {
         InvalidParameterValue { message: String },
         #[display("Unsupported binary format for OID {oid}")]
         UnsupportedBinaryFormat { oid: TypeOid },
-        #[display("Table {table} occurs more than once (self-join); a single-occurrence substitution is not a complete membership test")]
-        MultipleOccurrences { table: EcoString },
     }
 }
 
