@@ -1,10 +1,10 @@
-use crate::cache::query::outer_join_optional_tables;
 use crate::cache::{SubqueryKind, UpdateQuerySource};
 use crate::oid::Oid;
 use crate::query::ast::rope::{
     Body, JoinQual, Query, Scalar, ScalarKind, Select, SelectItem, Source, Table, Where, WhereKind,
 };
 use crate::query::ast::{SubLinkType, UnaryOp};
+use crate::query::predicates::{OuterJoinRole, query_branch_predicates_build};
 use crate::query::resolve::{QueryBranch, ResolvedQuery};
 
 /// One table's update query: the branch it sits in, as the cache
@@ -20,29 +20,37 @@ pub struct TableUpdateQuery<'a> {
 /// every subquery, once per table directly in its FROM.
 pub fn query_table_update_queries(bound: &ResolvedQuery) -> Vec<TableUpdateQuery<'_>> {
     let mut result = Vec::new();
+    let bindings = bound.bindings();
     for (select, source) in select_branches_with_source(bound.tree().root()) {
-        let (terminal, non_terminal) = outer_join_optional_tables(bound, select);
+        let predicates = query_branch_predicates_build(bound, select);
         let branch = QueryBranch { bound, select };
         for table in select.direct_tables() {
-            let relation_oid = bound
-                .bindings()
-                .source(table.id())
-                .and_then(|slot| bound.bindings().slot(slot))
+            let slot = bindings.source(table.id());
+            let relation_oid = slot
+                .and_then(|slot| bindings.slot(slot))
                 .map(|slot| slot.table().relation_oid);
-            let Some(relation_oid) = relation_oid else {
+            let (Some(slot), Some(relation_oid)) = (slot, relation_oid) else {
                 debug_assert!(false, "a direct table of a resolved query has a slot");
                 continue;
             };
-            let effective_source = if source == UpdateQuerySource::FromClause {
-                if non_terminal.contains(table.name().as_str()) {
-                    UpdateQuerySource::OuterJoinOptional
-                } else if terminal.contains(table.name().as_str()) {
+            let role = predicates
+                .table_reference_predicates(slot)
+                .map(|reference| reference.outer_join_role);
+            let effective_source = match (source, role) {
+                (UpdateQuerySource::FromClause, Some(OuterJoinRole::Terminal)) => {
                     UpdateQuerySource::OuterJoinTerminal
-                } else {
-                    source
                 }
-            } else {
-                source
+                // A reference the model can't place is treated as optional.
+                (UpdateQuerySource::FromClause, Some(OuterJoinRole::Optional) | None) => {
+                    UpdateQuerySource::OuterJoinOptional
+                }
+                (UpdateQuerySource::FromClause, Some(OuterJoinRole::Kept))
+                | (
+                    UpdateQuerySource::Subquery(_)
+                    | UpdateQuerySource::OuterJoinTerminal
+                    | UpdateQuerySource::OuterJoinOptional,
+                    _,
+                ) => source,
             };
             result.push(TableUpdateQuery {
                 table,
@@ -858,9 +866,8 @@ mod tests {
 
     #[test]
     fn test_update_query_source_non_terminal_left_join() {
-        let result = update_queries(
-            "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id WHERE b.status = 'active'",
-        );
+        let result =
+            update_queries("SELECT * FROM a LEFT JOIN b ON a.id = b.a_id WHERE b.status IS NULL");
 
         assert_eq!(result.len(), 2);
 
@@ -929,9 +936,11 @@ mod tests {
         );
     }
 
+    /// An inner join's ON above a LEFT join rejects NULL for `b`, which
+    /// reduces the LEFT join to an inner one, so `b` is maintained as an
+    /// inner-join table.
     #[test]
-    fn test_update_query_source_non_terminal_chained_join() {
-        // b is optional side of LEFT JOIN, and b.val appears in downstream INNER JOIN
+    fn test_update_query_source_reduced_by_inner_join() {
         let result = update_queries(
             "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id JOIN c ON b.val = c.val WHERE a.id = 1",
         );
@@ -939,11 +948,7 @@ mod tests {
         assert_eq!(result.len(), 3);
 
         let b = result.iter().find(|(t, _, _)| t == "b").unwrap();
-        assert_eq!(
-            b.2,
-            UpdateQuerySource::OuterJoinOptional,
-            "b is non-terminal (used in downstream join condition)"
-        );
+        assert_eq!(b.2, UpdateQuerySource::FromClause, "b's join is reduced");
 
         let a = result.iter().find(|(t, _, _)| t == "a").unwrap();
         assert_eq!(a.2, UpdateQuerySource::FromClause);
@@ -954,5 +959,39 @@ mod tests {
             UpdateQuerySource::FromClause,
             "c is not on optional side"
         );
+    }
+
+    /// Each table reference's source, in FROM order, from its own outer-join
+    /// role rather than its table's name.
+    #[test]
+    fn test_update_query_source_per_reference() {
+        use UpdateQuerySource::{FromClause, OuterJoinOptional, OuterJoinTerminal};
+        #[rustfmt::skip]
+        let cases: &[(&str, &[UpdateQuerySource])] = &[
+            ("SELECT * FROM users WHERE id = 1", &[FromClause]),
+            // WHERE rejects NULL for b: the join is reduced.
+            ("SELECT * FROM a LEFT JOIN b ON a.id = b.a_id WHERE b.status = 'active'",
+             &[FromClause, FromClause]),
+            ("SELECT * FROM a RIGHT JOIN b ON a.id = b.a_id WHERE b.id = 1",
+             &[OuterJoinTerminal, FromClause]),
+            ("SELECT * FROM a RIGHT JOIN b ON a.id = b.a_id WHERE a.status IS NULL",
+             &[OuterJoinOptional, FromClause]),
+            ("SELECT a.id, t.name FROM a LEFT JOIN b t ON a.id = t.a_id WHERE a.id = 1",
+             &[FromClause, OuterJoinTerminal]),
+            // Each reference of a self-join has its own role.
+            ("SELECT * FROM a a1 LEFT JOIN a a2 ON a2.id = a1.val WHERE a1.status = 'x'",
+             &[FromClause, OuterJoinTerminal]),
+            // The preserved `a` behind an inner join is not terminal because
+            // another reference to `a` is.
+            ("SELECT * FROM a JOIN b ON b.id = a.val LEFT JOIN a a2 ON a2.id = a.tenant_id",
+             &[FromClause, FromClause, OuterJoinTerminal]),
+        ];
+        for (sql, expected) in cases {
+            let sources: Vec<UpdateQuerySource> = update_queries(sql)
+                .into_iter()
+                .map(|(_, _, source)| source)
+                .collect();
+            assert_eq!(sources, *expected, "{sql}");
+        }
     }
 }

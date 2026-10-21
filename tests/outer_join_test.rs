@@ -940,3 +940,76 @@ async fn test_join_parent_incomplete_table_not_subsumed() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// A preserved reference sharing its table with a terminal one is not
+/// terminal itself: an UPDATE to one of its uncached rows can meet a partner
+/// that was never loaded, so it must invalidate (PGC-518).
+#[tokio::test]
+async fn test_preserved_reference_named_like_terminal_uncached_update() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE pnt_t (id INTEGER PRIMARY KEY, c_id INTEGER, x INTEGER)",
+        &[],
+    )
+    .await?;
+    ctx.query("CREATE TABLE pnt_c (id INTEGER PRIMARY KEY)", &[])
+        .await?;
+    ctx.query("INSERT INTO pnt_c VALUES (1), (5)", &[]).await?;
+    ctx.query("INSERT INTO pnt_t VALUES (1, 1, NULL), (2, 9, NULL)", &[])
+        .await?;
+    ctx.cdc_decode_settle().await?;
+
+    let query = "SELECT a.id, b.id FROM pnt_t a JOIN pnt_c c ON c.id = a.c_id \
+                 LEFT JOIN pnt_t b ON b.id = a.x ORDER BY a.id";
+    let m = ctx.metrics().await?;
+    ctx.simple_query(query).await?;
+    let _m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    ctx.query("UPDATE pnt_t SET c_id = 5 WHERE id = 2", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+
+    let (proxied, origin) = ctx.proxy_and_origin_rows(query).await?;
+    assert_eq!(origin.len(), 2, "row 2 now meets c 5");
+    assert_eq!(proxied, origin);
+
+    Ok(())
+}
+
+/// Each reference of a LEFT self-join has its own role: WHERE reads only the
+/// preserved one, so the NULL-filled one is terminal and an INSERT that only
+/// it can take is applied in place (PGC-518).
+#[tokio::test]
+async fn test_left_self_join_cdc_insert_applied_in_place() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE lsi_t (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER)",
+        &[],
+    )
+    .await?;
+    ctx.query("INSERT INTO lsi_t VALUES (1, 10, 1), (2, 20, 1)", &[])
+        .await?;
+    ctx.cdc_decode_settle().await?;
+
+    let query = "SELECT a.id, b.id FROM lsi_t a LEFT JOIN lsi_t b ON b.id = a.x \
+                 WHERE a.y = 1 ORDER BY a.id";
+    let m = ctx.metrics().await?;
+    ctx.simple_query(query).await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    // Row 10 fails `a.y = 1`, so it can only stand in for `b`.
+    ctx.query("INSERT INTO lsi_t VALUES (10, NULL, 0)", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+
+    let (proxied, origin) = ctx.proxy_and_origin_rows(query).await?;
+    assert_eq!(origin.len(), 2, "row 1 attaches row 10");
+    assert_eq!(proxied, origin);
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    Ok(())
+}

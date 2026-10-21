@@ -27,8 +27,9 @@ Conventions: files are `ADR-XXX-brief-title.md` with the next sequential number;
 
 ## Query parsing, analysis & transformation
 - [ADR-002](ADR-002-resolved-ast.md) — Resolved AST: fully schema-qualified query form for analysis *(superseded by ADR-057)*
-- [ADR-003](ADR-003-constant-propagation.md) — Constant propagation through column equivalences for constraint analysis
+- [ADR-003](ADR-003-constant-propagation.md) — Constant propagation through column equivalences for constraint analysis *(superseded by ADR-059)*
 - [ADR-011](ADR-011-set-operation-support.md) — Set operations (UNION/INTERSECT/EXCEPT): per-branch populate, whole-query invalidate
+- [ADR-059](ADR-059-per-reference-predicate-model.md) — Per-reference predicate model: conjuncts with reach and reduction; per-reference filters, exactness, link columns and outer-join role; one update query per table reference *(supersedes ADR-003; amends ADR-024, ADR-037)*
 - [ADR-012](ADR-012-predicate-pushdown.md) — Predicate pushdown into FROM subqueries
 - [ADR-013](ADR-013-ecostring-identifier-types.md) — EcoString for resolved-AST identifiers *(amended by ADR-032)*
 - [ADR-032](ADR-032-ecostring-by-default.md) — EcoString as the default for owned strings *(amends ADR-013)*
@@ -36,10 +37,10 @@ Conventions: files are `ADR-XXX-brief-title.md` with the next sequential number;
 - [ADR-015](ADR-015-scalar-subquery-decorrelation.md) — Scalar correlated subquery decorrelation (LEFT JOIN + GROUP BY)
 - [ADR-016](ADR-016-in-any-decorrelation.md) — IN/ANY decorrelation (reuses EXISTS infrastructure)
 - [ADR-017](ADR-017-not-in-all-decorrelation.md) — NOT IN/ALL decorrelation (reuses NOT EXISTS infrastructure)
-- [ADR-024](ADR-024-predicate-subsumption.md) — Predicate subsumption: skip population when a cached query contains a new one
+- [ADR-024](ADR-024-predicate-subsumption.md) — Predicate subsumption: skip population when a cached query contains a new one *(amended by ADR-059)*
 - [ADR-029](ADR-029-subsumption-complex-bucket-index.md) — Subsumption complex-bucket per-column index
 - [ADR-030](ADR-030-subsumption-two-sided-range-index.md) — Subsumption two-sided (BETWEEN-style) range index
-- [ADR-037](ADR-037-constraint-containment-index.md) — Generalized constraint-containment index *(generalizes ADR-024/029/030; shared with the CDC matcher)*
+- [ADR-037](ADR-037-constraint-containment-index.md) — Generalized constraint-containment index *(generalizes ADR-024/029/030; shared with the CDC matcher; amended by ADR-059)*
 - [ADR-057](ADR-057-query-tree-with-side-table-bindings.md) — One immutable query tree with resolution as a side table keyed by pre-order `NodeId`; structural results of resolution as annotations; arena as the named second round *(supersedes ADR-002's parallel hierarchy)*
 
 ## Caching tiers & serving

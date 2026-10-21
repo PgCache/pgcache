@@ -1,6 +1,6 @@
 # ADR-003: Constant Propagation for Query Constraint Analysis
 
-**Status**: Accepted
+**Status**: Superseded by [ADR-059](ADR-059-per-reference-predicate-model.md)
 **Date**: 2025-10-11
 
 ## Context

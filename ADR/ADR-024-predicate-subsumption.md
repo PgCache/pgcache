@@ -25,14 +25,14 @@ Examples:
 ### What Cannot Be Subsumed
 
 - **Cached queries with LIMIT**: May not have loaded all matching rows
-- **Tables a cached query didn't load in full**: a cached query is a candidate for a table only when the table is complete in its branch — every join between the branch's FROM root and the table is a LEFT join with it on the left or a RIGHT join with it on the right, and the branch's WHERE reads no other table. Population loads exactly the rows its constraints describe then. Inner and cross joins, the nullable side of an outer join, and a WHERE on another table disqualify it; ON clauses never do. A table in a derived table, CTE or subquery is judged in its own branch
+- **Tables a cached query didn't load in full**: a cached query is a candidate for a table only through a reference the predicate model marks `exact` (ADR-059). Every join on the reference's path must preserve it (an unreduced LEFT join with it on the left, or RIGHT with it on the right), and every WHERE conjunct must be a recognized constraint on it alone. Its region is the reference's `filters`. Inner and cross joins, the NULL-filled side of an outer join, a WHERE conjunct the analyzer can't read, and one on another reference (a same-reference `a = b` included) disqualify it; ON clauses never do. A table in a derived table, CTE or subquery is judged in its own branch. A relation referenced from more than one branch is not a candidate, because its cached rows are the union of the branches' (PGC-511 lifts this)
 - **Set operations** (UNION/INTERSECT/EXCEPT): Per-branch constraint analysis not yet implemented
 - **OR predicates**: Constraint extraction treats these as opaque
 - **Inequality constraints in cached query**: Implication checking (e.g. `id > 10` implies `id > 5`) not yet implemented
 
-### Per-Table Checking
+### Per-Reference Checking
 
-The subsumption check is per-table, not across the full constraint set. For each relation OID in the new query, at least one existing `UpdateQuery` entry must cover that table. This prevents false positives where one table is covered but another isn't (e.g. a join of a covered and uncovered table).
+The subsumption check is per table reference, not across the full constraint set. Every base-table reference of the new query, in every branch (root, subqueries, derived tables, CTE bodies), must be covered by some candidate region on its relation, compared against that reference's own `filters`. This prevents false positives where one reference is covered but another isn't: a join of a covered and an uncovered table, or a self-join whose second reference needs rows the first's parent never loaded.
 
 ### Flow
 
@@ -56,8 +56,8 @@ If the cache DB execution fails (e.g. table dropped by concurrent eviction), sub
 
 ## Rationale
 - **Per-register oneshot** for the subsumption result gives the coordinator a synchronous answer for each request without complex event-loop coordination. The coordinator awaits inline, which is acceptable because the writer responds promptly (before dispatching population)
-- **Per-table checking** prevents false subsumption in multi-table queries where only some tables have coverage
-- **Per-table completeness** rather than single-table candidates: population loads a table's part of every FROM row that passes WHERE, so a table no join can drop rows from, and that WHERE filters only through its own constraints, holds exactly what its constraints describe. Join selectivity is never reasoned about
+- **Per-reference checking** prevents false subsumption in multi-table and self-joined queries where only some references have coverage
+- **Per-reference exactness** rather than single-table candidates: population loads a reference's part of every FROM row that passes WHERE, so a reference no join can drop rows from, and that WHERE filters only through its own constraints, holds exactly what its filters describe. Join selectivity is never reasoned about
 - **Equality-only v1** covers the highest-value cases (multi-tenant filtering, reference tables) while keeping the logic simple and provably correct. Inequality subsumption can be added later with pairwise implication checks
 - **Reusing generation stamping** avoids duplicating data — the rows are already in the cache table, they just need their generation updated
 
@@ -76,7 +76,7 @@ If the cache DB execution fails (e.g. table dropped by concurrent eviction), sub
 
 ## Implementation Notes
 - Subsumption check: `subsumption_check()` and `query_subsume()` in `src/cache/writer/query.rs`
-- Constraint comparison: `table_constraints_subsumed()` in `src/query/constraints.rs`
+- Constraint comparison: `table_constraints_subsumed()` in `src/query/constraints/subsume.rs`; regions and references from `src/cache/admission/` over the predicate model (ADR-059)
 - Coordinator flow: `subsumption_await()` in `src/cache/query_cache.rs`
 - Message types: `SubsumptionResult`, `AdmitAction` in `src/cache/messages.rs`
 - Metrics: `pgcache.cache.subsumptions` counter, `pgcache.cache.subsumption_latency_seconds` histogram in `src/metrics.rs`
