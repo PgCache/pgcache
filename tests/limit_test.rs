@@ -1,11 +1,15 @@
 use std::io::Error;
 
-use crate::util::{TestContext, assert_cache_hit, assert_cache_miss, assert_row_at};
+use crate::util::{
+    TestContext, assert_cache_hit, assert_cache_miss, assert_limit_order_decides,
+    assert_proxy_rows_match_origin, assert_row_at,
+};
 
 mod util;
 
-/// Shared table setup used across all limit/offset sub-tests.
-/// Creates an `items` table with 10 rows ordered by id (1..=10).
+/// Shared table setup used across all limit/offset sub-tests: an `items`
+/// table with ids 1..=10, inserted in descending id order so a population
+/// that ignored `ORDER BY id` would load the wrong rows.
 async fn setup_items_table(ctx: &mut TestContext) -> Result<(), Error> {
     ctx.query(
         "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, category TEXT)",
@@ -15,8 +19,8 @@ async fn setup_items_table(ctx: &mut TestContext) -> Result<(), Error> {
 
     ctx.query(
         "INSERT INTO items (id, name, category) VALUES \
-         (1, 'a', 'x'), (2, 'b', 'x'), (3, 'c', 'x'), (4, 'd', 'y'), (5, 'e', 'y'), \
-         (6, 'f', 'y'), (7, 'g', 'z'), (8, 'h', 'z'), (9, 'i', 'z'), (10, 'j', 'z')",
+         (10, 'j', 'z'), (9, 'i', 'z'), (8, 'h', 'z'), (7, 'g', 'z'), (6, 'f', 'y'), \
+         (5, 'e', 'y'), (4, 'd', 'y'), (3, 'c', 'x'), (2, 'b', 'x'), (1, 'a', 'x')",
         &[],
     )
     .await?;
@@ -27,34 +31,33 @@ async fn setup_items_table(ctx: &mut TestContext) -> Result<(), Error> {
 /// Test that a LIMIT query is cached and served correctly.
 ///
 /// Flow:
-///   1. SELECT ... LIMIT 3 → cache miss, forwarded to origin
+///   1. SELECT ... LIMIT 2 → cache miss, forwarded to origin
 ///   2. Wait for cache population
-///   3. Same query → cache hit, served from cache with correct 3 rows
+///   3. Same query → cache hit, served from cache with correct 2 rows
 #[tokio::test]
 async fn test_limit_basic_cache() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
     setup_items_table(&mut ctx).await?;
 
-    let query = "SELECT id, name FROM items WHERE category = 'x' ORDER BY id LIMIT 3";
+    let query = "SELECT id, name FROM items WHERE category = 'x' ORDER BY id LIMIT 2";
+    assert_limit_order_decides(&ctx, query).await?;
 
     // First query — cache miss
     let m = ctx.metrics().await?;
     let res = ctx.simple_query(query).await?;
-    // RowDescription + 3 DataRows + CommandComplete = 5 messages
-    assert_eq!(res.len(), 5);
+    // RowDescription + 2 DataRows + CommandComplete = 4 messages
+    assert_eq!(res.len(), 4);
     assert_row_at(&res, 1, &[("id", "1"), ("name", "a")])?;
     assert_row_at(&res, 2, &[("id", "2"), ("name", "b")])?;
-    assert_row_at(&res, 3, &[("id", "3"), ("name", "c")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
     ctx.cache_settle().await?;
 
     // Second query — cache hit, same data
     let res = ctx.simple_query(query).await?;
-    assert_eq!(res.len(), 5);
+    assert_eq!(res.len(), 4);
     assert_row_at(&res, 1, &[("id", "1"), ("name", "a")])?;
     assert_row_at(&res, 2, &[("id", "2"), ("name", "b")])?;
-    assert_row_at(&res, 3, &[("id", "3"), ("name", "c")])?;
     let _m = assert_cache_hit(&mut ctx, m).await?;
 
     Ok(())
@@ -63,34 +66,35 @@ async fn test_limit_basic_cache() -> Result<(), Error> {
 /// Test that LIMIT and OFFSET queries share a cache entry.
 ///
 /// Flow:
-///   1. SELECT ... ORDER BY id LIMIT 5 → cache miss, populates with 5 rows
-///   2. SELECT ... ORDER BY id LIMIT 3 → cache hit (3 < 5, sufficient)
-///   3. SELECT ... ORDER BY id LIMIT 2 OFFSET 1 → cache hit (2+1=3 ≤ 5)
+///   1. SELECT ... ORDER BY id LIMIT 3 → cache miss, populates with 3 rows
+///   2. SELECT ... ORDER BY id LIMIT 2 → cache hit (2 ≤ 3, sufficient)
+///   3. SELECT ... ORDER BY id LIMIT 2 OFFSET 1 → cache hit (2+1=3 ≤ 3)
 #[tokio::test]
 async fn test_limit_shared_fingerprint() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
     setup_items_table(&mut ctx).await?;
 
     let base = "SELECT id, name FROM items WHERE category = 'z' ORDER BY id";
+    assert_limit_order_decides(&ctx, &format!("{base} LIMIT 3")).await?;
 
-    // LIMIT 4 → cache miss, populates up to 4 rows
+    // LIMIT 3 → cache miss, populates up to 3 rows
     let m = ctx.metrics().await?;
-    let res = ctx.simple_query(&format!("{base} LIMIT 4")).await?;
-    assert_eq!(res.len(), 6); // RowDescription + 4 rows + CommandComplete
+    let res = ctx.simple_query(&format!("{base} LIMIT 3")).await?;
+    assert_eq!(res.len(), 5); // RowDescription + 3 rows + CommandComplete
     assert_row_at(&res, 1, &[("id", "7")])?;
-    assert_row_at(&res, 4, &[("id", "10")])?;
+    assert_row_at(&res, 3, &[("id", "9")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
     ctx.cache_settle().await?;
 
-    // LIMIT 2 → cache hit (2 ≤ 4)
+    // LIMIT 2 → cache hit (2 ≤ 3)
     let res = ctx.simple_query(&format!("{base} LIMIT 2")).await?;
     assert_eq!(res.len(), 4); // RowDescription + 2 rows + CommandComplete
     assert_row_at(&res, 1, &[("id", "7"), ("name", "g")])?;
     assert_row_at(&res, 2, &[("id", "8"), ("name", "h")])?;
     let m = assert_cache_hit(&mut ctx, m).await?;
 
-    // LIMIT 2 OFFSET 1 → cache hit (2+1=3 ≤ 4)
+    // LIMIT 2 OFFSET 1 → cache hit (2+1=3 ≤ 3)
     let res = ctx
         .simple_query(&format!("{base} LIMIT 2 OFFSET 1"))
         .await?;
@@ -118,6 +122,7 @@ async fn test_limit_bump() -> Result<(), Error> {
     setup_items_table(&mut ctx).await?;
 
     let base = "SELECT id, name FROM items WHERE category = 'y' ORDER BY id";
+    assert_limit_order_decides(&ctx, &format!("{base} LIMIT 2")).await?;
 
     // LIMIT 2 → cache miss, populates with 2 rows
     let m = ctx.metrics().await?;
@@ -185,13 +190,16 @@ async fn test_limit_bump_to_unlimited() -> Result<(), Error> {
     setup_items_table(&mut ctx).await?;
 
     let base = "SELECT id, name FROM items WHERE category = 'x' ORDER BY id";
+    assert_limit_order_decides(&ctx, &format!("{base} LIMIT 2")).await?;
 
-    // LIMIT 2 → cache miss
+    // LIMIT 2 → cache miss, then a hit serving the populated top 2
     let m = ctx.metrics().await?;
     ctx.simple_query(&format!("{base} LIMIT 2")).await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
     ctx.cache_settle().await?;
+    assert_proxy_rows_match_origin(&mut ctx, &format!("{base} LIMIT 2")).await?;
+    let m = assert_cache_hit(&mut ctx, m).await?;
 
     // No LIMIT → cache miss (needs all rows, only 2 cached)
     let res = ctx.simple_query(base).await?;
@@ -233,6 +241,7 @@ async fn test_limit_cdc_delete_invalidates() -> Result<(), Error> {
     setup_items_table(&mut ctx).await?;
 
     let query = "SELECT id, name FROM items WHERE category = 'z' ORDER BY id LIMIT 3";
+    assert_limit_order_decides(&ctx, query).await?;
 
     // First query — cache miss
     let m = ctx.metrics().await?;
@@ -246,7 +255,7 @@ async fn test_limit_cdc_delete_invalidates() -> Result<(), Error> {
     ctx.cache_settle().await?;
 
     // Cache hit
-    ctx.simple_query(query).await?;
+    assert_proxy_rows_match_origin(&mut ctx, query).await?;
     let m = assert_cache_hit(&mut ctx, m).await?;
 
     // Delete a row from origin (bypassing proxy, directly on origin)
@@ -282,6 +291,7 @@ async fn test_limit_cdc_insert_no_invalidation() -> Result<(), Error> {
     setup_items_table(&mut ctx).await?;
 
     let query = "SELECT id, name FROM items WHERE category = 'x' ORDER BY id LIMIT 2";
+    assert_limit_order_decides(&ctx, query).await?;
 
     // First query — cache miss
     let m = ctx.metrics().await?;
@@ -320,7 +330,7 @@ async fn test_limit_cdc_insert_no_invalidation() -> Result<(), Error> {
 /// Test LIMIT with OFFSET serving from cache.
 ///
 /// Flow:
-///   1. SELECT ... LIMIT 4 → cache miss, populates 4 rows
+///   1. SELECT ... LIMIT 3 → cache miss, populates 3 rows
 ///   2. SELECT ... LIMIT 2 OFFSET 1 → cache hit with correct window
 #[tokio::test]
 async fn test_limit_offset_cache_hit() -> Result<(), Error> {
@@ -328,15 +338,16 @@ async fn test_limit_offset_cache_hit() -> Result<(), Error> {
     setup_items_table(&mut ctx).await?;
 
     let base = "SELECT id, name FROM items WHERE category = 'z' ORDER BY id";
+    assert_limit_order_decides(&ctx, &format!("{base} LIMIT 3")).await?;
 
-    // LIMIT 4 → cache miss, populates 4 rows
+    // LIMIT 3 → cache miss, populates 3 rows
     let m = ctx.metrics().await?;
-    ctx.simple_query(&format!("{base} LIMIT 4")).await?;
+    ctx.simple_query(&format!("{base} LIMIT 3")).await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
     ctx.cache_settle().await?;
 
-    // LIMIT 2 OFFSET 1 → cache hit (2+1=3 ≤ 4)
+    // LIMIT 2 OFFSET 1 → cache hit (2+1=3 ≤ 3)
     let res = ctx
         .simple_query(&format!("{base} LIMIT 2 OFFSET 1"))
         .await?;
@@ -351,29 +362,29 @@ async fn test_limit_offset_cache_hit() -> Result<(), Error> {
 /// Test LIMIT with OFFSET serving from cache.
 ///
 /// Flow:
-///   1. SELECT ... LIMIT 2 offset 2 → cache miss, populates 4 rows
-///   2. SELECT ... LIMIT 4 → cache hit with correct window
+///   1. SELECT ... LIMIT 1 OFFSET 2 → cache miss, populates 3 rows
+///   2. SELECT ... LIMIT 3 → cache hit with correct window
 #[tokio::test]
 async fn test_limit_offset_limit_cache_hit() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
     setup_items_table(&mut ctx).await?;
 
     let base = "SELECT id, name FROM items WHERE category = 'z' ORDER BY id";
+    assert_limit_order_decides(&ctx, &format!("{base} LIMIT 3")).await?;
 
-    // LIMIT 4 → cache miss, populates 4 rows
+    // LIMIT 1 OFFSET 2 → cache miss, populates 3 rows
     let m = ctx.metrics().await?;
-    ctx.simple_query(&format!("{base} LIMIT 2 OFFSET 2"))
+    ctx.simple_query(&format!("{base} LIMIT 1 OFFSET 2"))
         .await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
     ctx.cache_settle().await?;
 
-    let res = ctx.simple_query(&format!("{base} LIMIT 4")).await?;
-    assert_eq!(res.len(), 6); // RowDescription + 4 rows + CommandComplete
+    let res = ctx.simple_query(&format!("{base} LIMIT 3")).await?;
+    assert_eq!(res.len(), 5); // RowDescription + 3 rows + CommandComplete
     assert_row_at(&res, 1, &[("id", "7"), ("name", "g")])?;
     assert_row_at(&res, 2, &[("id", "8"), ("name", "h")])?;
     assert_row_at(&res, 3, &[("id", "9"), ("name", "i")])?;
-    assert_row_at(&res, 4, &[("id", "10"), ("name", "j")])?;
     let _m = assert_cache_hit(&mut ctx, m).await?;
 
     Ok(())
@@ -393,24 +404,29 @@ async fn test_limit_extended_protocol() -> Result<(), Error> {
     let stmt = ctx
         .prepare("SELECT id, name FROM items WHERE category = $1 ORDER BY id LIMIT $2")
         .await?;
+    assert_limit_order_decides(
+        &ctx,
+        "SELECT id, name FROM items WHERE category = 'z' ORDER BY id LIMIT 3",
+    )
+    .await?;
 
-    // LIMIT 4 → cache miss
+    // LIMIT 3 → cache miss
     let m = ctx.metrics().await?;
-    let rows = ctx.query(&stmt, &[&"z", &4i64]).await?;
-    assert_eq!(rows.len(), 4);
+    let rows = ctx.query(&stmt, &[&"z", &3i64]).await?;
+    assert_eq!(rows.len(), 3);
     assert_eq!(rows[0].get::<_, i32>("id"), 7);
-    assert_eq!(rows[3].get::<_, i32>("id"), 10);
+    assert_eq!(rows[2].get::<_, i32>("id"), 9);
     let m = assert_cache_miss(&mut ctx, m).await?;
 
     ctx.cache_settle().await?;
 
-    // LIMIT 4 → cache hit
-    let rows = ctx.query(&stmt, &[&"z", &4i64]).await?;
-    assert_eq!(rows.len(), 4);
+    // LIMIT 3 → cache hit
+    let rows = ctx.query(&stmt, &[&"z", &3i64]).await?;
+    assert_eq!(rows.len(), 3);
     assert_eq!(rows[0].get::<_, i32>("id"), 7);
     let m = assert_cache_hit(&mut ctx, m).await?;
 
-    // LIMIT 2 → cache hit (2 ≤ 4)
+    // LIMIT 2 → cache hit (2 ≤ 3)
     let rows = ctx.query(&stmt, &[&"z", &2i64]).await?;
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].get::<_, i32>("id"), 7);
@@ -499,12 +515,13 @@ async fn test_limit_cdc_update_promotes_untracked_row_single_table() -> Result<(
     .await?;
     ctx.query(
         "INSERT INTO rankings (id, value) VALUES \
-         (1, 50), (2, 40), (3, 30), (4, 20), (5, 10)",
+         (5, 10), (4, 20), (3, 30), (2, 40), (1, 50)",
         &[],
     )
     .await?;
 
     let query = "SELECT id, value FROM rankings ORDER BY value DESC LIMIT 2";
+    assert_limit_order_decides(&ctx, query).await?;
 
     let m = ctx.metrics().await?;
     let res = ctx.simple_query(query).await?;
@@ -599,12 +616,13 @@ async fn test_limit_cdc_update_demotes_cached_row_leaves_gap() -> Result<(), Err
     .await?;
     ctx.query(
         "INSERT INTO rankings (id, value) VALUES \
-         (1, 50), (2, 40), (3, 30), (4, 20), (5, 10)",
+         (5, 10), (4, 20), (3, 30), (2, 40), (1, 50)",
         &[],
     )
     .await?;
 
     let query = "SELECT id, value FROM rankings ORDER BY value DESC LIMIT 2";
+    assert_limit_order_decides(&ctx, query).await?;
 
     let m = ctx.metrics().await?;
     let res = ctx.simple_query(query).await?;
@@ -643,12 +661,13 @@ async fn test_limit_cdc_update_non_window_column_keeps_cache() -> Result<(), Err
     .await?;
     ctx.query(
         "INSERT INTO rankings (id, name, value) VALUES \
-         (1, 'alpha', 50), (2, 'beta', 40), (3, 'gamma', 30)",
+         (3, 'gamma', 30), (2, 'beta', 40), (1, 'alpha', 50)",
         &[],
     )
     .await?;
 
     let query = "SELECT id, name, value FROM rankings ORDER BY value DESC LIMIT 2";
+    assert_limit_order_decides(&ctx, query).await?;
 
     let m = ctx.metrics().await?;
     let res = ctx.simple_query(query).await?;
@@ -658,7 +677,7 @@ async fn test_limit_cdc_update_non_window_column_keeps_cache() -> Result<(), Err
     let m = assert_cache_miss(&mut ctx, m).await?;
 
     ctx.cache_settle().await?;
-    ctx.simple_query(query).await?;
+    assert_proxy_rows_match_origin(&mut ctx, query).await?;
     let m = assert_cache_hit(&mut ctx, m).await?;
 
     ctx.origin_query("UPDATE rankings SET name = 'AAA' WHERE id = 1", &[])
@@ -691,14 +710,16 @@ async fn test_limit_cdc_sort_update_spares_other_predicate() -> Result<(), Error
     .await?;
     ctx.query(
         "INSERT INTO posts (id, owner, score) VALUES \
-         (1, 10, 50), (2, 10, 40), (3, 10, 30), \
-         (4, 20, 50), (5, 20, 40), (6, 20, 30)",
+         (3, 10, 30), (2, 10, 40), (1, 10, 50), \
+         (6, 20, 30), (5, 20, 40), (4, 20, 50)",
         &[],
     )
     .await?;
 
     let query_a = "SELECT id, score FROM posts WHERE owner = 10 ORDER BY score DESC LIMIT 2";
     let query_b = "SELECT id, score FROM posts WHERE owner = 20 ORDER BY score DESC LIMIT 2";
+    assert_limit_order_decides(&ctx, query_a).await?;
+    assert_limit_order_decides(&ctx, query_b).await?;
 
     // Warm both owner pages into cache.
     let m = ctx.metrics().await?;
@@ -748,12 +769,13 @@ async fn test_limit_cdc_predicate_column_change_still_invalidates() -> Result<()
     .await?;
     ctx.query(
         "INSERT INTO posts (id, owner, score) VALUES \
-         (1, 10, 50), (2, 10, 40), (3, 10, 30), (4, 10, 20)",
+         (4, 10, 20), (3, 10, 30), (2, 10, 40), (1, 10, 50)",
         &[],
     )
     .await?;
 
     let query = "SELECT id, score FROM posts WHERE owner = 10 ORDER BY score DESC LIMIT 2";
+    assert_limit_order_decides(&ctx, query).await?;
 
     let m = ctx.metrics().await?;
     let res = ctx.simple_query(query).await?;
@@ -793,7 +815,8 @@ async fn setup_posts_table(ctx: &mut TestContext, rows: &str) -> Result<(), Erro
     Ok(())
 }
 
-/// Warm `query` into cache: miss → settle → hit. Returns the metrics baseline.
+/// Warm `query` into cache: miss → settle → a hit serving origin's rows.
+/// Returns the metrics baseline.
 async fn warm_query(
     ctx: &mut TestContext,
     query: &str,
@@ -802,7 +825,7 @@ async fn warm_query(
     ctx.simple_query(query).await?;
     let m = assert_cache_miss(ctx, m).await?;
     ctx.cache_settle().await?;
-    ctx.simple_query(query).await?;
+    assert_proxy_rows_match_origin(ctx, query).await?;
     assert_cache_hit(ctx, m).await
 }
 
@@ -812,9 +835,10 @@ async fn warm_query(
 #[tokio::test]
 async fn test_limit_cdc_promotion_desc_keeps_cache() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
-    setup_posts_table(&mut ctx, "(1, 10, 50), (2, 10, 40), (3, 10, 30)").await?;
+    setup_posts_table(&mut ctx, "(3, 10, 30), (2, 10, 40), (1, 10, 50)").await?;
 
     let query = "SELECT id, score FROM posts WHERE owner = 10 ORDER BY score DESC LIMIT 2";
+    assert_limit_order_decides(&ctx, query).await?;
     let m = warm_query(&mut ctx, query).await?;
 
     ctx.origin_query("UPDATE posts SET score = 100 WHERE id = 2", &[])
@@ -835,9 +859,10 @@ async fn test_limit_cdc_promotion_desc_keeps_cache() -> Result<(), Error> {
 #[tokio::test]
 async fn test_limit_cdc_direction_asc() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
-    setup_posts_table(&mut ctx, "(1, 10, 10), (2, 10, 20), (3, 10, 30)").await?;
+    setup_posts_table(&mut ctx, "(3, 10, 30), (2, 10, 20), (1, 10, 10)").await?;
 
     let query = "SELECT id, score FROM posts WHERE owner = 10 ORDER BY score ASC LIMIT 2";
+    assert_limit_order_decides(&ctx, query).await?;
     let m = warm_query(&mut ctx, query).await?;
 
     // Promotion (ASC: value falls): in place, cache hit, re-sorted.
@@ -911,13 +936,14 @@ async fn test_limit_cdc_multi_key_tiebreak_direction() -> Result<(), Error> {
     .await?;
     ctx.query(
         "INSERT INTO posts (id, owner, score, tiebreak) VALUES \
-         (1, 10, 50, 5), (2, 10, 50, 7), (3, 10, 50, 9)",
+         (3, 10, 50, 9), (2, 10, 50, 7), (1, 10, 50, 5)",
         &[],
     )
     .await?;
 
     let query = "SELECT id, tiebreak FROM posts WHERE owner = 10 \
                  ORDER BY score DESC, tiebreak ASC LIMIT 2";
+    assert_limit_order_decides(&ctx, query).await?;
     let m = warm_query(&mut ctx, query).await?;
 
     // Tiebreak falls (ASC key): promotion — post 2 overtakes post 1 in place.
@@ -946,9 +972,10 @@ async fn test_limit_cdc_multi_key_tiebreak_direction() -> Result<(), Error> {
 #[tokio::test]
 async fn test_limit_cdc_alias_sort_key_promotion() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
-    setup_posts_table(&mut ctx, "(1, 10, 50), (2, 10, 40), (3, 10, 30)").await?;
+    setup_posts_table(&mut ctx, "(3, 10, 30), (2, 10, 40), (1, 10, 50)").await?;
 
     let query = "SELECT id, score AS s FROM posts WHERE owner = 10 ORDER BY s DESC LIMIT 2";
+    assert_limit_order_decides(&ctx, query).await?;
     let m = warm_query(&mut ctx, query).await?;
 
     ctx.origin_query("UPDATE posts SET score = 100 WHERE id = 2", &[])
@@ -969,9 +996,10 @@ async fn test_limit_cdc_alias_sort_key_promotion() -> Result<(), Error> {
 #[tokio::test]
 async fn test_limit_cdc_expression_sort_key_stays_conservative() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
-    setup_posts_table(&mut ctx, "(1, 10, 50), (2, 10, 40), (3, 10, 30)").await?;
+    setup_posts_table(&mut ctx, "(3, 10, 30), (2, 10, 40), (1, 10, 50)").await?;
 
     let query = "SELECT id, score FROM posts WHERE owner = 10 ORDER BY score + 0 DESC LIMIT 2";
+    assert_limit_order_decides(&ctx, query).await?;
     let m = warm_query(&mut ctx, query).await?;
 
     ctx.origin_query("UPDATE posts SET score = 100 WHERE id = 2", &[])
@@ -984,4 +1012,81 @@ async fn test_limit_cdc_expression_sort_key_stays_conservative() -> Result<(), E
     let _m = assert_cache_miss(&mut ctx, m).await?;
 
     Ok(())
+}
+
+// ----- Capped population (PGC-523, PGC-524) -----
+
+/// Tables `pa (id, x)` and `pb (id)`, each holding 1..=200 inserted in
+/// ascending order, with `x = id`.
+async fn setup_population_cap_tables(ctx: &mut TestContext) -> Result<(), Error> {
+    ctx.query("CREATE TABLE pa (id INTEGER PRIMARY KEY, x INTEGER)", &[])
+        .await?;
+    ctx.query("CREATE TABLE pb (id INTEGER PRIMARY KEY)", &[])
+        .await?;
+    ctx.query(
+        "INSERT INTO pa SELECT g, g FROM generate_series(1, 200) g",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO pb SELECT g FROM generate_series(1, 200) g",
+        &[],
+    )
+    .await?;
+    ctx.cdc_decode_settle().await
+}
+
+/// Populates `query` from a miss, then asserts a hit serves origin's rows.
+async fn cached_rows_match_origin(ctx: &mut TestContext, query: &str) -> Result<(), Error> {
+    let m = ctx.metrics().await?;
+    ctx.simple_query(query).await?;
+    let m = assert_cache_miss(ctx, m).await?;
+    ctx.cache_settle().await?;
+    assert_proxy_rows_match_origin(ctx, query).await?;
+    assert_cache_hit(ctx, m).await?;
+    Ok(())
+}
+
+/// A capped population loads the query's top rows, not the first rows
+/// origin returns: `ORDER BY id DESC` over ascending inserts (PGC-523).
+#[tokio::test]
+async fn test_limit_population_follows_order_by() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_population_cap_tables(&mut ctx).await?;
+
+    let query = "SELECT id FROM pa ORDER BY id DESC LIMIT 3";
+    assert_limit_order_decides(&ctx, query).await?;
+    cached_rows_match_origin(&mut ctx, query).await
+}
+
+/// The outer LIMIT doesn't cap an `IN` subquery's rows: a capped subquery
+/// would miss the match of a populated outer row (PGC-524).
+#[tokio::test]
+async fn test_limit_population_leaves_in_subquery_whole() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_population_cap_tables(&mut ctx).await?;
+    ctx.query("DELETE FROM pa WHERE id <= 150 AND id % 2 = 0", &[])
+        .await?;
+    ctx.cdc_decode_settle().await?;
+
+    cached_rows_match_origin(
+        &mut ctx,
+        "SELECT id FROM pa WHERE x IN (SELECT id FROM pb WHERE id > 100) ORDER BY id LIMIT 3",
+    )
+    .await
+}
+
+/// The outer LIMIT doesn't cap a `NOT IN` subquery's rows: rows another
+/// query cached would pass a capped exclusion list (PGC-524).
+#[tokio::test]
+async fn test_limit_population_leaves_not_in_subquery_whole() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_population_cap_tables(&mut ctx).await?;
+
+    cached_rows_match_origin(&mut ctx, "SELECT id FROM pa WHERE id <= 5").await?;
+    cached_rows_match_origin(
+        &mut ctx,
+        "SELECT id FROM pa WHERE x NOT IN (SELECT id FROM pb WHERE id <= 100) ORDER BY id LIMIT 3",
+    )
+    .await
 }

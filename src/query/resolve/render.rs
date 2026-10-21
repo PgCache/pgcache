@@ -609,6 +609,61 @@ impl ResolvedQuery {
     pub fn order_by_into(&self, clause: OrderBy<'_>, buf: &mut String) {
         order_by_deparse_with(clause, &mut Bound::text(self.bindings()), buf);
     }
+
+    /// An ORDER BY item of `select` rendered over its FROM's columns, for a
+    /// read with another select list: an output name or a position renders
+    /// that output's expression. False, leaving `buf` alone, when neither
+    /// names an output.
+    pub fn order_by_source_into(
+        &self,
+        select: Select<'_>,
+        clause: OrderBy<'_>,
+        buf: &mut String,
+    ) -> bool {
+        let expr = clause.expr();
+        let output = match expr.kind() {
+            ScalarKind::Column(column)
+                if matches!(
+                    self.column_target_at(column.id()),
+                    Some(ColumnTarget::Output)
+                ) =>
+            {
+                self.select_outputs(select)
+                    .into_iter()
+                    .find(|output| output.name.as_ref() == Some(column.column()))
+                    .map(|output| output.text)
+            }
+            ScalarKind::Literal(literal) => {
+                let LiteralValue::Integer(position) = literal.value() else {
+                    return false;
+                };
+                usize::try_from(*position)
+                    .ok()
+                    .and_then(|position| position.checked_sub(1))
+                    .and_then(|index| self.select_outputs(select).into_iter().nth(index))
+                    .map(|output| output.text)
+            }
+            ScalarKind::Column(_)
+            | ScalarKind::Function(_)
+            | ScalarKind::Case(_)
+            | ScalarKind::Arithmetic(_)
+            | ScalarKind::Subquery(_)
+            | ScalarKind::Array(_)
+            | ScalarKind::TypeCast(_) => {
+                let mut text = String::new();
+                scalar_deparse_with(expr, &mut Bound::text(self.bindings()), &mut text);
+                Some(text)
+            }
+        };
+        let Some(text) = output else {
+            return false;
+        };
+        buf.push_str(&text);
+        buf.push(' ');
+        clause.direction().deparse(buf);
+        clause.null_order().deparse(buf);
+        true
+    }
 }
 
 #[cfg(test)]

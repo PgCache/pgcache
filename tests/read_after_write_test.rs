@@ -8,7 +8,8 @@ use std::io::Error;
 use tokio_postgres::SimpleQueryMessage;
 
 use crate::util::{
-    TestContext, WireClient, assert_cache_hit, assert_cache_miss, assert_row_at, metrics_delta,
+    TestContext, WireClient, assert_cache_hit, assert_cache_miss, assert_limit_order_decides,
+    assert_proxy_rows_match_origin, assert_row_at, metrics_delta,
 };
 
 mod util;
@@ -507,12 +508,14 @@ async fn test_gate_limit_shape() -> Result<(), Error> {
     let mut ctx = TestContext::setup_fault(&RAW_LAG).await?;
     ctx.query("CREATE TABLE lt (id int primary key, v int)", &[])
         .await?;
-    ctx.query("INSERT INTO lt VALUES (1, 10), (2, 20), (3, 30)", &[])
+    ctx.query("INSERT INTO lt VALUES (3, 30), (2, 20), (1, 10)", &[])
         .await?;
     ctx.cdc_apply_settle().await?;
 
     let q = "SELECT id, v FROM lt ORDER BY id LIMIT 2";
+    assert_limit_order_decides(&ctx, q).await?;
     register(&mut ctx, q).await?;
+    assert_proxy_rows_match_origin(&mut ctx, q).await?;
 
     ctx.simple_query("UPDATE lt SET v = 99 WHERE id = 1")
         .await?;

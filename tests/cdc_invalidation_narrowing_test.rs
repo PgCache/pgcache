@@ -21,7 +21,10 @@
 use std::io::Error;
 use std::time::Duration;
 
-use crate::util::{TestContext, assert_cache_hit, assert_cache_miss, assert_row_at};
+use crate::util::{
+    TestContext, assert_cache_hit, assert_cache_miss, assert_limit_order_decides,
+    assert_proxy_rows_match_origin, assert_row_at,
+};
 
 mod util;
 
@@ -117,8 +120,8 @@ async fn test_narrowing_predicate_change_leaves_limit_window() -> Result<(), Err
     .await?;
     ctx.query(
         "INSERT INTO posts (id, owner, score) VALUES \
-         (1,10,50),(2,10,40),(3,10,30),(4,10,20), \
-         (5,20,55),(6,20,45),(7,20,35)",
+         (4,10,20),(3,10,30),(2,10,40),(1,10,50), \
+         (7,20,35),(6,20,45),(5,20,55)",
         &[],
     )
     .await?;
@@ -126,6 +129,8 @@ async fn test_narrowing_predicate_change_leaves_limit_window() -> Result<(), Err
         format!("SELECT id, score FROM posts WHERE owner = {k} ORDER BY score DESC LIMIT 2")
     };
 
+    assert_limit_order_decides(&ctx, &page(10)).await?;
+    assert_limit_order_decides(&ctx, &page(20)).await?;
     ctx.simple_query(&page(10)).await?;
     ctx.simple_query(&page(20)).await?;
     ctx.cache_settle().await?;
@@ -166,8 +171,8 @@ async fn test_narrowing_delete_invalidates_limit_query() -> Result<(), Error> {
     .await?;
     ctx.query(
         "INSERT INTO posts (id, owner, score) VALUES \
-         (1,10,50),(2,10,40),(3,10,30),(4,10,20), \
-         (5,20,55),(6,20,45)",
+         (4,10,20),(3,10,30),(2,10,40),(1,10,50), \
+         (6,20,45),(5,20,55)",
         &[],
     )
     .await?;
@@ -175,9 +180,11 @@ async fn test_narrowing_delete_invalidates_limit_query() -> Result<(), Error> {
         format!("SELECT id, score FROM posts WHERE owner = {k} ORDER BY score DESC LIMIT 2")
     };
 
+    assert_limit_order_decides(&ctx, &page(10)).await?;
     ctx.simple_query(&page(10)).await?;
     ctx.simple_query(&page(20)).await?;
     ctx.cache_settle().await?;
+    assert_proxy_rows_match_origin(&mut ctx, &page(10)).await?;
 
     // Delete owner 10's top row. The window must drop post 1 and surface post 3
     // (score 30), outside the cached top-2.

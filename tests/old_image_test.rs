@@ -13,7 +13,9 @@
 use std::io::Error;
 use std::time::Duration;
 
-use crate::util::{TestContext, assert_row_at};
+use crate::util::{
+    TestContext, assert_limit_order_decides, assert_proxy_rows_match_origin, assert_row_at,
+};
 
 mod util;
 
@@ -278,9 +280,11 @@ async fn test_old_image_quoted_identifiers() -> Result<(), Error> {
     .await?;
     let q_val = "SELECT id FROM items WHERE val = 5";
     let q_window = "SELECT id, val FROM items WHERE val > 0 ORDER BY val DESC LIMIT 2";
+    assert_limit_order_decides(&ctx, q_window).await?;
     ctx.simple_query(q_val).await?;
     ctx.simple_query(q_window).await?;
     ctx.cache_settle().await?;
+    assert_proxy_rows_match_origin(&mut ctx, q_window).await?;
 
     // UPDATE and DELETE both drive the batched lookup over the relation; any
     // unquoted identifier would error the segment eval and kill the writer.
@@ -435,13 +439,15 @@ async fn test_old_image_reserved_prefix_columns_stay_conservative() -> Result<()
     )
     .await?;
     ctx.query(
-        "INSERT INTO items (id, score, __pgc_lt_score) VALUES (1, 50, 0), (2, 40, 0), (3, 30, 0)",
+        "INSERT INTO items (id, score, __pgc_lt_score) VALUES (3, 30, 0), (2, 40, 0), (1, 50, 0)",
         &[],
     )
     .await?;
     let q = "SELECT id, score FROM items WHERE score > 0 ORDER BY score DESC LIMIT 2";
+    assert_limit_order_decides(&ctx, q).await?;
     ctx.simple_query(q).await?;
     ctx.cache_settle().await?;
+    assert_proxy_rows_match_origin(&mut ctx, q).await?;
 
     // A demotion that also touches the colliding column: without the batch
     // skip, the misfiled boolean could fabricate a promotion verdict and skip

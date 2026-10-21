@@ -16,7 +16,10 @@ use tokio_postgres::{Client, Row, SimpleQueryMessage, ToStatement};
 
 // --- Re-exports: keep the `crate::util::Foo` import paths stable ---
 
-pub(crate) use assertions::{assert_row_at, assert_row_fields, extract_row, result_rows, rows_of};
+pub(crate) use assertions::{
+    assert_limit_order_decides, assert_proxy_rows_match_origin, assert_row_at, assert_row_fields,
+    extract_row, result_rows, rows_of,
+};
 pub(crate) use context::{TestContext, cache_settle_at, lsn_parse};
 pub(crate) use http::{http_get, http_post, http_put};
 pub(crate) use metrics::{

@@ -55,6 +55,7 @@ Conventions: files are `ADR-XXX-brief-title.md` with the next sequential number;
 - [ADR-047](ADR-047-mv-rebuild-discard-backoff.md) — MV rebuild discard-backoff (stop rebuilding thrashing MVs) *(extends ADR-031)*
 - [ADR-036](ADR-036-response-memoization.md) — In-process response memoization (third tier; serves client-ready wire bytes)
 - [ADR-040](ADR-040-shape-keyed-serving.md) — Shape-keyed prepared-statement serving (collapse per-literal plan churn)
+- [ADR-060](ADR-060-limit-capped-population.md) — LIMIT-capped population: the cache holds a superset of a capped query's top N; root-only, ordered capped read; CDC keeps the superset
 
 ## CDC & cache consistency
 - [ADR-018](ADR-018-dynamic-publication-management.md) — Dynamic publication management (filter CDC at source via ALTER PUBLICATION)

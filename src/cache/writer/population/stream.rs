@@ -144,11 +144,15 @@ struct PopulationRead<'a> {
 /// another already issued. Each reference to a CTE carries its own copy of
 /// the body, and all reads share one origin snapshot.
 fn population_reads(population: &ResolvedQuery, max_limit: Option<u64>) -> Vec<PopulationRead<'_>> {
+    let root = population.select();
     let mut issued = HashSet::new();
     let mut reads = Vec::new();
     for (branch, _) in select_branches_with_source(population.tree().root()) {
+        // A LIMIT bounds the result's rows, never a subquery's.
+        let limit =
+            max_limit.filter(|_| root.is_some_and(|root| root.id().index() == branch.id().index()));
         for table_node in branch.direct_tables() {
-            let select = population_select_build(population, table_node, branch, max_limit);
+            let select = population_select_build(population, table_node, branch, limit);
             if issued.insert((table_relation_oid(population, table_node), select.clone())) {
                 reads.push(PopulationRead { table_node, select });
             }
@@ -227,18 +231,34 @@ async fn staging_table_create(
 }
 
 /// The origin SELECT for one table of a branch: the branch's FROM and WHERE
-/// with the table's columns as the select list, capped at the query's max
-/// limit. DISTINCT folds join fan-out; GROUP BY and HAVING are dropped
-/// because the cache holds raw rows and aggregates at retrieval.
+/// with the table's columns as the select list. DISTINCT folds join fan-out;
+/// GROUP BY and HAVING are dropped because the cache holds raw rows and
+/// aggregates at retrieval.
+///
+/// `limit` is the root's cap, which only a query reading one table has: the
+/// read is sorted as the query is, so it loads the query's top rows, and one
+/// table has no fan-out to fold. A sort it can't render reads uncapped.
 fn population_select_build(
     population: &ResolvedQuery,
     table_node: Table<'_>,
     branch: Select<'_>,
-    max_limit: Option<u64>,
+    limit: Option<u64>,
 ) -> String {
+    let single_table = branch.from().len() == 1 && branch.direct_tables().len() == 1;
+    debug_assert!(
+        limit.is_none() || single_table,
+        "a capped population reads one table"
+    );
+    let window = limit
+        .filter(|_| single_table)
+        .and_then(|limit| Some((population_order_by(population, branch)?, limit)));
     let mut buf = String::with_capacity(1024);
     let mut cx = population.deparse_context();
-    buf.push_str("SELECT DISTINCT");
+    buf.push_str(if window.is_some() {
+        "SELECT"
+    } else {
+        "SELECT DISTINCT"
+    });
     population.source_columns_into(table_node.id(), &mut buf);
     from_deparse_with(branch.from(), &mut cx, &mut buf);
     where_clause_deparse_with(
@@ -248,10 +268,26 @@ fn population_select_build(
         &mut cx,
         &mut buf,
     );
-    if let Some(limit) = max_limit {
+    if let Some((order_by, limit)) = window {
+        buf.push_str(&order_by);
         write!(buf, " LIMIT {limit}").ok();
     }
     buf
+}
+
+/// The query's ORDER BY over `select`'s FROM, empty when it has none; `None`
+/// when an item names no output.
+fn population_order_by(population: &ResolvedQuery, select: Select<'_>) -> Option<String> {
+    let mut buf = String::new();
+    let mut separator = " ORDER BY ";
+    for clause in population.tree().root().order_by() {
+        buf.push_str(separator);
+        if !population.order_by_source_into(select, clause, &mut buf) {
+            return None;
+        }
+        separator = ", ";
+    }
+    Some(buf)
 }
 
 /// Origin WAL position as a `u64` byte offset (the same encoding as the
@@ -433,9 +469,9 @@ mod tests {
     #[test]
     fn test_population_select_cases() {
         #[rustfmt::skip]
-        let cases: [(&str, &str, Option<u64>, &[&str]); 8] = [
+        let cases: [(&str, &str, Option<u64>, &[&str]); 16] = [
             ("single table", "SELECT name FROM users WHERE id = 1 ORDER BY name", Some(5), &[
-                "SELECT DISTINCT public.users.id, public.users.name FROM public.users WHERE public.users.id = 1 LIMIT 5",
+                "SELECT public.users.id, public.users.name FROM public.users WHERE public.users.id = 1 ORDER BY public.users.name ASC LIMIT 5",
             ]),
             ("aliased join", "SELECT u.name, o.total FROM users u JOIN orders o ON o.user_id = u.id WHERE o.total > 2", None, &[
                 "SELECT DISTINCT u.id, u.name FROM public.users u JOIN public.orders o ON o.user_id = u.id WHERE o.total > 2",
@@ -461,6 +497,31 @@ mod tests {
             ("self-join reads both references", "SELECT u.name FROM users u JOIN users v ON v.id = u.id", None, &[
                 "SELECT DISTINCT u.id, u.name FROM public.users u JOIN public.users v ON v.id = u.id",
                 "SELECT DISTINCT v.id, v.name FROM public.users u JOIN public.users v ON v.id = u.id",
+            ]),
+            ("capped by alias", "SELECT name AS n FROM users ORDER BY n DESC", Some(3), &[
+                "SELECT public.users.id, public.users.name FROM public.users ORDER BY public.users.name DESC LIMIT 3",
+            ]),
+            ("capped by position", "SELECT total, id FROM orders ORDER BY 1 DESC NULLS LAST, 2", Some(4), &[
+                "SELECT public.orders.id, public.orders.user_id, public.orders.total FROM public.orders ORDER BY public.orders.total DESC NULLS LAST, public.orders.id ASC LIMIT 4",
+            ]),
+            ("capped by star position", "SELECT * FROM orders ORDER BY 3", Some(4), &[
+                "SELECT public.orders.id, public.orders.user_id, public.orders.total FROM public.orders ORDER BY public.orders.total ASC LIMIT 4",
+            ]),
+            ("capped by expression", "SELECT name FROM users ORDER BY id + 0 DESC", Some(2), &[
+                "SELECT public.users.id, public.users.name FROM public.users ORDER BY (public.users.id + 0) DESC LIMIT 2",
+            ]),
+            ("capped without order", "SELECT name FROM users", Some(2), &[
+                "SELECT public.users.id, public.users.name FROM public.users LIMIT 2",
+            ]),
+            ("unresolvable position reads uncapped", "SELECT name FROM users ORDER BY 2", Some(2), &[
+                "SELECT DISTINCT public.users.id, public.users.name FROM public.users",
+            ]),
+            ("subquery branch uncapped", "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders WHERE total > 1) ORDER BY id", Some(2), &[
+                "SELECT public.users.id, public.users.name FROM public.users WHERE public.users.id IN (SELECT public.orders.user_id FROM public.orders WHERE public.orders.total > 1) ORDER BY public.users.id ASC LIMIT 2",
+                "SELECT DISTINCT public.orders.id, public.orders.user_id, public.orders.total FROM public.orders WHERE public.orders.total > 1",
+            ]),
+            ("derived-table root uncapped", "SELECT id FROM (SELECT id, name FROM users WHERE id > 1) d ORDER BY id", Some(2), &[
+                "SELECT DISTINCT public.users.id, public.users.name FROM public.users WHERE public.users.id > 1",
             ]),
         ];
         for (label, sql, max_limit, expected) in cases {
