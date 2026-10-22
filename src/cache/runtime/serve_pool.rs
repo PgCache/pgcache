@@ -222,9 +222,102 @@ pub(super) async fn serve_loop(
     debug!("cache serve loop");
     #[cfg(feature = "fault-injection")]
     crate::cache::serve::fault::init();
+    let Some(ServeLoopPool {
+        context,
+        mut conn_rx,
+        parked,
+    }) = serve_loop_pool_start(&settings, &cancel, state_view).await
+    else {
+        return;
+    };
+
+    // Recycle one idle connection per tick while the monitor flags memory pressure
+    // (PGC-251 Slice 1d). The first interval tick fires immediately; harmless
+    // (recycle_wanted is clear at startup).
+    let mut recycle_interval = tokio::time::interval(RECYCLE_INTERVAL);
+    recycle_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        // Block for at least one request
+        let mut msg = tokio::select! {
+            _ = cancel.cancelled() => {
+                debug!("cache serve shutdown signal received");
+                break;
+            }
+            _ = recycle_interval.tick() => {
+                recycle_tick(&context.state_view, &mut conn_rx, &context.replenish_tx, &parked);
+                pool_shrink_apply(&context.serve_pool, &mut conn_rx, &parked);
+                continue;
+            }
+            msg = serve_rx.recv() => {
+                let Some(msg) = msg else { break };
+                msg
+            }
+        };
+        msg.timing_mut().worker_received_at = Some(Instant::now());
+
+        // Retire surplus idle connections the controller no longer wants
+        // before taking one for this serve.
+        pool_shrink_apply(&context.serve_pool, &mut conn_rx, &parked);
+        let Some(conn) = connection_acquire(&mut conn_rx, &cancel).await else {
+            break;
+        };
+        let acquired_at = Instant::now();
+        msg.timing_mut().conn_acquired_at = Some(acquired_at);
+        // Queue-pressure signal for the pool controller: serve-queue plus
+        // pool wait. A coalesce-drained waiter keeps its original
+        // dispatched_at through the park, so its wait is measured from
+        // drain start instead — otherwise a multi-second population would
+        // read as pool pressure and drive spurious probes (PGC-453).
+        let timing = msg.timing_mut();
+        if let Some(origin) = timing.drain_started_at.or(timing.dispatched_at) {
+            context.serve_pool.wait_observe(duration_to_us_u64(
+                acquired_at.saturating_duration_since(origin),
+            ));
+        }
+
+        // Serve-pool liveness gauge (PGC-278): a drained pool with serves still
+        // in flight is the freeze signature. `pool_available` is read after this
+        // serve's connection was taken, so it reflects what's left.
+        #[allow(clippy::cast_precision_loss)]
+        crate::metrics::handles()
+            .cache
+            .pool_available
+            .set(conn_rx.len() as f64);
+        context.serve_spawn(msg, conn, acquired_at);
+
+        // Channel depth gauge + controller backlog hint; queue length never
+        // approaches 2^53.
+        context.serve_pool.queue_depth_set(serve_rx.len());
+        #[allow(clippy::cast_precision_loss)]
+        crate::metrics::handles()
+            .state
+            .queue_worker
+            .set(serve_rx.len() as f64);
+    }
+
+    debug!("cache serve loop exiting");
+}
+
+/// The serve loop's pool: the context its spawned serves take, the
+/// idle-connection receiver, and the parked-connection slot.
+struct ServeLoopPool {
+    context: ServeContext,
+    conn_rx: Receiver<CacheConnection>,
+    parked: ParkedSlot,
+}
+
+/// Create the connection pool at its floor and spawn its reconciler. `None`
+/// when the pool can't be created: the error is logged and the cache
+/// cancelled.
+async fn serve_loop_pool_start(
+    settings: &Settings,
+    cancel: &CancellationToken,
+    state_view: Arc<CacheStateView>,
+) -> Option<ServeLoopPool> {
     let (pool_min, pool_max) = serve_pool_bounds(settings.num_workers);
     let serve_pool = Arc::clone(&state_view.serve_pool);
-    let (conn_tx, mut conn_rx) = match connection_pool_create(&settings, pool_min, pool_max).await {
+    let (conn_tx, conn_rx) = match connection_pool_create(settings, pool_min, pool_max).await {
         Ok(pool) => pool,
         Err(e) => {
             error!(
@@ -232,7 +325,7 @@ pub(super) async fn serve_loop(
                 error_chain_format(e.current_context())
             );
             cancel.cancel();
-            return;
+            return None;
         }
     };
     serve_pool.desired_set(pool_min);
@@ -252,107 +345,87 @@ pub(super) async fn serve_loop(
         Arc::clone(&serve_pool),
         Arc::clone(&parked),
     ));
+    Some(ServeLoopPool {
+        context: ServeContext {
+            conn_tx,
+            replenish_tx,
+            state_view,
+            serve_pool,
+        },
+        conn_rx,
+        parked,
+    })
+}
 
-    // Recycle one idle connection per tick while the monitor flags memory pressure
-    // (PGC-251 Slice 1d). The first interval tick fires immediately; harmless
-    // (recycle_wanted is clear at startup).
-    let mut recycle_interval = tokio::time::interval(RECYCLE_INTERVAL);
-    recycle_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+/// Drop one idle pooled connection while the monitor flags memory pressure
+/// and replenish a fresh backend, returning the dropped backend's plan-cache
+/// RSS to the OS; then expire or release the parked connection.
+fn recycle_tick(
+    state_view: &CacheStateView,
+    conn_rx: &mut Receiver<CacheConnection>,
+    replenish_tx: &UnboundedSender<()>,
+    parked: &ParkedSlot,
+) {
+    let recycle_wanted = state_view.recycle_wanted.load(Ordering::Relaxed);
+    if recycle_wanted && let Ok(conn) = conn_rx.try_recv() {
+        drop(conn);
+        let _ = replenish_tx.send(());
+        state_view.recycle_count.fetch_add(1, Ordering::Relaxed);
+        crate::metrics::handles().cache.pool_recycled.increment(1);
+    }
+    parked_maintain(parked, recycle_wanted, state_view);
+}
 
-    loop {
-        // Block for at least one request
-        let mut msg = tokio::select! {
-            _ = cancel.cancelled() => {
-                debug!("cache serve shutdown signal received");
-                break;
-            }
-            _ = recycle_interval.tick() => {
-                // Drop one idle pooled connection and replenish a fresh backend,
-                // returning the dropped backend's plan-cache RSS to the OS.
-                if state_view.recycle_wanted.load(Ordering::Relaxed)
-                    && let Ok(conn) = conn_rx.try_recv()
-                {
-                    drop(conn);
-                    let _ = replenish_tx.send(());
-                    state_view.recycle_count.fetch_add(1, Ordering::Relaxed);
-                    crate::metrics::handles().cache.pool_recycled.increment(1);
-                }
-                parked_maintain(
-                    &parked,
-                    state_view.recycle_wanted.load(Ordering::Relaxed),
-                    &state_view,
-                );
-                pool_shrink_apply(&serve_pool, &mut conn_rx, &parked);
-                continue;
-            }
-            msg = serve_rx.recv() => {
-                let Some(msg) = msg else { break };
-                msg
-            }
-        };
-        msg.timing_mut().worker_received_at = Some(Instant::now());
-
-        // Retire surplus idle connections the controller no longer wants
-        // before taking one for this serve.
-        pool_shrink_apply(&serve_pool, &mut conn_rx, &parked);
-
-        // Wait for an available connection, raced against teardown: on total
-        // pool loss at generation cancel (every conn poisoned, reconcile
-        // exited) nothing will ever refill the channel — and `recv()` cannot
-        // return `None` because this loop holds a `conn_tx` clone — so an
-        // unraced wait would wedge the loop holding a client's reply slot
-        // (PGC-450). Dropping the request drops its reply_tx; the proxy's
-        // reply slot observes Dropped and closes that client cleanly instead
-        // of hanging forever.
-        let conn = if let Ok(conn) = conn_rx.try_recv() {
-            conn
-        } else {
-            tokio::select! {
-                _ = cancel.cancelled() => {
-                    debug!("cache serve shutdown while awaiting a pool connection");
-                    break;
-                }
-                conn = conn_rx.recv() => {
-                    let Some(conn) = conn else {
-                        error!("cache connection pool closed");
-                        cancel.cancel();
-                        return;
-                    };
-                    conn
-                }
-            }
-        };
-        let acquired_at = Instant::now();
-        msg.timing_mut().conn_acquired_at = Some(acquired_at);
-        // Queue-pressure signal for the pool controller: serve-queue plus
-        // pool wait. A coalesce-drained waiter keeps its original
-        // dispatched_at through the park, so its wait is measured from
-        // drain start instead — otherwise a multi-second population would
-        // read as pool pressure and drive spurious probes (PGC-453).
-        let timing = msg.timing_mut();
-        if let Some(origin) = timing.drain_started_at.or(timing.dispatched_at) {
-            serve_pool.wait_observe(duration_to_us_u64(
-                acquired_at.saturating_duration_since(origin),
-            ));
+/// A pooled connection for the next serve, or `None` on teardown. The wait
+/// is raced against cancellation: on total pool loss at generation cancel
+/// (every conn poisoned, reconcile exited) nothing will ever refill the
+/// channel — and `recv()` cannot return `None` while the serve loop holds a
+/// `conn_tx` clone — so an unraced wait would wedge the loop holding a
+/// client's reply slot (PGC-450). Dropping the request drops its reply_tx;
+/// the proxy's reply slot observes Dropped and closes that client cleanly
+/// instead of hanging forever.
+async fn connection_acquire(
+    conn_rx: &mut Receiver<CacheConnection>,
+    cancel: &CancellationToken,
+) -> Option<CacheConnection> {
+    if let Ok(conn) = conn_rx.try_recv() {
+        return Some(conn);
+    }
+    tokio::select! {
+        _ = cancel.cancelled() => {
+            debug!("cache serve shutdown while awaiting a pool connection");
+            None
         }
+        conn = conn_rx.recv() => {
+            if conn.is_none() {
+                error!("cache connection pool closed");
+                cancel.cancel();
+            }
+            conn
+        }
+    }
+}
 
-        // Spawn the serve (request + connection) onto the shared runtime.
-        let return_tx = conn_tx.clone();
-        let replenish_tx = replenish_tx.clone();
-        let state_view = Arc::clone(&state_view);
-        // Serve-pool liveness gauges (PGC-278): a drained pool with serves still
-        // in flight is the freeze signature. `pool_available` is read after this
-        // serve's connection was taken, so it reflects what's left.
-        #[allow(clippy::cast_precision_loss)]
-        crate::metrics::handles()
-            .cache
-            .pool_available
-            .set(conn_rx.len() as f64);
+/// What a spawned serve takes from the loop: the pool's return and
+/// replenish channels, the state view, and the pool's service-time sink.
+struct ServeContext {
+    conn_tx: Sender<CacheConnection>,
+    replenish_tx: UnboundedSender<()>,
+    state_view: Arc<CacheStateView>,
+    serve_pool: Arc<ServePool>,
+}
+
+impl ServeContext {
+    /// Spawn the serve (request + connection) onto the shared runtime.
+    fn serve_spawn(&self, msg: ServeJob, conn: CacheConnection, acquired_at: Instant) {
+        let return_tx = self.conn_tx.clone();
+        let replenish_tx = self.replenish_tx.clone();
+        let state_view = Arc::clone(&self.state_view);
+        let serve_pool = Arc::clone(&self.serve_pool);
         crate::metrics::handles()
             .cache
             .serves_in_flight
             .increment(1.0);
-        let serve_pool_task = Arc::clone(&serve_pool);
         tokio::spawn(async move {
             // Decrement on drop, not fall-through, so a panicking or
             // cancelled serve still balances the gauge (PGC-278).
@@ -366,20 +439,9 @@ pub(super) async fn serve_loop(
                 }
             }
             // Service-time signal for the pool controller (both job kinds).
-            serve_pool_task.task_observe(duration_to_us_u64(acquired_at.elapsed()));
+            serve_pool.task_observe(duration_to_us_u64(acquired_at.elapsed()));
         });
-
-        // Channel depth gauge + controller backlog hint; queue length never
-        // approaches 2^53.
-        serve_pool.queue_depth_set(serve_rx.len());
-        #[allow(clippy::cast_precision_loss)]
-        crate::metrics::handles()
-            .state
-            .queue_worker
-            .set(serve_rx.len() as f64);
     }
-
-    debug!("cache serve loop exiting");
 }
 
 /// Drop idle connections beyond the controller's desired size. Only idle
@@ -416,9 +478,10 @@ fn pool_shrink_apply(
 /// trigger sees it (PGC-457).
 fn parked_maintain(parked: &ParkedSlot, recycle_wanted: bool, state_view: &CacheStateView) {
     let mut slot = parked_lock(parked);
-    if let Some((_, since)) = slot.as_ref()
-        && (recycle_wanted || since.elapsed() > PARK_EXPIRY)
-    {
+    let drop_parked = slot
+        .as_ref()
+        .is_some_and(|(_, since)| recycle_wanted || since.elapsed() > PARK_EXPIRY);
+    if drop_parked {
         *slot = None;
         if recycle_wanted {
             state_view.recycle_count.fetch_add(1, Ordering::Relaxed);
