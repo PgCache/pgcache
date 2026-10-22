@@ -1297,3 +1297,250 @@ async fn test_anti_join_filtered_optional_delete_invalidates() -> Result<(), Err
     let m = query_warm(&mut ctx, query).await?;
     origin_change_invalidates(&mut ctx, m, "DELETE FROM bios WHERE id = 101", query).await
 }
+
+// =============================================================================
+// Null tests in an outer join's ON clause (the soft-delete idiom, PGC-510)
+// =============================================================================
+
+/// Orders of two tenants with refunds, one of them soft-deleted, and an
+/// archived order.
+async fn setup_orders_refunds(ctx: &mut TestContext) -> Result<(), Error> {
+    ctx.query(
+        "CREATE TABLE sd_orders (id INTEGER PRIMARY KEY, tenant_id INTEGER, archived_at TIMESTAMPTZ)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "CREATE TABLE sd_refunds (id INTEGER PRIMARY KEY, order_id INTEGER, amount INTEGER, \
+         deleted_at TIMESTAMPTZ)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO sd_orders VALUES (1, 1, NULL), (2, 1, '2026-01-01'), (3, 2, NULL)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO sd_refunds VALUES (10, 1, 5, NULL), (11, 2, 7, '2026-01-02'), (12, 3, 9, NULL)",
+        &[],
+    )
+    .await?;
+    ctx.cdc_decode_settle().await
+}
+
+const SOFT_DELETE_QUERY: &str = "SELECT o.id, r.id AS refund, r.amount \
+    FROM sd_orders o LEFT JOIN sd_refunds r \
+    ON r.order_id = o.id AND r.deleted_at IS NULL \
+    WHERE o.tenant_id = 1 ORDER BY o.id, r.id";
+
+/// A refund inserted already soft-deleted fails the ON null test: its order
+/// stays NULL-padded, in place.
+#[tokio::test]
+async fn test_soft_delete_join_insert_deleted_refund_applied_in_place() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_orders_refunds(&mut ctx).await?;
+
+    let m = query_warm(&mut ctx, SOFT_DELETE_QUERY).await?;
+    origin_change_applied_in_place(
+        &mut ctx,
+        m,
+        "INSERT INTO sd_refunds VALUES (13, 2, 11, '2026-01-03')",
+        SOFT_DELETE_QUERY,
+    )
+    .await?;
+    Ok(())
+}
+
+/// A live refund inserted for a NULL-padded order attaches to it, in place.
+#[tokio::test]
+async fn test_soft_delete_join_insert_live_refund_applied_in_place() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_orders_refunds(&mut ctx).await?;
+
+    let m = query_warm(&mut ctx, SOFT_DELETE_QUERY).await?;
+    origin_change_applied_in_place(
+        &mut ctx,
+        m,
+        "INSERT INTO sd_refunds VALUES (13, 2, 11, NULL)",
+        SOFT_DELETE_QUERY,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Soft-deleting an attached refund detaches it: the order stays, NULL-padded,
+/// in place.
+#[tokio::test]
+async fn test_soft_delete_join_set_deleted_at_applied_in_place() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_orders_refunds(&mut ctx).await?;
+
+    let m = query_warm(&mut ctx, SOFT_DELETE_QUERY).await?;
+    origin_change_applied_in_place(
+        &mut ctx,
+        m,
+        "UPDATE sd_refunds SET deleted_at = '2026-01-04' WHERE id = 10",
+        SOFT_DELETE_QUERY,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Restoring a soft-deleted refund, which population never loaded, attaches
+/// it, in place.
+#[tokio::test]
+async fn test_soft_delete_join_clear_deleted_at_applied_in_place() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_orders_refunds(&mut ctx).await?;
+
+    let m = query_warm(&mut ctx, SOFT_DELETE_QUERY).await?;
+    origin_change_applied_in_place(
+        &mut ctx,
+        m,
+        "UPDATE sd_refunds SET deleted_at = NULL WHERE id = 11",
+        SOFT_DELETE_QUERY,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Deleting an order drops its row, refund and all, in place.
+#[tokio::test]
+async fn test_soft_delete_join_order_delete_applied_in_place() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_orders_refunds(&mut ctx).await?;
+
+    let m = query_warm(&mut ctx, SOFT_DELETE_QUERY).await?;
+    origin_change_applied_in_place(
+        &mut ctx,
+        m,
+        "DELETE FROM sd_orders WHERE id = 1",
+        SOFT_DELETE_QUERY,
+    )
+    .await?;
+    Ok(())
+}
+
+/// The same join on `IS NOT NULL` attaches only soft-deleted refunds: setting
+/// `deleted_at` attaches a refund and clearing it detaches one, in place.
+#[tokio::test]
+async fn test_soft_delete_join_is_not_null_applied_in_place() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_orders_refunds(&mut ctx).await?;
+
+    let query = "SELECT o.id, r.id AS refund FROM sd_orders o LEFT JOIN sd_refunds r \
+                 ON r.order_id = o.id AND r.deleted_at IS NOT NULL \
+                 WHERE o.tenant_id = 1 ORDER BY o.id, r.id";
+    let m = query_warm(&mut ctx, query).await?;
+    let m = origin_change_applied_in_place(
+        &mut ctx,
+        m,
+        "UPDATE sd_refunds SET deleted_at = '2026-01-04' WHERE id = 10",
+        query,
+    )
+    .await?;
+    origin_change_applied_in_place(
+        &mut ctx,
+        m,
+        "UPDATE sd_refunds SET deleted_at = NULL WHERE id = 11",
+        query,
+    )
+    .await?;
+    Ok(())
+}
+
+/// A null test on the preserved side of a LEFT JOIN's ON filters no order:
+/// archived orders are returned NULL-padded, an inserted one included.
+#[tokio::test]
+async fn test_left_join_on_preserved_null_test_returns_every_order() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_orders_refunds(&mut ctx).await?;
+
+    let query = "SELECT o.id, r.id AS refund FROM sd_orders o LEFT JOIN sd_refunds r \
+                 ON r.order_id = o.id AND o.archived_at IS NULL \
+                 WHERE o.tenant_id = 1 ORDER BY o.id, r.id";
+    query_warm(&mut ctx, query).await?;
+
+    ctx.origin_query("INSERT INTO sd_orders VALUES (4, 1, '2026-01-05')", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+
+    let (proxied, origin) = ctx.proxy_and_origin_rows(query).await?;
+    assert_eq!(origin.len(), 3, "origin returns every tenant-1 order");
+    assert_eq!(proxied, origin, "result after preserved-side insert");
+    Ok(())
+}
+
+/// The preserved-side column of an ON null test decides which refund
+/// attaches: archiving an order detaches a refund the cache may hold, and
+/// unarchiving one attaches a refund it may not, so the change invalidates.
+#[tokio::test]
+async fn test_left_join_on_preserved_null_test_update_invalidates() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_orders_refunds(&mut ctx).await?;
+
+    let query = "SELECT o.id, r.id AS refund FROM sd_orders o LEFT JOIN sd_refunds r \
+                 ON r.order_id = o.id AND o.archived_at IS NULL \
+                 WHERE o.tenant_id = 1 ORDER BY o.id, r.id";
+    let m = query_warm(&mut ctx, query).await?;
+    origin_change_invalidates(
+        &mut ctx,
+        m,
+        "UPDATE sd_orders SET archived_at = NULL WHERE id = 2",
+        query,
+    )
+    .await
+}
+
+/// In an inner join the ON null test filters as a WHERE would: a soft-deleted
+/// refund never joins, and the result follows origin after the insert.
+#[tokio::test]
+async fn test_inner_join_on_null_test_filters_like_where() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_orders_refunds(&mut ctx).await?;
+
+    let query = "SELECT o.id, r.id AS refund FROM sd_orders o JOIN sd_refunds r \
+                 ON r.order_id = o.id AND r.deleted_at IS NULL \
+                 WHERE o.tenant_id = 1 ORDER BY o.id, r.id";
+    let m = query_warm(&mut ctx, query).await?;
+    origin_change_invalidates(
+        &mut ctx,
+        m,
+        "INSERT INTO sd_refunds VALUES (13, 2, 11, '2026-01-03')",
+        query,
+    )
+    .await?;
+
+    let (proxied, origin) = ctx.proxy_and_origin_rows(query).await?;
+    assert_eq!(origin.len(), 1, "only the live refund joins");
+    assert_eq!(proxied, origin, "result after soft-deleted insert");
+    Ok(())
+}
+
+/// A soft-delete LEFT JOIN loads every order its WHERE admits, so its
+/// preserved side covers a single-table query on the same filter, and the
+/// child then follows CDC.
+#[tokio::test]
+async fn test_soft_delete_join_preserved_parent_subsumes() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_orders_refunds(&mut ctx).await?;
+
+    let m = query_warm(&mut ctx, SOFT_DELETE_QUERY).await?;
+
+    let child = "SELECT id, tenant_id FROM sd_orders WHERE tenant_id = 1 ORDER BY id";
+    let (proxied, origin) = ctx.proxy_and_origin_rows(child).await?;
+    assert_eq!(origin.len(), 2, "origin returns both tenant-1 orders");
+    assert_eq!(proxied, origin, "subsumed child");
+    let m = assert_subsume_hit(&mut ctx, m).await?;
+
+    ctx.origin_query("INSERT INTO sd_orders VALUES (4, 1, NULL)", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+
+    let (proxied, origin) = ctx.proxy_and_origin_rows(child).await?;
+    assert_eq!(origin.len(), 3, "origin returns the inserted order");
+    assert_eq!(proxied, origin, "child after CDC insert");
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+    Ok(())
+}

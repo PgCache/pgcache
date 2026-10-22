@@ -9,7 +9,7 @@ use crate::query::ast::rope::{
     Body, Case, Function, Join, JoinQual, NodeKind, Query, QueryTree, Scalar, ScalarKind, Select,
     SelectItem, Source, Where, WhereKind,
 };
-use crate::query::ast::{BinaryOp, JoinType};
+use crate::query::ast::{BinaryOp, JoinType, UnaryOp};
 
 /// Reject queries that reference a PostgreSQL system catalog: a `pg_`
 /// prefix on the schema or the table name, anywhere in the tree.
@@ -156,7 +156,8 @@ fn join_supported(join: Join<'_>, fv: &FunctionVolatilityMap) -> Result<(), Cach
     source_supported(join.right(), fv)
 }
 
-/// Whether a join condition is an equality or an AND of equalities.
+/// Whether a join condition is an equality, a null test on a column (the
+/// soft-delete idiom, PGC-510), or an AND of those.
 fn join_condition_valid(expr: Where<'_>) -> bool {
     match expr.kind() {
         WhereKind::Binary(binary) => match binary.op() {
@@ -175,10 +176,18 @@ fn join_condition_valid(expr: Where<'_>) -> bool {
             | BinaryOp::NotLike
             | BinaryOp::NotILike => false,
         },
-        WhereKind::Scalar(_)
-        | WhereKind::Unary(_)
-        | WhereKind::Multi(_)
-        | WhereKind::Subquery(_) => false,
+        WhereKind::Unary(unary) => match unary.op() {
+            UnaryOp::IsNull | UnaryOp::IsNotNull => matches!(
+                unary.expr().kind(),
+                WhereKind::Scalar(scalar) if matches!(scalar.kind(), ScalarKind::Column(_))
+            ),
+            UnaryOp::Not
+            | UnaryOp::IsTrue
+            | UnaryOp::IsNotTrue
+            | UnaryOp::IsFalse
+            | UnaryOp::IsNotFalse => false,
+        },
+        WhereKind::Scalar(_) | WhereKind::Multi(_) | WhereKind::Subquery(_) => false,
     }
 }
 
@@ -487,6 +496,41 @@ mod tests {
             matches!(result, Err(CacheabilityError::UnsupportedFrom { .. })),
             "Nested join with non-equality condition should not be cacheable"
         );
+    }
+
+    /// A null test on a column beside the join's equalities is cacheable in
+    /// an inner, LEFT or RIGHT join; FULL stays out, as does a null test on
+    /// anything but a column, or any other unary test.
+    #[test]
+    fn test_join_null_test_condition_cacheability() {
+        let cacheable = [
+            "SELECT * FROM a JOIN b ON a.id = b.a_id AND b.deleted_at IS NULL WHERE a.id = 1",
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id AND b.deleted_at IS NULL WHERE a.id = 1",
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id AND b.deleted_at IS NOT NULL",
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id AND a.archived_at IS NULL",
+            "SELECT * FROM a RIGHT JOIN b ON a.id = b.a_id AND a.deleted_at IS NULL WHERE b.id = 1",
+            "SELECT * FROM a LEFT JOIN b ON b.deleted_at IS NULL AND a.id = b.a_id AND a.x = b.x",
+        ];
+        for sql in cacheable {
+            assert!(check_cacheable(sql).is_ok(), "{sql}");
+        }
+        let rejected = [
+            "SELECT * FROM a FULL JOIN b ON a.id = b.a_id AND b.deleted_at IS NULL",
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id AND lower(b.name) IS NULL",
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id AND b.deleted_at + 1 IS NULL",
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id AND b.active IS TRUE",
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id AND NOT b.deleted_at IS NULL",
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id OR b.deleted_at IS NULL",
+        ];
+        for sql in rejected {
+            assert!(
+                matches!(
+                    check_cacheable(sql),
+                    Err(CacheabilityError::UnsupportedFrom { .. })
+                ),
+                "{sql}"
+            );
+        }
     }
 
     #[test]

@@ -764,6 +764,22 @@ mod tests {
          &["a exact=true role=Kept filters=[] links=[x]",
            "b exact=false role=Optional filters=[] links=[id, x]",
            "c exact=false role=Optional filters=[] links=[id]"]),
+        // A null test in an outer join's ON: on the nullable side it only
+        // decides which rows attach, leaving the side terminal; on the
+        // preserved side it decides which nullable row attaches, so its
+        // column is a link column (PGC-510).
+        ("SELECT * FROM a LEFT JOIN b ON b.id = a.id AND b.x IS NULL",
+         &["a exact=true role=Kept filters=[] links=[id]",
+           "b exact=false role=Terminal filters=[] links=[]"]),
+        ("SELECT * FROM a LEFT JOIN b ON b.id = a.id AND a.x IS NULL WHERE a.y = 1",
+         &["a exact=true role=Kept filters=[y Equal Integer(1)] links=[id, x]",
+           "b exact=false role=Terminal filters=[] links=[]"]),
+        ("SELECT * FROM a RIGHT JOIN b ON b.id = a.id AND a.x IS NOT NULL",
+         &["a exact=false role=Terminal filters=[] links=[]",
+           "b exact=true role=Kept filters=[] links=[id]"]),
+        ("SELECT * FROM a JOIN b ON b.id = a.id AND b.x IS NULL WHERE a.y = 1",
+         &["a exact=false role=Kept filters=[y Equal Integer(1)] links=[id]",
+           "b exact=false role=Kept filters=[] links=[id]"]),
     ];
 
     #[test]
@@ -808,6 +824,22 @@ mod tests {
         };
         assert!(unrecognized("a"));
         assert!(!unrecognized("b"));
+    }
+
+    /// A null test in ON is kept for its column, not its meaning: the side
+    /// it tests is flagged, the other is not (PGC-510).
+    #[test]
+    fn test_on_null_test_flags_tested_side() {
+        let bound = resolve("SELECT * FROM a LEFT JOIN b ON b.id = a.id AND b.x IS NULL");
+        let branch = root_predicates(&bound);
+        let unrecognized = |name: &str| {
+            branch
+                .relation_predicates(bound.bindings(), slot_of(&bound, &branch, name))
+                .expect("relation predicates")
+                .unrecognized
+        };
+        assert!(!unrecognized("a"));
+        assert!(unrecognized("b"));
     }
 
     /// Each reference of a self-join keeps its own filters.

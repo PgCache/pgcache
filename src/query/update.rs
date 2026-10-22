@@ -859,6 +859,11 @@ mod tests {
              &[OuterJoinOptional, FromClause]),
             ("SELECT a.id, t.name FROM a LEFT JOIN b t ON a.id = t.a_id WHERE a.id = 1",
              &[FromClause, OuterJoinTerminal]),
+            // A null test in the join's own ON leaves either side's role alone.
+            ("SELECT * FROM a LEFT JOIN b ON a.id = b.a_id AND b.status IS NULL WHERE a.id = 1",
+             &[FromClause, OuterJoinTerminal]),
+            ("SELECT * FROM a LEFT JOIN b ON a.id = b.a_id AND a.status IS NULL",
+             &[FromClause, OuterJoinTerminal]),
             // Each reference of a self-join has its own role.
             ("SELECT * FROM a a1 LEFT JOIN a a2 ON a2.id = a1.val WHERE a1.status = 'x'",
              &[FromClause, OuterJoinTerminal]),

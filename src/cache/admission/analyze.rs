@@ -443,6 +443,10 @@ mod tests {
         // An ON the extractor can't read drops no preserved row.
         ("SELECT * FROM a LEFT JOIN b ON b.id = a.id AND b.y = a.x + 1",
          &[("a", true), ("b", false)]),
+        ("SELECT * FROM a LEFT JOIN b ON b.id = a.id AND b.y IS NULL WHERE a.x = 1",
+         &[("a", true), ("b", false)]),
+        ("SELECT * FROM a LEFT JOIN b ON b.id = a.id AND a.y IS NULL WHERE a.x = 1",
+         &[("a", true), ("b", false)]),
         // A WHERE on the nullable side drops unmatched or matched rows.
         ("SELECT * FROM a LEFT JOIN b ON b.id = a.id WHERE b.x = 1",
          &[("a", false), ("b", false)]),

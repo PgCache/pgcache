@@ -471,13 +471,17 @@ mod tests {
     #[test]
     fn test_population_select_cases() {
         #[rustfmt::skip]
-        let cases: [(&str, &str, Option<u64>, &[&str]); 15] = [
+        let cases: [(&str, &str, Option<u64>, &[&str]); 16] = [
             ("single table", "SELECT name FROM users WHERE id = 1 ORDER BY name", Some(5), &[
                 "SELECT public.users.id, public.users.name FROM public.users WHERE public.users.id = 1 ORDER BY public.users.name ASC LIMIT 5",
             ]),
             ("aliased join", "SELECT u.name, o.total FROM users u JOIN orders o ON o.user_id = u.id WHERE o.total > 2", None, &[
                 "SELECT DISTINCT u.id, u.name FROM public.users u JOIN public.orders o ON o.user_id = u.id WHERE o.total > 2",
                 "SELECT DISTINCT o.id, o.user_id, o.total FROM public.users u JOIN public.orders o ON o.user_id = u.id WHERE o.total > 2",
+            ]),
+            ("null test in ON", "SELECT u.name FROM users u LEFT JOIN orders o ON o.user_id = u.id AND o.total IS NULL WHERE u.id = 1", None, &[
+                "SELECT DISTINCT u.id, u.name FROM public.users u LEFT JOIN public.orders o ON o.user_id = u.id AND o.total IS NULL WHERE u.id = 1",
+                "SELECT DISTINCT o.id, o.user_id, o.total FROM public.users u LEFT JOIN public.orders o ON o.user_id = u.id AND o.total IS NULL WHERE u.id = 1",
             ]),
             ("grouping dropped", "SELECT user_id, count(*) FROM orders GROUP BY user_id HAVING count(*) > 1", None, &[
                 "SELECT DISTINCT public.orders.id, public.orders.user_id, public.orders.total FROM public.orders",
