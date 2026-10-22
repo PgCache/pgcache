@@ -159,7 +159,7 @@ impl WriterRegistration {
         );
 
         // Clear registration_started_at to signal completion
-        if let Some(mut q) = core.cache.cached_queries.get1_mut(&fingerprint) {
+        if let Some(mut q) = core.cache.cached_queries.get1_mut(fingerprint) {
             q.registration_started_at = None;
         }
 

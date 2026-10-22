@@ -25,7 +25,7 @@ fn update_queries_limit_set(
     has_limit: bool,
 ) {
     for oid in relation_oids {
-        if let Some(mut queries) = core.cache.update_queries.get_mut(oid) {
+        if let Some(mut queries) = core.cache.update_queries.get_mut(*oid) {
             queries.has_limit_set(fingerprint, has_limit);
         }
     }
@@ -50,7 +50,7 @@ impl WriterRegistration {
         let new_generation = core.cache.generation_allocate();
 
         // Extract data before remove/reinsert (generation is key2)
-        let Some(mut cached) = core.cache.cached_queries.remove1(&fingerprint) else {
+        let Some(mut cached) = core.cache.cached_queries.remove1(fingerprint) else {
             return Ok(());
         };
 
@@ -92,7 +92,7 @@ impl WriterRegistration {
         let update_info = core
             .cache
             .cached_queries
-            .get1_mut(&fingerprint)
+            .get1_mut(fingerprint)
             .map(|mut query| {
                 query.cached_bytes = merge.cached_bytes;
                 let started_at = query.registration_started_at.take();
@@ -193,7 +193,7 @@ impl WriterRegistration {
         core.cache.generations.remove(&old_generation);
 
         // Update cached query — must remove and reinsert because generation is key2
-        if let Some(mut cached) = core.cache.cached_queries.remove1(&fingerprint) {
+        if let Some(mut cached) = core.cache.cached_queries.remove1(fingerprint) {
             cached.generation = new_generation;
             cached.max_limit = new_max_limit;
             cached.registration_started_at = Some(Instant::now());

@@ -1813,6 +1813,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "iddqd"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9c6a3a37e36cfd4170bf01265cb987a40993369198fb072c1a0041c0cc485cf"
+dependencies = [
+ "allocator-api2",
+ "equivalent",
+ "foldhash",
+ "hashbrown 0.17.1",
+]
+
+[[package]]
 name = "ident_case"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2658,7 +2670,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
- "iddqd",
+ "iddqd 0.5.0",
  "itoa",
  "jiff",
  "lexopt",
@@ -2750,7 +2762,7 @@ dependencies = [
  "clap",
  "csv",
  "ecow",
- "iddqd",
+ "iddqd 0.4.6",
  "pg_query",
  "pgcache",
  "postgres-types",

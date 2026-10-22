@@ -410,7 +410,7 @@ fn query_invalidated_mark(core: &mut WriterCore, fingerprint: Fingerprint, gener
         m.cached_since_ns = None;
     }
     core.cache.generations.remove(&generation);
-    if let Some(mut query) = core.cache.cached_queries.get1_mut(&fingerprint) {
+    if let Some(mut query) = core.cache.cached_queries.get1_mut(fingerprint) {
         query.invalidated = true;
     }
     // Fold the MV dirty transition into the same get_mut block so dispatches

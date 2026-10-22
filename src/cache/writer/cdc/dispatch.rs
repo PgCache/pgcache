@@ -471,7 +471,7 @@ impl WriterCdc {
         // the pre-DDL entry (or, after a drop, the old OID under the new
         // table's name). The cache table itself waits for the drain, since
         // the open frame may hold locks on it.
-        if let Some(table) = core.cache.tables.remove1(&relation_oid) {
+        if let Some(table) = core.cache.tables.remove1(relation_oid) {
             core.forgotten_tables.push(table);
             core.relations_dirty = true;
             core.write_aliases_publish();

@@ -321,7 +321,7 @@ impl WriterCore {
         self.cache.generations.remove(&old_generation);
 
         // 6. Update CachedQuery in BiHashMap (generation is key2, must remove/reinsert)
-        if let Some(mut cached) = self.cache.cached_queries.remove1(&fingerprint) {
+        if let Some(mut cached) = self.cache.cached_queries.remove1(fingerprint) {
             cached.generation = new_generation;
             self.cache.cached_queries.insert_overwrite(cached);
         }
@@ -369,7 +369,7 @@ impl WriterCore {
             .collect();
 
         for fp in &stale_fingerprints {
-            if let Some(query) = self.cache.cached_queries.remove1(fp) {
+            if let Some(query) = self.cache.cached_queries.remove1(*fp) {
                 self.cache
                     .update_queries_remove_fingerprint(*fp, &query.relation_oids);
                 self.active_relations_release(&query.relation_oids);
@@ -491,7 +491,7 @@ impl WriterCore {
     /// Used by the eviction loop and schema-change (table) invalidation.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) async fn cache_query_evict(&mut self, fingerprint: Fingerprint) -> CacheResult<()> {
-        let Some(query) = self.cache.cached_queries.remove1(&fingerprint) else {
+        let Some(query) = self.cache.cached_queries.remove1(fingerprint) else {
             trace!(fingerprint = %fingerprint, "cache_query_evict: not found, skipping");
             return Ok(());
         };

@@ -621,7 +621,7 @@ impl WriterCore {
     pub(super) async fn cache_tables_drop(&mut self, relation_oids: &[Oid]) {
         let tables: Vec<CatalogTable> = relation_oids
             .iter()
-            .filter_map(|oid| self.cache.tables.remove1(oid))
+            .filter_map(|oid| self.cache.tables.remove1(*oid))
             .collect();
         if !tables.is_empty() {
             self.write_aliases_publish();

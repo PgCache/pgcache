@@ -416,7 +416,7 @@ impl WriterRegistration {
         // Deleted-key tracking is released per `(fingerprint, generation)` by the
         // population's terminal handler (Merge flush / Failed command), not here —
         // this fingerprint may have a superseded generation still in flight.
-        match core.cache.cached_queries.remove1(&fingerprint) {
+        match core.cache.cached_queries.remove1(fingerprint) {
             Some(query) => {
                 core.cache.generations.remove(&query.generation);
                 core.cache
