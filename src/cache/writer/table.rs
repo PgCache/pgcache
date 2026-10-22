@@ -424,6 +424,67 @@ impl WriterCore {
         Ok(())
     }
 
+    /// Fill the primary key a Relation message left empty (PGC-530): the
+    /// registered table's while its key columns are all still there, else
+    /// the catalog's.
+    pub(super) async fn table_metadata_primary_key_resolve(
+        &self,
+        metadata: &mut TableMetadata,
+    ) -> CacheResult<()> {
+        if !metadata.primary_key_columns.is_empty() {
+            return Ok(());
+        }
+        let registered = self
+            .cache
+            .tables
+            .get1(&metadata.relation_oid)
+            .map(|table| table.primary_key_columns.clone())
+            .filter(|key| {
+                !key.is_empty()
+                    && key
+                        .iter()
+                        .all(|column| metadata.columns.get(column.as_str()).is_some())
+            });
+        let key = match registered {
+            Some(key) => key,
+            None => self.query_table_primary_key(metadata.relation_oid).await?,
+        };
+        if key.is_empty() {
+            return Ok(());
+        }
+        let columns: Vec<ColumnMetadata> = metadata
+            .columns
+            .iter()
+            .map(|column| ColumnMetadata {
+                is_primary_key: key.contains(&column.name),
+                ..column.clone()
+            })
+            .collect();
+        metadata.columns = ColumnStore::new(columns);
+        metadata.primary_key_columns = key;
+        Ok(())
+    }
+
+    /// The relation's primary-key columns in column order, as registration
+    /// reads them; empty without a primary key.
+    async fn query_table_primary_key(&self, relation_oid: Oid) -> CacheResult<Vec<EcoString>> {
+        let rows = self
+            .db_origin
+            .query(
+                "SELECT a.attname FROM pg_constraint pgc \
+                 JOIN pg_attribute a ON a.attrelid = pgc.conrelid AND a.attnum = any(pgc.conkey) \
+                 WHERE pgc.conrelid = $1 AND pgc.contype = 'p' AND NOT a.attisdropped \
+                 ORDER BY a.attnum",
+                &[&relation_oid],
+            )
+            .await
+            .map_into_report::<CacheError>()?;
+        Ok(rows
+            .iter()
+            .map(|row| EcoString::from(row.get::<_, &str>(0)))
+            .collect())
+    }
+
     #[instrument(skip_all)]
     /// Whether the origin relation's REPLICA IDENTITY is FULL
     /// (`pg_class.relreplident = 'f'`). Absent rows (dropped mid-registration)
@@ -790,6 +851,15 @@ impl WriterCore {
             if let Some(current_table) = self.cache.tables.get1(&relation_oid)
                 && current_table.schema_eq(&table_metadata)
             {
+                // Without the schema-change signal a replica identity change
+                // arrives only here; the shape and its queries stand.
+                if current_table.replica_identity_full != table_metadata.replica_identity_full {
+                    let updated = TableMetadata {
+                        replica_identity_full: table_metadata.replica_identity_full,
+                        ..TableMetadata::clone(current_table)
+                    };
+                    self.cache.tables.insert_overwrite(updated.into());
+                }
                 return Ok(());
             }
 

@@ -1262,7 +1262,10 @@ async fn test_subquery_not_in_compared_column_update_applied_in_place() -> Resul
 
 /// `pa` rows 1..=9 with `x = id`; `pb` rows 1..=5 with `flag = 1` (the NOT IN
 /// subquery's rows) and 6..=8 with `flag = 0` (rows it never reads).
-async fn setup_flagged_exclusions(ctx: &mut TestContext) -> Result<(), Error> {
+async fn setup_flagged_exclusions(
+    ctx: &mut TestContext,
+    replica_identity_full: bool,
+) -> Result<(), Error> {
     ctx.query("CREATE TABLE pa (id INTEGER PRIMARY KEY, x INTEGER)", &[])
         .await?;
     ctx.query(
@@ -1270,6 +1273,10 @@ async fn setup_flagged_exclusions(ctx: &mut TestContext) -> Result<(), Error> {
         &[],
     )
     .await?;
+    if replica_identity_full {
+        ctx.origin_query("ALTER TABLE pb REPLICA IDENTITY FULL", &[])
+            .await?;
+    }
     ctx.query(
         "INSERT INTO pa SELECT g, g FROM generate_series(1, 9) g",
         &[],
@@ -1292,7 +1299,7 @@ const NOT_IN_FLAGGED: &str =
 #[tokio::test]
 async fn test_subquery_not_in_filtered_delete_invalidates() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
-    setup_flagged_exclusions(&mut ctx).await?;
+    setup_flagged_exclusions(&mut ctx, false).await?;
     let m = query_warm(&mut ctx, NOT_IN_FLAGGED).await?;
     origin_change_invalidates(&mut ctx, m, "DELETE FROM pb WHERE id = 3", NOT_IN_FLAGGED).await
 }
@@ -1302,7 +1309,7 @@ async fn test_subquery_not_in_filtered_delete_invalidates() -> Result<(), Error>
 #[tokio::test]
 async fn test_subquery_not_in_uncached_row_delete_applied_in_place() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
-    setup_flagged_exclusions(&mut ctx).await?;
+    setup_flagged_exclusions(&mut ctx, false).await?;
     let m = query_warm(&mut ctx, NOT_IN_FLAGGED).await?;
     origin_change_applied_in_place(&mut ctx, m, "DELETE FROM pb WHERE id = 7", NOT_IN_FLAGGED)
         .await?;
@@ -1315,7 +1322,7 @@ async fn test_subquery_not_in_uncached_row_delete_applied_in_place() -> Result<(
 #[tokio::test]
 async fn test_subquery_not_in_cached_row_delete_judged_on_old_image() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
-    setup_flagged_exclusions(&mut ctx).await?;
+    setup_flagged_exclusions(&mut ctx, false).await?;
     let by_day = "SELECT id FROM pa WHERE x NOT IN \
                   (SELECT id FROM pb WHERE day <= '2024-01-06') ORDER BY id";
     query_warm(&mut ctx, "SELECT id, day FROM pb WHERE flag = 0").await?;
@@ -1329,4 +1336,43 @@ async fn test_subquery_not_in_cached_row_delete_judged_on_old_image() -> Result<
     assert_proxy_rows_match_origin(&mut ctx, by_day).await?;
     assert_cache_hit(&mut ctx, m).await?;
     Ok(())
+}
+
+/// Under REPLICA IDENTITY FULL the DELETE tuple is the whole row: a row
+/// outside the subquery's set leaves the NOT IN query cached, one inside it
+/// invalidates (PGC-528, PGC-530).
+#[tokio::test]
+async fn test_subquery_not_in_delete_replica_identity_full() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_flagged_exclusions(&mut ctx, true).await?;
+    let m = query_warm(&mut ctx, NOT_IN_FLAGGED).await?;
+    let m =
+        origin_change_applied_in_place(&mut ctx, m, "DELETE FROM pb WHERE id = 8", NOT_IN_FLAGGED)
+            .await?;
+    origin_change_invalidates(&mut ctx, m, "DELETE FROM pb WHERE id = 2", NOT_IN_FLAGGED).await
+}
+
+/// Without the schema-change event trigger, a replica identity change reaches
+/// pgcache only as a Relation message. It updates the table's identity in
+/// place, keeping its queries; a stale FULL would read the next PK-only DELETE
+/// tuple as the whole row and miss the invalidation (PGC-530).
+#[tokio::test]
+async fn test_replica_identity_change_without_event_trigger() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_flagged_exclusions(&mut ctx, true).await?;
+    let m = query_warm(&mut ctx, NOT_IN_FLAGGED).await?;
+
+    ctx.origin_query("ALTER EVENT TRIGGER pgcache_ddl_command_end DISABLE", &[])
+        .await?;
+    ctx.origin_query("ALTER TABLE pb REPLICA IDENTITY DEFAULT", &[])
+        .await?;
+    // A row outside the subquery's set carries the Relation message in.
+    let m = origin_change_applied_in_place(
+        &mut ctx,
+        m,
+        "INSERT INTO pb VALUES (9, 0, DATE '2024-02-01')",
+        NOT_IN_FLAGGED,
+    )
+    .await?;
+    origin_change_invalidates(&mut ctx, m, "DELETE FROM pb WHERE id = 2", NOT_IN_FLAGGED).await
 }

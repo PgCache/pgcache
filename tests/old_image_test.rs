@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use crate::util::{
     TestContext, assert_limit_order_decides, assert_proxy_rows_match_origin, assert_row_at,
+    origin_change_applied_in_place, query_warm,
 };
 
 mod util;
@@ -548,4 +549,58 @@ async fn test_old_image_date_time_float_precision() -> Result<(), Error> {
         "an update inside the filters must evict their memos"
     );
     Ok(())
+}
+
+/// A table whose replica identity isn't its primary key keeps its key and
+/// its cached queries through the Relation message pgoutput sends before its
+/// first change: the message flags the replica identity, not the primary key.
+/// Repeated updates keep one row per key (PGC-530).
+async fn replica_identity_keeps_key(identity_sql: &[&str], table: &str) -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    ctx.query(
+        &format!(
+            "CREATE TABLE {table} (id INT PRIMARY KEY, code INT NOT NULL, owner INT, val INT)"
+        ),
+        &[],
+    )
+    .await?;
+    for sql in identity_sql {
+        ctx.origin_query(*sql, &[]).await?;
+    }
+    ctx.query(
+        &format!("INSERT INTO {table} VALUES (1, 100, 10, 5), (2, 200, 10, 7)"),
+        &[],
+    )
+    .await?;
+    ctx.cdc_decode_settle().await?;
+
+    let query = format!("SELECT id, val FROM {table} WHERE owner = 10 ORDER BY id");
+    let mut m = query_warm(&mut ctx, &query).await?;
+    for val in [6, 8] {
+        m = origin_change_applied_in_place(
+            &mut ctx,
+            m,
+            &format!("UPDATE {table} SET val = {val} WHERE id = 1"),
+            &query,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_replica_identity_full_keeps_primary_key() -> Result<(), Error> {
+    replica_identity_keeps_key(&["ALTER TABLE ri_full REPLICA IDENTITY FULL"], "ri_full").await
+}
+
+#[tokio::test]
+async fn test_replica_identity_index_keeps_primary_key() -> Result<(), Error> {
+    replica_identity_keeps_key(
+        &[
+            "CREATE UNIQUE INDEX ri_index_code ON ri_index (code)",
+            "ALTER TABLE ri_index REPLICA IDENTITY USING INDEX ri_index_code",
+        ],
+        "ri_index",
+    )
+    .await
 }

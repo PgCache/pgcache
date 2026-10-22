@@ -18,18 +18,22 @@ use crate::catalog::{
 use crate::oid::{Oid, TypeOid};
 use crate::pg::protocol::ByteString;
 
-/// Parse RelationBody into TableMetadata for cache registration.
+/// Parse RelationBody into TableMetadata for cache registration. A column's
+/// key flag marks the replica identity, which is the primary key only under
+/// REPLICA IDENTITY DEFAULT; under any other identity the key is left empty
+/// for the writer to resolve (PGC-530).
 pub(super) fn parse_relation_to_table_metadata(relation_body: &RelationBody) -> TableMetadata {
     let relation_oid = Oid::from_raw(relation_body.rel_id());
     let table_name: EcoString = relation_body.name().unwrap_or("unknown_table").into();
     let schema_name: EcoString = relation_body.namespace().unwrap_or("unknown_schema").into();
 
-    // Build column metadata from relation body
+    let identity_is_primary_key =
+        matches!(relation_body.replica_identity(), ReplicaIdentity::Default);
     let mut columns = Vec::new();
     let mut primary_key_columns = Vec::new();
 
     for (idx, column) in relation_body.columns().iter().enumerate() {
-        let is_primary_key = column.flags() == 1; // flags field is 1 when column is part of primary key
+        let is_primary_key = identity_is_primary_key && column.flags() == 1;
 
         let type_oid = TypeOid::from_raw(column.type_id().cast_unsigned());
         let data_type = type_oid

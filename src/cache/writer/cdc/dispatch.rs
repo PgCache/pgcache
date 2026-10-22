@@ -295,6 +295,9 @@ impl WriterCdc {
         // origin-only types would otherwise read as a schema change on
         // every Relation message (PGC-266).
         core.table_metadata_types_resolve(&mut table_metadata).await;
+        core.table_metadata_primary_key_resolve(&mut table_metadata)
+            .await
+            .attach_loc("resolving a Relation message's primary key")?;
         core.frame_relation_oids.insert(table_metadata.relation_oid);
         let relation_oid = table_metadata.relation_oid;
         // A mid-frame Relation message whose metadata CHANGED (intra-txn

@@ -20,6 +20,7 @@ Two event triggers on origin, on `ddl_command_end` and `sql_drop`, emit each com
 - Only `ALTER TABLE` rows count as altering a table. `CREATE TABLE` has no pre-state to evict, and its message routinely arrives after a query has registered on the new table.
 - The trigger filters its own noise at the source: pgcache's `ALTER PUBLICATION` (which reports `publication relation` objects on every registration and eviction) and temp-schema DDL.
 - pgcache installs the triggers at provisioning when its role may, otherwise `pgcache --check` prints the SQL for an administrator. They are never dropped at shutdown: they are shared by every pgcache on the database. Without them, behaviour is the pre-existing one.
+- **The `Relation` message is the fallback signal, and it can't be read as a catalog.** Its column key flags mark the replica identity, which is the primary key only under REPLICA IDENTITY DEFAULT. So the key comes from the registered table or the origin catalog, never from the flags, and a message that differs only in its replica identity updates the table's identity in place rather than reshaping it (PGC-530).
 
 ## Rationale
 - **Stream order for free.** A transactional message is decoded with the data changes of its transaction, in commit order. The signal cannot race the rows it affects, and it inherits reconnect and slot semantics. No second channel, no origin table.
