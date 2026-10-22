@@ -292,6 +292,13 @@ impl QueryBranchPredicates {
     /// closed under the equalities: an equality carries a constraint to a
     /// column whose reference it filters.
     fn filters_derive(&self) -> Vec<Vec<ColumnConstraint>> {
+        let (filters, edges) = self.filter_edges_collect();
+        self.filters_close(filters, edges)
+    }
+
+    /// Each reference's directly stated filters, and the equalities that
+    /// carry a constraint from one column to another, as `(from, to)`.
+    fn filter_edges_collect(&self) -> (Vec<Vec<ColumnConstraint>>, Vec<FilterEdge>) {
         let mut filters = vec![Vec::new(); self.table_references.len()];
         let mut edges = Vec::new();
         for conjunct in self.conjuncts.iter().filter(|conjunct| !conjunct.external) {
@@ -312,6 +319,16 @@ impl QueryBranchPredicates {
                 ConjunctForm::Opaque => {}
             }
         }
+        (filters, edges)
+    }
+
+    /// `filters` closed under `edges`: a constraint on an edge's `from`
+    /// column is restated on its `to` column until nothing new appears.
+    fn filters_close(
+        &self,
+        mut filters: Vec<Vec<ColumnConstraint>>,
+        edges: Vec<FilterEdge>,
+    ) -> Vec<Vec<ColumnConstraint>> {
         loop {
             let carried: Vec<ColumnConstraint> = edges
                 .iter()
@@ -361,32 +378,41 @@ impl QueryBranchPredicates {
     /// uncorrelated subquery's tables don't count: its own read loads them
     /// whatever this reference's rows are.
     fn link_columns_derive(&self, reference: &TableReference) -> Vec<ColumnPosition> {
-        let slot = reference.slot;
         let mut link_columns = Vec::new();
-        for conjunct in &self.conjuncts {
-            let links = conjunct.external
-                || conjunct.columns.iter().any(|column| {
-                    column.slot != slot
-                        && (conjunct.correlated || self.reference_index(column.slot).is_some())
-                })
-                || match conjunct.scope {
-                    ConjunctScope::On(id) => {
-                        path_step(&reference.path, id).is_some_and(|(_, step)| {
-                            self.join(id).is_some_and(|join| join.preserves(step.side))
-                        })
-                    }
-                    ConjunctScope::Where => false,
-                };
-            if !links {
-                continue;
-            }
-            for column in conjunct.columns.iter().filter(|column| column.slot == slot) {
-                if !link_columns.contains(&column.position) {
-                    link_columns.push(column.position);
-                }
+        let linked_columns = self
+            .conjuncts
+            .iter()
+            .filter(|conjunct| self.conjunct_links(reference, conjunct))
+            .flat_map(|conjunct| &conjunct.columns)
+            .filter(|column| column.slot == reference.slot);
+        for column in linked_columns {
+            if !link_columns.contains(&column.position) {
+                link_columns.push(column.position);
             }
         }
         link_columns
+    }
+
+    /// Whether a change elsewhere can alter `conjunct`'s match for the
+    /// reference: it reaches outside the branch, mentions another reference
+    /// or a correlated subquery's column, or is the ON of an outer join
+    /// preserving the reference.
+    fn conjunct_links(&self, reference: &TableReference, conjunct: &Conjunct) -> bool {
+        if conjunct.external {
+            return true;
+        }
+        let mentions_other = conjunct.columns.iter().any(|column| {
+            column.slot != reference.slot
+                && (conjunct.correlated || self.reference_index(column.slot).is_some())
+        });
+        if mentions_other {
+            return true;
+        }
+        let ConjunctScope::On(id) = conjunct.scope else {
+            return false;
+        };
+        path_step(&reference.path, id)
+            .is_some_and(|(_, step)| self.join(id).is_some_and(|join| join.preserves(step.side)))
     }
 
     /// `Optional` when a conjunct above an unreduced outer join that
@@ -401,22 +427,9 @@ impl QueryBranchPredicates {
             if !self.step_null_fills(step) {
                 continue;
             }
-            alone = self.join(step.join).is_some_and(|join| {
-                let side = match step.side {
-                    JoinSide::Left => &join.left,
-                    JoinSide::Right => &join.right,
-                };
-                side.as_slice() == [reference.slot]
-            });
+            alone = self.reference_alone_on_side(reference, step);
             let above = reference.path.get(..position).unwrap_or_default();
-            let mentioned = self.conjuncts.iter().any(|conjunct| {
-                conjunct.mentions(reference.slot)
-                    && match conjunct.scope {
-                        ConjunctScope::Where => true,
-                        ConjunctScope::On(id) => above.iter().any(|step| step.join == id),
-                    }
-            });
-            if mentioned {
+            if self.reference_mentioned_above(reference, above) {
                 return OuterJoinRole::Optional;
             }
             role = OuterJoinRole::Terminal;
@@ -426,7 +439,36 @@ impl QueryBranchPredicates {
         }
         role
     }
+
+    /// Whether the reference is the only source under `step`'s side.
+    fn reference_alone_on_side(&self, reference: &TableReference, step: &JoinPathStep) -> bool {
+        self.join(step.join).is_some_and(|join| {
+            let side = match step.side {
+                JoinSide::Left => &join.left,
+                JoinSide::Right => &join.right,
+            };
+            side.as_slice() == [reference.slot]
+        })
+    }
+
+    /// Whether WHERE or the ON of a join in `above` mentions the reference.
+    fn reference_mentioned_above(
+        &self,
+        reference: &TableReference,
+        above: &[JoinPathStep],
+    ) -> bool {
+        self.conjuncts.iter().any(|conjunct| {
+            conjunct.mentions(reference.slot)
+                && match conjunct.scope {
+                    ConjunctScope::Where => true,
+                    ConjunctScope::On(id) => above.iter().any(|step| step.join == id),
+                }
+        })
+    }
 }
+
+/// An equality's carry of a constraint from one column to another.
+type FilterEdge = (ColumnBinding, ColumnBinding);
 
 /// The step through join `id`, with its position, when the path has one.
 fn path_step(path: &[JoinPathStep], id: JoinId) -> Option<(usize, &JoinPathStep)> {
@@ -626,105 +668,107 @@ mod tests {
         assert!(branch.conjunct_filters(on_conjunct, b));
     }
 
-    /// Each reference's filters, exactness, link columns and role.
+    /// Each reference's filters, exactness, link columns and role, per
+    /// query: single tables, then joins, then subqueries and expressions.
+    #[rustfmt::skip]
+    const REFERENCE_PREDICATE_CASES: &[(&str, &[&str])] = &[
+        ("SELECT * FROM a WHERE x = 1 AND y IN (2, 1)",
+         &["a exact=true role=Kept filters=[x Equal Integer(1), y AnyOf [Integer(1), Integer(2)]] links=[]"]),
+        ("SELECT * FROM a",
+         &["a exact=true role=Kept filters=[] links=[]"]),
+        // A same-reference equality describes no row set by itself.
+        ("SELECT * FROM a WHERE x = y",
+         &["a exact=false role=Kept filters=[] links=[]"]),
+        // The literal bound of a BETWEEN holds without the other.
+        ("SELECT * FROM a WHERE x BETWEEN 1 AND y",
+         &["a exact=false role=Kept filters=[x GreaterThanOrEqual Integer(1)] links=[]"]),
+        ("SELECT * FROM a WHERE x NOT IN (1, y, 2)",
+         &["a exact=false role=Kept filters=[x NotEqual Integer(1), x NotEqual Integer(2)] links=[]"]),
+        // An outer equality carries a constraint from the preserved side only.
+        ("SELECT * FROM a LEFT JOIN b ON b.id = a.id WHERE a.id = 5",
+         &["a exact=true role=Kept filters=[id Equal Integer(5)] links=[id]",
+           "b exact=false role=Terminal filters=[id Equal Integer(5)] links=[]"]),
+        ("SELECT * FROM a LEFT JOIN b ON b.id = a.id AND b.x = 5",
+         &["a exact=true role=Kept filters=[] links=[id]",
+           "b exact=false role=Terminal filters=[x Equal Integer(5)] links=[]"]),
+        // A preserved-side ON literal filters nothing but is a link column.
+        ("SELECT * FROM a LEFT JOIN b ON b.id = a.id AND a.x = 1",
+         &["a exact=true role=Kept filters=[] links=[id, x]",
+           "b exact=false role=Terminal filters=[] links=[]"]),
+        // Reduced: the equality carries both ways and b is kept.
+        ("SELECT * FROM a LEFT JOIN b ON b.id = a.id WHERE b.id = 5",
+         &["a exact=false role=Kept filters=[id Equal Integer(5)] links=[id]",
+           "b exact=false role=Kept filters=[id Equal Integer(5)] links=[id]"]),
+        ("SELECT * FROM a LEFT JOIN b ON b.id = a.id WHERE b.x IS NULL",
+         &["a exact=false role=Kept filters=[] links=[id]",
+           "b exact=false role=Optional filters=[] links=[id]"]),
+        ("SELECT * FROM a RIGHT JOIN b ON b.id = a.id WHERE b.x = 1",
+         &["a exact=false role=Terminal filters=[] links=[]",
+           "b exact=true role=Kept filters=[x Equal Integer(1)] links=[id]"]),
+        // A table referenced from an enclosing ON is optional.
+        ("SELECT * FROM a LEFT JOIN b ON b.id = a.id LEFT JOIN c ON c.x = b.x",
+         &["a exact=true role=Kept filters=[] links=[id]",
+           "b exact=false role=Optional filters=[] links=[id, x]",
+           "c exact=false role=Terminal filters=[] links=[]"]),
+        // A reference beside another on a NULL-filled side is no leaf;
+        // one alone on its innermost NULL-filled side is.
+        ("SELECT * FROM a LEFT JOIN (b LEFT JOIN c ON c.id = b.id) ON b.id = a.id",
+         &["a exact=true role=Kept filters=[] links=[id]",
+           "b exact=false role=Optional filters=[] links=[id]",
+           "c exact=false role=Terminal filters=[] links=[]"]),
+        ("SELECT * FROM a LEFT JOIN (b JOIN c ON c.id = b.id) ON b.id = a.id",
+         &["a exact=true role=Kept filters=[] links=[id]",
+           "b exact=false role=Optional filters=[] links=[id]",
+           "c exact=false role=Optional filters=[] links=[id]"]),
+        // Expression ON and cross-table WHERE columns are link columns.
+        ("SELECT * FROM a JOIN b ON b.id = a.x + 1 WHERE a.y = 1",
+         &["a exact=false role=Kept filters=[y Equal Integer(1)] links=[x]",
+           "b exact=false role=Kept filters=[] links=[id]"]),
+        ("SELECT * FROM a JOIN b ON b.id = a.id WHERE a.x < b.y",
+         &["a exact=false role=Kept filters=[] links=[id, x]",
+           "b exact=false role=Kept filters=[] links=[id, y]"]),
+        // A comma list is a chain of cross joins.
+        ("SELECT * FROM a, b, c WHERE a.id = b.id AND b.id = c.id AND c.x = 3",
+         &["a exact=false role=Kept filters=[] links=[id]",
+           "b exact=false role=Kept filters=[] links=[id]",
+           "c exact=false role=Kept filters=[x Equal Integer(3)] links=[id]"]),
+        // An inner merged column is its left side; USING is an equality.
+        ("SELECT * FROM a JOIN b USING (id) WHERE id = 1",
+         &["a exact=false role=Kept filters=[id Equal Integer(1)] links=[id]",
+           "b exact=false role=Kept filters=[id Equal Integer(1)] links=[id]"]),
+        // An outer merged column isn't recognized yet; it reads the left side.
+        ("SELECT * FROM a LEFT JOIN b USING (id) WHERE id = 1",
+         &["a exact=false role=Kept filters=[] links=[id]",
+           "b exact=false role=Terminal filters=[] links=[]"]),
+        // A derived table is a reference but never exact.
+        ("SELECT * FROM a JOIN (SELECT id FROM b WHERE x = 1) d ON d.id = a.id WHERE d.id = 2",
+         &["a exact=false role=Kept filters=[id Equal Integer(2)] links=[id]",
+           "d exact=false role=Kept filters=[id Equal Integer(2)] links=[id]"]),
+        // An uncorrelated subquery's tables don't link: its own read
+        // loads them whatever the outer rows are.
+        ("SELECT * FROM a WHERE x = 1 AND y IN (SELECT b.y FROM b)",
+         &["a exact=false role=Kept filters=[x Equal Integer(1)] links=[]"]),
+        ("SELECT * FROM a WHERE y IN (SELECT b.y FROM b JOIN c ON c.id = b.id WHERE c.x + 1 = 2)",
+         &["a exact=false role=Kept filters=[] links=[]"]),
+        ("SELECT * FROM a WHERE x NOT IN (SELECT b.x FROM b)",
+         &["a exact=false role=Kept filters=[] links=[]"]),
+        // A terminal reference has no links, whatever its ON.
+        ("SELECT * FROM a LEFT JOIN b ON b.x + 1 = a.x",
+         &["a exact=true role=Kept filters=[] links=[x]",
+           "b exact=false role=Terminal filters=[] links=[]"]),
+        ("SELECT * FROM a LEFT JOIN b ON b.x::text = a.y::text",
+         &["a exact=true role=Kept filters=[] links=[y]",
+           "b exact=false role=Terminal filters=[] links=[]"]),
+        // Beside a partner on the NULL-filled side, it stays optional and linked.
+        ("SELECT * FROM a LEFT JOIN (b JOIN c ON c.id = b.id) ON b.x = a.x",
+         &["a exact=true role=Kept filters=[] links=[x]",
+           "b exact=false role=Optional filters=[] links=[id, x]",
+           "c exact=false role=Optional filters=[] links=[id]"]),
+    ];
+
     #[test]
     fn test_reference_predicates() {
-        #[rustfmt::skip]
-        let cases: &[(&str, &[&str])] = &[
-            ("SELECT * FROM a WHERE x = 1 AND y IN (2, 1)",
-             &["a exact=true role=Kept filters=[x Equal Integer(1), y AnyOf [Integer(1), Integer(2)]] links=[]"]),
-            ("SELECT * FROM a",
-             &["a exact=true role=Kept filters=[] links=[]"]),
-            // A same-reference equality describes no row set by itself.
-            ("SELECT * FROM a WHERE x = y",
-             &["a exact=false role=Kept filters=[] links=[]"]),
-            // The literal bound of a BETWEEN holds without the other.
-            ("SELECT * FROM a WHERE x BETWEEN 1 AND y",
-             &["a exact=false role=Kept filters=[x GreaterThanOrEqual Integer(1)] links=[]"]),
-            ("SELECT * FROM a WHERE x NOT IN (1, y, 2)",
-             &["a exact=false role=Kept filters=[x NotEqual Integer(1), x NotEqual Integer(2)] links=[]"]),
-            // An outer equality carries a constraint from the preserved side only.
-            ("SELECT * FROM a LEFT JOIN b ON b.id = a.id WHERE a.id = 5",
-             &["a exact=true role=Kept filters=[id Equal Integer(5)] links=[id]",
-               "b exact=false role=Terminal filters=[id Equal Integer(5)] links=[]"]),
-            ("SELECT * FROM a LEFT JOIN b ON b.id = a.id AND b.x = 5",
-             &["a exact=true role=Kept filters=[] links=[id]",
-               "b exact=false role=Terminal filters=[x Equal Integer(5)] links=[]"]),
-            // A preserved-side ON literal filters nothing but is a link column.
-            ("SELECT * FROM a LEFT JOIN b ON b.id = a.id AND a.x = 1",
-             &["a exact=true role=Kept filters=[] links=[id, x]",
-               "b exact=false role=Terminal filters=[] links=[]"]),
-            // Reduced: the equality carries both ways and b is kept.
-            ("SELECT * FROM a LEFT JOIN b ON b.id = a.id WHERE b.id = 5",
-             &["a exact=false role=Kept filters=[id Equal Integer(5)] links=[id]",
-               "b exact=false role=Kept filters=[id Equal Integer(5)] links=[id]"]),
-            ("SELECT * FROM a LEFT JOIN b ON b.id = a.id WHERE b.x IS NULL",
-             &["a exact=false role=Kept filters=[] links=[id]",
-               "b exact=false role=Optional filters=[] links=[id]"]),
-            ("SELECT * FROM a RIGHT JOIN b ON b.id = a.id WHERE b.x = 1",
-             &["a exact=false role=Terminal filters=[] links=[]",
-               "b exact=true role=Kept filters=[x Equal Integer(1)] links=[id]"]),
-            // A table referenced from an enclosing ON is optional.
-            ("SELECT * FROM a LEFT JOIN b ON b.id = a.id LEFT JOIN c ON c.x = b.x",
-             &["a exact=true role=Kept filters=[] links=[id]",
-               "b exact=false role=Optional filters=[] links=[id, x]",
-               "c exact=false role=Terminal filters=[] links=[]"]),
-            // A reference beside another on a NULL-filled side is no leaf;
-            // one alone on its innermost NULL-filled side is.
-            ("SELECT * FROM a LEFT JOIN (b LEFT JOIN c ON c.id = b.id) ON b.id = a.id",
-             &["a exact=true role=Kept filters=[] links=[id]",
-               "b exact=false role=Optional filters=[] links=[id]",
-               "c exact=false role=Terminal filters=[] links=[]"]),
-            ("SELECT * FROM a LEFT JOIN (b JOIN c ON c.id = b.id) ON b.id = a.id",
-             &["a exact=true role=Kept filters=[] links=[id]",
-               "b exact=false role=Optional filters=[] links=[id]",
-               "c exact=false role=Optional filters=[] links=[id]"]),
-            // Expression ON and cross-table WHERE columns are link columns.
-            ("SELECT * FROM a JOIN b ON b.id = a.x + 1 WHERE a.y = 1",
-             &["a exact=false role=Kept filters=[y Equal Integer(1)] links=[x]",
-               "b exact=false role=Kept filters=[] links=[id]"]),
-            ("SELECT * FROM a JOIN b ON b.id = a.id WHERE a.x < b.y",
-             &["a exact=false role=Kept filters=[] links=[id, x]",
-               "b exact=false role=Kept filters=[] links=[id, y]"]),
-            // A comma list is a chain of cross joins.
-            ("SELECT * FROM a, b, c WHERE a.id = b.id AND b.id = c.id AND c.x = 3",
-             &["a exact=false role=Kept filters=[] links=[id]",
-               "b exact=false role=Kept filters=[] links=[id]",
-               "c exact=false role=Kept filters=[x Equal Integer(3)] links=[id]"]),
-            // An inner merged column is its left side; USING is an equality.
-            ("SELECT * FROM a JOIN b USING (id) WHERE id = 1",
-             &["a exact=false role=Kept filters=[id Equal Integer(1)] links=[id]",
-               "b exact=false role=Kept filters=[id Equal Integer(1)] links=[id]"]),
-            // An outer merged column isn't recognized yet; it reads the left side.
-            ("SELECT * FROM a LEFT JOIN b USING (id) WHERE id = 1",
-             &["a exact=false role=Kept filters=[] links=[id]",
-               "b exact=false role=Terminal filters=[] links=[]"]),
-            // A derived table is a reference but never exact.
-            ("SELECT * FROM a JOIN (SELECT id FROM b WHERE x = 1) d ON d.id = a.id WHERE d.id = 2",
-             &["a exact=false role=Kept filters=[id Equal Integer(2)] links=[id]",
-               "d exact=false role=Kept filters=[id Equal Integer(2)] links=[id]"]),
-            // An uncorrelated subquery's tables don't link: its own read
-            // loads them whatever the outer rows are.
-            ("SELECT * FROM a WHERE x = 1 AND y IN (SELECT b.y FROM b)",
-             &["a exact=false role=Kept filters=[x Equal Integer(1)] links=[]"]),
-            ("SELECT * FROM a WHERE y IN (SELECT b.y FROM b JOIN c ON c.id = b.id WHERE c.x + 1 = 2)",
-             &["a exact=false role=Kept filters=[] links=[]"]),
-            ("SELECT * FROM a WHERE x NOT IN (SELECT b.x FROM b)",
-             &["a exact=false role=Kept filters=[] links=[]"]),
-            // A terminal reference has no links, whatever its ON.
-            ("SELECT * FROM a LEFT JOIN b ON b.x + 1 = a.x",
-             &["a exact=true role=Kept filters=[] links=[x]",
-               "b exact=false role=Terminal filters=[] links=[]"]),
-            ("SELECT * FROM a LEFT JOIN b ON b.x::text = a.y::text",
-             &["a exact=true role=Kept filters=[] links=[y]",
-               "b exact=false role=Terminal filters=[] links=[]"]),
-            // Beside a partner on the NULL-filled side, it stays optional and linked.
-            ("SELECT * FROM a LEFT JOIN (b JOIN c ON c.id = b.id) ON b.x = a.x",
-             &["a exact=true role=Kept filters=[] links=[x]",
-               "b exact=false role=Optional filters=[] links=[id, x]",
-               "c exact=false role=Optional filters=[] links=[id]"]),
-        ];
-        for (sql, expected) in cases {
+        for (sql, expected) in REFERENCE_PREDICATE_CASES {
             assert_eq!(reference_lines(sql), *expected, "{sql}");
         }
     }
