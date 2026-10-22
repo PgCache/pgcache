@@ -298,9 +298,14 @@ impl<'a, 'c> OldImagePrepass<'a, 'c> {
     }
 
     fn insert(&mut self, relation_oid: Oid, row_data: &[Option<ByteString>]) {
-        if let Some(spec) = tracked_spec(self.core, &mut self.specs, relation_oid) {
-            self.core
-                .old_image_overlay_record_write(relation_oid, row_data, &spec.index_positions);
+        if let Some(spec) = tracked_spec(self.core, &mut self.specs, relation_oid)
+            && let Some(key) = pk_key(self.core, relation_oid, row_data)
+        {
+            self.core.old_image_overlay_record_write(
+                (relation_oid, key),
+                row_data,
+                &spec.index_positions,
+            );
         }
     }
 
@@ -364,16 +369,17 @@ impl<'a, 'c> OldImagePrepass<'a, 'c> {
         let wants_old_image = miss && !pk_changed && spec.lookup_allowed(self.core, relation_oid);
         if pk_changed {
             self.core
-                .old_image_overlay_record_delete_keyed(relation_oid, source_key);
-            self.core.old_image_overlay_record_write(
-                relation_oid,
-                new_row_data,
-                &spec.index_positions,
-            );
+                .old_image_overlay_record_delete((relation_oid, source_key));
+            if let Some(key) = pk_key(self.core, relation_oid, new_row_data) {
+                self.core.old_image_overlay_record_write(
+                    (relation_oid, key),
+                    new_row_data,
+                    &spec.index_positions,
+                );
+            }
         } else {
-            self.core.old_image_overlay_record_write_keyed(
-                relation_oid,
-                source_key,
+            self.core.old_image_overlay_record_write(
+                (relation_oid, source_key),
                 new_row_data,
                 &spec.index_positions,
             );
@@ -397,7 +403,7 @@ impl<'a, 'c> OldImagePrepass<'a, 'c> {
         );
         let wants_old_image = miss && spec.lookup_allowed(self.core, relation_oid);
         self.core
-            .old_image_overlay_record_delete_keyed(relation_oid, key);
+            .old_image_overlay_record_delete((relation_oid, key));
         if wants_old_image {
             self.lookup_queue(
                 relation_oid,
@@ -423,11 +429,17 @@ impl<'a, 'c> OldImagePrepass<'a, 'c> {
             return;
         }
         if !key_data.is_empty() {
-            self.core
-                .old_image_overlay_record_delete(relation_oid, key_data);
+            self.overlay_tombstone(relation_oid, key_data);
         }
-        self.core
-            .old_image_overlay_record_delete(relation_oid, new_row_data);
+        self.overlay_tombstone(relation_oid, new_row_data);
+    }
+
+    /// Tombstone the row's PK in the overlay, when it has a complete one.
+    fn overlay_tombstone(&mut self, relation_oid: Oid, row: &[Option<ByteString>]) {
+        if let Some(key) = pk_key(self.core, relation_oid, row) {
+            self.core
+                .old_image_overlay_record_delete((relation_oid, key));
+        }
     }
 
     fn lookup_queue(&mut self, relation_oid: Oid, row: LookupRow<'a>) {

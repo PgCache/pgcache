@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use ecow::EcoString;
 
 use super::core::WriterCore;
-use super::staging::pk_body_render;
 use crate::cache::messages::{CdcValue, cdc_values_convert};
 use crate::oid::Oid;
 use crate::pg::Lsn;
@@ -79,6 +78,9 @@ pub(super) enum ToastState {
     /// affected queries instead of upserting the incomplete image.
     Unrepaired(Vec<EcoString>),
 }
+
+/// An old-image overlay entry's key: the relation and its row's rendered PK.
+pub(super) type OverlayKey = (Oid, EcoString);
 
 /// One entry of `batch_toast_overlay` (PGC-264): what this batch last did to
 /// a PK's toastable columns.
@@ -224,44 +226,6 @@ impl WriterCore {
         }
     }
 
-    /// Record an in-batch complete write's eval-index column values under the
-    /// row's PK (PGC-255 rung 1): later same-PK events resolve their old image
-    /// from these instead of the (now stale) pre-batch committed row.
-    /// `index_positions` is the relation's eval-index column position set —
-    /// callers skip relations where it is empty (no value-dependent entries,
-    /// nothing to resolve).
-    pub(super) fn old_image_overlay_record_write(
-        &mut self,
-        relation_oid: Oid,
-        row_data: &[Option<ByteString>],
-        index_positions: &[usize],
-    ) {
-        let Some(table_metadata) = self.cache.tables.get1(&relation_oid) else {
-            return;
-        };
-        let Some(key) = pk_body_render(table_metadata, row_data) else {
-            return;
-        };
-        self.old_image_overlay_record_write_keyed(relation_oid, key, row_data, index_positions);
-    }
-
-    /// Tombstone a PK in the old-image overlay (PGC-255): the row was deleted
-    /// (or its old key vacated) this batch, so neither the pre-batch committed
-    /// image nor any earlier overlay value is a valid old-image source.
-    pub(super) fn old_image_overlay_record_delete(
-        &mut self,
-        relation_oid: Oid,
-        row_data: &[Option<ByteString>],
-    ) {
-        let Some(table_metadata) = self.cache.tables.get1(&relation_oid) else {
-            return;
-        };
-        let Some(key) = pk_body_render(table_metadata, row_data) else {
-            return;
-        };
-        self.old_image_overlay_record_delete_keyed(relation_oid, key);
-    }
-
     /// Rung-1 old-image lookup by pre-rendered PK key: `Some(Values)` =
     /// resolved from an in-batch write, `Some(Deleted)` = tombstoned (fall
     /// back to the wildcard probe), `None` = no in-batch state — consult the
@@ -277,12 +241,15 @@ impl WriterCore {
             .get(&(relation_oid, key.clone()))
     }
 
-    /// Keyed variant of `old_image_overlay_record_write` — the caller already
-    /// rendered the row's PK.
-    pub(super) fn old_image_overlay_record_write_keyed(
+    /// Record an in-batch complete write's eval-index column values under the
+    /// row's PK (PGC-255 rung 1): later same-PK events resolve their old image
+    /// from these instead of the (now stale) pre-batch committed row.
+    /// `index_positions` is the relation's eval-index column position set —
+    /// callers skip relations where it is empty (no value-dependent entries,
+    /// nothing to resolve).
+    pub(super) fn old_image_overlay_record_write(
         &mut self,
-        relation_oid: Oid,
-        key: EcoString,
+        key: OverlayKey,
         row_data: &[Option<ByteString>],
         index_positions: &[usize],
     ) {
@@ -294,19 +261,17 @@ impl WriterCore {
         );
         let displaced = self
             .batch_old_image_overlay
-            .insert((relation_oid, key), OverlayEntry::Values(values));
+            .insert(key, OverlayEntry::Values(values));
         self.toast_overlay_recycle(displaced);
     }
 
-    /// Keyed variant of `old_image_overlay_record_delete`.
-    pub(super) fn old_image_overlay_record_delete_keyed(
-        &mut self,
-        relation_oid: Oid,
-        key: EcoString,
-    ) {
+    /// Tombstone a PK in the old-image overlay (PGC-255): the row was deleted
+    /// (or its old key vacated) this batch, so neither the pre-batch committed
+    /// image nor any earlier overlay value is a valid old-image source.
+    pub(super) fn old_image_overlay_record_delete(&mut self, key: OverlayKey) {
         let displaced = self
             .batch_old_image_overlay
-            .insert((relation_oid, key), OverlayEntry::Deleted);
+            .insert(key, OverlayEntry::Deleted);
         self.toast_overlay_recycle(displaced);
     }
 
