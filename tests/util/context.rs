@@ -28,6 +28,42 @@ pub(crate) struct TestContext {
     pub dbs: TempDBs,
 }
 
+/// A CDC stage a settle waits on.
+#[derive(Clone, Copy)]
+enum CdcStage {
+    /// Decoded: the receive watermark has reached the target.
+    Decode,
+    /// Applied: the settled watermark has reached the target.
+    Apply,
+}
+
+impl CdcStage {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Decode => "decode",
+            Self::Apply => "apply",
+        }
+    }
+
+    fn watermark(self, cdc: &CdcStatusSnapshot) -> u64 {
+        match self {
+            Self::Decode => cdc.received,
+            Self::Apply => cdc.settled,
+        }
+    }
+
+    /// The watermarks a timeout message reports for this stage.
+    fn progress(self, cdc: &CdcStatusSnapshot) -> String {
+        match self {
+            Self::Decode => format!("received={}", cdc.received),
+            Self::Apply => format!(
+                "settled={} applied={} received={}",
+                cdc.settled, cdc.applied, cdc.received
+            ),
+        }
+    }
+}
+
 /// The CDC watermarks read from `/status`.
 struct CdcStatusSnapshot {
     /// `last_received_lsn`: the receive/liveness watermark (keepalive-advanced).
@@ -39,18 +75,15 @@ struct CdcStatusSnapshot {
     settled: u64,
 }
 
+/// What a `connect_pgcache_*` call yields: the spawned proxy, its listen
+/// and metrics ports, and a client connected through it.
+type ConnectedPgCache = (PgCacheProcess, u16, u16, Client);
+
 impl TestContext {
     pub(crate) async fn setup() -> Result<Self, Error> {
         let (dbs, origin) = start_databases().await?;
-        let (pgcache, cache_port, metrics_port, cache) = connect_pgcache(&dbs).await?;
-        Ok(Self {
-            dbs,
-            pgcache,
-            cache_port,
-            metrics_port,
-            cache,
-            origin,
-        })
+        let connected = connect_pgcache(&dbs).await?;
+        Ok(Self::assemble(dbs, origin, connected))
     }
 
     /// Set up a test context whose `before_start` closure runs against origin
@@ -63,15 +96,8 @@ impl TestContext {
     {
         let (dbs, origin) = start_databases().await?;
         let origin = before_start(origin).await?;
-        let (pgcache, cache_port, metrics_port, cache) = connect_pgcache(&dbs).await?;
-        Ok(Self {
-            dbs,
-            pgcache,
-            cache_port,
-            metrics_port,
-            cache,
-            origin,
-        })
+        let connected = connect_pgcache(&dbs).await?;
+        Ok(Self::assemble(dbs, origin, connected))
     }
 
     /// A fresh direct connection to origin: a session started now, with the
@@ -85,93 +111,46 @@ impl TestContext {
     /// regardless of size).
     pub(crate) async fn setup_with_args(extra_args: &[&str]) -> Result<Self, Error> {
         let (dbs, origin) = start_databases().await?;
-        let (pgcache, cache_port, metrics_port, cache) =
-            connect_pgcache_args(&dbs, extra_args).await?;
-        Ok(Self {
-            dbs,
-            pgcache,
-            cache_port,
-            metrics_port,
-            cache,
-            origin,
-        })
+        let connected = connect_pgcache_args(&dbs, extra_args).await?;
+        Ok(Self::assemble(dbs, origin, connected))
     }
 
     /// Set up a test context with fault-injection environment variables set on
     /// the pgcache process (requires the binary built with `fault-injection`).
     pub(crate) async fn setup_fault(env: &[(&str, &str)]) -> Result<Self, Error> {
         let (dbs, origin) = start_databases().await?;
-        let (pgcache, cache_port, metrics_port, cache) = connect_pgcache_fault(&dbs, env).await?;
-        Ok(Self {
-            dbs,
-            pgcache,
-            cache_port,
-            metrics_port,
-            cache,
-            origin,
-        })
+        let connected = connect_pgcache_fault(&dbs, env).await?;
+        Ok(Self::assemble(dbs, origin, connected))
     }
 
     /// [`Self::setup_fault`] under the clock eviction policy, where an
     /// invalidated query is kept for fast readmission.
     pub(crate) async fn setup_fault_clock(env: &[(&str, &str)]) -> Result<Self, Error> {
         let (dbs, origin) = start_databases().await?;
-        let (pgcache, cache_port, metrics_port, cache) =
-            connect_pgcache_fault_policy(&dbs, "clock", env).await?;
-        Ok(Self {
-            dbs,
-            pgcache,
-            cache_port,
-            metrics_port,
-            cache,
-            origin,
-        })
+        let connected = connect_pgcache_fault_policy(&dbs, "clock", env).await?;
+        Ok(Self::assemble(dbs, origin, connected))
     }
 
     /// Set up a test context that force-evicts down to `max_cached_queries` via
     /// the fault-injection count cap (requires `--features fault-injection`).
     pub(crate) async fn setup_small_cache(max_cached_queries: usize) -> Result<Self, Error> {
         let (dbs, origin) = start_databases().await?;
-        let (pgcache, cache_port, metrics_port, cache) =
-            connect_pgcache_small_cache(&dbs, max_cached_queries).await?;
-        Ok(Self {
-            cache,
-            origin,
-            cache_port,
-            metrics_port,
-            pgcache,
-            dbs,
-        })
+        let connected = connect_pgcache_small_cache(&dbs, max_cached_queries).await?;
+        Ok(Self::assemble(dbs, origin, connected))
     }
 
     /// Set up a test context with clock eviction policy.
     pub(crate) async fn setup_clock(admission_threshold: u32) -> Result<Self, Error> {
         let (dbs, origin) = start_databases().await?;
-        let (pgcache, cache_port, metrics_port, cache) =
-            connect_pgcache_clock(&dbs, admission_threshold).await?;
-        Ok(Self {
-            dbs,
-            pgcache,
-            cache_port,
-            metrics_port,
-            cache,
-            origin,
-        })
+        let connected = connect_pgcache_clock(&dbs, admission_threshold).await?;
+        Ok(Self::assemble(dbs, origin, connected))
     }
 
     /// Set up a test context with a table allowlist.
     pub(crate) async fn setup_allowlist(allowed_tables: &str) -> Result<Self, Error> {
         let (dbs, origin) = start_databases().await?;
-        let (pgcache, cache_port, metrics_port, cache) =
-            connect_pgcache_allowlist(&dbs, allowed_tables).await?;
-        Ok(Self {
-            cache,
-            origin,
-            cache_port,
-            metrics_port,
-            pgcache,
-            dbs,
-        })
+        let connected = connect_pgcache_allowlist(&dbs, allowed_tables).await?;
+        Ok(Self::assemble(dbs, origin, connected))
     }
 
     /// Set up a test context with pinned queries.
@@ -187,18 +166,9 @@ impl TestContext {
         Fut: std::future::Future<Output = Result<Client, Error>>,
     {
         let (dbs, origin) = start_databases().await?;
-        // Run setup closure to create tables/data before pgcache starts
         let origin = before_start(origin).await?;
-        let (pgcache, cache_port, metrics_port, cache) =
-            connect_pgcache_pinned(&dbs, pinned_queries).await?;
-        Ok(Self {
-            cache,
-            origin,
-            cache_port,
-            metrics_port,
-            pgcache,
-            dbs,
-        })
+        let connected = connect_pgcache_pinned(&dbs, pinned_queries).await?;
+        Ok(Self::assemble(dbs, origin, connected))
     }
 
     /// Set up a test context with pinned queries that force-evicts down to
@@ -216,16 +186,8 @@ impl TestContext {
     {
         let (dbs, origin) = start_databases().await?;
         let origin = before_start(origin).await?;
-        let (pgcache, cache_port, metrics_port, cache) =
-            connect_pgcache_pinned_fault(&dbs, pinned_queries, env).await?;
-        Ok(Self {
-            cache,
-            origin,
-            cache_port,
-            metrics_port,
-            pgcache,
-            dbs,
-        })
+        let connected = connect_pgcache_pinned_fault(&dbs, pinned_queries, env).await?;
+        Ok(Self::assemble(dbs, origin, connected))
     }
 
     pub(crate) async fn setup_pinned_small_cache<F, Fut>(
@@ -239,16 +201,24 @@ impl TestContext {
     {
         let (dbs, origin) = start_databases().await?;
         let origin = before_start(origin).await?;
-        let (pgcache, cache_port, metrics_port, cache) =
+        let connected =
             connect_pgcache_pinned_small_cache(&dbs, pinned_queries, max_cached_queries).await?;
-        Ok(Self {
+        Ok(Self::assemble(dbs, origin, connected))
+    }
+
+    fn assemble(
+        dbs: TempDBs,
+        origin: Client,
+        (pgcache, cache_port, metrics_port, cache): ConnectedPgCache,
+    ) -> Self {
+        Self {
             cache,
             origin,
             cache_port,
             metrics_port,
             pgcache,
             dbs,
-        })
+        }
     }
 
     /// Create an additional client connection through the pgcache proxy.
@@ -384,22 +354,7 @@ impl TestContext {
         &self,
         timeout: Duration,
     ) -> Result<(), Error> {
-        let captured_lsn_str = self.flush_lsn_capture().await?;
-        let captured_lsn = lsn_parse(&captured_lsn_str)?;
-        let deadline = Instant::now() + timeout;
-        loop {
-            let cdc = self.cdc_status().await?;
-            if cdc.received >= captured_lsn {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(Error::other(format!(
-                    "cdc decode settle timed out: received={} captured={captured_lsn} ({captured_lsn_str})",
-                    cdc.received
-                )));
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        self.cdc_settle_until(CdcStage::Decode, timeout).await
     }
 
     /// Wait until pgcache has *applied to the cache* every committed change up
@@ -431,18 +386,25 @@ impl TestContext {
         &self,
         timeout: Duration,
     ) -> Result<(), Error> {
+        self.cdc_settle_until(CdcStage::Apply, timeout).await
+    }
+
+    /// Poll `/status` until `stage`'s watermark reaches the origin's flush
+    /// position captured now.
+    async fn cdc_settle_until(&self, stage: CdcStage, timeout: Duration) -> Result<(), Error> {
         let captured_lsn_str = self.flush_lsn_capture().await?;
         let captured_lsn = lsn_parse(&captured_lsn_str)?;
         let deadline = Instant::now() + timeout;
         loop {
             let cdc = self.cdc_status().await?;
-            if cdc.settled >= captured_lsn {
+            if stage.watermark(&cdc) >= captured_lsn {
                 return Ok(());
             }
             if Instant::now() >= deadline {
                 return Err(Error::other(format!(
-                    "cdc apply settle timed out: settled={} applied={} received={} captured={captured_lsn} ({captured_lsn_str})",
-                    cdc.settled, cdc.applied, cdc.received
+                    "cdc {} settle timed out: {} captured={captured_lsn} ({captured_lsn_str})",
+                    stage.name(),
+                    stage.progress(&cdc)
                 )));
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -560,36 +522,7 @@ pub(crate) async fn cache_settle_at(metrics_port: u16, timeout: Duration) -> Res
         if status != 200 {
             return Err(Error::other(format!("/status returned {status}: {body}")));
         }
-        let json: serde_json::Value = serde_json::from_str(&body)
-            .map_err(|e| Error::other(format!("invalid JSON: {e}\nbody: {body}")))?;
-        let queries = json
-            .get("queries")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| Error::other("queries missing or not an array"))?;
-        let in_flight: Vec<String> = queries
-            .iter()
-            .filter_map(|q| {
-                let state = q.get("state").and_then(serde_json::Value::as_str)?;
-                // MV builds run off the writer thread, so a /status response
-                // no longer implies a dispatched build has finished — treat
-                // scheduled/in-flight builds as unsettled work too.
-                let mv_state = q
-                    .get("mv_state")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("");
-                let mv_in_flight =
-                    mv_state.starts_with("Scheduled") || mv_state.starts_with("Building");
-                if state == "Loading" || state.starts_with("Pending") || mv_in_flight {
-                    let fp = q
-                        .get("fingerprint")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0);
-                    Some(format!("{fp}={state}/mv:{mv_state}"))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let in_flight = status_in_flight_queries(&body)?;
         if in_flight.is_empty() {
             return Ok(());
         }
@@ -600,6 +533,39 @@ pub(crate) async fn cache_settle_at(metrics_port: u16, timeout: Duration) -> Res
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// The queries a `/status` body shows with unsettled work, each as
+/// `fingerprint=state/mv:mv_state`.
+fn status_in_flight_queries(body: &str) -> Result<Vec<String>, Error> {
+    let json: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| Error::other(format!("invalid JSON: {e}\nbody: {body}")))?;
+    let queries = json
+        .get("queries")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| Error::other("queries missing or not an array"))?;
+    Ok(queries.iter().filter_map(query_in_flight).collect())
+}
+
+/// `Some` while the query is loading or pending, or has an MV build
+/// scheduled or running: builds run off the writer thread, so a `/status`
+/// response doesn't imply a dispatched build has finished.
+fn query_in_flight(query: &serde_json::Value) -> Option<String> {
+    let state = query.get("state").and_then(serde_json::Value::as_str)?;
+    let mv_state = query
+        .get("mv_state")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let state_in_flight = state == "Loading" || state.starts_with("Pending");
+    let mv_in_flight = mv_state.starts_with("Scheduled") || mv_state.starts_with("Building");
+    if !state_in_flight && !mv_in_flight {
+        return None;
+    }
+    let fp = query
+        .get("fingerprint")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    Some(format!("{fp}={state}/mv:{mv_state}"))
 }
 
 /// Parse a PostgreSQL LSN in `"X/Y"` hex form (as returned by
