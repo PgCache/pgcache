@@ -328,105 +328,62 @@ mod tests {
         TableMetadata::for_test(name, relation_oid.get(), columns)
     }
 
-    /// Build a comprehensive table catalog covering all tables used in tests.
+    /// Every table the tests reference: name, oid, and columns, the first
+    /// of which is the primary key.
+    const TEST_TABLES: &[(&str, u32, &[&str])] = &[
+        ("a", 1, &["id", "name", "val", "tenant_id", "status"]),
+        (
+            "b",
+            2,
+            &[
+                "id",
+                "name",
+                "a_id",
+                "x",
+                "val",
+                "b_id",
+                "user_id",
+                "tenant_id",
+                "status",
+            ],
+        ),
+        ("c", 3, &["id", "x", "b_id", "val", "tenant_id"]),
+        ("d", 4, &["id"]),
+        (
+            "users",
+            10,
+            &[
+                "id",
+                "name",
+                "email",
+                "user_id",
+                "status",
+                "active",
+                "uuid",
+                "age",
+                "tenant_id",
+            ],
+        ),
+        ("location", 11, &["user_id"]),
+        ("orders", 12, &["id", "user_id", "total", "product_id"]),
+        ("admins", 13, &["id", "tenant_id"]),
+        ("active_users", 14, &["id", "user_id"]),
+        ("banned_users", 15, &["id", "user_id"]),
+        ("products", 16, &["id", "store_id", "name", "category_id"]),
+        ("stores", 17, &["id", "region_id"]),
+        ("regions", 18, &["id", "name"]),
+        ("excluded_regions", 19, &["id", "region_id"]),
+        ("categories", 20, &["id", "name"]),
+        ("excluded_categories", 21, &["id"]),
+        ("blacklist", 22, &["id", "product_id", "category_id"]),
+    ];
+
+    /// The catalog of every table the tests reference.
     fn test_tables() -> Catalog {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(
-            test_table(
-                "a",
-                Oid::from_raw(1),
-                &["id", "name", "val", "tenant_id", "status"],
-            )
-            .into(),
-        );
-        tables.insert_overwrite(
-            test_table(
-                "b",
-                Oid::from_raw(2),
-                &[
-                    "id",
-                    "name",
-                    "a_id",
-                    "x",
-                    "val",
-                    "b_id",
-                    "user_id",
-                    "tenant_id",
-                    "status",
-                ],
-            )
-            .into(),
-        );
-        tables.insert_overwrite(
-            test_table(
-                "c",
-                Oid::from_raw(3),
-                &["id", "x", "b_id", "val", "tenant_id"],
-            )
-            .into(),
-        );
-        tables.insert_overwrite(test_table("d", Oid::from_raw(4), &["id"]).into());
-        tables.insert_overwrite(
-            test_table(
-                "users",
-                Oid::from_raw(10),
-                &[
-                    "id",
-                    "name",
-                    "email",
-                    "user_id",
-                    "status",
-                    "active",
-                    "uuid",
-                    "age",
-                    "tenant_id",
-                ],
-            )
-            .into(),
-        );
-        tables.insert_overwrite(test_table("location", Oid::from_raw(11), &["user_id"]).into());
-        tables.insert_overwrite(
-            test_table(
-                "orders",
-                Oid::from_raw(12),
-                &["id", "user_id", "total", "product_id"],
-            )
-            .into(),
-        );
-        tables
-            .insert_overwrite(test_table("admins", Oid::from_raw(13), &["id", "tenant_id"]).into());
-        tables.insert_overwrite(
-            test_table("active_users", Oid::from_raw(14), &["id", "user_id"]).into(),
-        );
-        tables.insert_overwrite(
-            test_table("banned_users", Oid::from_raw(15), &["id", "user_id"]).into(),
-        );
-        tables.insert_overwrite(
-            test_table(
-                "products",
-                Oid::from_raw(16),
-                &["id", "store_id", "name", "category_id"],
-            )
-            .into(),
-        );
-        tables
-            .insert_overwrite(test_table("stores", Oid::from_raw(17), &["id", "region_id"]).into());
-        tables.insert_overwrite(test_table("regions", Oid::from_raw(18), &["id", "name"]).into());
-        tables.insert_overwrite(
-            test_table("excluded_regions", Oid::from_raw(19), &["id", "region_id"]).into(),
-        );
-        tables
-            .insert_overwrite(test_table("categories", Oid::from_raw(20), &["id", "name"]).into());
-        tables
-            .insert_overwrite(test_table("excluded_categories", Oid::from_raw(21), &["id"]).into());
-        tables.insert_overwrite(
-            test_table(
-                "blacklist",
-                Oid::from_raw(22),
-                &["id", "product_id", "category_id"],
-            )
-            .into(),
-        );
+        for &(name, oid, columns) in TEST_TABLES {
+            tables.insert_overwrite(test_table(name, Oid::from_raw(oid), columns).into());
+        }
         tables
     }
 
@@ -447,6 +404,20 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// `sql` yields exactly one update query per entry of `expected`, each
+    /// table's with the source named for it.
+    fn sources_expect(sql: &str, expected: &[(&str, UpdateQuerySource)]) {
+        let result = update_queries(sql);
+        assert_eq!(result.len(), expected.len(), "{sql}");
+        for (table, source) in expected {
+            let found = result
+                .iter()
+                .find(|(t, _, _)| t.as_str() == *table)
+                .unwrap_or_else(|| panic!("no update query for {table}"));
+            assert_eq!(found.2, *source, "{table}");
+        }
     }
 
     #[test]
@@ -709,10 +680,10 @@ mod tests {
         );
     }
 
+    /// IN inside IN: every inner table is Inclusion.
     #[test]
     fn test_update_query_source_nested_in_in() {
-        // Double-nested: IN inside IN — all inner tables are Inclusion
-        let result = update_queries(
+        sources_expect(
             "SELECT name FROM products \
              WHERE store_id IN ( \
                  SELECT id FROM stores \
@@ -720,33 +691,25 @@ mod tests {
                      SELECT id FROM regions WHERE name = 'East' \
                  ) \
              )",
-        );
-
-        assert_eq!(result.len(), 3);
-
-        let products = result.iter().find(|(t, _, _)| t == "products").unwrap();
-        assert_eq!(products.2, UpdateQuerySource::FromClause);
-
-        let stores = result.iter().find(|(t, _, _)| t == "stores").unwrap();
-        assert_eq!(
-            stores.2,
-            UpdateQuerySource::Subquery(SubqueryKind::Inclusion),
-            "IN subquery table should be Inclusion"
-        );
-
-        let regions = result.iter().find(|(t, _, _)| t == "regions").unwrap();
-        assert_eq!(
-            regions.2,
-            UpdateQuerySource::Subquery(SubqueryKind::Inclusion),
-            "Nested IN inside IN should still be Inclusion"
+            &[
+                ("products", FromClause),
+                (
+                    "stores",
+                    UpdateQuerySource::Subquery(SubqueryKind::Inclusion),
+                ),
+                (
+                    "regions",
+                    UpdateQuerySource::Subquery(SubqueryKind::Inclusion),
+                ),
+            ],
         );
     }
 
+    /// NOT IN inside IN: the outer IN isn't negated, so the inner NOT IN is
+    /// Exclusion.
     #[test]
     fn test_update_query_source_nested_not_in_inside_in() {
-        // NOT IN nested inside IN:
-        // The outer IN context is not negated, so the inner NOT IN is Exclusion
-        let result = update_queries(
+        sources_expect(
             "SELECT name FROM products \
              WHERE store_id IN ( \
                  SELECT id FROM stores \
@@ -754,36 +717,25 @@ mod tests {
                      SELECT region_id FROM excluded_regions \
                  ) \
              )",
-        );
-
-        assert_eq!(result.len(), 3);
-
-        let products = result.iter().find(|(t, _, _)| t == "products").unwrap();
-        assert_eq!(products.2, UpdateQuerySource::FromClause);
-
-        let stores = result.iter().find(|(t, _, _)| t == "stores").unwrap();
-        assert_eq!(
-            stores.2,
-            UpdateQuerySource::Subquery(SubqueryKind::Inclusion),
-            "Outer IN subquery table should be Inclusion"
-        );
-
-        let excluded = result
-            .iter()
-            .find(|(t, _, _)| t == "excluded_regions")
-            .unwrap();
-        assert_eq!(
-            excluded.2,
-            UpdateQuerySource::Subquery(SubqueryKind::Exclusion),
-            "NOT IN inside IN should be Exclusion"
+            &[
+                ("products", FromClause),
+                (
+                    "stores",
+                    UpdateQuerySource::Subquery(SubqueryKind::Inclusion),
+                ),
+                (
+                    "excluded_regions",
+                    UpdateQuerySource::Subquery(SubqueryKind::Exclusion),
+                ),
+            ],
         );
     }
 
+    /// IN inside NOT IN: the NOT IN sets negated, which the inner IN
+    /// inherits, flipping its Inclusion to Exclusion.
     #[test]
     fn test_update_query_source_nested_in_inside_not_in() {
-        // IN nested inside NOT IN:
-        // The NOT IN sets negated=true, so the inner IN inherits negated → Exclusion
-        let result = update_queries(
+        sources_expect(
             "SELECT name FROM products \
              WHERE id NOT IN ( \
                  SELECT product_id FROM blacklist \
@@ -791,34 +743,25 @@ mod tests {
                      SELECT id FROM categories WHERE name = 'Restricted' \
                  ) \
              )",
-        );
-
-        assert_eq!(result.len(), 3);
-
-        let products = result.iter().find(|(t, _, _)| t == "products").unwrap();
-        assert_eq!(products.2, UpdateQuerySource::FromClause);
-
-        let blacklist = result.iter().find(|(t, _, _)| t == "blacklist").unwrap();
-        assert_eq!(
-            blacklist.2,
-            UpdateQuerySource::Subquery(SubqueryKind::Exclusion),
-            "NOT IN subquery table should be Exclusion"
-        );
-
-        let categories = result.iter().find(|(t, _, _)| t == "categories").unwrap();
-        assert_eq!(
-            categories.2,
-            UpdateQuerySource::Subquery(SubqueryKind::Exclusion),
-            "IN inside NOT IN should be Exclusion (negated flips Inclusion → Exclusion)"
+            &[
+                ("products", FromClause),
+                (
+                    "blacklist",
+                    UpdateQuerySource::Subquery(SubqueryKind::Exclusion),
+                ),
+                (
+                    "categories",
+                    UpdateQuerySource::Subquery(SubqueryKind::Exclusion),
+                ),
+            ],
         );
     }
 
+    /// NOT IN inside NOT IN: the double negation flips the inner table back
+    /// to Inclusion.
     #[test]
     fn test_update_query_source_nested_not_in_inside_not_in() {
-        // NOT IN inside NOT IN:
-        // Outer NOT IN sets negated=true, inner NOT IN (ALL) with negated=true → Inclusion
-        // Double negation: NOT IN under NOT IN flips back to Inclusion
-        let result = update_queries(
+        sources_expect(
             "SELECT name FROM products \
              WHERE id NOT IN ( \
                  SELECT product_id FROM blacklist \
@@ -826,122 +769,66 @@ mod tests {
                      SELECT id FROM excluded_categories \
                  ) \
              )",
-        );
-
-        assert_eq!(result.len(), 3);
-
-        let blacklist = result.iter().find(|(t, _, _)| t == "blacklist").unwrap();
-        assert_eq!(
-            blacklist.2,
-            UpdateQuerySource::Subquery(SubqueryKind::Exclusion),
-            "Outer NOT IN table should be Exclusion"
-        );
-
-        let excluded = result
-            .iter()
-            .find(|(t, _, _)| t == "excluded_categories")
-            .unwrap();
-        assert_eq!(
-            excluded.2,
-            UpdateQuerySource::Subquery(SubqueryKind::Inclusion),
-            "NOT IN inside NOT IN should be Inclusion (double negation)"
+            &[
+                ("products", FromClause),
+                (
+                    "blacklist",
+                    UpdateQuerySource::Subquery(SubqueryKind::Exclusion),
+                ),
+                (
+                    "excluded_categories",
+                    UpdateQuerySource::Subquery(SubqueryKind::Inclusion),
+                ),
+            ],
         );
     }
 
     // ==================== Outer Join Source Tests ====================
 
+    /// The preserved side is FromClause; the terminal optional side is
+    /// OuterJoinTerminal.
     #[test]
     fn test_update_query_source_terminal_left_join() {
-        let result = update_queries(
+        sources_expect(
             "SELECT a.id, b.name FROM a LEFT JOIN b ON a.id = b.a_id WHERE a.id = 1",
-        );
-
-        assert_eq!(result.len(), 2);
-
-        let a = result.iter().find(|(t, _, _)| t == "a").unwrap();
-        assert_eq!(
-            a.2,
-            UpdateQuerySource::FromClause,
-            "preserved side is FromClause"
-        );
-
-        let b = result.iter().find(|(t, _, _)| t == "b").unwrap();
-        assert_eq!(
-            b.2,
-            UpdateQuerySource::OuterJoinTerminal,
-            "terminal optional side is OuterJoinTerminal"
+            &[("a", FromClause), ("b", OuterJoinTerminal)],
         );
     }
 
+    /// An optional side mentioned above its join is OuterJoinOptional.
     #[test]
     fn test_update_query_source_non_terminal_left_join() {
-        let result =
-            update_queries("SELECT * FROM a LEFT JOIN b ON a.id = b.a_id WHERE b.status IS NULL");
-
-        assert_eq!(result.len(), 2);
-
-        let a = result.iter().find(|(t, _, _)| t == "a").unwrap();
-        assert_eq!(
-            a.2,
-            UpdateQuerySource::FromClause,
-            "preserved side should be FromClause"
-        );
-
-        let b = result.iter().find(|(t, _, _)| t == "b").unwrap();
-        assert_eq!(
-            b.2,
-            UpdateQuerySource::OuterJoinOptional,
-            "non-terminal optional side should be OuterJoinOptional"
+        sources_expect(
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id WHERE b.status IS NULL",
+            &[("a", FromClause), ("b", OuterJoinOptional)],
         );
     }
 
+    /// `b` is non-terminal, its columns being in the outer LEFT JOIN's
+    /// condition; `c` appears only in its own ON, so it is terminal.
     #[test]
     fn test_update_query_source_chained_outer_joins() {
-        let result = update_queries(
+        sources_expect(
             "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id LEFT JOIN c ON b.x = c.x WHERE a.id = 1",
-        );
-
-        assert_eq!(result.len(), 3);
-
-        let a = result.iter().find(|(t, _, _)| t == "a").unwrap();
-        assert_eq!(a.2, UpdateQuerySource::FromClause);
-
-        // b is non-terminal: its columns appear in the outer LEFT JOIN's condition
-        let b = result.iter().find(|(t, _, _)| t == "b").unwrap();
-        assert_eq!(
-            b.2,
-            UpdateQuerySource::OuterJoinOptional,
-            "b is non-terminal (used in outer join condition)"
-        );
-
-        // c is terminal optional side: only appears in its own ON clause
-        let c = result.iter().find(|(t, _, _)| t == "c").unwrap();
-        assert_eq!(
-            c.2,
-            UpdateQuerySource::OuterJoinTerminal,
-            "c is terminal optional side"
+            &[
+                ("a", FromClause),
+                ("b", OuterJoinOptional),
+                ("c", OuterJoinTerminal),
+            ],
         );
     }
 
+    /// Both inner-joined tables are FromClause; the LEFT-joined `c` is the
+    /// terminal optional side.
     #[test]
     fn test_update_query_source_mixed_inner_left() {
-        let result = update_queries(
+        sources_expect(
             "SELECT * FROM a JOIN b ON a.id = b.a_id LEFT JOIN c ON b.id = c.b_id WHERE a.id = 1",
-        );
-
-        assert_eq!(result.len(), 3);
-
-        let a = result.iter().find(|(t, _, _)| t == "a").unwrap();
-        assert_eq!(a.2, UpdateQuerySource::FromClause, "a is INNER JOIN");
-
-        let b = result.iter().find(|(t, _, _)| t == "b").unwrap();
-        assert_eq!(b.2, UpdateQuerySource::FromClause, "b is INNER JOIN");
-
-        let c = result.iter().find(|(t, _, _)| t == "c").unwrap();
-        assert_eq!(
-            c.2,
-            UpdateQuerySource::OuterJoinTerminal,
-            "c is terminal optional side"
+            &[
+                ("a", FromClause),
+                ("b", FromClause),
+                ("c", OuterJoinTerminal),
+            ],
         );
     }
 
@@ -950,23 +837,9 @@ mod tests {
     /// inner-join table.
     #[test]
     fn test_update_query_source_reduced_by_inner_join() {
-        let result = update_queries(
+        sources_expect(
             "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id JOIN c ON b.val = c.val WHERE a.id = 1",
-        );
-
-        assert_eq!(result.len(), 3);
-
-        let b = result.iter().find(|(t, _, _)| t == "b").unwrap();
-        assert_eq!(b.2, UpdateQuerySource::FromClause, "b's join is reduced");
-
-        let a = result.iter().find(|(t, _, _)| t == "a").unwrap();
-        assert_eq!(a.2, UpdateQuerySource::FromClause);
-
-        let c = result.iter().find(|(t, _, _)| t == "c").unwrap();
-        assert_eq!(
-            c.2,
-            UpdateQuerySource::FromClause,
-            "c is not on optional side"
+            &[("a", FromClause), ("b", FromClause), ("c", FromClause)],
         );
     }
 
