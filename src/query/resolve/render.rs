@@ -52,6 +52,23 @@ enum Mode {
     },
 }
 
+impl Mode {
+    /// The parameter list `literal` joins as `$N`: under a shape rendering,
+    /// in predicate position, and of a parameterizable kind.
+    fn parameter_slot(&mut self, literal: &LiteralValue) -> Option<&mut Vec<LiteralValue>> {
+        let Mode::Shape {
+            literals,
+            predicate_depth,
+            projection_depth,
+        } = self
+        else {
+            return None;
+        };
+        let predicate_position = *projection_depth == 0 && *predicate_depth > 0;
+        (predicate_position && literal_is_parameterizable(literal)).then_some(literals)
+    }
+}
+
 /// A FROM entry something else stands in for: the entry renders as
 /// `(<source>) alias(columns)` and every column bound to its slot as
 /// `alias.column`, so a CDC row can take a relation's place in its query.
@@ -283,21 +300,11 @@ impl Bound<'_> {
     }
 
     fn literal_render(&mut self, literal: &LiteralValue, buf: &mut String) {
-        match &mut self.mode {
-            Mode::Shape {
-                literals,
-                predicate_depth,
-                projection_depth,
-            } if *projection_depth == 0
-                && *predicate_depth > 0
-                && literal_is_parameterizable(literal) =>
-            {
-                literals.push(literal.clone());
-                let _ = write!(buf, "${}", literals.len());
-            }
-            Mode::Shape { .. } | Mode::Text => {
-                literal.deparse(buf);
-            }
+        if let Some(literals) = self.mode.parameter_slot(literal) {
+            literals.push(literal.clone());
+            let _ = write!(buf, "${}", literals.len());
+        } else {
+            literal.deparse(buf);
         }
     }
 
@@ -612,26 +619,36 @@ impl ResolvedQuery {
         clause: OrderBy<'a>,
     ) -> OrderByResolution<'a> {
         let expr = clause.expr();
-        let wanted = match expr.kind() {
+        match self.order_by_target(expr) {
+            OrderByTarget::Own => OrderByResolution::Own(expr),
+            OrderByTarget::Unresolved => OrderByResolution::Unresolved,
+            OrderByTarget::Output(wanted) => self.output_find(select, wanted),
+        }
+    }
+
+    /// What an ORDER BY expression refers to: an output column name, an
+    /// output position, or its own expression.
+    fn order_by_target<'a>(&'a self, expr: Scalar<'a>) -> OrderByTarget<'a> {
+        match expr.kind() {
             ScalarKind::Column(column)
                 if matches!(
                     self.column_target_at(column.id()),
                     Some(ColumnTarget::Output)
                 ) =>
             {
-                OutputWanted::Named(column.column())
+                OrderByTarget::Output(OutputWanted::Named(column.column()))
             }
             ScalarKind::Literal(literal) => {
                 let LiteralValue::Integer(position) = literal.value() else {
-                    return OrderByResolution::Unresolved;
+                    return OrderByTarget::Unresolved;
                 };
-                let Some(index) = usize::try_from(*position)
+                match usize::try_from(*position)
                     .ok()
                     .and_then(|position| position.checked_sub(1))
-                else {
-                    return OrderByResolution::Unresolved;
-                };
-                OutputWanted::At(index)
+                {
+                    Some(index) => OrderByTarget::Output(OutputWanted::At(index)),
+                    None => OrderByTarget::Unresolved,
+                }
             }
             ScalarKind::Column(_)
             | ScalarKind::Function(_)
@@ -639,8 +656,16 @@ impl ResolvedQuery {
             | ScalarKind::Arithmetic(_)
             | ScalarKind::Subquery(_)
             | ScalarKind::Array(_)
-            | ScalarKind::TypeCast(_) => return OrderByResolution::Own(expr),
-        };
+            | ScalarKind::TypeCast(_) => OrderByTarget::Own,
+        }
+    }
+
+    /// The select-list output `wanted` names, stars expanded.
+    fn output_find<'a>(
+        &'a self,
+        select: Select<'a>,
+        wanted: OutputWanted<'_>,
+    ) -> OrderByResolution<'a> {
         let bindings = self.bindings();
         let mut position = 0;
         for item in select.items().into_iter().flatten() {
@@ -659,25 +684,43 @@ impl ResolvedQuery {
                     position += 1;
                 }
                 SelectItem::Star(star) => {
-                    for star_item in bindings.star_by_id(star.id()).unwrap_or(&[]) {
-                        let name = match star_item {
-                            StarItem::Column(binding) => {
-                                bindings.binding_column(binding).map(|column| &column.name)
-                            }
-                            StarItem::Merged(id) => bindings.merged(*id).map(|merged| &merged.name),
-                        };
-                        if wanted.matches(position, name) {
-                            return OrderByResolution::Output {
-                                position,
-                                source: OrderBySource::Star(star_item),
-                            };
-                        }
-                        position += 1;
+                    let star_items = bindings.star_by_id(star.id()).unwrap_or(&[]);
+                    if let Some(found) = self.star_output_find(star_items, wanted, position) {
+                        return found;
                     }
+                    position += star_items.len();
                 }
             }
         }
         OrderByResolution::Unresolved
+    }
+
+    /// The output `wanted` names among one star's items, the first of which
+    /// is output `position`.
+    fn star_output_find<'a>(
+        &'a self,
+        star_items: &'a [StarItem],
+        wanted: OutputWanted<'_>,
+        position: usize,
+    ) -> Option<OrderByResolution<'a>> {
+        let bindings = self.bindings();
+        star_items
+            .iter()
+            .enumerate()
+            .find_map(|(offset, star_item)| {
+                let name = match star_item {
+                    StarItem::Column(binding) => {
+                        bindings.binding_column(binding).map(|column| &column.name)
+                    }
+                    StarItem::Merged(id) => bindings.merged(*id).map(|merged| &merged.name),
+                };
+                wanted
+                    .matches(position + offset, name)
+                    .then(|| OrderByResolution::Output {
+                        position: position + offset,
+                        source: OrderBySource::Star(star_item),
+                    })
+            })
     }
 
     /// An ORDER BY item of `select` rendered over its FROM's columns, for a
@@ -726,6 +769,16 @@ enum OrderByResolution<'a> {
     },
     /// A position or name no output has.
     Unresolved,
+}
+
+/// What an ORDER BY item refers to, before any output is looked up.
+enum OrderByTarget<'a> {
+    /// Its own expression over the FROM.
+    Own,
+    /// A position or name that can't name an output.
+    Unresolved,
+    /// A select-list output, by name or position.
+    Output(OutputWanted<'a>),
 }
 
 /// The select-list output an ORDER BY item names.
