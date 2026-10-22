@@ -328,8 +328,9 @@ pub fn mv_serve_sql_into(sql: &mut String, plan: &MvServePlan, limit: Option<&Li
     }
 }
 
-/// Emit `ORDER BY N ASC|DESC, ...` by looking each expression's 1-based
-/// position up in the SELECT list; `None` when one is missing.
+/// Emit `ORDER BY N ASC|DESC [NULLS FIRST|LAST], ...` by looking each
+/// expression's 1-based position up in the SELECT list; `None` when one is
+/// missing.
 fn mv_order_by_positional<'t>(
     sql: &mut String,
     bound: &ResolvedQuery,
@@ -345,6 +346,7 @@ fn mv_order_by_positional<'t>(
             OrderDirection::Asc => sql.push_str(" ASC"),
             OrderDirection::Desc => sql.push_str(" DESC"),
         }
+        clause.null_order().deparse(sql);
         sep = ",";
     }
     Some(())
@@ -674,6 +676,18 @@ mod tests {
             "SELECT 2 AS a, 1 AS b, count(*) FROM orders GROUP BY status ORDER BY 1",
         );
         assert_eq!(out, "SELECT * FROM pgcache_mv.q_42 ORDER BY 1 ASC");
+    }
+
+    /// A positional ORDER BY keeps its NULLS FIRST / LAST (PGC-531).
+    #[test]
+    fn test_mv_serve_sql_positional_order_by_keeps_null_order() {
+        let out = build_serve_sql(
+            "SELECT status, max(total) FROM orders GROUP BY status ORDER BY 2 DESC NULLS LAST, 1",
+        );
+        assert_eq!(
+            out,
+            "SELECT * FROM pgcache_mv.q_42 ORDER BY 2 DESC NULLS LAST, 1 ASC"
+        );
     }
 
     // ==================== SetOp body serve SQL ====================

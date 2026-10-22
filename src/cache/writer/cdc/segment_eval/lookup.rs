@@ -24,7 +24,7 @@ use crate::cache::writer::cdc::{PG_EVAL_ROW_CHUNK, WriterCdc};
 use crate::cache::writer::core::WriterCore;
 use crate::cache::writer::frame::FrameRowEvent;
 use crate::cache::{CacheError, CacheResult, MapIntoReport};
-use crate::catalog::TableMetadata;
+use crate::catalog::{ColumnMetadata, TableMetadata};
 use crate::pg::protocol::ByteString;
 use crate::query::evaluate::bool_wire_text_parse;
 use crate::query::transform::BATCH_IDX_COLUMN;
@@ -40,6 +40,11 @@ const OLD_VALUE_ALIAS_PREFIX: &str = "__pgc_ov_";
 /// `Unknown` wildcard — conservative, and it keeps `WHERE body = '…'`-style
 /// constraints from dragging whole documents through every lookup chunk.
 const OLD_VALUE_TEXT_FETCH_CAP: usize = 512;
+
+/// Whether the lookup fetches a column under `OLD_VALUE_TEXT_FETCH_CAP`.
+fn old_value_capped(column: &ColumnMetadata) -> bool {
+    matches!(column.cache_type_name.as_str(), "text" | "varchar")
+}
 
 /// One row of the per-relation row-change/old-image lookup batch. The join
 /// row is the new tuple for updates and the delete tuple for deletes;
@@ -95,7 +100,7 @@ fn row_change_select_into(
         let wide = table_metadata
             .columns
             .get(column.as_str())
-            .is_some_and(|m| matches!(m.cache_type_name.as_str(), "text" | "varchar"));
+            .is_some_and(old_value_capped);
         if wide {
             let _ = write!(
                 buf,
@@ -255,7 +260,11 @@ fn lookup_result_apply(
                     let value = row
                         .text(idx)
                         .map(|v| ByteString::from(old_image_bool_normalize(meta, v)));
-                    old_values.push((meta.index(), value));
+                    // A capped column's NULL may be an over-cap value: unknown,
+                    // not a known NULL (PGC-531).
+                    if value.is_some() || !old_value_capped(meta) {
+                        old_values.push((meta.index(), value));
+                    }
                 }
             }
             Some(_) => {}

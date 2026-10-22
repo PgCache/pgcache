@@ -604,3 +604,72 @@ async fn test_replica_identity_index_keeps_primary_key() -> Result<(), Error> {
     )
     .await
 }
+
+/// Under REPLICA IDENTITY USING INDEX a DELETE's key tuple carries only the
+/// identity index's columns, so the cache keys on them: a DELETE removes the
+/// row, and an UPDATE of the identity column moves it (PGC-531).
+#[tokio::test]
+async fn test_replica_identity_index_delete_and_key_update() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    ctx.query(
+        "CREATE TABLE ri_keyed (id INT PRIMARY KEY, code INT NOT NULL, val INT)",
+        &[],
+    )
+    .await?;
+    for sql in [
+        "CREATE UNIQUE INDEX ri_keyed_code ON ri_keyed (code)",
+        "ALTER TABLE ri_keyed REPLICA IDENTITY USING INDEX ri_keyed_code",
+    ] {
+        ctx.origin_query(sql, &[]).await?;
+    }
+    ctx.query(
+        "INSERT INTO ri_keyed VALUES (1, 100, 5), (2, 200, 7), (3, 300, 9)",
+        &[],
+    )
+    .await?;
+    ctx.cdc_decode_settle().await?;
+
+    let query = "SELECT id, code, val FROM ri_keyed WHERE val > 0 ORDER BY id";
+    let m = query_warm(&mut ctx, query).await?;
+    let m = origin_change_applied_in_place(
+        &mut ctx,
+        m,
+        "UPDATE ri_keyed SET code = 150 WHERE id = 1",
+        query,
+    )
+    .await?;
+    origin_change_applied_in_place(&mut ctx, m, "DELETE FROM ri_keyed WHERE id = 2", query).await?;
+    Ok(())
+}
+
+/// Without the schema-change event trigger, a primary key redefined onto
+/// another column of a FULL table reaches pgcache only through the Relation
+/// message; the key is read from the catalog, so rows sharing the old key
+/// stay distinct (PGC-531).
+#[tokio::test]
+async fn test_replica_identity_full_redefined_primary_key() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    ctx.query(
+        "CREATE TABLE ri_rekey (id INT PRIMARY KEY, code INT NOT NULL, val INT)",
+        &[],
+    )
+    .await?;
+    ctx.origin_query("ALTER TABLE ri_rekey REPLICA IDENTITY FULL", &[])
+        .await?;
+    ctx.query("INSERT INTO ri_rekey VALUES (1, 100, 5), (2, 200, 7)", &[])
+        .await?;
+    ctx.cdc_decode_settle().await?;
+
+    let query = "SELECT id, code, val FROM ri_rekey WHERE val > 0 ORDER BY code";
+    query_warm(&mut ctx, query).await?;
+    for sql in [
+        "ALTER EVENT TRIGGER pgcache_ddl_command_end DISABLE",
+        "ALTER TABLE ri_rekey DROP CONSTRAINT ri_rekey_pkey, ADD PRIMARY KEY (code)",
+        "INSERT INTO ri_rekey VALUES (1, 300, 9)",
+    ] {
+        ctx.origin_query(sql, &[]).await?;
+    }
+    ctx.cdc_apply_settle().await?;
+    ctx.cache_settle().await?;
+    assert_proxy_rows_match_origin(&mut ctx, query).await
+}

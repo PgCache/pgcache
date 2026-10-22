@@ -157,7 +157,9 @@ fn update_invalidations_collect(
 
 /// What is known of a deleted row (PGC-528): the tuple itself under REPLICA
 /// IDENTITY FULL, else the old image the segment's ladder recovered, or the
-/// lookup's finding that no cache-table row had the key.
+/// lookup's finding that no cache-table row had the key. That finding proves
+/// nothing while a population over the relation is in flight: its rows reach
+/// the cache table only at the merge (PGC-531).
 fn delete_image<'a>(
     core: &WriterCore,
     relation_oid: Oid,
@@ -178,7 +180,11 @@ fn delete_image<'a>(
                 row,
                 known: view.old_image_known,
             },
-            None if view.old_image_absent => DeleteImage::NotCached,
+            None if view.old_image_absent
+                && !core.population_deleted_keys.is_recording(relation_oid) =>
+            {
+                DeleteImage::NotCached
+            }
             None => DeleteImage::Unknown,
         },
         None => DeleteImage::Unknown,

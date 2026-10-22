@@ -1376,3 +1376,47 @@ async fn test_replica_identity_change_without_event_trigger() -> Result<(), Erro
     .await?;
     origin_change_invalidates(&mut ctx, m, "DELETE FROM pb WHERE id = 2", NOT_IN_FLAGGED).await
 }
+
+/// A DELETE while the query's population is in flight: the subquery's rows
+/// aren't in the cache table until the merge, so "no cached row" proves
+/// nothing and the DELETE counts as relevant (PGC-531).
+#[tokio::test]
+async fn test_subquery_not_in_delete_during_population_invalidates() -> Result<(), Error> {
+    let mut ctx =
+        TestContext::setup_fault(&[("PGCACHE_FAULT_POPULATION_DELAY_MS", "2000")]).await?;
+    setup_flagged_exclusions(&mut ctx, false).await?;
+    ctx.simple_query(NOT_IN_FLAGGED).await?;
+    // Inside the delayed population, after its snapshot.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    ctx.origin_query("DELETE FROM pb WHERE id = 3", &[]).await?;
+    ctx.cdc_apply_settle().await?;
+    ctx.cache_settle().await?;
+    assert_proxy_rows_match_origin(&mut ctx, NOT_IN_FLAGGED).await
+}
+
+/// A filter on a wide text column: the lookup ships an over-cap value as
+/// NULL, which must read as unknown, not as the row's NULL (PGC-531).
+#[tokio::test]
+async fn test_subquery_not_in_wide_text_delete_invalidates() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    ctx.query("CREATE TABLE docs_index (id INTEGER PRIMARY KEY)", &[])
+        .await?;
+    ctx.query("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)", &[])
+        .await?;
+    ctx.query(
+        "INSERT INTO docs_index SELECT g FROM generate_series(1, 4) g",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO docs VALUES (1, repeat('x', 2000)), (2, 'draft'), (3, 'short')",
+        &[],
+    )
+    .await?;
+    ctx.cdc_decode_settle().await?;
+
+    let query = "SELECT id FROM docs_index WHERE id NOT IN \
+                 (SELECT id FROM docs WHERE body <> 'draft') ORDER BY id";
+    let m = query_warm(&mut ctx, query).await?;
+    origin_change_invalidates(&mut ctx, m, "DELETE FROM docs WHERE id = 1", query).await
+}

@@ -171,7 +171,22 @@ impl WriterCore {
         };
 
         let indexes = self.query_table_indexes_get(relation_oid).await?;
-        let replica_identity_full = self.query_replica_identity_full(relation_oid).await?;
+        let identity = self.query_replica_identity_get(relation_oid).await?;
+        let replica_identity_full = identity == ReplicaIdentity::Full;
+        // A CDC key tuple carries only the replica identity's columns, so under
+        // USING INDEX the cache keys on that index, unique and NOT NULL by rule
+        // (PGC-531).
+        if identity == ReplicaIdentity::Index {
+            let key = self
+                .query_replica_identity_index_columns_get(relation_oid)
+                .await?;
+            if !key.is_empty() {
+                for column in &mut columns {
+                    column.is_primary_key = key.contains(&column.name);
+                }
+                primary_key_columns = key;
+            }
+        }
         let partitions = self.query_table_partitions_get(relation_oid).await?;
         let ancestors = self.query_table_ancestors_get(relation_oid).await?;
         let write_aliases = self
@@ -424,9 +439,10 @@ impl WriterCore {
         Ok(())
     }
 
-    /// Fill the primary key a Relation message left empty (PGC-530): the
-    /// registered table's while its key columns are all still there, else
-    /// the catalog's.
+    /// Fill the primary key a Relation message left empty under FULL or
+    /// NOTHING (PGC-530) from the catalog, which also catches a key redefined
+    /// without the schema-change signal. If the catalog can't be read, the
+    /// registered table's key stands in rather than failing the stream.
     pub(super) async fn table_metadata_primary_key_resolve(
         &self,
         metadata: &mut TableMetadata,
@@ -434,20 +450,23 @@ impl WriterCore {
         if !metadata.primary_key_columns.is_empty() {
             return Ok(());
         }
-        let registered = self
-            .cache
-            .tables
-            .get1(&metadata.relation_oid)
-            .map(|table| table.primary_key_columns.clone())
-            .filter(|key| {
-                !key.is_empty()
-                    && key
-                        .iter()
-                        .all(|column| metadata.columns.get(column.as_str()).is_some())
-            });
-        let key = match registered {
-            Some(key) => key,
-            None => self.query_table_primary_key(metadata.relation_oid).await?,
+        let key = match self
+            .query_table_primary_key_get(metadata.relation_oid)
+            .await
+        {
+            Ok(key) => key,
+            Err(e) => {
+                let Some(table) = self.cache.tables.get1(&metadata.relation_oid) else {
+                    return Err(e);
+                };
+                warn!(
+                    "reading the primary key of {}.{} failed, keeping the registered key: {}",
+                    metadata.schema,
+                    metadata.name,
+                    error_chain_format(e.current_context())
+                );
+                table.primary_key_columns.clone()
+            }
         };
         if key.is_empty() {
             return Ok(());
@@ -467,38 +486,77 @@ impl WriterCore {
 
     /// The relation's primary-key columns in column order, as registration
     /// reads them; empty without a primary key.
-    async fn query_table_primary_key(&self, relation_oid: Oid) -> CacheResult<Vec<EcoString>> {
+    async fn query_table_primary_key_get(&self, relation_oid: Oid) -> CacheResult<Vec<EcoString>> {
+        self.query_column_names_get(
+            "SELECT a.attname FROM pg_constraint pgc \
+             JOIN pg_attribute a ON a.attrelid = pgc.conrelid AND a.attnum = any(pgc.conkey) \
+             WHERE pgc.conrelid = $1 AND pgc.contype = 'p' AND NOT a.attisdropped \
+             ORDER BY a.attnum",
+            relation_oid,
+        )
+        .await
+    }
+
+    /// The replica identity index's columns in column order; empty when the
+    /// relation has none.
+    async fn query_replica_identity_index_columns_get(
+        &self,
+        relation_oid: Oid,
+    ) -> CacheResult<Vec<EcoString>> {
+        self.query_column_names_get(
+            "SELECT a.attname FROM pg_index i \
+             JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = any(i.indkey) \
+             WHERE i.indrelid = $1 AND i.indisreplident AND NOT a.attisdropped \
+             ORDER BY a.attnum",
+            relation_oid,
+        )
+        .await
+    }
+
+    async fn query_column_names_get(
+        &self,
+        sql: &str,
+        relation_oid: Oid,
+    ) -> CacheResult<Vec<EcoString>> {
         let rows = self
             .db_origin
-            .query(
-                "SELECT a.attname FROM pg_constraint pgc \
-                 JOIN pg_attribute a ON a.attrelid = pgc.conrelid AND a.attnum = any(pgc.conkey) \
-                 WHERE pgc.conrelid = $1 AND pgc.contype = 'p' AND NOT a.attisdropped \
-                 ORDER BY a.attnum",
-                &[&relation_oid],
-            )
+            .query(sql, &[&relation_oid])
             .await
             .map_into_report::<CacheError>()?;
-        Ok(rows
-            .iter()
-            .map(|row| EcoString::from(row.get::<_, &str>(0)))
-            .collect())
+        rows.iter()
+            .map(|row| {
+                row.try_get::<_, &str>(0)
+                    .map(EcoString::from)
+                    .map_into_report::<CacheError>()
+            })
+            .collect()
     }
 
     #[instrument(skip_all)]
-    /// Whether the origin relation's REPLICA IDENTITY is FULL
-    /// (`pg_class.relreplident = 'f'`). Absent rows (dropped mid-registration)
-    /// default to false — the conservative old-image ladder then applies.
-    pub(super) async fn query_replica_identity_full(&self, relation_oid: Oid) -> CacheResult<bool> {
+    /// The origin relation's REPLICA IDENTITY (`pg_class.relreplident`).
+    /// Absent rows (dropped mid-registration) read as DEFAULT — the
+    /// conservative old-image ladder then applies.
+    async fn query_replica_identity_get(&self, relation_oid: Oid) -> CacheResult<ReplicaIdentity> {
         let rows = self
             .db_origin
             .query(
-                "SELECT relreplident = 'f' AS full FROM pg_class WHERE oid = $1",
+                "SELECT relreplident::text AS identity FROM pg_class WHERE oid = $1",
                 &[&relation_oid],
             )
             .await
             .map_into_report::<CacheError>()?;
-        Ok(rows.first().is_some_and(|row| row.get("full")))
+        let identity = match rows.first() {
+            Some(row) => row
+                .try_get::<_, &str>("identity")
+                .map_into_report::<CacheError>()?,
+            None => "d",
+        };
+        Ok(match identity {
+            "f" => ReplicaIdentity::Full,
+            "i" => ReplicaIdentity::Index,
+            "n" => ReplicaIdentity::Nothing,
+            _ => ReplicaIdentity::Default,
+        })
     }
 
     pub(super) async fn query_table_indexes_get(
@@ -896,6 +954,15 @@ impl WriterCore {
 
         Ok(())
     }
+}
+
+/// A relation's REPLICA IDENTITY setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplicaIdentity {
+    Default,
+    Full,
+    Index,
+    Nothing,
 }
 
 #[cfg(test)]
