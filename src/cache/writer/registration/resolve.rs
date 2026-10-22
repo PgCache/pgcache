@@ -217,9 +217,9 @@ impl WriterRegistration {
             AdmissionQuery {
                 bound,
                 decorrelated,
+                fingerprint,
+                has_limit,
             },
-            fingerprint,
-            has_limit,
             &self.aggregate_functions,
             &core.cache.tables,
             AdmissionDepth::Full,

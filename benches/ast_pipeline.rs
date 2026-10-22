@@ -419,9 +419,9 @@ fn admission_cost(
             AdmissionQuery {
                 bound,
                 decorrelated: None,
+                fingerprint,
+                has_limit: bound.tree().root().has_limit(),
             },
-            fingerprint,
-            bound.tree().root().has_limit(),
             aggregates,
             catalog,
             AdmissionDepth::Full,

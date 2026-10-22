@@ -15,7 +15,7 @@ use crate::cache::mv_shape::select_computes;
 #[cfg(feature = "proxy")]
 use crate::cache::mv_shape::{ShapeGate, shape_classify};
 use crate::cache::query::{limit_clause_of, limit_rows_needed};
-use crate::cache::update_query::{UpdateEvalStrategy, UpdateQuery, UpdateQuerySource};
+use crate::cache::update_query::{OrderByKey, UpdateEvalStrategy, UpdateQuery, UpdateQuerySource};
 use crate::cache::{CacheError, CacheResult};
 use crate::catalog::Catalog;
 use crate::oid::Oid;
@@ -26,7 +26,7 @@ use crate::query::compiled_predicate::CompiledPredicate;
 use crate::query::decorrelate::query_decorrelate;
 use crate::query::literal_settings::LiteralSettings;
 use crate::query::resolve::ResolveResult;
-use crate::query::resolve::ResolvedQuery;
+use crate::query::resolve::{QueryBranch, ResolvedQuery};
 use crate::query::transform::{
     LiteralCanonOutcome, PgEvalTemplate, query_literals_canonicalise, query_predicate_pushdown,
 };
@@ -190,10 +190,13 @@ pub(crate) fn shape_gate_classify(
 }
 
 /// The query as admission reads it: as registered, and decorrelated when
-/// it had correlated subqueries.
+/// it had correlated subqueries, with its identity and whether the
+/// registered form carried a LIMIT (stripped before binding).
 pub struct AdmissionQuery<'a> {
     pub bound: &'a Arc<ResolvedQuery>,
     pub decorrelated: Option<&'a Arc<ResolvedQuery>>,
+    pub fingerprint: Fingerprint,
+    pub has_limit: bool,
 }
 
 /// Derive one [`TableAdmission`] per update query of the query, or of its
@@ -202,112 +205,157 @@ pub struct AdmissionQuery<'a> {
 /// Pure — the caller stores (writer) or simulates (fit) the results.
 pub fn query_admission_analyze(
     query: AdmissionQuery<'_>,
-    fingerprint: Fingerprint,
-    has_limit: bool,
     aggregate_functions: &HashSet<EcoString>,
     tables: &Catalog,
     depth: AdmissionDepth,
 ) -> CacheResult<AdmissionAnalysis> {
-    let AdmissionQuery {
-        bound,
-        decorrelated,
-    } = query;
-    let update_source = decorrelated.unwrap_or(bound);
-
-    let mut admissions = Vec::new();
+    let update_source = query.decorrelated.unwrap_or(query.bound);
     let update_queries = query_table_update_queries(update_source);
-    let single_branch = single_branch_relations(&update_queries);
-    for bound_update in update_queries {
+    let context = AdmissionContext {
+        query: &query,
+        update_source,
+        single_branch: single_branch_relations(&update_queries),
+        aggregate_functions,
+        tables,
+        depth,
+    };
+    let admissions = update_queries
+        .into_iter()
+        .map(|bound_update| context.table_admission_build(bound_update))
+        .collect();
+    Ok(AdmissionAnalysis {
+        transformed: query.decorrelated.is_some(),
+        tables: admissions,
+    })
+}
+
+/// What every table's admission is derived against.
+struct AdmissionContext<'a> {
+    query: &'a AdmissionQuery<'a>,
+    /// The query the update queries are read from: the decorrelated form
+    /// when there is one.
+    update_source: &'a Arc<ResolvedQuery>,
+    single_branch: HashSet<Oid>,
+    aggregate_functions: &'a HashSet<EcoString>,
+    tables: &'a Catalog,
+    depth: AdmissionDepth,
+}
+
+impl AdmissionContext<'_> {
+    fn full(&self) -> bool {
+        self.depth == AdmissionDepth::Full
+    }
+
+    fn table_admission_build(&self, bound_update: TableUpdateQuery<'_>) -> TableAdmission {
         let table_node = bound_update.table;
         let source = bound_update.source;
         let relation_oid = bound_update.relation_oid;
         let branch = bound_update.branch;
-        let relation = bound_update.predicates;
+        let table_name = table_node.name().as_str();
         let eval_strategy = update_eval_strategy_classify(branch, source);
-        let pg_batchable = depth == AdmissionDepth::Full
-            && eval_strategy == UpdateEvalStrategy::PgEval
-            && pg_batchable_classify(branch, aggregate_functions);
-        // Walk the whole query: the branch has no ORDER BY.
-        let limit_window_columns = if has_limit {
-            limit_window_columns_collect(bound, table_node.name().as_str())
-        } else {
-            HashSet::new()
-        };
-        let predicate_columns = predicate_columns_collect(branch, table_node.name().as_str());
         let is_single_table = branch.is_single_table();
-        // Direction-aware window spec (PGC-334) — the shapes the cached-path
-        // window check can reason about. Walks the parent query like
-        // `limit_window_columns` (the branch has no ORDER BY).
-        let order_by_keys =
-            (has_limit && is_single_table && matches!(source, UpdateQuerySource::FromClause))
-                .then(|| limit_order_keys_collect(bound, table_node.name().as_str()))
-                .flatten();
-        // Compile the LocalEval WHERE once so the per-row CDC membership probe
-        // doesn't re-destructure the tree (PGC-339). PgEval queries never
-        // consult this, so skip building it.
-        let compiled_where =
-            if depth == AdmissionDepth::Full && eval_strategy == UpdateEvalStrategy::LocalEval {
-                branch.select.where_clause().map(|w| {
-                    CompiledPredicate::compile(update_source, w, table_node.name().as_str())
-                })
-            } else {
-                None
-            };
-        // Precompute the PgEval membership template so the per-row check
-        // skips the per-row deparse (PGC-343). Only PgEval uses
-        // it; needs the relation's TableMetadata.
-        let pg_eval_template =
-            if depth == AdmissionDepth::Full && eval_strategy == UpdateEvalStrategy::PgEval {
-                tables.get1(&relation_oid).and_then(|table_metadata| {
-                    PgEvalTemplate::build(branch, table_metadata, table_node.id())
-                })
-            } else {
-                None
-            };
-
-        let table_name = table_node.name().clone();
+        let has_limit = self.query.has_limit;
         let mut update_query = UpdateQuery {
-            fingerprint,
+            fingerprint: self.query.fingerprint,
             ordinal: 0,
-            bound: Arc::clone(update_source),
+            bound: Arc::clone(self.update_source),
             branch: branch.select.id(),
             source,
             table: table_node.id(),
-            predicates: relation,
+            predicates: bound_update.predicates,
             has_limit,
             eval_strategy,
-            limit_window_columns,
-            order_by_keys,
+            limit_window_columns: self.limit_window_columns(table_name),
+            order_by_keys: self.order_by_keys(table_name, is_single_table, source),
             change_dependent: false,
-            pg_batchable,
-            predicate_columns,
+            pg_batchable: self.pg_batchable(branch, eval_strategy),
+            predicate_columns: predicate_columns_collect(branch, table_name),
             is_single_table,
-            compiled_where,
-            pg_eval_template,
+            compiled_where: self.compiled_where(branch, table_name, eval_strategy),
+            pg_eval_template: self.pg_eval_template(branch, relation_oid, eval_strategy),
         };
         // Whether a CDC UPDATE for this query can ever invalidate — i.e.
         // whether `handle_update` must run `query_row_changes` + the
         // invalidation check rather than skip them (PGC-227). Derived from
         // the single source of truth so the flag can't drift.
-        if depth == AdmissionDepth::Full {
+        if self.full() {
             update_query.change_dependent = update_query.update_invalidation_possible();
         }
-
-        let subsumer_shape = single_branch.contains(&relation_oid) && update_query.predicates.exact;
-
-        admissions.push(TableAdmission {
+        let subsumer_shape =
+            self.single_branch.contains(&relation_oid) && update_query.predicates.exact;
+        TableAdmission {
             relation_oid,
-            table_name,
+            table_name: table_node.name().clone(),
             update_query,
             subsumer_shape,
             subsumer_eligible: subsumer_shape && !has_limit,
-        });
+        }
     }
 
-    Ok(AdmissionAnalysis {
-        transformed: decorrelated.is_some(),
-        tables: admissions,
-    })
+    /// Walks the whole query: the branch has no ORDER BY.
+    fn limit_window_columns(&self, table_name: &str) -> HashSet<EcoString> {
+        if self.query.has_limit {
+            limit_window_columns_collect(self.query.bound, table_name)
+        } else {
+            HashSet::new()
+        }
+    }
+
+    /// Direction-aware window spec (PGC-334) — the shapes the cached-path
+    /// window check can reason about. Walks the parent query like
+    /// `limit_window_columns` (the branch has no ORDER BY).
+    fn order_by_keys(
+        &self,
+        table_name: &str,
+        is_single_table: bool,
+        source: UpdateQuerySource,
+    ) -> Option<Box<[OrderByKey]>> {
+        let windowed =
+            self.query.has_limit && is_single_table && source == UpdateQuerySource::FromClause;
+        windowed
+            .then(|| limit_order_keys_collect(self.query.bound, table_name))
+            .flatten()
+    }
+
+    fn pg_batchable(&self, branch: QueryBranch<'_>, eval_strategy: UpdateEvalStrategy) -> bool {
+        self.full()
+            && eval_strategy == UpdateEvalStrategy::PgEval
+            && pg_batchable_classify(branch, self.aggregate_functions)
+    }
+
+    /// Compile the LocalEval WHERE once so the per-row CDC membership probe
+    /// doesn't re-destructure the tree (PGC-339). PgEval queries never
+    /// consult this, so skip building it.
+    fn compiled_where(
+        &self,
+        branch: QueryBranch<'_>,
+        table_name: &str,
+        eval_strategy: UpdateEvalStrategy,
+    ) -> Option<CompiledPredicate> {
+        if !self.full() || eval_strategy != UpdateEvalStrategy::LocalEval {
+            return None;
+        }
+        branch
+            .select
+            .where_clause()
+            .map(|w| CompiledPredicate::compile(self.update_source, w, table_name))
+    }
+
+    /// Precompute the PgEval membership template so the per-row check
+    /// skips the per-row deparse (PGC-343). Only PgEval uses it; needs the
+    /// relation's TableMetadata.
+    fn pg_eval_template(
+        &self,
+        branch: QueryBranch<'_>,
+        relation_oid: Oid,
+        eval_strategy: UpdateEvalStrategy,
+    ) -> Option<PgEvalTemplate> {
+        if !self.full() || eval_strategy != UpdateEvalStrategy::PgEval {
+            return None;
+        }
+        let table_metadata = self.tables.get1(&relation_oid)?;
+        PgEvalTemplate::build(branch, table_metadata, branch.select.id())
+    }
 }
 
 #[cfg(test)]
@@ -357,9 +405,9 @@ mod tests {
             AdmissionQuery {
                 bound: &bound,
                 decorrelated: decorrelated.as_ref(),
+                fingerprint: Fingerprint::from_raw(1),
+                has_limit: false,
             },
-            Fingerprint::from_raw(1),
-            false,
             &aggregate_functions,
             &tables,
             AdmissionDepth::DecisionOnly,

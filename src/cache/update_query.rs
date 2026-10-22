@@ -672,9 +672,9 @@ mod tests {
             AdmissionQuery {
                 bound: &bound,
                 decorrelated: None,
+                fingerprint: FINGERPRINT,
+                has_limit,
             },
-            FINGERPRINT,
-            has_limit,
             &HashSet::new(),
             &tables,
             AdmissionDepth::Full,
