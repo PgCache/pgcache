@@ -3,7 +3,7 @@ members = [".", "conformance", "consistency", "fit", "fit/wasm"]
 
 [package]
 name = "pgcache"
-version = "0.7.1"
+version = "0.8.0"
 edition = "2024"
 license = "Elastic-2.0"
 
@@ -194,6 +194,9 @@ http = { version = "1", optional = true }
 http-body-util = { version = "0.1", optional = true }
 socket2 = { version = "0.6.4", optional = true }
 bytes = "1"
+# Must match the version postgres-protocol implements FallibleIterator from
+# (rust-postgres pins 0.2); a newer one is a different trait and array decoding
+# fails to compile.
 fallible-iterator = "0.2.0"
 smallvec = "1.15.1"
 jiff = { version = "0.2.38", default-features = false, features = ["std", "tzdb-bundle-always"] }
