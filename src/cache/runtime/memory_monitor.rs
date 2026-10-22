@@ -8,6 +8,7 @@ use tracing::{debug, info, warn};
 
 use crate::cache::types::CacheStateView;
 use crate::cache::{CacheError, CacheResult, MapIntoReport};
+use crate::memory::ThrottleDecision;
 use crate::result::error_chain_format;
 use crate::settings::{DynamicConfigHandle, Settings};
 
@@ -28,36 +29,15 @@ const RECYCLE_PRESSURE_FRACTION: f64 = 0.8;
 pub(super) async fn memory_monitor(
     state_view: Arc<CacheStateView>,
     dynamic: DynamicConfigHandle,
-    shared_buffers: u64,
-    pool_size: usize,
+    mut estimator: CountCapEstimator,
     cancel: CancellationToken,
 ) {
     const TICK: Duration = Duration::from_millis(500);
-    let cache = &crate::metrics::handles().cache;
 
     let Some(total_ram) = crate::memory::total_budget_bytes() else {
         debug!("memory monitor: RAM not detectable; registration throttling disabled");
         return;
     };
-
-    // Decaying peak of the measured per-query private cost carried across ticks,
-    // feeding the count cap (PGC-251). The cap anchors on the *live* private
-    // reading (refinement 2), so no fixed baseline is tracked.
-    let mut marginal_ewma = 0.0_f64;
-    let mut peak_marginal = 0.0_f64;
-    // High-water count + the private footprint at it, for the incremental
-    // Δprivate/Δcount marginal. Sampling only on a *new* high-water count means
-    // genuine growth is measured and the plateau (eviction churning the count
-    // just below the cap) produces no noisy samples.
-    let mut hw_private: Option<u64> = None;
-    let mut hw_count: usize = 0;
-    // Recycle count at the last re-measurement probe, to detect a full pool refresh.
-    let mut last_recycle_count: usize = 0;
-    // When set, a re-measurement probe is in flight: publish this bounded cap
-    // (current count + one growth chunk) until a fresh sample lands (Slice 1e).
-    let mut probe_target: Option<usize> = None;
-    // Previously published cap, for rate-limiting cap increases (Slice 1e).
-    let mut last_published_cap: Option<usize> = None;
 
     loop {
         tokio::select! {
@@ -69,29 +49,13 @@ pub(super) async fn memory_monitor(
             continue;
         };
 
-        let throttled = state_view.registration_throttled.load(Ordering::Relaxed);
         let decision = crate::memory::throttle_evaluate(
             used,
             total_ram,
             dynamic.load().memory_limit.map(|l| l as u64),
-            throttled,
+            state_view.registration_throttled.load(Ordering::Relaxed),
         );
-        let next = decision.throttled;
-        let high_mark = decision.high_mark;
-        if next != throttled {
-            state_view
-                .registration_throttled
-                .store(next, Ordering::Relaxed);
-            if next {
-                warn!(
-                    used_mb = used / 1_048_576,
-                    budget_mb = high_mark / 1_048_576,
-                    "memory pressure: throttling new-query registration (forwarding to origin)"
-                );
-            } else {
-                info!("memory pressure relieved: resuming query registration");
-            }
-        }
+        throttle_apply(&state_view, &decision, used);
 
         // Size the count cap from the measured *private* per-query cost (PGC-251).
         // `private` excludes shared_buffers (shared memory), so the marginal is
@@ -99,55 +63,7 @@ pub(super) async fn memory_monitor(
         // shared_buffers config is reserved separately against the ceiling.
         let private = crate::memory::system_private_bytes().unwrap_or(used);
         let count = state_view.registered_count.load(Ordering::Relaxed);
-        let hw_p = hw_private.unwrap_or(private);
-        let cap_decision = crate::memory::count_cap_evaluate(
-            private,
-            hw_p,
-            count,
-            hw_count,
-            decision.ceiling,
-            shared_buffers,
-            marginal_ewma,
-            peak_marginal,
-        );
-        marginal_ewma = cap_decision.marginal_ewma;
-        peak_marginal = cap_decision.peak_marginal;
-        // Advance the high-water reference when a growth chunk was sampled (or to
-        // seed it on the first tick).
-        if cap_decision.sampled || hw_private.is_none() {
-            hw_private = Some(private);
-            hw_count = count;
-        }
-        // A fresh sample re-learned the cost, so the probe (if any) is complete.
-        if cap_decision.sampled {
-            probe_target = None;
-        }
-
-        // Re-measurement probe (PGC-251 Slice 1e): when a full pool has been
-        // recycled, forget the stale per-query estimate, re-anchor the high-water
-        // to now, and allow one MIN_GROWTH chunk of growth. Without this the cap
-        // can't adapt to a *lighter* workload — the count stays pinned at the cap,
-        // so no growth sample is ever taken and the marginal stays frozen at the
-        // old (heavier) cost. The next chunk re-samples the current workload.
-        let recycled = state_view.recycle_count.load(Ordering::Relaxed);
-        if recycled >= last_recycle_count + pool_size {
-            last_recycle_count = recycled;
-            hw_count = count;
-            hw_private = Some(private);
-            marginal_ewma = 0.0;
-            peak_marginal = 0.0;
-            probe_target = Some(count + crate::memory::COUNT_CAP_MIN_GROWTH);
-        }
-
-        // While probing (estimate reset, fresh sample pending) publish a bounded
-        // cap permitting exactly the probe chunk (exempt from rate-limiting — it
-        // must grow by MIN_GROWTH to re-sample); otherwise the re-learned cap,
-        // with its *increase* rate-limited so a single bad sample can't spike it.
-        let published_cap = match probe_target {
-            Some(target) => target,
-            None => crate::memory::cap_rate_limit(cap_decision.cap, last_published_cap),
-        };
-        last_published_cap = Some(published_cap);
+        let published_cap = estimator.tick(&state_view, private, decision.ceiling);
 
         // Connection recycling (PGC-251 Slice 1d): flag memory pressure so the
         // serve loop rolls the pool one connection at a time.
@@ -158,19 +74,155 @@ pub(super) async fn memory_monitor(
             .query_count_cap
             .store(published_cap, Ordering::Relaxed);
 
-        cache.memory_used_bytes.set(used as f64);
-        cache.memory_budget_bytes.set(high_mark as f64);
-        cache
-            .rss_bytes
-            .set(crate::memory::process_rss_bytes().unwrap_or(0) as f64);
-        cache.registration_throttled.set(f64::from(u8::from(next)));
-        cache.marginal_bytes_per_query.set(peak_marginal);
-        // usize::MAX (no cap) would saturate the gauge; report 0 = "uncapped".
-        cache.query_count_cap.set(if published_cap == usize::MAX {
-            0.0
-        } else {
-            published_cap as f64
-        });
+        gauges_publish(used, &decision, estimator.peak_marginal, published_cap);
+    }
+}
+
+/// Flip the registration throttle when the decision changed, logging the
+/// transition.
+fn throttle_apply(state_view: &CacheStateView, decision: &ThrottleDecision, used: u64) {
+    let throttled = state_view.registration_throttled.load(Ordering::Relaxed);
+    if decision.throttled == throttled {
+        return;
+    }
+    state_view
+        .registration_throttled
+        .store(decision.throttled, Ordering::Relaxed);
+    if decision.throttled {
+        warn!(
+            used_mb = used / 1_048_576,
+            budget_mb = decision.high_mark / 1_048_576,
+            "memory pressure: throttling new-query registration (forwarding to origin)"
+        );
+    } else {
+        info!("memory pressure relieved: resuming query registration");
+    }
+}
+
+#[allow(clippy::cast_precision_loss)] // byte gauges never exceed 2^52
+fn gauges_publish(
+    used: u64,
+    decision: &ThrottleDecision,
+    peak_marginal: f64,
+    published_cap: usize,
+) {
+    let cache = &crate::metrics::handles().cache;
+    cache.memory_used_bytes.set(used as f64);
+    cache.memory_budget_bytes.set(decision.high_mark as f64);
+    cache
+        .rss_bytes
+        .set(crate::memory::process_rss_bytes().unwrap_or(0) as f64);
+    cache
+        .registration_throttled
+        .set(f64::from(u8::from(decision.throttled)));
+    cache.marginal_bytes_per_query.set(peak_marginal);
+    // usize::MAX (no cap) would saturate the gauge; report 0 = "uncapped".
+    cache.query_count_cap.set(if published_cap == usize::MAX {
+        0.0
+    } else {
+        published_cap as f64
+    });
+}
+
+/// The query count cap learned from the measured per-query private cost
+/// (PGC-251), carried across monitor ticks.
+pub(super) struct CountCapEstimator {
+    /// The cache PG's `shared_buffers`, reserved against the ceiling.
+    shared_buffers: u64,
+    /// Serve-pool size: the full-pool-recycled threshold of the
+    /// re-measurement probe.
+    pool_size: usize,
+    /// Decaying per-query cost and its peak. The cap anchors on the *live*
+    /// private reading (refinement 2), so no fixed baseline is tracked.
+    marginal_ewma: f64,
+    peak_marginal: f64,
+    /// High-water count + the private footprint at it, for the incremental
+    /// Δprivate/Δcount marginal. Sampling only on a *new* high-water count
+    /// means genuine growth is measured and the plateau (eviction churning
+    /// the count just below the cap) produces no noisy samples.
+    hw_private: Option<u64>,
+    hw_count: usize,
+    /// Recycle count at the last re-measurement probe, to detect a full pool
+    /// refresh.
+    last_recycle_count: usize,
+    /// When set, a re-measurement probe is in flight: publish this bounded
+    /// cap (current count + one growth chunk) until a fresh sample lands
+    /// (Slice 1e).
+    probe_target: Option<usize>,
+    /// Previously published cap, for rate-limiting cap increases (Slice 1e).
+    last_published_cap: Option<usize>,
+}
+
+impl CountCapEstimator {
+    pub(super) fn new(shared_buffers: u64, pool_size: usize) -> Self {
+        Self {
+            shared_buffers,
+            pool_size,
+            marginal_ewma: 0.0,
+            peak_marginal: 0.0,
+            hw_private: None,
+            hw_count: 0,
+            last_recycle_count: 0,
+            probe_target: None,
+            last_published_cap: None,
+        }
+    }
+
+    /// Fold one tick's readings in; the cap to publish.
+    fn tick(&mut self, state_view: &CacheStateView, private: u64, ceiling: u64) -> usize {
+        let count = state_view.registered_count.load(Ordering::Relaxed);
+        let recycled = state_view.recycle_count.load(Ordering::Relaxed);
+        let cap_decision = crate::memory::count_cap_evaluate(
+            private,
+            self.hw_private.unwrap_or(private),
+            count,
+            self.hw_count,
+            ceiling,
+            self.shared_buffers,
+            self.marginal_ewma,
+            self.peak_marginal,
+        );
+        self.marginal_ewma = cap_decision.marginal_ewma;
+        self.peak_marginal = cap_decision.peak_marginal;
+        // Advance the high-water reference when a growth chunk was sampled (or to
+        // seed it on the first tick).
+        if cap_decision.sampled || self.hw_private.is_none() {
+            self.hw_private = Some(private);
+            self.hw_count = count;
+        }
+        // A fresh sample re-learned the cost, so the probe (if any) is complete.
+        if cap_decision.sampled {
+            self.probe_target = None;
+        }
+        if recycled >= self.last_recycle_count + self.pool_size {
+            self.probe_start(private, count, recycled);
+        }
+
+        // While probing (estimate reset, fresh sample pending) publish a bounded
+        // cap permitting exactly the probe chunk (exempt from rate-limiting — it
+        // must grow by MIN_GROWTH to re-sample); otherwise the re-learned cap,
+        // with its *increase* rate-limited so a single bad sample can't spike it.
+        let published_cap = match self.probe_target {
+            Some(target) => target,
+            None => crate::memory::cap_rate_limit(cap_decision.cap, self.last_published_cap),
+        };
+        self.last_published_cap = Some(published_cap);
+        published_cap
+    }
+
+    /// Re-measurement probe (PGC-251 Slice 1e): when a full pool has been
+    /// recycled, forget the stale per-query estimate, re-anchor the high-water
+    /// to now, and allow one MIN_GROWTH chunk of growth. Without this the cap
+    /// can't adapt to a *lighter* workload — the count stays pinned at the cap,
+    /// so no growth sample is ever taken and the marginal stays frozen at the
+    /// old (heavier) cost. The next chunk re-samples the current workload.
+    fn probe_start(&mut self, private: u64, count: usize, recycled: usize) {
+        self.last_recycle_count = recycled;
+        self.hw_count = count;
+        self.hw_private = Some(private);
+        self.marginal_ewma = 0.0;
+        self.peak_marginal = 0.0;
+        self.probe_target = Some(count + crate::memory::COUNT_CAP_MIN_GROWTH);
     }
 }
 
