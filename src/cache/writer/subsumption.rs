@@ -1,6 +1,6 @@
-//! Subsumption: can a newly-registered query be served from data an existing
-//! broader cached query already holds? If so it is stamped and marked Ready
-//! without a population round-trip.
+//! Subsumption: can a newly-registered or readmitted query be served from
+//! data an existing broader cached query already holds? If so it is stamped
+//! and marked Ready without a population round-trip.
 
 use std::num::NonZeroU64;
 use std::sync::Arc;
@@ -12,15 +12,17 @@ use super::core::{QueryServing, WriterCore};
 use super::registration::{
     QueryResolution, RegistrationIdentity, WriterRegistration, cached_query_insert,
 };
-use crate::cache::Generation;
 use crate::cache::admission::{
     SubsumerCandidate, SubsumerSource, subsumption_covered, subsumption_references,
 };
-use crate::cache::types::{Cache, SharedQueryShape, SharedResolvedQuery};
+use crate::cache::messages::SubsumptionResult;
+use crate::cache::types::Cache;
 use crate::cache::{CacheError, CacheResult, MapIntoReport};
 use crate::oid::Oid;
+use crate::query::Fingerprint;
 use crate::query::constraint_index::table_constraints_keyed;
 use crate::query::constraints::TableConstraint;
+use crate::query::resolve::ResolvedQuery;
 use crate::result::error_chain_format;
 use crate::timing::duration_to_ns_u64;
 
@@ -72,40 +74,38 @@ impl SubsumerSource for WriterSubsumerSource<'_> {
 }
 
 impl WriterRegistration {
-    /// Whether every table reference of the new query is covered by the
-    /// region of a Ready, LIMIT-free cached query on its relation.
+    /// Whether every table reference of `bound` is covered by the region of a
+    /// Ready, LIMIT-free cached query on its relation.
     pub(super) fn subsumption_check(
         &self,
         core: &WriterCore,
-        resolution: &QueryResolution,
+        relation_oids: &[Oid],
+        bound: &ResolvedQuery,
     ) -> bool {
-        if resolution.relation_oids.is_empty() {
+        if relation_oids.is_empty() {
             return false;
         }
 
         // Set operations (UNION/INTERSECT/EXCEPT) are rejected for now.
-        let Some(references) = subsumption_references(&resolution.bound) else {
+        let Some(references) = subsumption_references(bound) else {
             return false;
         };
         subsumption_covered(&references, &WriterSubsumerSource { cache: &core.cache })
     }
 
-    /// Handle a subsumed query: assign generation, stamp rows in cache DB, mark Ready.
-    /// Returns what it serves on success. Falls back to None if cache DB execution fails.
+    /// Handle a subsumed new query: insert its entry, then stamp its rows and
+    /// mark it Ready. `NotSubsumed` when the cache DB failed and the caller
+    /// must populate the entry instead.
     pub(super) async fn query_subsume(
         &self,
         core: &mut WriterCore,
         identity: RegistrationIdentity,
         resolution: QueryResolution,
-    ) -> CacheResult<Option<(Generation, SharedResolvedQuery, SharedQueryShape)>> {
-        let subsume_start = Instant::now();
+    ) -> CacheResult<SubsumptionResult> {
         let fingerprint = identity.fingerprint;
         let bound = Arc::clone(&resolution.bound);
         let serve_shape = Arc::clone(&resolution.serve_shape);
         let max_limit = resolution.max_limit;
-        // Running the query under the new generation stamps the rows it
-        // reads, which the subsumer already holds.
-        let stamp_sql = bound.sql();
 
         let (generation, relations_changed) = cached_query_insert(core, identity, resolution);
 
@@ -113,70 +113,92 @@ impl WriterRegistration {
             core.publication_relations_add().await?;
         }
 
-        // Stamp rows: SET generation, execute query, reset generation
-        let set_gen_sql = format!("SET mem.query_generation = {generation}");
-        if let Err(e) = core
-            .db_cache
-            .batch_execute(&set_gen_sql)
-            .await
-            .map_into_report::<CacheError>()
-        {
-            error!(
-                "subsumption generation set failed: {}",
-                error_chain_format(e.current_context()),
-            );
-            return Ok(None);
-        }
+        let serving = QueryServing {
+            generation,
+            bound,
+            serve_shape,
+            max_limit,
+        };
+        Ok(subsumed_ready_mark(core, fingerprint, serving).await)
+    }
+}
 
-        let cache_exec_result = core
-            .db_cache
-            .batch_execute(&stamp_sql)
-            .await
-            .map_into_report::<CacheError>();
+/// Stamp the rows a subsumed query reads under its generation and mark it
+/// Ready, for a new entry or a readmitted one. `NotSubsumed` when stamping
+/// failed on the cache DB; the entry is left as it was, Loading, for the
+/// caller to populate.
+pub(super) async fn subsumed_ready_mark(
+    core: &mut WriterCore,
+    fingerprint: Fingerprint,
+    serving: QueryServing,
+) -> SubsumptionResult {
+    let subsume_start = Instant::now();
+    let generation = serving.generation;
+    // Running the query under the new generation stamps the rows it reads,
+    // which the subsumer already holds.
+    let stamp_sql = serving.bound.sql();
 
-        // Always reset generation, even on failure
-        let _ = core
-            .db_cache
-            .batch_execute("SET mem.query_generation = 0")
-            .await;
-
-        if let Err(e) = cache_exec_result {
-            error!(
-                "subsumption cache query failed: {}",
-                error_chain_format(e.current_context()),
-            );
-            return Ok(None);
-        }
-
-        core.state_ready_transition(
-            fingerprint,
-            QueryServing {
-                generation,
-                bound: Arc::clone(&bound),
-                serve_shape: Arc::clone(&serve_shape),
-                max_limit,
-            },
+    // Stamp rows: SET generation, execute query, reset generation
+    let set_gen_sql = format!("SET mem.query_generation = {generation}");
+    if let Err(e) = core
+        .db_cache
+        .batch_execute(&set_gen_sql)
+        .await
+        .map_into_report::<CacheError>()
+    {
+        error!(
+            "subsumption generation set failed: {}",
+            error_chain_format(e.current_context()),
         );
+        return SubsumptionResult::NotSubsumed;
+    }
 
-        // Clear registration_started_at to signal completion
-        if let Some(mut q) = core.cache.cached_queries.get1_mut(fingerprint) {
-            q.registration_started_at = None;
-        }
+    let cache_exec_result = core
+        .db_cache
+        .batch_execute(&stamp_sql)
+        .await
+        .map_into_report::<CacheError>();
 
-        // Record per-query metrics for subsumption
-        if let Some(mut m) = core.state_view.metrics.get_mut(&fingerprint) {
-            m.cached_since_ns =
-                NonZeroU64::new(duration_to_ns_u64(core.state_view.started_at.elapsed()));
-            m.subsumption_count += 1;
-        }
+    // Always reset generation, even on failure
+    let _ = core
+        .db_cache
+        .batch_execute("SET mem.query_generation = 0")
+        .await;
 
-        crate::metrics::handles().reg.subsumptions.increment(1);
-        crate::metrics::handles()
-            .reg
-            .subsumption_latency
-            .record(subsume_start.elapsed().as_secs_f64());
+    if let Err(e) = cache_exec_result {
+        error!(
+            "subsumption cache query failed: {}",
+            error_chain_format(e.current_context()),
+        );
+        return SubsumptionResult::NotSubsumed;
+    }
 
-        debug!("query subsumed {fingerprint}");
-        Ok(Some((generation, bound, serve_shape)))
+    let bound = Arc::clone(&serving.bound);
+    let serve_shape = Arc::clone(&serving.serve_shape);
+    core.state_ready_transition(fingerprint, serving);
+
+    // Clear registration_started_at to signal completion
+    if let Some(mut q) = core.cache.cached_queries.get1_mut(fingerprint) {
+        q.registration_started_at = None;
+    }
+
+    // Record per-query metrics for subsumption
+    if let Some(mut m) = core.state_view.metrics.get_mut(&fingerprint) {
+        m.cached_since_ns =
+            NonZeroU64::new(duration_to_ns_u64(core.state_view.started_at.elapsed()));
+        m.subsumption_count += 1;
+    }
+
+    crate::metrics::handles().reg.subsumptions.increment(1);
+    crate::metrics::handles()
+        .reg
+        .subsumption_latency
+        .record(subsume_start.elapsed().as_secs_f64());
+
+    debug!("query subsumed {fingerprint}");
+    SubsumptionResult::Subsumed {
+        generation,
+        bound,
+        serve_shape,
     }
 }

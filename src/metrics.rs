@@ -149,6 +149,8 @@ pub mod names {
     pub const CACHE_CDC_TOAST_STALE_ABORTS: &str = "pgcache.cache.cdc_toast_stale_aborts";
     pub const CACHE_EVICTIONS: &str = "pgcache.cache.evictions";
     pub const CACHE_READMISSIONS: &str = "pgcache.cache.readmissions";
+    /// Readmissions served by a Ready parent instead of a population (PGC-532).
+    pub const CACHE_READMISSION_SUBSUMPTIONS: &str = "pgcache.cache.readmission_subsumptions";
     pub const CACHE_SUBSUMPTIONS: &str = "pgcache.cache.subsumptions";
     pub const CACHE_SUBSUMPTION_LATENCY_SECONDS: &str = "pgcache.cache.subsumption_latency_seconds";
 
@@ -1010,6 +1012,7 @@ pub struct StateHandles {
     pub evictions_pinned_bump: Counter,
     pub evictions_bump: Counter,
     pub readmissions: Counter,
+    pub readmission_subsumptions: Counter,
     pub queue_writer_query: Gauge,
     pub queue_writer_cdc: Gauge,
     pub queue_writer_internal: Gauge,
@@ -1022,9 +1025,10 @@ impl StateHandles {
             CACHE_DISK_AVAILABLE_BYTES, CACHE_DISK_LIMIT_BYTES, CACHE_DISK_TOTAL_BYTES,
             CACHE_DISK_USED_BYTES, CACHE_EVICTIONS, CACHE_GENERATION, CACHE_QUERIES_INVALIDATED,
             CACHE_QUERIES_LOADING, CACHE_QUERIES_PENDING, CACHE_QUERIES_REGISTERED,
-            CACHE_READMISSIONS, CACHE_TABLES_TRACKED, CACHE_WORKER_QUEUE, CACHE_WRITER_CDC_QUEUE,
-            CACHE_WRITER_INTERNAL_QUEUE, CACHE_WRITER_QUERY_QUEUE,
-            CACHE_WRITER_UPDATE_QUERIES_MAX_PER_RELATION, CACHE_WRITER_UPDATE_QUERIES_TOTAL,
+            CACHE_READMISSION_SUBSUMPTIONS, CACHE_READMISSIONS, CACHE_TABLES_TRACKED,
+            CACHE_WORKER_QUEUE, CACHE_WRITER_CDC_QUEUE, CACHE_WRITER_INTERNAL_QUEUE,
+            CACHE_WRITER_QUERY_QUEUE, CACHE_WRITER_UPDATE_QUERIES_MAX_PER_RELATION,
+            CACHE_WRITER_UPDATE_QUERIES_TOTAL,
         };
         Self {
             queries_registered: metrics::gauge!(CACHE_QUERIES_REGISTERED),
@@ -1045,6 +1049,7 @@ impl StateHandles {
             evictions_pinned_bump: metrics::counter!(CACHE_EVICTIONS, "result" => "pinned_bump"),
             evictions_bump: metrics::counter!(CACHE_EVICTIONS, "result" => "bump"),
             readmissions: metrics::counter!(CACHE_READMISSIONS),
+            readmission_subsumptions: metrics::counter!(CACHE_READMISSION_SUBSUMPTIONS),
             queue_writer_query: metrics::gauge!(CACHE_WRITER_QUERY_QUEUE),
             queue_writer_cdc: metrics::gauge!(CACHE_WRITER_CDC_QUEUE),
             queue_writer_internal: metrics::gauge!(CACHE_WRITER_INTERNAL_QUEUE),

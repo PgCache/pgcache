@@ -75,7 +75,7 @@ If the cache DB execution fails (e.g. table dropped by concurrent eviction), sub
 - Inner-joined tables are never candidates, even when a foreign key guarantees every row a partner
 
 ## Implementation Notes
-- Subsumption check: `subsumption_check()` and `query_subsume()` in `src/cache/writer/query.rs`
+- Subsumption check: `subsumption_check()` and `query_subsume()` in `src/cache/writer/subsumption.rs`; the check also runs on readmission of an invalidated query (`query_readmit`), which stamps through the same `subsumed_ready_mark()` tail instead of repopulating (PGC-532)
 - Constraint comparison: `table_constraints_subsumed()` in `src/query/constraints/subsume.rs`; regions and references from `src/cache/admission/` over the predicate model (ADR-059)
 - Coordinator flow: `subsumption_await()` in `src/cache/query_cache.rs`
 - Message types: `SubsumptionResult`, `AdmitAction` in `src/cache/messages.rs`

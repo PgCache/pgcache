@@ -10,8 +10,9 @@ use tracing::{debug, instrument, trace};
 use super::{PopulationTarget, WriterRegistration};
 use crate::cache::CacheResult;
 use crate::cache::coalesce_queue::fetch_stage_ewma_update;
-use crate::cache::messages::PopulationMerge;
+use crate::cache::messages::{PopulationMerge, SubsumptionResult};
 use crate::cache::writer::core::{QueryServing, WriterCore};
+use crate::cache::writer::subsumption::subsumed_ready_mark;
 use crate::oid::Oid;
 use crate::query::Fingerprint;
 use crate::timing::{duration_to_ns_u64, duration_to_us_u64};
@@ -33,25 +34,36 @@ fn update_queries_limit_set(
 
 impl WriterRegistration {
     /// Fast readmission for a CDC-invalidated query.
-    /// Reuses existing metadata (relation_oids, resolved, update_queries) and
-    /// dispatches population work without re-resolving tables.
+    /// Reuses existing metadata (relation_oids, resolved, update_queries) and,
+    /// unless a Ready parent covers the query, dispatches population work
+    /// without re-resolving tables.
     pub(super) async fn query_readmit(
         &mut self,
         core: &mut WriterCore,
         fingerprint: Fingerprint,
         started_at: Instant,
-    ) -> CacheResult<()> {
+    ) -> CacheResult<SubsumptionResult> {
         debug!("readmitting query {fingerprint}");
         crate::metrics::handles().state.readmissions.increment(1);
         if let Some(mut m) = core.state_view.metrics.get_mut(&fingerprint) {
             m.readmission_count += 1;
         }
 
+        // Checked while the entry is still flagged invalidated, so the parent
+        // readiness gate never picks the query as its own parent.
+        let covered = core
+            .cache
+            .cached_queries
+            .get1(&fingerprint)
+            .is_some_and(|cached| {
+                self.subsumption_check(core, &cached.relation_oids, &cached.bound)
+            });
+
         let new_generation = core.cache.generation_allocate();
 
         // Extract data before remove/reinsert (generation is key2)
         let Some(mut cached) = core.cache.cached_queries.remove1(fingerprint) else {
-            return Ok(());
+            return Ok(SubsumptionResult::NotSubsumed);
         };
 
         let serving = QueryServing {
@@ -71,17 +83,31 @@ impl WriterRegistration {
 
         core.state_loading_transition(fingerprint, &serving);
 
+        let generation = serving.generation;
+        let max_limit = serving.max_limit;
+        if covered {
+            let result = subsumed_ready_mark(core, fingerprint, serving).await;
+            if matches!(result, SubsumptionResult::Subsumed { .. }) {
+                crate::metrics::handles()
+                    .state
+                    .readmission_subsumptions
+                    .increment(1);
+                trace!("readmission subsumed for query {fingerprint}");
+                return Ok(result);
+            }
+        }
+
         self.population_start(
             core,
             PopulationTarget {
                 fingerprint,
-                generation: serving.generation,
+                generation,
                 population: &population,
-                max_limit: serving.max_limit,
+                max_limit,
             },
         )?;
         trace!("readmission population queued for query {fingerprint}");
-        Ok(())
+        Ok(SubsumptionResult::NotSubsumed)
     }
 
     /// Mark a query as ready after its population `merge` applied.

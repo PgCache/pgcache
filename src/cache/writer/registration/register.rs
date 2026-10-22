@@ -47,17 +47,19 @@ impl WriterRegistration {
         };
         let fingerprint = identity.fingerprint;
 
-        // Fast readmit path for invalidated queries — skip subsumption
+        // Fast readmit path for invalidated queries: reuses the entry's
+        // metadata and runs its own subsumption check.
         if core
             .cache
             .cached_queries
             .get1(&fingerprint)
             .is_some_and(|query| query.invalidated)
         {
-            let _ = request.subsumption_tx.send(SubsumptionResult::NotSubsumed);
-            return self
+            let result = self
                 .query_readmit(core, fingerprint, identity.started_at)
-                .await;
+                .await?;
+            let _ = request.subsumption_tx.send(result);
+            return Ok(());
         }
 
         // Phase 1: Resolve
@@ -75,7 +77,7 @@ impl WriterRegistration {
 
         // Phase 2: Subsumption check
         let subsumption_start = Instant::now();
-        let subsumed = self.subsumption_check(core, &resolution);
+        let subsumed = self.subsumption_check(core, &resolution.relation_oids, &resolution.bound);
         crate::metrics::handles()
             .reg
             .register_subsumption_check
@@ -121,19 +123,12 @@ impl WriterRegistration {
         resolution: QueryResolution,
     ) -> CacheResult<SubsumptionResult> {
         let subsume_start = Instant::now();
-        let subsume_result = self.query_subsume(core, identity, resolution).await?;
+        let result = self.query_subsume(core, identity, resolution).await?;
         crate::metrics::handles()
             .reg
             .register_subsume
             .record(subsume_start.elapsed().as_secs_f64());
-        Ok(match subsume_result {
-            Some((generation, bound, serve_shape)) => SubsumptionResult::Subsumed {
-                generation,
-                bound,
-                serve_shape,
-            },
-            None => SubsumptionResult::NotSubsumed,
-        })
+        Ok(result)
     }
 
     /// Cache DB execution failed during subsumption. `query_subsume` already
