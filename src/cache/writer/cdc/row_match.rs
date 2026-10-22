@@ -25,6 +25,47 @@ pub(super) fn row_constraints_match(
         .all(|constraint| constraint_row_matches(constraint, table_metadata, row_data))
 }
 
+/// What is known of a deleted row (PGC-528). Under REPLICA IDENTITY DEFAULT
+/// the DELETE tuple carries only the PK, so its other columns read as NULL
+/// and can't decide a filter.
+#[derive(Clone, Copy)]
+pub(super) enum DeleteImage<'a> {
+    /// REPLICA IDENTITY FULL: the tuple is the whole old row.
+    Full(&'a [Option<ByteString>]),
+    /// Recovered by the old-image ladder: real values at `known` only.
+    Partial {
+        row: &'a [Option<ByteString>],
+        known: &'a [usize],
+    },
+    /// The lookup found no cache-table row with the key: nothing a Ready
+    /// query reads can have held it.
+    NotCached,
+    /// Nothing recovered.
+    Unknown,
+}
+
+/// Whether the deleted row may have met `filters`: a constraint on a column
+/// the image doesn't know counts as met, and an uncached row met none.
+pub(super) fn delete_filters_match(
+    filters: &[TableConstraint],
+    table_metadata: &TableMetadata,
+    image: DeleteImage<'_>,
+) -> bool {
+    match image {
+        DeleteImage::Full(row) => row_constraints_match(filters, table_metadata, row),
+        DeleteImage::Partial { row, known } => filters.iter().all(|constraint| {
+            let position = table_metadata
+                .columns
+                .get(constraint_column(constraint))
+                .map(|column_meta| column_meta.index());
+            !position.is_some_and(|position| known.contains(&position))
+                || constraint_row_matches(constraint, table_metadata, row)
+        }),
+        DeleteImage::NotCached => false,
+        DeleteImage::Unknown => true,
+    }
+}
+
 /// A constraint on a column the table or row doesn't carry is skipped.
 fn constraint_row_matches(
     constraint: &TableConstraint,
@@ -264,6 +305,75 @@ mod tests {
 
     fn name_int4(op: BinaryOp, value: i64) -> TableConstraint {
         cast("name", CastTarget::Int4, op, LiteralValue::Integer(value))
+    }
+
+    /// A deleted row is judged only on what is known of it: a full tuple on
+    /// every filter, a recovered one on its known columns, an uncached one
+    /// meets none, and nothing known meets all (PGC-528).
+    #[test]
+    fn test_delete_filters_match_by_image() {
+        let table = fixture_table();
+        let name_is_alice = TableConstraint::Comparison(
+            "name".into(),
+            BinaryOp::Equal,
+            LiteralValue::String("alice".into()),
+        );
+        let filters = [name_is_alice];
+        let alice = row(Some("alice"), None);
+        let bob = row(Some("bob"), None);
+        let pk_only = row(None, None);
+
+        assert!(delete_filters_match(
+            &filters,
+            &table,
+            DeleteImage::Full(&alice)
+        ));
+        assert!(!delete_filters_match(
+            &filters,
+            &table,
+            DeleteImage::Full(&bob)
+        ));
+        // A PK-only tuple read as full would wrongly fail the filter.
+        assert!(!delete_filters_match(
+            &filters,
+            &table,
+            DeleteImage::Full(&pk_only)
+        ));
+
+        let known_name: &[usize] = &[0, 1];
+        assert!(delete_filters_match(
+            &filters,
+            &table,
+            DeleteImage::Partial {
+                row: &alice,
+                known: known_name
+            }
+        ));
+        assert!(!delete_filters_match(
+            &filters,
+            &table,
+            DeleteImage::Partial {
+                row: &bob,
+                known: known_name
+            }
+        ));
+        let known_pk: &[usize] = &[0];
+        assert!(delete_filters_match(
+            &filters,
+            &table,
+            DeleteImage::Partial {
+                row: &pk_only,
+                known: known_pk
+            }
+        ));
+
+        assert!(!delete_filters_match(
+            &filters,
+            &table,
+            DeleteImage::NotCached
+        ));
+        assert!(delete_filters_match(&filters, &table, DeleteImage::Unknown));
+        assert!(!delete_filters_match(&[], &table, DeleteImage::NotCached));
     }
 
     #[test]

@@ -1156,3 +1156,27 @@ async fn test_limit_positional_sort_key_demotion_invalidates() -> Result<(), Err
     }
     Ok(())
 }
+
+/// A capped IN query whose subquery is filtered on a non-key column still
+/// sees a DELETE from the subquery's table shrink its window (PGC-528).
+#[tokio::test]
+async fn test_limit_filtered_subquery_delete_invalidates() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_population_cap_tables(&mut ctx).await?;
+    ctx.query(
+        "CREATE TABLE pf (id INTEGER PRIMARY KEY, flag INTEGER)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO pf SELECT g, 1 FROM generate_series(1, 10) g",
+        &[],
+    )
+    .await?;
+    ctx.cdc_decode_settle().await?;
+
+    let query = "SELECT id FROM pa WHERE x IN (SELECT id FROM pf WHERE flag = 1) \
+                 ORDER BY id LIMIT 2";
+    let m = query_warm(&mut ctx, query).await?;
+    origin_change_invalidates(&mut ctx, m, "DELETE FROM pf WHERE id = 1", query).await
+}

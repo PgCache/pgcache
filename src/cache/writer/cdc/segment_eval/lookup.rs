@@ -360,6 +360,12 @@ impl WriterCdc {
                 .filter(|r| r.wants_changes)
                 .map(|r| r.event_idx),
         );
+        batch.old_image_lookup_covered.extend(
+            batch_rows
+                .iter()
+                .filter(|r| r.wants_old_image)
+                .map(|r| r.event_idx),
+        );
         Ok(())
     }
 

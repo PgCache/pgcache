@@ -8,6 +8,7 @@ use std::time::Instant;
 use ecow::EcoString;
 use tracing::{error, instrument, trace};
 
+use super::row_match::DeleteImage;
 use super::segment_eval::BatchEvalView;
 use super::{
     CdcOperation, MembershipRow, RelationRow, RelationUpdate, RowEvent, WriterCdc,
@@ -146,11 +147,42 @@ fn update_invalidations_collect(
         key_data: Some(update.key_data),
         operation: CdcOperation::Upsert,
         row_changes,
+        delete_image: None,
     };
     let fp_list =
         update_queries_check_invalidate(core, update.relation_oid, &update_event, candidates);
     trace!("invalidation_count {}", fp_list.len());
     fp_list
+}
+
+/// What is known of a deleted row (PGC-528): the tuple itself under REPLICA
+/// IDENTITY FULL, else the old image the segment's ladder recovered, or the
+/// lookup's finding that no cache-table row had the key.
+fn delete_image<'a>(
+    core: &WriterCore,
+    relation_oid: Oid,
+    row_data: &'a [Option<ByteString>],
+    batch: Option<&BatchEvalView<'a>>,
+) -> DeleteImage<'a> {
+    let replica_identity_full = core
+        .cache
+        .tables
+        .get1(&relation_oid)
+        .is_some_and(|table| table.replica_identity_full);
+    if replica_identity_full {
+        return DeleteImage::Full(row_data);
+    }
+    match batch {
+        Some(view) => match view.old_image {
+            Some(row) => DeleteImage::Partial {
+                row,
+                known: view.old_image_known,
+            },
+            None if view.old_image_absent => DeleteImage::NotCached,
+            None => DeleteImage::Unknown,
+        },
+        None => DeleteImage::Unknown,
+    }
 }
 
 /// What the toast fallback does with one cached query over the relation.
@@ -376,6 +408,7 @@ impl WriterCdc {
             key_data: None,
             operation: CdcOperation::Upsert,
             row_changes: None,
+            delete_image: None,
         };
         let fp_list =
             update_queries_check_invalidate(core, relation_oid, &insert_event, &local_candidates);
@@ -687,6 +720,7 @@ impl WriterCdc {
             key_data: Some(update.key_data),
             operation: CdcOperation::Upsert,
             row_changes: None,
+            delete_image: None,
         };
         let mut pg_eval: Vec<&UpdateQuery> = Vec::new();
         for update_query in update_queries.iter() {
@@ -778,6 +812,7 @@ impl WriterCdc {
                 key_data: None,
                 operation: CdcOperation::Delete,
                 row_changes: None,
+                delete_image: Some(delete_image(core, relation_oid, row_data, batch.as_ref())),
             };
             let fp_list = update_queries_check_invalidate(
                 core,

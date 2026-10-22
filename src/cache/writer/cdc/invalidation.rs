@@ -5,7 +5,8 @@ use tracing::debug;
 
 use super::CdcOperation;
 use super::row_match::{
-    join_membership_unchanged, row_constraints_match, window_move_is_promotion,
+    DeleteImage, delete_filters_match, join_membership_unchanged, row_constraints_match,
+    window_move_is_promotion,
 };
 use crate::cache::CacheResult;
 use crate::cache::Generation;
@@ -32,6 +33,9 @@ pub(super) struct RowEvent<'a> {
     /// `Some` → row is cached (UPDATE main path); `None` → row not cached
     /// (INSERT, DELETE, or UPDATE of an uncached row).
     pub(super) row_changes: Option<&'a RowChanges>,
+    /// A DELETE's view of the removed row, which `row_data` (PK-only under
+    /// REPLICA IDENTITY DEFAULT) can't give; `None` for other operations.
+    pub(super) delete_image: Option<DeleteImage<'a>>,
 }
 
 /// Candidate fingerprints whose extracted constraints a CDC row could satisfy,
@@ -146,8 +150,13 @@ fn row_uncached_invalidates(
         // A capped query also invalidates on a shrink: a row leaving its top N
         // needs the next row, which was never loaded (ADR-060).
         UpdateQuerySource::Subquery(kind) => {
-            row_relevant(update_query, table_metadata, event)
-                && (update_query.has_limit || subquery_change_expands(kind, event.operation))
+            let relevant = match event.delete_image {
+                Some(image) => {
+                    delete_filters_match(&update_query.predicates.filters, table_metadata, image)
+                }
+                None => row_relevant(update_query, table_metadata, event),
+            };
+            relevant && (update_query.has_limit || subquery_change_expands(kind, event.operation))
         }
         // Terminal optional side of an outer join. Changes here only affect
         // NULL-padded columns — the preserved side already has the row. No
@@ -158,11 +167,20 @@ fn row_uncached_invalidates(
         // cascade to affect other tables' result set membership (e.g. a new
         // match may activate a downstream join path that was previously
         // NULL-padded). Invalidate if the row is relevant to this query.
-        UpdateQuerySource::OuterJoinOptional => row_constraints_match(
-            &update_query.predicates.filters,
-            table_metadata,
-            event.row_data,
-        ),
+        UpdateQuerySource::OuterJoinOptional => match event.delete_image {
+            // The WHERE that mentions an optional side can drop its attached
+            // rows from population (an anti-join's `IS NULL`), so an uncached
+            // row may still decide the result.
+            Some(DeleteImage::NotCached) => true,
+            Some(image) => {
+                delete_filters_match(&update_query.predicates.filters, table_metadata, image)
+            }
+            None => row_constraints_match(
+                &update_query.predicates.filters,
+                table_metadata,
+                event.row_data,
+            ),
+        },
     }
 }
 

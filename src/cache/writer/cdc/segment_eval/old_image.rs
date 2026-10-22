@@ -6,8 +6,8 @@ use std::collections::HashMap;
 
 use ecow::EcoString;
 
-use super::SegmentMembership;
 use super::lookup::LookupRow;
+use super::{OldImage, SegmentMembership};
 use crate::cache::writer::cdc::row_changes::table_has_reserved_columns;
 use crate::cache::writer::core::WriterCore;
 use crate::cache::writer::frame::{FrameRowEvent, OverlayEntry, ToastState};
@@ -137,21 +137,22 @@ pub(super) fn old_image_bool_normalize<'a>(meta: &ColumnMetadata, value: &'a str
     }
 }
 
-/// Expand sparse eval-index `(position, value)` pairs to a full-width row.
-/// Unfetched positions stay `None`, which probes as the `Unknown` wildcard —
-/// vacuous, since the probe only consults index columns, all of which are
-/// fetched.
+/// Expand sparse eval-index `(position, value)` pairs to a full-width image
+/// that knows those positions. Unfetched positions stay `None`, which probes
+/// as the `Unknown` wildcard.
 pub(super) fn old_image_expand(
     full_width: usize,
     values: &[(usize, Option<ByteString>)],
-) -> Vec<Option<ByteString>> {
+) -> OldImage {
     let mut row = vec![None; full_width];
+    let mut known = Vec::with_capacity(values.len());
     for (position, value) in values {
         if let Some(slot) = row.get_mut(*position) {
             *slot = value.clone();
+            known.push(*position);
         }
     }
-    row
+    OldImage { row, known }
 }
 
 /// The relation's fetch spec, computed on first use per segment. An untracked
@@ -191,7 +192,7 @@ fn pk_key(core: &WriterCore, relation_oid: Oid, row: &[Option<ByteString>]) -> O
 /// What the rung-1 overlay knows about a row's pre-event image.
 enum OverlayResolution {
     /// An earlier in-batch write left the old image.
-    Hit(Vec<Option<ByteString>>),
+    Hit(OldImage),
     /// Tombstoned: no valid old-image source → wildcard.
     Tombstone,
     /// Not in the overlay — a candidate for the rung-2 lookup.

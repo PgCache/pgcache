@@ -20,7 +20,7 @@ use std::io::Error;
 
 use crate::util::{
     TestContext, assert_cache_hit, assert_cache_miss, assert_proxy_rows_match_origin,
-    assert_row_at, query_warm,
+    assert_row_at, origin_change_applied_in_place, origin_change_invalidates, query_warm,
 };
 
 mod util;
@@ -1253,5 +1253,80 @@ async fn test_subquery_not_in_compared_column_update_applied_in_place() -> Resul
         assert_proxy_rows_match_origin(&mut ctx, query).await?;
         m = assert_cache_hit(&mut ctx, m).await?;
     }
+    Ok(())
+}
+
+// =============================================================================
+// DELETE on a filtered subquery's table (PGC-528)
+// =============================================================================
+
+/// `pa` rows 1..=9 with `x = id`; `pb` rows 1..=5 with `flag = 1` (the NOT IN
+/// subquery's rows) and 6..=8 with `flag = 0` (rows it never reads).
+async fn setup_flagged_exclusions(ctx: &mut TestContext) -> Result<(), Error> {
+    ctx.query("CREATE TABLE pa (id INTEGER PRIMARY KEY, x INTEGER)", &[])
+        .await?;
+    ctx.query(
+        "CREATE TABLE pb (id INTEGER PRIMARY KEY, flag INTEGER, day DATE)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO pa SELECT g, g FROM generate_series(1, 9) g",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO pb SELECT g, CASE WHEN g <= 5 THEN 1 ELSE 0 END, \
+         DATE '2024-01-01' + g FROM generate_series(1, 8) g",
+        &[],
+    )
+    .await?;
+    ctx.cdc_decode_settle().await
+}
+
+const NOT_IN_FLAGGED: &str =
+    "SELECT id FROM pa WHERE x NOT IN (SELECT id FROM pb WHERE flag = 1) ORDER BY id";
+
+/// A DELETE from a filtered NOT IN subquery's table grows the result, so it
+/// invalidates though the PK-only DELETE tuple carries no `flag` (PGC-528).
+#[tokio::test]
+async fn test_subquery_not_in_filtered_delete_invalidates() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_flagged_exclusions(&mut ctx).await?;
+    let m = query_warm(&mut ctx, NOT_IN_FLAGGED).await?;
+    origin_change_invalidates(&mut ctx, m, "DELETE FROM pb WHERE id = 3", NOT_IN_FLAGGED).await
+}
+
+/// Deleting a row nothing cached leaves the NOT IN query cached: no cache-table
+/// row had its key, so it was in no Ready query's subquery set (PGC-528).
+#[tokio::test]
+async fn test_subquery_not_in_uncached_row_delete_applied_in_place() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_flagged_exclusions(&mut ctx).await?;
+    let m = query_warm(&mut ctx, NOT_IN_FLAGGED).await?;
+    origin_change_applied_in_place(&mut ctx, m, "DELETE FROM pb WHERE id = 7", NOT_IN_FLAGGED)
+        .await?;
+    Ok(())
+}
+
+/// Deleting a row another query cached is judged on its recovered values:
+/// failing the subquery's filter, on an int or a date column, it leaves the
+/// NOT IN query cached (PGC-528, PGC-529).
+#[tokio::test]
+async fn test_subquery_not_in_cached_row_delete_judged_on_old_image() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_flagged_exclusions(&mut ctx).await?;
+    let by_day = "SELECT id FROM pa WHERE x NOT IN \
+                  (SELECT id FROM pb WHERE day <= '2024-01-06') ORDER BY id";
+    query_warm(&mut ctx, "SELECT id, day FROM pb WHERE flag = 0").await?;
+    query_warm(&mut ctx, by_day).await?;
+    let m = query_warm(&mut ctx, NOT_IN_FLAGGED).await?;
+    // Row 6 is cached (by the flag = 0 query) and fails both subqueries'
+    // filters: `flag` is 0 and its day is 2024-01-07.
+    let m =
+        origin_change_applied_in_place(&mut ctx, m, "DELETE FROM pb WHERE id = 6", NOT_IN_FLAGGED)
+            .await?;
+    assert_proxy_rows_match_origin(&mut ctx, by_day).await?;
+    assert_cache_hit(&mut ctx, m).await?;
     Ok(())
 }

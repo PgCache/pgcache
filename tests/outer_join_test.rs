@@ -1278,3 +1278,22 @@ async fn test_null_side_with_partner_origin_change_invalidates() -> Result<(), E
     )
     .await
 }
+
+/// An anti-join whose ON filters the optional side on a non-key column: a
+/// DELETE of an attached row exposes a preserved row, so it invalidates
+/// though the PK-only DELETE tuple carries no `flag`. The anti-join's WHERE
+/// keeps attached rows out of population, so even an uncached row can decide
+/// the result (PGC-528).
+#[tokio::test]
+async fn test_anti_join_filtered_optional_delete_invalidates() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_authors_bios(&mut ctx).await?;
+    ctx.query("ALTER TABLE bios ADD COLUMN flag INTEGER DEFAULT 1", &[])
+        .await?;
+    ctx.cdc_decode_settle().await?;
+
+    let query = "SELECT a.id FROM authors a LEFT JOIN bios b \
+                 ON b.author_id = a.id AND b.flag = 1 WHERE b.id IS NULL ORDER BY a.id";
+    let m = query_warm(&mut ctx, query).await?;
+    origin_change_invalidates(&mut ctx, m, "DELETE FROM bios WHERE id = 101", query).await
+}

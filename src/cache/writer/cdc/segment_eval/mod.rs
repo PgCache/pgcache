@@ -63,11 +63,21 @@ struct RelationBatch {
     row_change_covered: HashSet<usize>,
     /// Per covered update event: column → changed (`IS DISTINCT FROM`).
     row_changes: HashMap<usize, RowChanges>,
-    /// Per update/delete event: the recovered old image as a full-width row
-    /// (eval-index columns carry values, the rest `None` → `Unknown` in the
-    /// probe). Resolved from the rung-1 overlay or the batched rung-2 lookup;
-    /// absent = wildcard fallback (PGC-255).
-    old_images: HashMap<usize, Vec<Option<ByteString>>>,
+    /// Per update/delete event: the recovered old image (PGC-255), resolved
+    /// from the rung-1 overlay or the batched rung-2 lookup; absent =
+    /// wildcard fallback.
+    old_images: HashMap<usize, OldImage>,
+    /// Events whose rung-2 lookup ran. Covered without an image ⇒ no cache
+    /// table row had the key before the frame (PGC-528).
+    old_image_lookup_covered: HashSet<usize>,
+}
+
+/// A recovered pre-event row: full width, `known` the positions it carries
+/// real values for. Elsewhere `None` is unknown, which probes as the
+/// `Unknown` wildcard.
+pub(super) struct OldImage {
+    pub(super) row: Vec<Option<ByteString>>,
+    pub(super) known: Vec<usize>,
 }
 
 impl SegmentMembership {
@@ -87,12 +97,15 @@ impl SegmentMembership {
             .row_change_covered
             .contains(&event_idx)
             .then(|| batch.row_changes.get(&event_idx));
-        let old_image = batch.old_images.get(&event_idx).map(Vec::as_slice);
+        let old_image = batch.old_images.get(&event_idx);
+        let old_image_absent =
+            old_image.is_none() && batch.old_image_lookup_covered.contains(&event_idx);
         let present = [
             fresh_keys.is_some(),
             rest_keys.is_some(),
             row_change.is_some(),
             old_image.is_some(),
+            old_image_absent,
         ];
         if !present.contains(&true) {
             return None;
@@ -103,7 +116,9 @@ impl SegmentMembership {
             hits: &batch.hits,
             event_idx,
             row_change,
-            old_image,
+            old_image: old_image.map(|image| image.row.as_slice()),
+            old_image_known: old_image.map_or(&[], |image| image.known.as_slice()),
+            old_image_absent,
         })
     }
 
@@ -124,6 +139,10 @@ pub(super) struct BatchEvalView<'a> {
     /// The event's recovered old image, when the recovery ladder resolved one
     /// — `None` = use the wildcard probe (PGC-255).
     pub(super) old_image: Option<&'a [Option<ByteString>]>,
+    /// The positions `old_image` carries real values for.
+    pub(super) old_image_known: &'a [usize],
+    /// The rung-2 lookup ran and no cache-table row had the event's key.
+    pub(super) old_image_absent: bool,
 }
 
 impl BatchEvalView<'_> {
