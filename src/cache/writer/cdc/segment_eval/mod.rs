@@ -27,6 +27,24 @@ pub(super) struct PreparedEvalKey {
     update_query: UpdateQueryKey,
 }
 
+/// One segment's row events, with the frame index of its first: event
+/// `offset` of `events` is frame event `base_idx + offset`.
+#[derive(Clone, Copy)]
+pub(super) struct SegmentEvents<'a> {
+    pub(super) events: &'a [FrameRowEvent],
+    pub(super) base_idx: usize,
+}
+
+impl<'a> SegmentEvents<'a> {
+    /// Each event with its frame index.
+    fn indexed(self) -> impl Iterator<Item = (usize, &'a FrameRowEvent)> {
+        self.events
+            .iter()
+            .enumerate()
+            .map(move |(offset, event)| (self.base_idx + offset, event))
+    }
+}
+
 /// Batched PgEval membership + row-change results for one segment of frame
 /// row events (PGC-241). Built by `segment_membership_eval` /
 /// `segment_row_changes_eval`, consumed per event by the decide pass.
@@ -200,11 +218,10 @@ impl WriterCdc {
     pub(super) async fn segment_eval(
         &mut self,
         core: &mut WriterCore,
-        events: &[FrameRowEvent],
-        base_idx: usize,
+        segment: SegmentEvents<'_>,
     ) -> CacheResult<SegmentMembership> {
-        let mut membership = self.segment_membership_eval(core, events, base_idx).await?;
-        self.segment_row_changes_eval(core, events, base_idx, &mut membership)
+        let mut membership = self.segment_membership_eval(core, segment).await?;
+        self.segment_row_changes_eval(core, segment, &mut membership)
             .await?;
         Ok(membership)
     }

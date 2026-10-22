@@ -8,7 +8,7 @@ use ecow::EcoString;
 use tokio::time::sleep;
 use tracing::{error, info};
 
-use super::segment_eval::{BatchEvalView, SegmentMembership};
+use super::segment_eval::{BatchEvalView, SegmentEvents, SegmentMembership};
 use super::toast_repair::toasted_column_names;
 use super::{RelationRow, RelationUpdate, WriterCdc};
 use crate::cache::memo::SlotKey;
@@ -266,7 +266,11 @@ impl WriterCdc {
         if rows.is_empty() {
             return Ok(Some(SegmentMembership::default()));
         }
-        match self.segment_eval(core, rows, base).await {
+        let segment = SegmentEvents {
+            events: rows,
+            base_idx: base,
+        };
+        match self.segment_eval(core, segment).await {
             Ok(membership) => Ok(Some(membership)),
             Err(e) => {
                 self.frame_dml_result(core, Err(e))

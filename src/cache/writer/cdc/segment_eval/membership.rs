@@ -8,7 +8,7 @@ use tokio_postgres::types::ToSql;
 use tokio_postgres::{SimpleQueryMessage, Statement};
 use tracing::{error, warn};
 
-use super::{PreparedEvalKey, RelationBatch, SegmentMembership, chunk_arrays_build};
+use super::{PreparedEvalKey, RelationBatch, SegmentEvents, SegmentMembership, chunk_arrays_build};
 use crate::cache::update_query::{UpdateEvalStrategy, UpdateQueries, UpdateQuery, UpdateQueryKey};
 use crate::cache::writer::cdc::row_match::update_query_matches_locally;
 use crate::cache::writer::cdc::{PG_EVAL_CHUNK, PG_EVAL_ROW_CHUNK, WriterCdc};
@@ -53,17 +53,14 @@ fn event_membership_row(event: &FrameRowEvent) -> Option<(Oid, &[Option<ByteStri
 }
 
 /// Bucket the segment's membership-eval rows per relation.
-fn segment_rows_bucket(
-    events: &[FrameRowEvent],
-    base_idx: usize,
-) -> HashMap<Oid, Vec<EventRow<'_>>> {
+fn segment_rows_bucket(segment: SegmentEvents<'_>) -> HashMap<Oid, Vec<EventRow<'_>>> {
     let mut rows_by_relation: HashMap<Oid, Vec<EventRow<'_>>> = HashMap::new();
-    for (offset, event) in events.iter().enumerate() {
+    for (event_idx, event) in segment.indexed() {
         if let Some((relation_oid, row)) = event_membership_row(event) {
             rows_by_relation
                 .entry(relation_oid)
                 .or_default()
-                .push((base_idx + offset, row));
+                .push((event_idx, row));
         }
     }
     rows_by_relation
@@ -105,11 +102,10 @@ impl WriterCdc {
     pub(super) async fn segment_membership_eval(
         &mut self,
         core: &WriterCore,
-        events: &[FrameRowEvent],
-        base_idx: usize,
+        segment: SegmentEvents<'_>,
     ) -> CacheResult<SegmentMembership> {
         let mut membership = SegmentMembership::default();
-        for (relation_oid, rows) in segment_rows_bucket(events, base_idx) {
+        for (relation_oid, rows) in segment_rows_bucket(segment) {
             self.relation_membership_eval(core, relation_oid, rows, &mut membership)
                 .await?;
         }

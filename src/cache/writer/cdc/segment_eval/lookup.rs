@@ -15,14 +15,13 @@ use tracing::{error, warn};
 use super::old_image::{
     OldImagePrepass, RelationFetchSpec, old_image_bool_normalize, old_image_expand,
 };
-use super::{RelationBatch, SegmentMembership, chunk_arrays_build};
+use super::{RelationBatch, SegmentEvents, SegmentMembership, chunk_arrays_build};
 use crate::cache::update_query::{RowChanges, UpdateQueries};
 use crate::cache::writer::cdc::row_changes::{
     RowChangeProjection, relation_order_columns, row_change_column_fold,
 };
 use crate::cache::writer::cdc::{PG_EVAL_ROW_CHUNK, WriterCdc};
 use crate::cache::writer::core::WriterCore;
-use crate::cache::writer::frame::FrameRowEvent;
 use crate::cache::{CacheError, CacheResult, MapIntoReport};
 use crate::catalog::{ColumnMetadata, TableMetadata};
 use crate::pg::protocol::ByteString;
@@ -256,16 +255,7 @@ fn lookup_result_apply(
         };
         match name.strip_prefix(OLD_VALUE_ALIAS_PREFIX) {
             Some(column) if lookup_row.wants_old_image => {
-                if let Some(meta) = table_metadata.columns.get(column) {
-                    let value = row
-                        .text(idx)
-                        .map(|v| ByteString::from(old_image_bool_normalize(meta, v)));
-                    // A capped column's NULL may be an over-cap value: unknown,
-                    // not a known NULL (PGC-531).
-                    if value.is_some() || !old_value_capped(meta) {
-                        old_values.push((meta.index(), value));
-                    }
-                }
+                old_value_cell_fold(table_metadata, column, row.text(idx), &mut old_values);
             }
             Some(_) => {}
             // Reserved-prefix relations never enter the batch.
@@ -285,6 +275,23 @@ fn lookup_result_apply(
     }
 }
 
+/// Record one `o.<col>` cell as the column's old value. A capped column's
+/// NULL may be an over-cap value: unknown, not a known NULL (PGC-531).
+fn old_value_cell_fold(
+    table_metadata: &TableMetadata,
+    column: &str,
+    text: Option<&str>,
+    old_values: &mut Vec<(usize, Option<ByteString>)>,
+) {
+    let Some(meta) = table_metadata.columns.get(column) else {
+        return;
+    };
+    let value = text.map(|v| ByteString::from(old_image_bool_normalize(meta, v)));
+    if value.is_some() || !old_value_capped(meta) {
+        old_values.push((meta.index(), value));
+    }
+}
+
 impl WriterCdc {
     /// Batch the segment's row-change SELECTs (PGC-241 stage 3): per relation,
     /// every update event's `col IS DISTINCT FROM <new>` comparison runs in one
@@ -300,13 +307,12 @@ impl WriterCdc {
     pub(super) async fn segment_row_changes_eval(
         &mut self,
         core: &mut WriterCore,
-        events: &[FrameRowEvent],
-        base_idx: usize,
+        segment: SegmentEvents<'_>,
         membership: &mut SegmentMembership,
     ) -> CacheResult<()> {
         let mut prepass = OldImagePrepass::new(core, membership);
-        for (offset, event) in events.iter().enumerate() {
-            prepass.event_record(base_idx + offset, event);
+        for (event_idx, event) in segment.indexed() {
+            prepass.event_record(event_idx, event);
         }
         let (specs, lookups) = prepass.into_parts();
 
