@@ -5,7 +5,7 @@ use ecow::EcoString;
 use postgres_protocol::escape;
 use rootcause::Report;
 use tokio_postgres::Row;
-use tokio_postgres::types::Type;
+use tokio_postgres::types::{ToSql, Type};
 use tracing::{debug, error, info, instrument, warn};
 
 use super::core::WriterCore;
@@ -114,78 +114,33 @@ impl WriterCore {
         table: &str,
     ) -> CacheResult<TableMetadata> {
         let rows = self.query_table_columns_get(schema, table).await?;
-
-        let mut primary_key_columns: Vec<EcoString> = Vec::new();
-        let mut columns: Vec<ColumnMetadata> = Vec::with_capacity(rows.len());
-        let mut relation_oid: Option<Oid> = None;
-        let mut schema: Option<&str> = schema;
-
-        for row in &rows {
-            if relation_oid.is_none() {
-                relation_oid = Some(row.get("relation_oid"));
-            }
-
-            if schema.is_none() {
-                schema = Some(row.get("table_schema"));
-            }
-
-            let type_oid: TypeOid = row.get("type_oid");
-            let type_info = self.column_type_resolve(type_oid).await?;
-            let pg_position: i64 = row.get("position");
-            let column_name: String = row.get("column_name");
-            let position = ColumnPosition::from_attnum(pg_position).ok_or_else(|| {
-                Report::from(CacheError::ColumnPositionOutOfRange {
-                    position: pg_position,
-                    column_name: column_name.clone(),
-                    table_name: table.to_owned(),
-                })
-            })?;
-
-            let column = ColumnMetadata {
-                name: column_name.into(),
-                position,
-                type_oid,
-                data_type: type_info.data_type,
-                type_name: type_info.type_name,
-                cache_type_name: type_info.cache_type_name,
-                is_primary_key: row.get("is_primary_key"),
-            };
-
-            if column.is_primary_key {
-                primary_key_columns.push(column.name.clone());
-            }
-
-            columns.push(column);
-        }
-
-        let Some(relation_oid) = relation_oid else {
+        let Some(first) = rows.first() else {
             return Err(CacheError::UnknownTable {
-                oid: relation_oid,
+                oid: None,
                 name: None,
             }
             .into());
         };
-
-        let Some(schema) = schema else {
-            return Err(CacheError::UnknownSchema.into());
+        let relation_oid: Oid = first.get("relation_oid");
+        let schema: &str = match schema {
+            Some(schema) => schema,
+            None => first.get("table_schema"),
         };
+
+        let mut columns: Vec<ColumnMetadata> = Vec::with_capacity(rows.len());
+        for row in &rows {
+            columns.push(self.column_metadata_build(row, table).await?);
+        }
+        let mut primary_key_columns = primary_key_columns_of(&columns);
 
         let indexes = self.query_table_indexes_get(relation_oid).await?;
         let identity = self.query_replica_identity_get(relation_oid).await?;
-        let replica_identity_full = identity == ReplicaIdentity::Full;
-        // A CDC key tuple carries only the replica identity's columns, so under
-        // USING INDEX the cache keys on that index, unique and NOT NULL by rule
-        // (PGC-531).
-        if identity == ReplicaIdentity::Index {
-            let key = self
-                .query_replica_identity_index_columns_get(relation_oid)
-                .await?;
-            if !key.is_empty() {
-                for column in &mut columns {
-                    column.is_primary_key = key.contains(&column.name);
-                }
-                primary_key_columns = key;
-            }
+        if let Some(key) = self
+            .replica_identity_key_get(identity, relation_oid)
+            .await?
+        {
+            key_columns_mark(&mut columns, &key);
+            primary_key_columns = key;
         }
         let partitions = self.query_table_partitions_get(relation_oid).await?;
         let ancestors = self.query_table_ancestors_get(relation_oid).await?;
@@ -195,8 +150,8 @@ impl WriterCore {
             .remove(&relation_oid)
             .unwrap_or_default();
 
-        let table = TableMetadata {
-            replica_identity_full,
+        Ok(TableMetadata {
+            replica_identity_full: identity == ReplicaIdentity::Full,
             name: table.into(),
             schema: schema.into(),
             relation_oid,
@@ -206,9 +161,49 @@ impl WriterCore {
             partitions,
             ancestors,
             write_aliases,
-        };
+        })
+    }
 
-        Ok(table)
+    /// One column's metadata from a [`Self::query_table_columns_get`] row.
+    async fn column_metadata_build(&self, row: &Row, table: &str) -> CacheResult<ColumnMetadata> {
+        let type_oid: TypeOid = row.get("type_oid");
+        let type_info = self.column_type_resolve(type_oid).await?;
+        let pg_position: i64 = row.get("position");
+        let column_name: String = row.get("column_name");
+        let position = ColumnPosition::from_attnum(pg_position).ok_or_else(|| {
+            Report::from(CacheError::ColumnPositionOutOfRange {
+                position: pg_position,
+                column_name: column_name.clone(),
+                table_name: table.to_owned(),
+            })
+        })?;
+        Ok(ColumnMetadata {
+            name: column_name.into(),
+            position,
+            type_oid,
+            data_type: type_info.data_type,
+            type_name: type_info.type_name,
+            cache_type_name: type_info.cache_type_name,
+            is_primary_key: row.get("is_primary_key"),
+        })
+    }
+
+    /// The key the cache keys on under REPLICA IDENTITY USING INDEX: a CDC
+    /// key tuple carries only the identity's columns, unique and NOT NULL by
+    /// rule (PGC-531). `None` under any other identity, or an index the
+    /// catalog no longer has.
+    async fn replica_identity_key_get(
+        &self,
+        identity: ReplicaIdentity,
+        relation_oid: Oid,
+    ) -> CacheResult<Option<Vec<EcoString>>> {
+        if identity != ReplicaIdentity::Index {
+            return Ok(None);
+        }
+        let key = self
+            .query_key_columns_get(KeyColumns::ReplicaIdentityIndex, relation_oid)
+            .await?;
+        Ok((!key.is_empty()).then_some(key))
     }
 
     #[instrument(skip_all)]
@@ -217,74 +212,19 @@ impl WriterCore {
         schema: Option<&str>,
         table: &str,
     ) -> CacheResult<Vec<Row>> {
-        let rows = if let Some(schema) = schema {
-            let sql = r"
-                SELECT
-                    c.oid AS relation_oid,
-                    n.nspname AS table_schema,
-                    c.relname AS table_name,
-                    a.attname AS column_name,
-                    RANK() OVER (order by a.attnum) AS position,
-                    a.atttypid AS type_oid,
-                    pg_catalog.format_type(a.atttypid, a.atttypmod) as type_name,
-                    a.attnum = any(pgc.conkey) as is_primary_key
-                FROM pg_class c
-                JOIN pg_namespace n ON n.oid = c.relnamespace
-                JOIN pg_attribute a ON a.attrelid = c.oid
-                JOIN pg_type t ON t.oid = a.atttypid
-                JOIN pg_constraint pgc ON pgc.conrelid = c.oid
-                WHERE c.relname = $1
-                AND n.nspname = $2
-                AND a.attnum > 0
-                AND pgc.contype = 'p'
-                AND NOT a.attisdropped
-                ORDER BY a.attnum;
-            ";
-
-            self.db_origin
-                .query(sql, &[&table, &schema])
-                .await
-                .map_into_report::<CacheError>()?
-        } else {
-            let sql = r"
-                SELECT
-                    c.oid AS relation_oid,
-                    n.nspname AS table_schema,
-                    c.relname AS table_name,
-                    a.attname AS column_name,
-                    RANK() OVER (order by a.attnum) AS position,
-                    a.atttypid AS type_oid,
-                    pg_catalog.format_type(a.atttypid, a.atttypmod) as type_name,
-                    a.attnum = any(pgc.conkey) as is_primary_key
-                FROM pg_class c
-                JOIN pg_namespace n ON n.oid = c.relnamespace
-                JOIN pg_attribute a ON a.attrelid = c.oid
-                JOIN pg_type t ON t.oid = a.atttypid
-                JOIN pg_constraint pgc ON pgc.conrelid = c.oid
-                WHERE c.relname = $1
-                AND c.oid = (
-                    SELECT c2.oid
-                    FROM pg_class c2
-                    JOIN pg_namespace n2 ON n2.oid = c2.relnamespace
-                    WHERE c2.relname = $1
-                    AND c2.relkind IN ('r', 'p')
-                    AND n2.nspname = any(current_schemas(false))
-                    ORDER BY array_position(current_schemas(false), n2.nspname)
-                    LIMIT 1
-                )
-                AND a.attnum > 0
-                AND pgc.contype = 'p'
-                AND NOT a.attisdropped
-                ORDER BY a.attnum;
-            ";
-
-            self.db_origin
-                .query(sql, &[&table])
-                .await
-                .map_into_report::<CacheError>()?
+        let scope = match schema {
+            Some(_) => TABLE_COLUMNS_NAMED_SCHEMA,
+            None => TABLE_COLUMNS_SEARCH_PATH,
         };
-
-        Ok(rows)
+        let sql = format!("{TABLE_COLUMNS_SELECT}{scope}{TABLE_COLUMNS_TAIL}");
+        let params: Vec<&(dyn ToSql + Sync)> = match &schema {
+            Some(schema) => vec![&table, schema],
+            None => vec![&table],
+        };
+        self.db_origin
+            .query(&sql, &params)
+            .await
+            .map_into_report::<CacheError>()
     }
 
     /// Find one child partition of a partitioned table, if any.
@@ -308,44 +248,32 @@ impl WriterCore {
     }
 
     /// Every descendant partition of the relation, in no particular order.
-    #[instrument(skip_all)]
     pub(super) async fn query_table_partitions_get(
         &self,
         relation_oid: Oid,
     ) -> CacheResult<Vec<Oid>> {
-        let sql = r"
-            WITH RECURSIVE descendants(oid) AS (
-                SELECT inhrelid FROM pg_inherits WHERE inhparent = $1
-                UNION
-                SELECT i.inhrelid FROM pg_inherits i JOIN descendants d ON i.inhparent = d.oid
-            )
-            SELECT oid::oid FROM descendants
-        ";
-        let rows = self
-            .db_origin
-            .query(sql, &[&relation_oid])
+        self.query_inherits_closure_get(InheritsDirection::Descendants, relation_oid)
             .await
-            .map_into_report::<CacheError>()?;
-        Ok(rows.iter().map(|row| row.get::<_, Oid>(0)).collect())
     }
 
     /// Every ancestor of the relation, in no particular order.
-    #[instrument(skip_all)]
     pub(super) async fn query_table_ancestors_get(
         &self,
         relation_oid: Oid,
     ) -> CacheResult<Vec<Oid>> {
-        let sql = r"
-            WITH RECURSIVE ancestors(oid) AS (
-                SELECT inhparent FROM pg_inherits WHERE inhrelid = $1
-                UNION
-                SELECT i.inhparent FROM pg_inherits i JOIN ancestors a ON i.inhrelid = a.oid
-            )
-            SELECT oid::oid FROM ancestors
-        ";
+        self.query_inherits_closure_get(InheritsDirection::Ancestors, relation_oid)
+            .await
+    }
+
+    #[instrument(skip_all)]
+    async fn query_inherits_closure_get(
+        &self,
+        direction: InheritsDirection,
+        relation_oid: Oid,
+    ) -> CacheResult<Vec<Oid>> {
         let rows = self
             .db_origin
-            .query(sql, &[&relation_oid])
+            .query(direction.closure_sql(), &[&relation_oid])
             .await
             .map_into_report::<CacheError>()?;
         Ok(rows.iter().map(|row| row.get::<_, Oid>(0)).collect())
@@ -451,7 +379,7 @@ impl WriterCore {
             return Ok(());
         }
         let key = match self
-            .query_table_primary_key_get(metadata.relation_oid)
+            .query_key_columns_get(KeyColumns::PrimaryKey, metadata.relation_oid)
             .await
         {
             Ok(key) => key,
@@ -484,43 +412,15 @@ impl WriterCore {
         Ok(())
     }
 
-    /// The relation's primary-key columns in column order, as registration
-    /// reads them; empty without a primary key.
-    async fn query_table_primary_key_get(&self, relation_oid: Oid) -> CacheResult<Vec<EcoString>> {
-        self.query_column_names_get(
-            "SELECT a.attname FROM pg_constraint pgc \
-             JOIN pg_attribute a ON a.attrelid = pgc.conrelid AND a.attnum = any(pgc.conkey) \
-             WHERE pgc.conrelid = $1 AND pgc.contype = 'p' AND NOT a.attisdropped \
-             ORDER BY a.attnum",
-            relation_oid,
-        )
-        .await
-    }
-
-    /// The replica identity index's columns in column order; empty when the
-    /// relation has none.
-    async fn query_replica_identity_index_columns_get(
+    /// A key's columns in column order; empty when the relation has none.
+    async fn query_key_columns_get(
         &self,
-        relation_oid: Oid,
-    ) -> CacheResult<Vec<EcoString>> {
-        self.query_column_names_get(
-            "SELECT a.attname FROM pg_index i \
-             JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = any(i.indkey) \
-             WHERE i.indrelid = $1 AND i.indisreplident AND NOT a.attisdropped \
-             ORDER BY a.attnum",
-            relation_oid,
-        )
-        .await
-    }
-
-    async fn query_column_names_get(
-        &self,
-        sql: &str,
+        key: KeyColumns,
         relation_oid: Oid,
     ) -> CacheResult<Vec<EcoString>> {
         let rows = self
             .db_origin
-            .query(sql, &[&relation_oid])
+            .query(key.columns_sql(), &[&relation_oid])
             .await
             .map_into_report::<CacheError>()?;
         rows.iter()
@@ -662,48 +562,27 @@ impl WriterCore {
         &self,
         table_metadata: &TableMetadata,
     ) -> CacheResult<()> {
+        let ddl = cache_table_ddl_build(table_metadata);
+        for sql in [&ddl.create_schema, &ddl.drop_table, &ddl.create_table] {
+            self.db_cache
+                .execute(sql, &[])
+                .await
+                .map_into_report::<CacheError>()?;
+        }
+        self.cache_indexes_create(table_metadata).await;
+        self.db_cache
+            .execute(&ddl.enable_tracking, &[])
+            .await
+            .map_into_report::<CacheError>()?;
+        Ok(())
+    }
+
+    /// Best-effort: an index is a performance optimization, not a
+    /// correctness requirement. An expression index may reference a function
+    /// absent from the cache DB; let it fail without aborting table caching.
+    async fn cache_indexes_create(&self, table_metadata: &TableMetadata) {
         let schema = escape::escape_identifier(&table_metadata.schema);
         let table = escape::escape_identifier(&table_metadata.name);
-
-        let column_defs: Vec<String> = table_metadata
-            .columns
-            .iter()
-            .map(|c| {
-                format!(
-                    "    {} {}",
-                    escape::escape_identifier(&c.name),
-                    c.cache_type_name
-                )
-            })
-            .collect();
-        let column_defs = column_defs.join(",\n");
-
-        let primary_key = table_metadata
-            .primary_key_columns
-            .iter()
-            .map(|c| escape::escape_identifier(c))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let create_schema_sql = format!("CREATE SCHEMA IF NOT EXISTS {schema}");
-        let drop_sql = format!("DROP TABLE IF EXISTS {schema}.{table}");
-        let create_sql = format!(
-            "CREATE UNLOGGED TABLE {schema}.{table} (\n{column_defs},\n\tPRIMARY KEY({primary_key})\n)"
-        );
-
-        self.db_cache
-            .execute(&create_schema_sql, &[])
-            .await
-            .map_into_report::<CacheError>()?;
-        self.db_cache
-            .execute(&drop_sql, &[])
-            .await
-            .map_into_report::<CacheError>()?;
-        self.db_cache
-            .execute(&create_sql, &[])
-            .await
-            .map_into_report::<CacheError>()?;
-
         for index in &table_metadata.indexes {
             let Some(index_sql) = index_sql_retarget(
                 &index.definition,
@@ -717,10 +596,6 @@ impl WriterCore {
                 );
                 continue;
             };
-            // Index creation is best-effort: an index is a performance
-            // optimization, not a correctness requirement. An expression index
-            // may reference a function absent from the cache DB; let it fail
-            // without aborting table caching.
             if let Err(e) = self
                 .db_cache
                 .execute(&index_sql, &[])
@@ -734,18 +609,6 @@ impl WriterCore {
                 );
             }
         }
-
-        // Enable generation tracking triggers on the table
-        let enable_tracking_sql = format!(
-            "SELECT pgcache_enable_tracking({}::regclass::oid)",
-            escape::escape_literal(&format!("{schema}.{table}"))
-        );
-        self.db_cache
-            .execute(&enable_tracking_sql, &[])
-            .await
-            .map_into_report::<CacheError>()?;
-
-        Ok(())
     }
 
     /// Drop the source-row cache tables for `relation_oids` and remove their
@@ -965,6 +828,171 @@ enum ReplicaIdentity {
     Nothing,
 }
 
+/// The column projection every table-metadata read starts from; a scope
+/// clause and [`TABLE_COLUMNS_TAIL`] complete it.
+const TABLE_COLUMNS_SELECT: &str = r"
+    SELECT
+        c.oid AS relation_oid,
+        n.nspname AS table_schema,
+        c.relname AS table_name,
+        a.attname AS column_name,
+        RANK() OVER (order by a.attnum) AS position,
+        a.atttypid AS type_oid,
+        pg_catalog.format_type(a.atttypid, a.atttypmod) as type_name,
+        a.attnum = any(pgc.conkey) as is_primary_key
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_attribute a ON a.attrelid = c.oid
+    JOIN pg_type t ON t.oid = a.atttypid
+    JOIN pg_constraint pgc ON pgc.conrelid = c.oid
+    WHERE c.relname = $1
+    AND ";
+
+/// The table in the schema given as `$2`.
+const TABLE_COLUMNS_NAMED_SCHEMA: &str = "n.nspname = $2";
+
+/// The first table of that name along the session's search path.
+const TABLE_COLUMNS_SEARCH_PATH: &str = r"c.oid = (
+        SELECT c2.oid
+        FROM pg_class c2
+        JOIN pg_namespace n2 ON n2.oid = c2.relnamespace
+        WHERE c2.relname = $1
+        AND c2.relkind IN ('r', 'p')
+        AND n2.nspname = any(current_schemas(false))
+        ORDER BY array_position(current_schemas(false), n2.nspname)
+        LIMIT 1
+    )";
+
+const TABLE_COLUMNS_TAIL: &str = r"
+    AND a.attnum > 0
+    AND pgc.contype = 'p'
+    AND NOT a.attisdropped
+    ORDER BY a.attnum";
+
+/// A direction through `pg_inherits`.
+#[derive(Clone, Copy)]
+enum InheritsDirection {
+    Descendants,
+    Ancestors,
+}
+
+impl InheritsDirection {
+    /// The transitive closure of `$1` in this direction, one oid per row.
+    fn closure_sql(self) -> &'static str {
+        match self {
+            Self::Descendants => {
+                r"
+                WITH RECURSIVE descendants(oid) AS (
+                    SELECT inhrelid FROM pg_inherits WHERE inhparent = $1
+                    UNION
+                    SELECT i.inhrelid FROM pg_inherits i JOIN descendants d ON i.inhparent = d.oid
+                )
+                SELECT oid::oid FROM descendants
+                "
+            }
+            Self::Ancestors => {
+                r"
+                WITH RECURSIVE ancestors(oid) AS (
+                    SELECT inhparent FROM pg_inherits WHERE inhrelid = $1
+                    UNION
+                    SELECT i.inhparent FROM pg_inherits i JOIN ancestors a ON i.inhrelid = a.oid
+                )
+                SELECT oid::oid FROM ancestors
+                "
+            }
+        }
+    }
+}
+
+/// A key of relation `$1` whose column names the cache keys on.
+#[derive(Clone, Copy)]
+enum KeyColumns {
+    /// The primary key's columns, as registration reads them.
+    PrimaryKey,
+    /// The replica identity index's columns.
+    ReplicaIdentityIndex,
+}
+
+impl KeyColumns {
+    /// The key's column names in column order, one per row.
+    fn columns_sql(self) -> &'static str {
+        match self {
+            Self::PrimaryKey => {
+                "SELECT a.attname FROM pg_constraint pgc \
+                 JOIN pg_attribute a ON a.attrelid = pgc.conrelid AND a.attnum = any(pgc.conkey) \
+                 WHERE pgc.conrelid = $1 AND pgc.contype = 'p' AND NOT a.attisdropped \
+                 ORDER BY a.attnum"
+            }
+            Self::ReplicaIdentityIndex => {
+                "SELECT a.attname FROM pg_index i \
+                 JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = any(i.indkey) \
+                 WHERE i.indrelid = $1 AND i.indisreplident AND NOT a.attisdropped \
+                 ORDER BY a.attnum"
+            }
+        }
+    }
+}
+
+/// The names of the columns marked primary key, in column order.
+fn primary_key_columns_of(columns: &[ColumnMetadata]) -> Vec<EcoString> {
+    columns
+        .iter()
+        .filter(|column| column.is_primary_key)
+        .map(|column| column.name.clone())
+        .collect()
+}
+
+/// Marks exactly the columns in `key` as the primary key.
+fn key_columns_mark(columns: &mut [ColumnMetadata], key: &[EcoString]) {
+    for column in columns {
+        column.is_primary_key = key.contains(&column.name);
+    }
+}
+
+/// The statements that create a source-row cache table: schema, drop of a
+/// previous copy, the unlogged table itself, and the generation-tracking
+/// trigger enable that runs once its indexes are in place.
+struct CacheTableDdl {
+    create_schema: String,
+    drop_table: String,
+    create_table: String,
+    enable_tracking: String,
+}
+
+fn cache_table_ddl_build(table_metadata: &TableMetadata) -> CacheTableDdl {
+    let schema = escape::escape_identifier(&table_metadata.schema);
+    let table = escape::escape_identifier(&table_metadata.name);
+    let column_defs: Vec<String> = table_metadata
+        .columns
+        .iter()
+        .map(|c| {
+            format!(
+                "    {} {}",
+                escape::escape_identifier(&c.name),
+                c.cache_type_name
+            )
+        })
+        .collect();
+    let column_defs = column_defs.join(",\n");
+    let primary_key = table_metadata
+        .primary_key_columns
+        .iter()
+        .map(|c| escape::escape_identifier(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    CacheTableDdl {
+        create_schema: format!("CREATE SCHEMA IF NOT EXISTS {schema}"),
+        drop_table: format!("DROP TABLE IF EXISTS {schema}.{table}"),
+        create_table: format!(
+            "CREATE UNLOGGED TABLE {schema}.{table} (\n{column_defs},\n\tPRIMARY KEY({primary_key})\n)"
+        ),
+        enable_tracking: format!(
+            "SELECT pgcache_enable_tracking({}::regclass::oid)",
+            escape::escape_literal(&format!("{schema}.{table}"))
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1005,5 +1033,31 @@ mod tests {
     #[test]
     fn test_index_sql_retarget_no_using_returns_none() {
         assert!(index_sql_retarget("not an index def", false, "public", "posts").is_none());
+    }
+
+    #[test]
+    fn test_cache_table_ddl_build_quotes_and_keys() {
+        let column = |name: &str, is_primary_key: bool| ColumnMetadata {
+            name: name.into(),
+            position: ColumnPosition::from_raw(1),
+            type_oid: TypeOid::from_raw(23),
+            data_type: Type::INT4,
+            type_name: "int4".into(),
+            cache_type_name: "int4".into(),
+            is_primary_key,
+        };
+        let metadata =
+            TableMetadata::for_test("Posts", 1, [column("id", true), column("order", false)]);
+        let ddl = cache_table_ddl_build(&metadata);
+        assert_eq!(ddl.create_schema, "CREATE SCHEMA IF NOT EXISTS \"public\"");
+        assert_eq!(ddl.drop_table, "DROP TABLE IF EXISTS \"public\".\"Posts\"");
+        assert_eq!(
+            ddl.create_table,
+            "CREATE UNLOGGED TABLE \"public\".\"Posts\" (\n    \"id\" int4,\n    \"order\" int4,\n\tPRIMARY KEY(\"id\")\n)"
+        );
+        assert_eq!(
+            ddl.enable_tracking,
+            "SELECT pgcache_enable_tracking('\"public\".\"Posts\"'::regclass::oid)"
+        );
     }
 }
