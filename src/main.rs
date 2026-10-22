@@ -30,9 +30,24 @@ use pgcache_lib::tracing_utils::SimpeFormatter;
 #[cfg(not(feature = "console"))]
 const LOG_BUFFERED_LINES: usize = 4096;
 
-#[cfg(not(any(feature = "dhat-heap", feature = "system-allocator", feature = "dial9")))]
+#[cfg(not(any(
+    feature = "dhat-heap",
+    feature = "system-allocator",
+    feature = "dial9",
+    feature = "hotpath-alloc"
+)))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+// hotpath counts allocations only through its own wrapper around the real
+// allocator; nothing else hooks the global allocator.
+#[cfg(all(
+    feature = "hotpath-alloc",
+    not(any(feature = "dhat-heap", feature = "system-allocator", feature = "dial9"))
+))]
+#[global_allocator]
+static GLOBAL: hotpath::CountingAllocator<mimalloc::MiMalloc> =
+    hotpath::CountingAllocator::with(mimalloc::MiMalloc);
 
 #[cfg(all(
     feature = "dial9",
