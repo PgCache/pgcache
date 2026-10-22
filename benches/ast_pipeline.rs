@@ -557,6 +557,16 @@ fn products(shape: &Shape, env: &Environment) -> Products {
     }
 }
 
+/// A named stage: `run`'s product is consumed by `black_box`.
+fn stage<'a, T>(name: &'a str, run: impl Fn() -> T + 'a) -> Stage<'a> {
+    (
+        name,
+        Box::new(move || {
+            let _ = black_box(run());
+        }),
+    )
+}
+
 fn timed_stages<'a>(shape: &'a Shape, made: &'a Products, env: &'a Environment) -> Vec<Stage<'a>> {
     let Products {
         tree,
@@ -565,95 +575,32 @@ fn timed_stages<'a>(shape: &'a Shape, made: &'a Products, env: &'a Environment) 
         predicate,
         row,
     } = made;
-    let mut stages: Vec<Stage<'a>> = vec![
-        (
-            "convert",
-            Box::new(|| {
-                black_box(parse(&shape.sql));
-            }),
-        ),
-        (
-            "session_key",
-            Box::new(|| {
-                black_box(query_tree_session_key(
-                    tree,
-                    &env.search_path,
-                    &env.settings,
-                ));
-            }),
-        ),
-        (
-            "resolve",
-            Box::new(|| {
-                black_box(resolve_bound(tree, &env.catalog));
-            }),
-        ),
-        (
-            "bound_clone",
-            Box::new(|| {
-                black_box(bound.clone());
-            }),
-        ),
-        (
-            "canonicalise",
-            Box::new(|| {
-                black_box(canonicalise(resolved, &env.settings));
-            }),
-        ),
-        (
-            "pushdown",
-            Box::new(|| {
-                black_box(query_predicate_pushdown(bound));
-            }),
-        ),
-        (
-            "decorrelate",
-            Box::new(|| {
-                let _ = black_box(query_decorrelate(bound, &env.aggregates));
-            }),
-        ),
-        (
-            "fingerprint",
-            Box::new(|| {
-                black_box(bound.fingerprint());
-            }),
-        ),
-        (
-            "render",
-            Box::new(|| {
-                black_box(bound.sql());
-            }),
-        ),
-        (
-            "shape",
-            Box::new(|| {
-                black_box(bound.shape());
-            }),
-        ),
-        (
-            "predicate_compile",
-            Box::new(|| {
-                black_box(predicate_compile(bound, shape.predicate_table));
-            }),
-        ),
-        (
-            "end_to_end",
-            Box::new(|| {
-                let tree = parse(&shape.sql);
-                let key = query_tree_session_key(&tree, &env.search_path, &env.settings);
-                let resolved = resolve_bound(&tree, &env.catalog);
-                let bound = canonicalise(&resolved, &env.settings);
-                black_box((key, bound.fingerprint(), bound.sql()));
-            }),
-        ),
+    let mut stages = vec![
+        stage("convert", || parse(&shape.sql)),
+        stage("session_key", || {
+            query_tree_session_key(tree, &env.search_path, &env.settings)
+        }),
+        stage("resolve", || resolve_bound(tree, &env.catalog)),
+        stage("bound_clone", || bound.clone()),
+        stage("canonicalise", || canonicalise(resolved, &env.settings)),
+        stage("pushdown", || query_predicate_pushdown(bound)),
+        stage("decorrelate", || query_decorrelate(bound, &env.aggregates)),
+        stage("fingerprint", || bound.fingerprint()),
+        stage("render", || bound.sql()),
+        stage("shape", || bound.shape()),
+        stage("predicate_compile", || {
+            predicate_compile(bound, shape.predicate_table)
+        }),
+        stage("end_to_end", || {
+            let tree = parse(&shape.sql);
+            let key = query_tree_session_key(&tree, &env.search_path, &env.settings);
+            let resolved = resolve_bound(&tree, &env.catalog);
+            let bound = canonicalise(&resolved, &env.settings);
+            (key, bound.fingerprint(), bound.sql())
+        }),
     ];
     if let Some(predicate) = predicate {
-        stages.push((
-            "predicate_eval",
-            Box::new(|| {
-                black_box(predicate.eval(row));
-            }),
-        ));
+        stages.push(stage("predicate_eval", || predicate.eval(row)));
     }
     stages
 }
