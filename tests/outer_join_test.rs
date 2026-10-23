@@ -1493,8 +1493,9 @@ async fn test_left_join_on_preserved_null_test_update_invalidates() -> Result<()
     .await
 }
 
-/// In an inner join the ON null test filters as a WHERE would: a soft-deleted
-/// refund never joins, and the result follows origin after the insert.
+/// In an inner join the ON null test filters as a WHERE would: a refund
+/// inserted already soft-deleted can never join, so it applies in place,
+/// while a live one can grow the result and invalidates (PGC-533).
 #[tokio::test]
 async fn test_inner_join_on_null_test_filters_like_where() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
@@ -1504,17 +1505,111 @@ async fn test_inner_join_on_null_test_filters_like_where() -> Result<(), Error> 
                  ON r.order_id = o.id AND r.deleted_at IS NULL \
                  WHERE o.tenant_id = 1 ORDER BY o.id, r.id";
     let m = query_warm(&mut ctx, query).await?;
-    origin_change_invalidates(
+    let m = origin_change_applied_in_place(
         &mut ctx,
         m,
         "INSERT INTO sd_refunds VALUES (13, 2, 11, '2026-01-03')",
         query,
     )
     .await?;
-
-    let (proxied, origin) = ctx.proxy_and_origin_rows(query).await?;
+    let (_, origin) = ctx.proxy_and_origin_rows(query).await?;
     assert_eq!(origin.len(), 1, "only the live refund joins");
+    let m = assert_cache_hit(&mut ctx, m).await?;
+
+    origin_change_invalidates(
+        &mut ctx,
+        m,
+        "INSERT INTO sd_refunds VALUES (14, 2, 12, NULL)",
+        query,
+    )
+    .await?;
+    let (proxied, origin) = ctx.proxy_and_origin_rows(query).await?;
+    assert_eq!(origin.len(), 2, "the live refund joins");
+    assert_eq!(proxied, origin, "result after live insert");
+    Ok(())
+}
+
+/// `WHERE r.deleted_at IS NOT NULL` rejects the NULL padding, so the LEFT
+/// JOIN is maintained as an inner join: a live refund never matches and
+/// applies in place, un-deleting one shrinks the result in place, and a
+/// soft-deleted insert grows it and invalidates (PGC-533).
+#[tokio::test]
+async fn test_left_join_where_not_null_maintained_as_inner() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_orders_refunds(&mut ctx).await?;
+
+    let query = "SELECT o.id, r.id AS refund FROM sd_orders o LEFT JOIN sd_refunds r \
+                 ON r.order_id = o.id \
+                 WHERE r.deleted_at IS NOT NULL AND o.tenant_id = 1 ORDER BY o.id, r.id";
+    let m = query_warm(&mut ctx, query).await?;
+    let (_, origin) = ctx.proxy_and_origin_rows(query).await?;
+    assert_eq!(origin.len(), 1, "only the soft-deleted refund is selected");
+    let m = assert_cache_hit(&mut ctx, m).await?;
+
+    let m = origin_change_applied_in_place(
+        &mut ctx,
+        m,
+        "INSERT INTO sd_refunds VALUES (13, 1, 11, NULL)",
+        query,
+    )
+    .await?;
+    let m = origin_change_applied_in_place(
+        &mut ctx,
+        m,
+        "UPDATE sd_refunds SET deleted_at = NULL WHERE id = 11",
+        query,
+    )
+    .await?;
+    let (_, origin) = ctx.proxy_and_origin_rows(query).await?;
+    assert_eq!(origin.len(), 0, "un-deleting the refund empties the result");
+    let m = assert_cache_hit(&mut ctx, m).await?;
+
+    origin_change_invalidates(
+        &mut ctx,
+        m,
+        "INSERT INTO sd_refunds VALUES (14, 2, 12, '2026-01-03')",
+        query,
+    )
+    .await?;
+    let (proxied, origin) = ctx.proxy_and_origin_rows(query).await?;
+    assert_eq!(origin.len(), 1, "the soft-deleted insert is selected");
     assert_eq!(proxied, origin, "result after soft-deleted insert");
+    Ok(())
+}
+
+/// A single-table soft-delete query describes a region, so it covers a
+/// child with the same test and a further filter, which then follows CDC;
+/// it does not cover the opposite test (PGC-533).
+#[tokio::test]
+async fn test_soft_delete_parent_subsumes_same_test_child() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_orders_refunds(&mut ctx).await?;
+
+    let parent = "SELECT id, order_id FROM sd_refunds WHERE deleted_at IS NULL ORDER BY id";
+    let m = query_warm(&mut ctx, parent).await?;
+
+    let child = "SELECT id, order_id FROM sd_refunds \
+                 WHERE deleted_at IS NULL AND order_id = 1 ORDER BY id";
+    let (proxied, origin) = ctx.proxy_and_origin_rows(child).await?;
+    assert_eq!(origin.len(), 1, "origin returns the live refund of order 1");
+    assert_eq!(proxied, origin, "subsumed child");
+    let m = assert_subsume_hit(&mut ctx, m).await?;
+
+    let m = origin_change_applied_in_place(
+        &mut ctx,
+        m,
+        "INSERT INTO sd_refunds VALUES (13, 1, 11, NULL)",
+        child,
+    )
+    .await?;
+    let (_, origin) = ctx.proxy_and_origin_rows(child).await?;
+    assert_eq!(origin.len(), 2, "the child sees the inserted live refund");
+    let m = assert_cache_hit(&mut ctx, m).await?;
+
+    let opposite = "SELECT id, order_id FROM sd_refunds WHERE deleted_at IS NOT NULL ORDER BY id";
+    let (proxied, origin) = ctx.proxy_and_origin_rows(opposite).await?;
+    assert_eq!(proxied, origin, "opposite test from origin");
+    assert_cache_miss(&mut ctx, m).await?;
     Ok(())
 }
 

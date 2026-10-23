@@ -121,6 +121,8 @@ pub(crate) fn column_range_contains(range: &ColumnRange, value: &LiteralValue) -
         ColumnRange::Unconstrained => Some(true),
         ColumnRange::Empty => Some(false),
         ColumnRange::Unknown => None,
+        // A non-NULL value never satisfies `IS NULL`; a NULL one returned above.
+        ColumnRange::Null => Some(false),
         ColumnRange::Equal(v) => literal_value_eq(v, value),
         ColumnRange::InSet(set) => in_set_contains(set, value),
         ColumnRange::Range {
@@ -171,7 +173,7 @@ fn range_contains(range: RangeView<'_>, value: &LiteralValue) -> Option<bool> {
 /// returns `false`. The building block for [`column_ranges_disjoint`], the
 /// UPDATE/DELETE read-after-write predicate check (PGC-379).
 fn column_range_disjoint(a: &ColumnRange, b: &ColumnRange) -> bool {
-    use ColumnRange::{Empty, Equal, InSet, Range, Unconstrained, Unknown};
+    use ColumnRange::{Empty, Equal, InSet, Null, Range, Unconstrained, Unknown};
     match (a, b) {
         // An unsatisfiable range shares no value with anything.
         (Empty, _) | (_, Empty) => true,
@@ -183,9 +185,13 @@ fn column_range_disjoint(a: &ColumnRange, b: &ColumnRange) -> bool {
         (InSet(set), other) | (other, InSet(set)) => set
             .iter()
             .all(|v| column_range_contains(other, v) == Some(false)),
+        (Null, Null) => false,
         // Any value satisfies an unconstrained range, so it overlaps every
         // non-empty range (the `Empty` cases returned above).
         (Unconstrained, _) | (_, Unconstrained) => false,
+        // A range built from comparisons excludes NULL. A point or set is
+        // decided above, where a NULL literal stays undecidable.
+        (Null, Range { .. }) | (Range { .. }, Null) => true,
         (
             Range {
                 lower: la,
@@ -532,6 +538,55 @@ mod tests {
             &ranges(&[("other", ColumnRange::Equal(int(5)))]),
         ));
     }
+    /// A read of only NULL rows provably excludes any value, and is disjoint
+    /// from every comparison-derived range; a NULL literal, as `SET x = NULL`
+    /// arrives, stays undecidable (PGC-533).
+    #[test]
+    fn test_null_range_contains_and_disjoint() {
+        assert_eq!(
+            column_range_contains(&ColumnRange::Null, &int(5)),
+            Some(false)
+        );
+        assert_eq!(
+            column_range_contains(&ColumnRange::Null, &LiteralValue::Null),
+            None
+        );
+        assert!(column_range_disjoint(
+            &ColumnRange::Null,
+            &ColumnRange::Equal(int(5))
+        ));
+        assert!(column_range_disjoint(&ColumnRange::Null, &gt(1)));
+        assert!(column_range_disjoint(&ColumnRange::Null, &inset(&[1, 2])));
+        assert!(!column_range_disjoint(
+            &ColumnRange::Null,
+            &ColumnRange::Null
+        ));
+        assert!(!column_range_disjoint(
+            &ColumnRange::Null,
+            &ColumnRange::Unconstrained
+        ));
+        assert!(!column_range_disjoint(
+            &ColumnRange::Null,
+            &ColumnRange::Equal(LiteralValue::Null)
+        ));
+        assert!(!column_range_disjoint(
+            &ColumnRange::Null,
+            &ColumnRange::InSet(HashSet::from([int(1), LiteralValue::Null]))
+        ));
+        // `IS NOT NULL` is the unbounded range: it overlaps every value.
+        let not_null = ColumnRange::Range {
+            lower: None,
+            upper: None,
+            not_equal: vec![],
+        };
+        assert_eq!(column_range_contains(&not_null, &int(5)), Some(true));
+        assert!(!column_range_disjoint(
+            &not_null,
+            &ColumnRange::Equal(int(5))
+        ));
+        assert!(column_range_disjoint(&not_null, &ColumnRange::Null));
+    }
+
     /// PGC-446: byte order is not collation order, so ordering claims over
     /// strings must be undecidable — a false exclusion would serve stale data.
     #[test]

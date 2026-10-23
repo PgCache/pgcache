@@ -729,6 +729,19 @@ fn test_subsumption_cases() {
         // different predicates — bare bytes vs int value. Subsumption must
         // not cross domains.
         ("bare and cast constraints do not cross subsume", "SELECT * FROM users WHERE name = '42'", "SELECT * FROM users WHERE name::int4 = 42", false),
+        // Null tests (PGC-533): only NULL covers only NULL, no comparison
+        // admits NULL, and `IS NOT NULL` covers every comparison.
+        ("null test same", "SELECT * FROM users WHERE name IS NULL", "SELECT * FROM users WHERE name IS NULL", true),
+        ("null test narrower", "SELECT * FROM users WHERE name IS NULL", "SELECT * FROM users WHERE name IS NULL AND id = 1", true),
+        ("null test does not cover value", "SELECT * FROM users WHERE name IS NULL", "SELECT * FROM users WHERE name = 'alice'", false),
+        ("value does not cover null test", "SELECT * FROM users WHERE name = 'alice'", "SELECT * FROM users WHERE name IS NULL", false),
+        ("full scan covers null test", "SELECT * FROM users", "SELECT * FROM users WHERE id IS NULL", true),
+        ("null test does not cover full scan", "SELECT * FROM users WHERE id IS NULL", "SELECT * FROM users", false),
+        ("not null covers range", "SELECT * FROM users WHERE id IS NOT NULL", "SELECT * FROM users WHERE id > 5", true),
+        ("range does not cover not null", "SELECT * FROM users WHERE id > 5", "SELECT * FROM users WHERE id IS NOT NULL", false),
+        ("not null does not cover null", "SELECT * FROM users WHERE id IS NOT NULL", "SELECT * FROM users WHERE id IS NULL", false),
+        ("not null beside a range is the range", "SELECT * FROM users WHERE id > 5", "SELECT * FROM users WHERE id > 5 AND id IS NOT NULL", true),
+        ("null beside a value is empty", "SELECT * FROM users WHERE id = 5", "SELECT * FROM users WHERE id = 5 AND id IS NULL", true),
     ];
     let tables = catalog(&["users"]);
     for (label, cached_sql, new_sql, expected) in cases {

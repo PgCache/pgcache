@@ -41,9 +41,9 @@ fn constraint_keyed(constraint: &TableConstraint, table: &TableMetadata) -> Tabl
                 .map(|value| literal_keyed(kind(column), value))
                 .collect(),
         ),
-        // A cast comparison lives in the cast's domain; the index already
-        // treats it as unkeyable.
-        TableConstraint::CastComparison(..) => constraint.clone(),
+        // A cast comparison lives in the cast's domain, which the index
+        // already treats as unkeyable; a null test has no literal.
+        TableConstraint::CastComparison(..) | TableConstraint::NullTest(..) => constraint.clone(),
     }
 }
 

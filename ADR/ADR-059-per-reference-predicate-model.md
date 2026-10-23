@@ -83,5 +83,6 @@ Every SELECT branch is described by a `QueryBranchPredicates` (`query/predicates
   * `query/update.rs` (sources from roles);
   * `proxy/connection/relay.rs` (read-after-write ranges).
 * `constraints/` keeps only `TableConstraint` and the range algebra.
+* A recognizer declares whether its constraint rejects NULL; reduction consults that, not recognition. `IS [NOT] NULL` over a bare column is recognized (PGC-533), and `IS NULL` is the one constraint NULL satisfies: it never reduces a join, and in the range algebra it is `ColumnRange::Null`, while `IS NOT NULL` is the unbounded `Range`.
 
 Supersedes ADR-003; amends ADR-024 and ADR-037.

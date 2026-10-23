@@ -234,6 +234,9 @@ impl<K: IdHashable + Copy> ColumnIndex<K> {
             ColumnRange::Unknown | ColumnRange::Empty | ColumnRange::Unconstrained => {
                 self.extend_all(&mut out);
             }
+            // Only a parent that is itself `IS NULL` covers it, and those
+            // sit in `opaque`, already in `out`.
+            ColumnRange::Null => {}
             ColumnRange::Equal(v) => {
                 if let Some(key) = ValueKey::try_new(v) {
                     if let Some(fps) = self.eq.get(&key) {

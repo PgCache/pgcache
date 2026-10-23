@@ -29,9 +29,9 @@ pub(super) fn constraints_group_by_column<'a>(
     let mut grouped: HashMap<ConstraintBucketKey<'a>, Vec<&'a TableConstraint>> = HashMap::new();
     for tc in constraints {
         let key: ConstraintBucketKey<'a> = match tc {
-            TableConstraint::Comparison(col, _, _) | TableConstraint::AnyOf(col, _) => {
-                (col.as_str(), None)
-            }
+            TableConstraint::Comparison(col, _, _)
+            | TableConstraint::AnyOf(col, _)
+            | TableConstraint::NullTest(col, _) => (col.as_str(), None),
             TableConstraint::CastComparison(col, cast, _, _) => (col.as_str(), Some(cast)),
         };
         grouped.entry(key).or_default().push(tc);

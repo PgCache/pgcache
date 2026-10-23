@@ -53,7 +53,10 @@ pub(super) fn placement(range: &ColumnRange) -> Placement {
             }
             (None, None) => Placement::Opaque,
         },
-        ColumnRange::Unknown | ColumnRange::Unconstrained | ColumnRange::Empty => Placement::Opaque,
+        ColumnRange::Unknown
+        | ColumnRange::Unconstrained
+        | ColumnRange::Empty
+        | ColumnRange::Null => Placement::Opaque,
     }
 }
 

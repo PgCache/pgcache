@@ -177,6 +177,7 @@ impl<K: IdHashable + Copy> ConstraintIndex<K> {
                             ColumnRange::Unknown
                             | ColumnRange::Unconstrained
                             | ColumnRange::Empty
+                            | ColumnRange::Null
                             | ColumnRange::InSet(_)
                             | ColumnRange::Range { .. } => None,
                         })

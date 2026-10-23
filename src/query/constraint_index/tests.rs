@@ -5,7 +5,7 @@ use super::classify::{Classification, classify, column_set_powerset};
 use super::*;
 use crate::query::ast::{BinaryOp, LiteralValue};
 use crate::query::cast::CastTarget;
-use crate::query::constraints::TableConstraint;
+use crate::query::constraints::{NullTest, TableConstraint};
 use crate::query::{Fingerprint, FingerprintSet};
 
 fn col(s: &str) -> EcoString {
@@ -46,6 +46,35 @@ fn any_of(c: &str, vs: Vec<LiteralValue>) -> TableConstraint {
 
 fn cast_eq(c: &str, cast: CastTarget, v: LiteralValue) -> TableConstraint {
     TableConstraint::CastComparison(col(c), cast, BinaryOp::Equal, v)
+}
+
+fn null_test(c: &str, test: NullTest) -> TableConstraint {
+    TableConstraint::NullTest(col(c), test)
+}
+
+/// A null test is a complex constraint on its column: a parent testing a
+/// column for NULL is a candidate for a child with the same test, not for
+/// one that compares the column (PGC-533).
+#[test]
+fn test_null_test_is_complex_and_found_by_same_test() {
+    assert!(matches!(
+        classify(&[null_test("name", NullTest::IsNull)]),
+        Classification::Complex { ref columns } if columns.columns() == [col("name")]
+    ));
+    let mut idx = ConstraintIndex::<Fingerprint>::new();
+    idx.insert(fp(1), &[null_test("name", NullTest::IsNull)]);
+    idx.insert(fp(2), &[null_test("name", NullTest::IsNotNull)]);
+    idx.insert(fp(3), &[eq("name", text("x"))]);
+    idx.insert(fp(4), &[]);
+
+    let got = idx.candidates(&[null_test("name", NullTest::IsNull), eq("id", int(1))]);
+    assert!(got.contains(&fp(1)));
+    assert!(got.contains(&fp(4)));
+    assert!(!got.contains(&fp(3)), "a value can't cover only-NULL rows");
+
+    let got = idx.candidates(&[gt("name", text("a"))]);
+    assert!(got.contains(&fp(2)), "IS NOT NULL covers every comparison");
+    assert!(got.contains(&fp(4)));
 }
 
 fn float_lit(x: f64) -> LiteralValue {
@@ -868,6 +897,27 @@ mod point {
     }
 
     // Point probe: the row is an `Equal`-on-every-column degenerate query.
+
+    /// The point probe returns both null-test entries for a NULL row value and
+    /// for a present one: the precise matcher decides (never under-returns).
+    #[test]
+    fn test_point_probe_returns_null_test_entries() {
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
+        idx.insert(fp(1), &[null_test("name", NullTest::IsNull)]);
+        idx.insert(fp(2), &[null_test("name", NullTest::IsNotNull)]);
+        idx.insert(fp(3), &[eq("name", text("x"))]);
+
+        let null_row = idx.candidates_point(|_| [Some(ColumnRange::Unknown), None, None]);
+        assert_eq!(null_row, fps([1, 2, 3]));
+
+        let present = idx.candidates_point(|c| match c {
+            "name" => [Some(ColumnRange::Equal(text("y"))), None, None],
+            _ => [Some(ColumnRange::Unknown), None, None],
+        });
+        assert!(present.contains(&fp(1)));
+        assert!(present.contains(&fp(2)));
+        assert!(!present.contains(&fp(3)));
+    }
 
     #[test]
     fn test_point_probe_basic() {

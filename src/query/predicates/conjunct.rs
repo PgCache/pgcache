@@ -7,12 +7,12 @@ use smallvec::{SmallVec, smallvec};
 
 use super::{ColumnConstraint, ColumnConstraintKind, ConjunctForm};
 use crate::query::ast::rope::{
-    Binary, Column, Literal, Multi, NodeRef, Run, Scalar, ScalarKind, View, Where, WhereKind,
+    Binary, Column, Literal, Multi, NodeRef, Run, Scalar, ScalarKind, Unary, View, Where, WhereKind,
 };
-use crate::query::ast::{BinaryOp, LiteralValue, MultiOp};
+use crate::query::ast::{BinaryOp, LiteralValue, MultiOp, UnaryOp};
 use crate::query::cast::{cast_target_is_coercion_supported, comparison_canonicalize, scalar_leaf};
 use crate::query::constraints::{
-    literal_value_canonical_order, literal_value_is_incomparable, literal_value_order,
+    NullTest, literal_value_canonical_order, literal_value_is_incomparable, literal_value_order,
 };
 use crate::query::resolve::{ColumnBinding, ResolvedQuery};
 
@@ -47,10 +47,10 @@ pub(super) fn conjunct_parts_collect<'t>(
                 ));
             }
             WhereKind::Multi(multi) => multi_parts_collect(bound, conjunct, multi, parts),
-            WhereKind::Scalar(_)
-            | WhereKind::Unary(_)
-            | WhereKind::Binary(_)
-            | WhereKind::Subquery(_) => {
+            WhereKind::Unary(unary) => {
+                parts.push(ConjunctPart::whole(null_test_form(bound, unary), conjunct));
+            }
+            WhereKind::Scalar(_) | WhereKind::Binary(_) | WhereKind::Subquery(_) => {
                 parts.push(ConjunctPart::whole(ConjunctForm::Opaque, conjunct));
             }
         }
@@ -120,6 +120,25 @@ fn comparison_form(bound: &ResolvedQuery, binary: Binary<'_>) -> ConjunctForm {
     column_pair(bound, binary).map_or(ConjunctForm::Opaque, |(left, right)| {
         ConjunctForm::Equality(left, right)
     })
+}
+
+/// `column IS [NOT] NULL`; a null test over anything else is opaque.
+fn null_test_form(bound: &ResolvedQuery, unary: Unary<'_>) -> ConjunctForm {
+    let test = match unary.op() {
+        UnaryOp::IsNull => NullTest::IsNull,
+        UnaryOp::IsNotNull => NullTest::IsNotNull,
+        UnaryOp::Not
+        | UnaryOp::IsTrue
+        | UnaryOp::IsNotTrue
+        | UnaryOp::IsFalse
+        | UnaryOp::IsNotFalse => return ConjunctForm::Opaque,
+    };
+    match operand(unary.expr()) {
+        Operand::Column(column) => {
+            column_constraint_form(bound, column, ColumnConstraintKind::NullTest(test))
+        }
+        Operand::Literal(_) | Operand::Other => ConjunctForm::Opaque,
+    }
 }
 
 fn column_pair(

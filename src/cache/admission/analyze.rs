@@ -452,6 +452,11 @@ mod tests {
          &[("a", false), ("b", false)]),
         ("SELECT * FROM a LEFT JOIN b ON b.id = a.id WHERE b.x IS NULL",
          &[("a", false), ("b", false)]),
+        // A null test is a constraint: alone it describes a region, and
+        // `IS NOT NULL` on the nullable side makes the join inner.
+        ("SELECT * FROM a WHERE x IS NULL", &[("a", true)]),
+        ("SELECT * FROM a LEFT JOIN b ON b.id = a.id WHERE b.x IS NOT NULL",
+         &[("a", false), ("b", false)]),
         ("SELECT * FROM a WHERE x = 1 OR y = 2", &[("a", false)]),
         // A same-reference equality filters rows no region describes.
         ("SELECT * FROM a WHERE x = y", &[("a", false)]),

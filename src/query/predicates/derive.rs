@@ -8,7 +8,7 @@ use super::{
     RelationPredicates, TableReference, TableReferencePredicates,
 };
 use crate::catalog::{ColumnPosition, TableMetadata};
-use crate::query::constraints::TableConstraint;
+use crate::query::constraints::{NullTest, TableConstraint};
 use crate::query::resolve::{Bindings, ColumnBinding, SlotId, TableSlot};
 
 impl FromJoin {
@@ -55,11 +55,30 @@ impl FromJoin {
     }
 }
 
+impl ColumnConstraintKind {
+    /// Whether a NULL in the column fails the constraint. Every comparison
+    /// does; `IS NULL` is the one constraint NULL satisfies.
+    fn rejects_null(&self) -> bool {
+        match self {
+            ColumnConstraintKind::Comparison { .. }
+            | ColumnConstraintKind::AnyOf(_)
+            | ColumnConstraintKind::CastComparison { .. } => true,
+            ColumnConstraintKind::NullTest(test) => *test == NullTest::IsNotNull,
+        }
+    }
+}
+
 impl ConjunctForm {
     /// The slots a row must have non-NULL for this conjunct to hold.
     fn null_rejected_slots(&self) -> impl Iterator<Item = SlotId> {
         let (first, second) = match self {
-            ConjunctForm::Constraint(constraint) => (Some(constraint.column.slot), None),
+            ConjunctForm::Constraint(constraint) => (
+                constraint
+                    .kind
+                    .rejects_null()
+                    .then_some(constraint.column.slot),
+                None,
+            ),
             ConjunctForm::Equality(left, right) => (Some(left.slot), Some(right.slot)),
             ConjunctForm::Opaque => (None, None),
         };
@@ -76,16 +95,18 @@ impl Conjunct {
 impl ColumnConstraint {
     /// This constraint restated on `other`, a column equal to its own. A
     /// cast comparison stays put: `x::int = 5 AND x = y` says nothing of
-    /// `y::int` unless `y` casts alike.
+    /// `y::int` unless `y` casts alike. `IS NULL` stays put too: with
+    /// `x = y` it admits no row, so restating it would say nothing.
     fn restated_on(&self, other: ColumnBinding) -> Option<Self> {
         match &self.kind {
-            ColumnConstraintKind::Comparison { .. } | ColumnConstraintKind::AnyOf(_) => {
-                Some(Self {
-                    column: other,
-                    kind: self.kind.clone(),
-                })
-            }
-            ColumnConstraintKind::CastComparison { .. } => None,
+            ColumnConstraintKind::Comparison { .. }
+            | ColumnConstraintKind::AnyOf(_)
+            | ColumnConstraintKind::NullTest(NullTest::IsNotNull) => Some(Self {
+                column: other,
+                kind: self.kind.clone(),
+            }),
+            ColumnConstraintKind::CastComparison { .. }
+            | ColumnConstraintKind::NullTest(NullTest::IsNull) => None,
         }
     }
 }
@@ -146,6 +167,7 @@ impl QueryBranchPredicates {
                     ColumnConstraintKind::CastComparison { cast, op, value } => {
                         TableConstraint::CastComparison(name, cast.clone(), *op, value.clone())
                     }
+                    ColumnConstraintKind::NullTest(test) => TableConstraint::NullTest(name, *test),
                 })
             })
             .collect::<Option<Vec<_>>>()?;
@@ -569,6 +591,7 @@ mod tests {
             TableConstraint::CastComparison(column, cast, op, value) => {
                 format!("{column}::{cast:?} {op:?} {value:?}")
             }
+            TableConstraint::NullTest(column, test) => format!("{column} {test:?}"),
         }
     }
 
@@ -628,6 +651,8 @@ mod tests {
             ("SELECT * FROM a LEFT JOIN b ON b.id = a.id WHERE b.x = 1", &[true]),
             ("SELECT * FROM a LEFT JOIN b ON b.id = a.id WHERE a.x = 1", &[false]),
             ("SELECT * FROM a LEFT JOIN b ON b.id = a.id WHERE b.x IS NULL", &[false]),
+            ("SELECT * FROM a LEFT JOIN b ON b.id = a.id WHERE b.x IS NOT NULL", &[true]),
+            ("SELECT * FROM a LEFT JOIN b ON b.id = a.id AND b.x IS NOT NULL", &[false]),
             ("SELECT * FROM a LEFT JOIN b ON b.id = a.id WHERE b.x + 1 = 2", &[false]),
             ("SELECT * FROM a RIGHT JOIN b ON b.id = a.id WHERE a.x = 1", &[true]),
             // Pre-order: the outer join first, then the nested one.
@@ -764,22 +789,37 @@ mod tests {
          &["a exact=true role=Kept filters=[] links=[x]",
            "b exact=false role=Optional filters=[] links=[id, x]",
            "c exact=false role=Optional filters=[] links=[id]"]),
-        // A null test in an outer join's ON: on the nullable side it only
-        // decides which rows attach, leaving the side terminal; on the
+        // A null test in an outer join's ON: on the nullable side it filters
+        // the rows that attach and leaves the side terminal; on the
         // preserved side it decides which nullable row attaches, so its
-        // column is a link column (PGC-510).
+        // column is a link column (PGC-510, PGC-533).
         ("SELECT * FROM a LEFT JOIN b ON b.id = a.id AND b.x IS NULL",
          &["a exact=true role=Kept filters=[] links=[id]",
-           "b exact=false role=Terminal filters=[] links=[]"]),
+           "b exact=false role=Terminal filters=[x IsNull] links=[]"]),
         ("SELECT * FROM a LEFT JOIN b ON b.id = a.id AND a.x IS NULL WHERE a.y = 1",
          &["a exact=true role=Kept filters=[y Equal Integer(1)] links=[id, x]",
            "b exact=false role=Terminal filters=[] links=[]"]),
         ("SELECT * FROM a RIGHT JOIN b ON b.id = a.id AND a.x IS NOT NULL",
-         &["a exact=false role=Terminal filters=[] links=[]",
+         &["a exact=false role=Terminal filters=[x IsNotNull] links=[]",
            "b exact=true role=Kept filters=[] links=[id]"]),
         ("SELECT * FROM a JOIN b ON b.id = a.id AND b.x IS NULL WHERE a.y = 1",
          &["a exact=false role=Kept filters=[y Equal Integer(1)] links=[id]",
-           "b exact=false role=Kept filters=[] links=[id]"]),
+           "b exact=false role=Kept filters=[x IsNull] links=[id]"]),
+        // A null test in WHERE is a filter like any comparison; `IS NOT
+        // NULL` on the nullable side reduces the join, `IS NULL` does not.
+        ("SELECT * FROM a WHERE x IS NULL",
+         &["a exact=true role=Kept filters=[x IsNull] links=[]"]),
+        ("SELECT * FROM a LEFT JOIN b ON b.id = a.id WHERE b.x IS NOT NULL",
+         &["a exact=false role=Kept filters=[] links=[id]",
+           "b exact=false role=Kept filters=[x IsNotNull] links=[id]"]),
+        // `IS NOT NULL` carries over an equality; `IS NULL` admits no row
+        // beside one, so it stays where it is.
+        ("SELECT * FROM a JOIN b ON b.x = a.x WHERE a.x IS NOT NULL",
+         &["a exact=false role=Kept filters=[x IsNotNull] links=[x]",
+           "b exact=false role=Kept filters=[x IsNotNull] links=[x]"]),
+        ("SELECT * FROM a JOIN b ON b.x = a.x WHERE a.x IS NULL",
+         &["a exact=false role=Kept filters=[x IsNull] links=[x]",
+           "b exact=false role=Kept filters=[] links=[x]"]),
     ];
 
     #[test]
@@ -826,20 +866,24 @@ mod tests {
         assert!(!unrecognized("b"));
     }
 
-    /// A null test in ON is kept for its column, not its meaning: the side
-    /// it tests is flagged, the other is not (PGC-510).
+    /// A null test over a bare column is read as a constraint; over any
+    /// other expression it is kept opaque for its columns (PGC-533).
     #[test]
-    fn test_on_null_test_flags_tested_side() {
-        let bound = resolve("SELECT * FROM a LEFT JOIN b ON b.id = a.id AND b.x IS NULL");
-        let branch = root_predicates(&bound);
-        let unrecognized = |name: &str| {
+    fn test_null_test_recognized_on_bare_column_only() {
+        let unrecognized = |sql: &str, name: &str| {
+            let bound = resolve(sql);
+            let branch = root_predicates(&bound);
             branch
                 .relation_predicates(bound.bindings(), slot_of(&bound, &branch, name))
                 .expect("relation predicates")
                 .unrecognized
         };
-        assert!(!unrecognized("a"));
-        assert!(unrecognized("b"));
+        let bare = "SELECT * FROM a LEFT JOIN b ON b.id = a.id AND b.x IS NULL";
+        assert!(!unrecognized(bare, "a"));
+        assert!(!unrecognized(bare, "b"));
+        let expression = "SELECT * FROM a LEFT JOIN b ON b.id = a.id AND b.x + 1 IS NULL";
+        assert!(!unrecognized(expression, "a"));
+        assert!(unrecognized(expression, "b"));
     }
 
     /// Each reference of a self-join keeps its own filters.

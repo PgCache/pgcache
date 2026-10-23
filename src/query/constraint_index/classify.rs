@@ -51,7 +51,9 @@ pub(super) fn classify(constraints: &[TableConstraint]) -> Classification {
                     }
                 }
             }
-            TableConstraint::Comparison(col, _, _) | TableConstraint::AnyOf(col, _) => {
+            TableConstraint::Comparison(col, _, _)
+            | TableConstraint::AnyOf(col, _)
+            | TableConstraint::NullTest(col, _) => {
                 all_columns.insert(col.clone());
                 complex = true;
             }
@@ -133,9 +135,9 @@ pub(super) fn column_ranges(
             let mut has_cast = false;
             for tc in constraints {
                 let (tc_col, is_cast) = match tc {
-                    TableConstraint::Comparison(c, _, _) | TableConstraint::AnyOf(c, _) => {
-                        (c, false)
-                    }
+                    TableConstraint::Comparison(c, _, _)
+                    | TableConstraint::AnyOf(c, _)
+                    | TableConstraint::NullTest(c, _) => (c, false),
                     TableConstraint::CastComparison(c, _, _, _) => (c, true),
                 };
                 if tc_col != col {

@@ -5,7 +5,7 @@ use crate::catalog::TableMetadata;
 use crate::pg::protocol::ByteString;
 use crate::query::ast::BinaryOp;
 use crate::query::cast::cast_target_coerce_text;
-use crate::query::constraints::TableConstraint;
+use crate::query::constraints::{NullTest, TableConstraint};
 use crate::query::evaluate::literal_compare;
 use crate::query::typed_compare::typed_compare;
 
@@ -82,17 +82,19 @@ fn constraint_row_matches(
     let Some(column_meta) = table_metadata.columns.get(constraint_column(constraint)) else {
         return true;
     };
-    // NULL never matches comparison operators
-    row_value.as_ref().is_some_and(|row_str| {
-        constraint_value_matches(constraint, &column_meta.data_type, row_str)
-    })
+    match row_value {
+        Some(row_str) => constraint_value_matches(constraint, &column_meta.data_type, row_str),
+        // NULL satisfies no comparison, only the null test for it.
+        None => matches!(constraint, TableConstraint::NullTest(_, NullTest::IsNull)),
+    }
 }
 
 fn constraint_column(constraint: &TableConstraint) -> &str {
     match constraint {
         TableConstraint::Comparison(col, ..)
         | TableConstraint::AnyOf(col, ..)
-        | TableConstraint::CastComparison(col, ..) => col.as_str(),
+        | TableConstraint::CastComparison(col, ..)
+        | TableConstraint::NullTest(col, ..) => col.as_str(),
     }
 }
 
@@ -111,6 +113,7 @@ fn constraint_value_matches(constraint: &TableConstraint, data_type: &Type, row_
         // and never match — safe to treat as non-matching here.
         TableConstraint::CastComparison(_, cast, op, val) => cast_target_coerce_text(cast, row_str)
             .is_some_and(|coerced| literal_compare(&coerced, *op, val)),
+        TableConstraint::NullTest(_, test) => *test == NullTest::IsNotNull,
     }
 }
 
@@ -374,6 +377,49 @@ mod tests {
         ));
         assert!(delete_filters_match(&filters, &table, DeleteImage::Unknown));
         assert!(!delete_filters_match(&[], &table, DeleteImage::NotCached));
+    }
+
+    /// A NULL row value satisfies `IS NULL` alone; a present one satisfies
+    /// `IS NOT NULL` alone. A deleted row whose image doesn't know the
+    /// column may have met either (PGC-533).
+    #[test]
+    fn test_null_test_matches_by_nullness() {
+        let is_null = TableConstraint::NullTest("name".into(), NullTest::IsNull);
+        let is_not_null = TableConstraint::NullTest("name".into(), NullTest::IsNotNull);
+        let null_name = row(None, None);
+        let alice = row(Some("alice"), None);
+        assert!(constraint_matches(is_null.clone(), &null_name));
+        assert!(!constraint_matches(is_null.clone(), &alice));
+        assert!(!constraint_matches(is_not_null.clone(), &null_name));
+        assert!(constraint_matches(is_not_null.clone(), &alice));
+
+        let table = fixture_table();
+        let known_pk: &[usize] = &[0];
+        let known_name: &[usize] = &[0, 1];
+        assert!(delete_filters_match(
+            std::slice::from_ref(&is_not_null),
+            &table,
+            DeleteImage::Partial {
+                row: &null_name,
+                known: known_pk
+            }
+        ));
+        assert!(!delete_filters_match(
+            std::slice::from_ref(&is_not_null),
+            &table,
+            DeleteImage::Partial {
+                row: &null_name,
+                known: known_name
+            }
+        ));
+        assert!(!delete_filters_match(
+            std::slice::from_ref(&is_null),
+            &table,
+            DeleteImage::Partial {
+                row: &alice,
+                known: known_name
+            }
+        ));
     }
 
     #[test]

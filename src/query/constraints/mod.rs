@@ -45,4 +45,14 @@ pub enum TableConstraint {
     /// subsumption buckets it by `(column, cast)` independently of bare
     /// `Comparison` constraints on the same column.
     CastComparison(EcoString, CastTarget, BinaryOp, LiteralValue),
+    /// `column IS [NOT] NULL`.
+    NullTest(EcoString, NullTest),
+}
+
+/// The polarity of a null test. `IsNull` is the one recognized conjunct that
+/// holds on an outer join's NULL padding, so it never reduces a join.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NullTest {
+    IsNull,
+    IsNotNull,
 }

@@ -8,7 +8,7 @@
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
-use super::TableConstraint;
+use super::{NullTest, TableConstraint};
 use crate::query::ast::{BinaryOp, LiteralValue};
 
 /// One end of a column's value range
@@ -32,7 +32,10 @@ pub(crate) enum ColumnRange {
     Equal(LiteralValue),
     /// Finite set of allowed values: column IN (v1, v2, ...)
     InSet(HashSet<LiteralValue>),
-    /// Bounded interval with possible exclusions
+    /// Only NULL: column IS NULL. No other range admits NULL.
+    Null,
+    /// Bounded interval with possible exclusions. Excludes NULL, as every
+    /// comparison does; unbounded without exclusions it is `IS NOT NULL`.
     Range {
         lower: Option<RangeBound>,
         upper: Option<RangeBound>,
@@ -128,6 +131,7 @@ pub(crate) fn column_range_build(constraints: &[&TableConstraint]) -> ColumnRang
     // Separate comparisons from in-sets
     let mut comparisons: Vec<(BinaryOp, &LiteralValue)> = Vec::new();
     let mut in_set: Option<&[LiteralValue]> = None;
+    let mut null_test: Option<NullTest> = None;
 
     for tc in constraints {
         match tc {
@@ -145,7 +149,28 @@ pub(crate) fn column_range_build(constraints: &[&TableConstraint]) -> ColumnRang
                     }
                 });
             }
+            TableConstraint::NullTest(_, test) => match null_test {
+                None => null_test = Some(*test),
+                Some(existing) if existing == *test => {}
+                Some(_) => return ColumnRange::Empty,
+            },
         }
+    }
+
+    let value_constrained = !comparisons.is_empty() || in_set.is_some();
+    match null_test {
+        // A comparison or set admits no NULL, so beside one nothing is left.
+        Some(NullTest::IsNull) if value_constrained => return ColumnRange::Empty,
+        Some(NullTest::IsNull) => return ColumnRange::Null,
+        // Every comparison already rejects NULL; alone it is the unbounded range.
+        Some(NullTest::IsNotNull) if !value_constrained => {
+            return ColumnRange::Range {
+                lower: None,
+                upper: None,
+                not_equal: Vec::new(),
+            };
+        }
+        Some(NullTest::IsNotNull) | None => {}
     }
 
     // If we have an in-set, integrate with any comparisons
@@ -190,10 +215,13 @@ fn in_set_range_build(
                 ColumnRange::Empty
             }
         }
-        ColumnRange::InSet(_) => {
-            // comparison_range_build never produces InSet; Unknown is the safe
+        ColumnRange::InSet(_) | ColumnRange::Null => {
+            // comparison_range_build produces neither; Unknown is the safe
             // answer (never claims subsumption) if that ever changes.
-            debug_assert!(false, "comparison_range_build never produces InSet");
+            debug_assert!(
+                false,
+                "comparison_range_build produces neither InSet nor Null"
+            );
             ColumnRange::Unknown
         }
         ColumnRange::Range {
@@ -407,6 +435,10 @@ pub(super) fn column_range_subsumes(cached: &ColumnRange, new: &ColumnRange) -> 
 
         // Unconstrained new: wants everything, cached is restricted
         (_, ColumnRange::Unconstrained) => false,
+
+        // Only NULL covers only NULL; no other range admits NULL
+        (ColumnRange::Null, ColumnRange::Null) => true,
+        (ColumnRange::Null, _) | (_, ColumnRange::Null) => false,
 
         // Equal vs Equal
         (ColumnRange::Equal(a), ColumnRange::Equal(b)) => *a == *b,
@@ -622,6 +654,56 @@ mod tests {
             let range = range_from_comparisons(&comparisons);
             assert!(expected(&range), "{label}: got {range:?}");
         }
+    }
+
+    /// A null test alone is its own range; beside a comparison or set,
+    /// `IS NULL` leaves nothing and `IS NOT NULL` changes nothing (PGC-533).
+    #[test]
+    fn test_column_range_build_null_tests() {
+        let null_test = |test| TableConstraint::NullTest("col".into(), test);
+        let comparison =
+            |op, v| TableConstraint::Comparison("col".into(), op, LiteralValue::Integer(v));
+        let build = |constraints: &[TableConstraint]| {
+            column_range_build(&constraints.iter().collect::<Vec<_>>())
+        };
+        assert!(matches!(
+            build(&[null_test(NullTest::IsNull)]),
+            ColumnRange::Null
+        ));
+        assert!(matches!(
+            build(&[null_test(NullTest::IsNotNull)]),
+            ColumnRange::Range { lower: None, upper: None, ref not_equal } if not_equal.is_empty()
+        ));
+        assert!(matches!(
+            build(&[null_test(NullTest::IsNull), comparison(BinaryOp::Equal, 5)]),
+            ColumnRange::Empty
+        ));
+        assert!(matches!(
+            build(&[
+                null_test(NullTest::IsNull),
+                TableConstraint::AnyOf("col".into(), vec![LiteralValue::Integer(1)])
+            ]),
+            ColumnRange::Empty
+        ));
+        assert!(matches!(
+            build(&[null_test(NullTest::IsNull), null_test(NullTest::IsNotNull)]),
+            ColumnRange::Empty
+        ));
+        assert!(matches!(
+            build(&[null_test(NullTest::IsNotNull), comparison(BinaryOp::GreaterThan, 3)]),
+            ColumnRange::Range { ref lower, upper: None, .. } if bound_is(lower, 3, false)
+        ));
+        assert!(matches!(
+            build(&[
+                null_test(NullTest::IsNotNull),
+                null_test(NullTest::IsNotNull)
+            ]),
+            ColumnRange::Range {
+                lower: None,
+                upper: None,
+                ..
+            }
+        ));
     }
 
     #[test]

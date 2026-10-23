@@ -857,6 +857,9 @@ mod tests {
              &[OuterJoinTerminal, FromClause]),
             ("SELECT * FROM a RIGHT JOIN b ON a.id = b.a_id WHERE a.status IS NULL",
              &[OuterJoinOptional, FromClause]),
+            // `IS NOT NULL` on the nullable side reduces the join to inner.
+            ("SELECT * FROM a LEFT JOIN b ON a.id = b.a_id WHERE b.status IS NOT NULL",
+             &[FromClause, FromClause]),
             ("SELECT a.id, t.name FROM a LEFT JOIN b t ON a.id = t.a_id WHERE a.id = 1",
              &[FromClause, OuterJoinTerminal]),
             // A null test in the join's own ON leaves either side's role alone.

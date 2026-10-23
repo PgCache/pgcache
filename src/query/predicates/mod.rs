@@ -13,7 +13,7 @@ use ecow::EcoString;
 use crate::catalog::ColumnPosition;
 use crate::query::ast::{BinaryOp, LiteralValue, NodeId};
 use crate::query::cast::CastTarget;
-use crate::query::constraints::TableConstraint;
+use crate::query::constraints::{NullTest, TableConstraint};
 use crate::query::resolve::{ColumnBinding, SlotId};
 
 mod branch;
@@ -129,6 +129,7 @@ pub enum ColumnConstraintKind {
         op: BinaryOp,
         value: LiteralValue,
     },
+    NullTest(NullTest),
 }
 
 /// How an unreduced outer join that NULL-fills a reference affects it.
