@@ -10,9 +10,9 @@ use smallvec::SmallVec;
 
 use crate::query::ast::{BinaryOp, LiteralValue};
 use crate::query::constraints::{
-    ColumnRange, column_range_contains, column_ranges_from_comparisons,
+    ColumnConstraintKind, ColumnRange, TableConstraint, column_range_contains, table_column_ranges,
 };
-use crate::query::write::{InsertRow, InsertStatement, UpdateStatement, WriteComparison};
+use crate::query::write::{InsertRow, InsertStatement, UpdateStatement};
 
 /// Cap on the combined update + delete predicate maps a single table may hold in
 /// one tier before it degrades to opaque. Counts *statements* (each
@@ -245,15 +245,19 @@ type MergedTuples = HashMap<Box<[EcoString]>, Vec<EqualityTuple>>;
 /// constrained twice (the legacy range-map path handles both, including the
 /// contradictory `c = 1 AND c = 2` case it folds to `Empty`).
 pub(super) fn equality_tuple_build(
-    comparisons: &[WriteComparison],
+    comparisons: &[TableConstraint],
 ) -> Option<(Box<[EcoString]>, EqualityTuple)> {
-    if comparisons.iter().any(|(_, op, _)| *op != BinaryOp::Equal) {
-        return None;
+    let mut pairs: SmallVec<[(&EcoString, &LiteralValue); 2]> = SmallVec::new();
+    for constraint in comparisons {
+        let ColumnConstraintKind::Comparison {
+            op: BinaryOp::Equal,
+            value,
+        } = &constraint.kind
+        else {
+            return None;
+        };
+        pairs.push((&constraint.column, value));
     }
-    let mut pairs: SmallVec<[(&EcoString, &LiteralValue); 2]> = comparisons
-        .iter()
-        .map(|(column, _, value)| (column, value))
-        .collect();
     pairs.sort_by(|a, b| a.0.cmp(b.0));
     if pairs.windows(2).any(|w| matches!(w, [a, b] if a.0 == b.0)) {
         return None;
@@ -488,7 +492,7 @@ impl TableAggregate {
 /// column overridden by its new value (`Equal(literal)`), or made unconstrained
 /// (removed) when the new value is unknown — a non-literal SET RHS.
 pub(super) fn update_predicate_build(update: &UpdateStatement) -> UpdatePredicate {
-    let where_ranges = column_ranges_from_comparisons(&update.where_comparisons);
+    let where_ranges = table_column_ranges(&update.where_comparisons);
     let mut image_ranges = where_ranges.clone();
     for (column, value) in &update.set {
         match value {

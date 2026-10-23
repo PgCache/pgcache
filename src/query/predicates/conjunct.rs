@@ -5,14 +5,15 @@ use std::cmp::Ordering;
 
 use smallvec::{SmallVec, smallvec};
 
-use super::{ColumnConstraint, ColumnConstraintKind, ConjunctForm};
+use super::{ColumnConstraint, ConjunctForm};
 use crate::query::ast::rope::{
     Binary, Column, Literal, Multi, NodeRef, Run, Scalar, ScalarKind, Unary, View, Where, WhereKind,
 };
 use crate::query::ast::{BinaryOp, LiteralValue, MultiOp, UnaryOp};
 use crate::query::cast::{cast_target_is_coercion_supported, comparison_canonicalize, scalar_leaf};
 use crate::query::constraints::{
-    NullTest, literal_value_canonical_order, literal_value_is_incomparable, literal_value_order,
+    ColumnConstraintKind, NullTest, literal_value_canonical_order, literal_value_is_incomparable,
+    literal_value_order,
 };
 use crate::query::resolve::{ColumnBinding, ResolvedQuery};
 

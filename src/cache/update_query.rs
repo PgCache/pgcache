@@ -711,11 +711,13 @@ mod tests {
     fn subsumer(queries: &UpdateQueries) -> bool {
         queries.subsumption_candidates(&[]).contains(&FINGERPRINT)
             || queries
-                .subsumption_candidates(&[TableConstraint::Comparison(
-                    "kind".into(),
-                    crate::query::ast::BinaryOp::Equal,
-                    crate::query::ast::LiteralValue::String("x".into()),
-                )])
+                .subsumption_candidates(&[TableConstraint {
+                    column: "kind".into(),
+                    kind: crate::query::constraints::ColumnConstraintKind::Comparison {
+                        op: crate::query::ast::BinaryOp::Equal,
+                        value: crate::query::ast::LiteralValue::String("x".into()),
+                    },
+                }])
                 .contains(&FINGERPRINT)
     }
 

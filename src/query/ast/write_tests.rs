@@ -5,6 +5,7 @@
 use ecow::EcoString;
 
 use crate::query::ast::{AstError, BinaryOp, LiteralValue, RawStatement, statement_convert_raw};
+use crate::query::constraints::{ColumnConstraintKind, TableConstraint};
 use crate::query::guc::Guc;
 use crate::query::write::IsolationEffect::{SessionDefault, SessionUnknown, Transaction};
 use crate::query::write::IsolationLevel::{ReadCommitted, RepeatableRead, Serializable};
@@ -12,6 +13,13 @@ use crate::query::write::{
     DeleteStatement, INSERT_MAX_ROWS, InsertStatement, IsolationEffect, RelationRef,
     SettingsEffect, TransactionBoundary, UpdateStatement, WriteClass,
 };
+
+fn comparison(column: &str, op: BinaryOp, value: LiteralValue) -> TableConstraint {
+    TableConstraint {
+        column: column.into(),
+        kind: ColumnConstraintKind::Comparison { op, value },
+    }
+}
 
 /// Classify one SQL statement through the public entry point.
 fn classify(sql: &str) -> Result<RawStatement, AstError> {
@@ -398,11 +406,7 @@ fn test_update_extracts_where_and_set() {
     assert_eq!(upd.relation.name, "t");
     assert_eq!(
         upd.where_comparisons,
-        vec![(
-            EcoString::from("id"),
-            BinaryOp::Equal,
-            LiteralValue::Integer(5)
-        )]
+        vec![comparison("id", BinaryOp::Equal, LiteralValue::Integer(5))]
     );
     assert_eq!(
         upd.set,
@@ -454,16 +458,8 @@ fn test_delete_extracts_bare_column_predicate() {
     assert_eq!(
         del.comparisons,
         vec![
-            (
-                EcoString::from("id"),
-                BinaryOp::Equal,
-                LiteralValue::Integer(5)
-            ),
-            (
-                EcoString::from("qty"),
-                BinaryOp::GreaterThan,
-                LiteralValue::Integer(10)
-            ),
+            comparison("id", BinaryOp::Equal, LiteralValue::Integer(5)),
+            comparison("qty", BinaryOp::GreaterThan, LiteralValue::Integer(10)),
         ]
     );
 }
@@ -474,11 +470,7 @@ fn test_delete_flips_literal_op_column() {
     let del = delete_rows("DELETE FROM t WHERE 5 = id");
     assert_eq!(
         del.comparisons,
-        vec![(
-            EcoString::from("id"),
-            BinaryOp::Equal,
-            LiteralValue::Integer(5)
-        )]
+        vec![comparison("id", BinaryOp::Equal, LiteralValue::Integer(5))]
     );
 }
 

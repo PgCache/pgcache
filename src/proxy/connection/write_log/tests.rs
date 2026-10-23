@@ -13,11 +13,18 @@ use crate::catalog::{RelationName, TableMetadata, WriteAlias};
 use crate::pg::Lsn;
 use crate::query::ast::rope::QueryTree;
 use crate::query::ast::{BinaryOp, LiteralValue};
-use crate::query::constraints::ColumnRange;
+use crate::query::constraints::{ColumnConstraintKind, ColumnRange, TableConstraint};
 use crate::query::resolve::ColumnsByTable;
 use crate::query::write::{
     DeleteStatement, InsertRow, InsertStatement, RelationRef, UpdateStatement, WriteClass,
 };
+
+fn comparison(column: &str, op: BinaryOp, value: LiteralValue) -> TableConstraint {
+    TableConstraint {
+        column: column.into(),
+        kind: ColumnConstraintKind::Comparison { op, value },
+    }
+}
 
 fn table(name: &str) -> WriteClass {
     WriteClass::Table(RelationRef {
@@ -413,7 +420,11 @@ fn delete_eq(table: &str, col: &str, value: i64) -> WriteClass {
             schema: None,
             name: table.into(),
         },
-        comparisons: vec![(col.into(), BinaryOp::Equal, LiteralValue::Integer(value))],
+        comparisons: vec![comparison(
+            col,
+            BinaryOp::Equal,
+            LiteralValue::Integer(value),
+        )],
     }))
 }
 
@@ -466,7 +477,11 @@ fn delete_range(table: &str, col: &str, below: i64) -> WriteClass {
             schema: None,
             name: table.into(),
         },
-        comparisons: vec![(col.into(), BinaryOp::LessThan, LiteralValue::Integer(below))],
+        comparisons: vec![comparison(
+            col,
+            BinaryOp::LessThan,
+            LiteralValue::Integer(below),
+        )],
     }))
 }
 
@@ -565,8 +580,8 @@ fn test_delete_multi_column_equality_tuples() {
                 name: "orders".into(),
             },
             comparisons: vec![
-                ("a".into(), BinaryOp::Equal, LiteralValue::Integer(a)),
-                ("b".into(), BinaryOp::Equal, LiteralValue::Integer(b)),
+                comparison("a", BinaryOp::Equal, LiteralValue::Integer(a)),
+                comparison("b", BinaryOp::Equal, LiteralValue::Integer(b)),
             ],
         }))
     }
@@ -621,8 +636,8 @@ fn test_delete_duplicate_column_routes_legacy() {
                 name: "orders".into(),
             },
             comparisons: vec![
-                ("id".into(), BinaryOp::Equal, LiteralValue::Integer(1)),
-                ("id".into(), BinaryOp::Equal, LiteralValue::Integer(2)),
+                comparison("id", BinaryOp::Equal, LiteralValue::Integer(1)),
+                comparison("id", BinaryOp::Equal, LiteralValue::Integer(2)),
             ],
         })),
         None,
@@ -662,8 +677,8 @@ fn update_eq(
             schema: None,
             name: table.into(),
         },
-        where_comparisons: vec![(
-            where_col.into(),
+        where_comparisons: vec![comparison(
+            where_col,
             BinaryOp::Equal,
             LiteralValue::Integer(where_val),
         )],
@@ -1363,8 +1378,8 @@ fn test_update_of_unreferenced_column_serves_read_for_range_shape() {
                 schema: None,
                 name: "actor".into(),
             },
-            where_comparisons: vec![(
-                "actor_id".into(),
+            where_comparisons: vec![comparison(
+                "actor_id",
                 BinaryOp::GreaterThan,
                 LiteralValue::Integer(5),
             )],

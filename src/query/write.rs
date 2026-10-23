@@ -8,7 +8,8 @@ use std::sync::Arc;
 use ecow::EcoString;
 use smallvec::SmallVec;
 
-use crate::query::ast::{BinaryOp, LiteralValue};
+use crate::query::ast::LiteralValue;
+use crate::query::constraints::TableConstraint;
 use crate::query::guc::{Guc, GucSet};
 
 /// Classification-time cap on extracted `INSERT ... VALUES` rows: a larger
@@ -279,17 +280,13 @@ pub struct InsertStatement {
     pub rows: Vec<InsertRow>,
 }
 
-/// One bare-column comparison from a DELETE/UPDATE WHERE, normalized to
-/// `column op literal` (PGC-381).
-pub type WriteComparison = (EcoString, BinaryOp, LiteralValue);
-
 /// An extracted single-table `DELETE` with a bare-column WHERE predicate.
-/// `comparisons` are AND-ed conjuncts (single-column equality/range only);
+/// `comparisons` are AND-ed `column op literal` conjuncts (PGC-381);
 /// a predicate-less DELETE never produces this (it classifies as `Table`).
 #[derive(Debug)]
 pub struct DeleteStatement {
     pub relation: RelationRef,
-    pub comparisons: Vec<WriteComparison>,
+    pub comparisons: Vec<TableConstraint>,
 }
 
 /// One `SET column = value` assignment. `None` = the new value isn't a literal
@@ -303,7 +300,7 @@ pub type SetAssignment = (EcoString, Option<LiteralValue>);
 #[derive(Debug)]
 pub struct UpdateStatement {
     pub relation: RelationRef,
-    pub where_comparisons: Vec<WriteComparison>,
+    pub where_comparisons: Vec<TableConstraint>,
     pub set: Vec<SetAssignment>,
 }
 

@@ -14,11 +14,11 @@ use super::where_clause::{const_value_extract, param_ref_extract, where_emit};
 use crate::query::ast::raw::{NodePtr, cast, cstr, list_is_empty, list_nodes, node_tag};
 use crate::query::ast::rope::{Binary, ScalarKind, TreeBuilder, View, Where, WhereKind};
 use crate::query::ast::{BinaryOp, LiteralValue};
+use crate::query::constraints::{ColumnConstraintKind, TableConstraint};
 use crate::query::guc::Guc;
 use crate::query::write::{
     DeleteStatement, INSERT_MAX_ROWS, InsertRow, InsertStatement, IsolationEffect, IsolationLevel,
     RelationRef, SetAssignment, SettingsEffect, TransactionBoundary, UpdateStatement, WriteClass,
-    WriteComparison,
 };
 
 /// Classification of a non-SELECT root statement.
@@ -605,7 +605,7 @@ unsafe fn update_classify(s: *const pg::UpdateStmt) -> WriteClass {
 /// An UPDATE's WHERE comparisons and SET list, or `None` to degrade.
 unsafe fn update_parts_extract(
     s: *const pg::UpdateStmt,
-) -> Option<(Vec<WriteComparison>, Vec<SetAssignment>)> {
+) -> Option<(Vec<TableConstraint>, Vec<SetAssignment>)> {
     unsafe {
         // A FROM clause joins other tables into the predicate — not single-table.
         if !list_is_empty((*s).fromClause) {
@@ -621,7 +621,7 @@ unsafe fn update_parts_extract(
 /// The WHERE's comparisons, or `None` when there is no WHERE (any read of the
 /// table intersects a whole-table write), it doesn't convert, or it doesn't
 /// reduce to bare-column comparisons.
-unsafe fn where_comparisons_extract(where_node: NodePtr) -> Option<Vec<WriteComparison>> {
+unsafe fn where_comparisons_extract(where_node: NodePtr) -> Option<Vec<TableConstraint>> {
     unsafe {
         if where_node.is_null() {
             return None;
@@ -665,12 +665,12 @@ unsafe fn update_set_extract(target_list: *const pg::List) -> Option<Vec<SetAssi
 /// part isn't a single-column `col op literal` comparison (OR, NOT, IN/BETWEEN,
 /// subquery, function, cast, cross-column) — the whole predicate then degrades
 /// to opaque. Shared by DELETE (and UPDATE, PGC-382).
-fn where_comparisons(where_expr: Where<'_>) -> Option<Vec<WriteComparison>> {
+fn where_comparisons(where_expr: Where<'_>) -> Option<Vec<TableConstraint>> {
     let mut out = Vec::new();
     where_comparisons_collect(where_expr, &mut out).then_some(out)
 }
 
-fn where_comparisons_collect(where_expr: Where<'_>, out: &mut Vec<WriteComparison>) -> bool {
+fn where_comparisons_collect(where_expr: Where<'_>, out: &mut Vec<TableConstraint>) -> bool {
     let WhereKind::Binary(binary) = where_expr.kind() else {
         return false;
     };
@@ -689,7 +689,7 @@ fn where_comparisons_collect(where_expr: Where<'_>, out: &mut Vec<WriteCompariso
 
 /// `column op literal` (or `literal op column`, flipped) from a binary
 /// comparison; `None` for logical/LIKE ops or non-bare-column operands.
-fn comparison_extract(binary: Binary<'_>) -> Option<WriteComparison> {
+fn comparison_extract(binary: Binary<'_>) -> Option<TableConstraint> {
     // `op_flip` returns `None` for non-comparison ops (AND/OR/LIKE/…); the
     // flipped op also normalizes `literal op column` to `column op literal`.
     let op = binary.op();
@@ -702,11 +702,15 @@ fn comparison_extract(binary: Binary<'_>) -> Option<WriteComparison> {
         },
         _ => None,
     };
-    match (operand(binary.lexpr())?, operand(binary.rexpr())?) {
-        (Operand::Column(column), Operand::Literal(value)) => Some((column, op, value)),
-        (Operand::Literal(value), Operand::Column(column)) => Some((column, flipped, value)),
-        _ => None,
-    }
+    let (column, op, value) = match (operand(binary.lexpr())?, operand(binary.rexpr())?) {
+        (Operand::Column(column), Operand::Literal(value)) => (column, op, value),
+        (Operand::Literal(value), Operand::Column(column)) => (column, flipped, value),
+        _ => return None,
+    };
+    Some(TableConstraint {
+        column,
+        kind: ColumnConstraintKind::Comparison { op, value },
+    })
 }
 
 /// One side of a write comparison, when it is bare.

@@ -43,8 +43,10 @@ pub(crate) fn delete_statement_parameterize(
     parameters: &QueryParameters,
 ) -> AstTransformResult<DeleteStatement> {
     let mut comparisons = stmt.comparisons.clone();
-    for (_, _, value) in &mut comparisons {
-        literal_value_parameters_replace(value, parameters)?;
+    for constraint in &mut comparisons {
+        for value in constraint.kind.literals_mut() {
+            literal_value_parameters_replace(value, parameters)?;
+        }
     }
     Ok(DeleteStatement {
         relation: stmt.relation.clone(),
@@ -62,8 +64,10 @@ pub(crate) fn update_statement_parameterize(
     parameters: &QueryParameters,
 ) -> AstTransformResult<UpdateStatement> {
     let mut where_comparisons = stmt.where_comparisons.clone();
-    for (_, _, value) in &mut where_comparisons {
-        literal_value_parameters_replace(value, parameters)?;
+    for constraint in &mut where_comparisons {
+        for value in constraint.kind.literals_mut() {
+            literal_value_parameters_replace(value, parameters)?;
+        }
     }
     let mut set = stmt.set.clone();
     for (_, value) in set.iter_mut() {
@@ -86,7 +90,18 @@ mod tests {
     use super::*;
     use crate::oid::TypeOid;
     use crate::query::ast::{BinaryOp, LiteralValue};
+    use crate::query::constraints::{ColumnConstraintKind, TableConstraint};
     use crate::query::write::RelationRef;
+
+    fn id_equals(value: LiteralValue) -> TableConstraint {
+        TableConstraint {
+            column: "id".into(),
+            kind: ColumnConstraintKind::Comparison {
+                op: BinaryOp::Equal,
+                value,
+            },
+        }
+    }
 
     fn typed_text_params(values: Vec<(Option<&[u8]>, PgType)>) -> QueryParameters {
         let len = values.len();
@@ -113,30 +128,28 @@ mod tests {
         let stmt = DeleteStatement {
             relation: relation("t"),
             comparisons: vec![
-                (
-                    "id".into(),
-                    BinaryOp::Equal,
-                    LiteralValue::Parameter("$1".into()),
-                ),
-                ("v".into(), BinaryOp::GreaterThan, LiteralValue::Integer(3)),
+                id_equals(LiteralValue::Parameter("$1".into())),
+                TableConstraint {
+                    column: "v".into(),
+                    kind: ColumnConstraintKind::Comparison {
+                        op: BinaryOp::GreaterThan,
+                        value: LiteralValue::Integer(3),
+                    },
+                },
             ],
         };
         let params = typed_text_params(vec![(Some(b"7"), PgType::INT4)]);
         let out = delete_statement_parameterize(&stmt, &params).expect("substitute");
-        assert_eq!(out.comparisons[0].2, LiteralValue::Integer(7));
+        assert_eq!(out.comparisons[0], id_equals(LiteralValue::Integer(7)));
         // A concrete literal is left untouched.
-        assert_eq!(out.comparisons[1].2, LiteralValue::Integer(3));
+        assert_eq!(out.comparisons[1], stmt.comparisons[1]);
     }
 
     #[test]
     fn test_update_statement_parameterize() {
         let stmt = UpdateStatement {
             relation: relation("t"),
-            where_comparisons: vec![(
-                "id".into(),
-                BinaryOp::Equal,
-                LiteralValue::Parameter("$1".into()),
-            )],
+            where_comparisons: vec![id_equals(LiteralValue::Parameter("$1".into()))],
             set: vec![
                 ("v".into(), Some(LiteralValue::Parameter("$2".into()))),
                 // A non-literal SET stays unknown after substitution.
@@ -146,7 +159,10 @@ mod tests {
         let params =
             typed_text_params(vec![(Some(b"7"), PgType::INT4), (Some(b"9"), PgType::INT4)]);
         let out = update_statement_parameterize(&stmt, &params).expect("substitute");
-        assert_eq!(out.where_comparisons[0].2, LiteralValue::Integer(7));
+        assert_eq!(
+            out.where_comparisons[0],
+            id_equals(LiteralValue::Integer(7))
+        );
         assert_eq!(out.set[0].1, Some(LiteralValue::Integer(9)));
         assert_eq!(out.set[1].1, None);
     }
@@ -155,11 +171,7 @@ mod tests {
     fn test_update_statement_parameterize_out_of_bounds_errors() {
         let stmt = UpdateStatement {
             relation: relation("t"),
-            where_comparisons: vec![(
-                "id".into(),
-                BinaryOp::Equal,
-                LiteralValue::Parameter("$2".into()),
-            )],
+            where_comparisons: vec![id_equals(LiteralValue::Parameter("$2".into()))],
             set: vec![("v".into(), Some(LiteralValue::Integer(1)))],
         };
         let params = typed_text_params(vec![(Some(b"7"), PgType::INT4)]);

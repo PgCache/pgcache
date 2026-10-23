@@ -11,9 +11,8 @@
 use ecow::EcoString;
 
 use crate::catalog::ColumnPosition;
-use crate::query::ast::{BinaryOp, LiteralValue, NodeId};
-use crate::query::cast::CastTarget;
-use crate::query::constraints::{NullTest, TableConstraint};
+use crate::query::ast::NodeId;
+use crate::query::constraints::{Constraint, TableConstraint};
 use crate::query::resolve::{ColumnBinding, SlotId};
 
 mod branch;
@@ -109,28 +108,7 @@ pub enum ConjunctForm {
 }
 
 /// A constraint on one column of one reference.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ColumnConstraint {
-    pub column: ColumnBinding,
-    pub kind: ColumnConstraintKind,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum ColumnConstraintKind {
-    Comparison {
-        op: BinaryOp,
-        value: LiteralValue,
-    },
-    /// Set membership; the values are sorted and distinct.
-    AnyOf(Vec<LiteralValue>),
-    /// A comparison in the cast's output domain.
-    CastComparison {
-        cast: CastTarget,
-        op: BinaryOp,
-        value: LiteralValue,
-    },
-    NullTest(NullTest),
-}
+pub type ColumnConstraint = Constraint<ColumnBinding>;
 
 /// How an unreduced outer join that NULL-fills a reference affects it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -9,7 +9,9 @@ use ecow::EcoString;
 use super::ColumnSet;
 use super::value_key::ValueKey;
 use crate::query::ast::{BinaryOp, LiteralValue};
-use crate::query::constraints::{ColumnRange, TableConstraint, column_range_build};
+use crate::query::constraints::{
+    ColumnConstraintKind, ColumnRange, TableConstraint, column_range_build,
+};
 
 pub(super) enum Classification {
     EqualityPure {
@@ -40,31 +42,25 @@ pub(super) fn classify(constraints: &[TableConstraint]) -> Classification {
     let mut complex = false;
 
     for tc in constraints {
-        match tc {
-            TableConstraint::Comparison(col, BinaryOp::Equal, val) => {
-                all_columns.insert(col.clone());
-                match equality.get(col) {
-                    Some(prev) if prev == val => {}
-                    Some(_) => complex = true,
-                    None => {
-                        equality.insert(col.clone(), val.clone());
-                    }
+        all_columns.insert(tc.column.clone());
+        match &tc.kind {
+            ColumnConstraintKind::Comparison {
+                op: BinaryOp::Equal,
+                value,
+            } => match equality.get(&tc.column) {
+                Some(prev) if prev == value => {}
+                Some(_) => complex = true,
+                None => {
+                    equality.insert(tc.column.clone(), value.clone());
                 }
-            }
-            TableConstraint::Comparison(col, _, _)
-            | TableConstraint::AnyOf(col, _)
-            | TableConstraint::NullTest(col, _) => {
-                all_columns.insert(col.clone());
-                complex = true;
-            }
-            // Cast constraints sit in a different value domain from bare
-            // comparisons; the equality-pure fast bucket can't index them
-            // by `(column, value)`. Mark as Complex so detailed subsumption
-            // (`table_constraints_subsumed`) handles the cast logic.
-            TableConstraint::CastComparison(col, _, _, _) => {
-                all_columns.insert(col.clone());
-                complex = true;
-            }
+            },
+            // A cast comparison sits in a different value domain from bare
+            // comparisons, so the equality-pure bucket can't index it by
+            // `(column, value)` either; detailed subsumption handles the cast.
+            ColumnConstraintKind::Comparison { .. }
+            | ColumnConstraintKind::AnyOf(_)
+            | ColumnConstraintKind::CastComparison { .. }
+            | ColumnConstraintKind::NullTest(_) => complex = true,
         }
     }
 
@@ -134,16 +130,10 @@ pub(super) fn column_ranges(
             let mut bare: Vec<&TableConstraint> = Vec::new();
             let mut has_cast = false;
             for tc in constraints {
-                let (tc_col, is_cast) = match tc {
-                    TableConstraint::Comparison(c, _, _)
-                    | TableConstraint::AnyOf(c, _)
-                    | TableConstraint::NullTest(c, _) => (c, false),
-                    TableConstraint::CastComparison(c, _, _, _) => (c, true),
-                };
-                if tc_col != col {
+                if tc.column != *col {
                     continue;
                 }
-                if is_cast {
+                if tc.kind.cast_target().is_some() {
                     has_cast = true;
                 } else {
                     bare.push(tc);

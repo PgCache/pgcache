@@ -8,48 +8,24 @@ use std::collections::{HashMap, HashSet};
 
 use ecow::EcoString;
 
+#[cfg(test)]
+use super::ColumnConstraintKind;
 use super::TableConstraint;
 use super::range::{
     BoundSide, ColumnRange, RangeBound, RangeView, column_range_build,
     literal_value_is_incomparable, literal_value_order,
 };
 use super::subsume::constraints_group_by_column;
-use crate::query::ast::{BinaryOp, LiteralValue};
+use crate::query::ast::LiteralValue;
 
-/// Reduce a set of bare-column `column op literal` comparisons (from a raw-tree
-/// DELETE/UPDATE WHERE, PGC-381) to a per-column [`ColumnRange`] map — the write
-/// side of read-after-write disjointness, mirroring [`table_column_ranges`] on
-/// the read side but sourced from comparisons the classifier extracted without
-/// resolution.
-pub(crate) fn column_ranges_from_comparisons(
-    comparisons: &[(EcoString, BinaryOp, LiteralValue)],
-) -> HashMap<EcoString, ColumnRange> {
-    let mut by_column: HashMap<EcoString, Vec<TableConstraint>> = HashMap::new();
-    for (column, op, value) in comparisons {
-        by_column
-            .entry(column.clone())
-            .or_default()
-            .push(TableConstraint::Comparison(
-                column.clone(),
-                *op,
-                value.clone(),
-            ));
-    }
-    by_column
-        .into_iter()
-        .map(|(column, cs)| {
-            let refs: Vec<&TableConstraint> = cs.iter().collect();
-            (column, column_range_build(&refs))
-        })
-        .collect()
-}
-
-/// Reduce a reference's filters to a per-column [`ColumnRange`], for
-/// the read side of read-after-write disjointness (PGC-124). Only bare-column
-/// comparisons are kept — a cast comparison (`col::date = …`) constrains a
-/// derived value, not the raw column the inserted row supplies, so it can't
-/// prove disjointness against a raw inserted value. A column absent from the
-/// result is unconstrained by the read (and so can't exclude any insert).
+/// Reduce a table's constraints to a per-column [`ColumnRange`]: a
+/// reference's filters on the read side of read-after-write disjointness
+/// (PGC-124), or a DELETE/UPDATE WHERE's comparisons on the write side
+/// (PGC-381). Only bare-column constraints are kept — a cast comparison
+/// (`col::date = …`) constrains a derived value, not the raw column the
+/// inserted row supplies, so it can't prove disjointness against a raw
+/// inserted value. A column absent from the result is unconstrained (and so
+/// can't exclude any row).
 pub(crate) fn table_column_ranges(filters: &[TableConstraint]) -> HashMap<EcoString, ColumnRange> {
     constraints_group_by_column(filters)
         .into_iter()
@@ -269,11 +245,18 @@ mod tests {
     use ordered_float::NotNan;
 
     use super::*;
+    use crate::query::ast::BinaryOp;
 
     fn range_from_comparisons(comparisons: &[(BinaryOp, LiteralValue)]) -> ColumnRange {
         let tcs: Vec<TableConstraint> = comparisons
             .iter()
-            .map(|(op, val)| TableConstraint::Comparison("col".into(), *op, val.clone()))
+            .map(|(op, val)| TableConstraint {
+                column: "col".into(),
+                kind: ColumnConstraintKind::Comparison {
+                    op: *op,
+                    value: val.clone(),
+                },
+            })
             .collect();
         let refs: Vec<&TableConstraint> = tcs.iter().collect();
         column_range_build(&refs)

@@ -3,12 +3,12 @@
 //! reference's rows must answer to.
 
 use super::{
-    ColumnConstraint, ColumnConstraintKind, Conjunct, ConjunctForm, ConjunctScope, FromJoin,
-    JoinId, JoinKind, JoinPathStep, JoinSide, OuterJoinRole, QueryBranchPredicates,
-    RelationPredicates, TableReference, TableReferencePredicates,
+    ColumnConstraint, Conjunct, ConjunctForm, ConjunctScope, FromJoin, JoinId, JoinKind,
+    JoinPathStep, JoinSide, OuterJoinRole, QueryBranchPredicates, RelationPredicates,
+    TableReference, TableReferencePredicates,
 };
 use crate::catalog::{ColumnPosition, TableMetadata};
-use crate::query::constraints::{NullTest, TableConstraint};
+use crate::query::constraints::{ColumnConstraintKind, NullTest};
 use crate::query::resolve::{Bindings, ColumnBinding, SlotId, TableSlot};
 
 impl FromJoin {
@@ -157,18 +157,7 @@ impl QueryBranchPredicates {
             .iter()
             .map(|constraint| {
                 let name = bindings.binding_column(&constraint.column)?.name.clone();
-                Some(match &constraint.kind {
-                    ColumnConstraintKind::Comparison { op, value } => {
-                        TableConstraint::Comparison(name, *op, value.clone())
-                    }
-                    ColumnConstraintKind::AnyOf(values) => {
-                        TableConstraint::AnyOf(name, values.clone())
-                    }
-                    ColumnConstraintKind::CastComparison { cast, op, value } => {
-                        TableConstraint::CastComparison(name, cast.clone(), *op, value.clone())
-                    }
-                    ColumnConstraintKind::NullTest(test) => TableConstraint::NullTest(name, *test),
-                })
+                Some(constraint.clone().map_column(|_| name))
             })
             .collect::<Option<Vec<_>>>()?;
         let link_columns = predicates
@@ -528,6 +517,7 @@ mod tests {
     use crate::oid::TypeOid;
     use crate::query::ast::NodeId;
     use crate::query::ast::rope::{NodeKind, View};
+    use crate::query::constraints::TableConstraint;
     use crate::query::decorrelate::query_decorrelate;
     use crate::query::predicates::query_branch_predicates_build;
     use crate::query::resolve::ResolvedQuery;
@@ -585,13 +575,14 @@ mod tests {
     }
 
     fn constraint_text(constraint: &TableConstraint) -> String {
-        match constraint {
-            TableConstraint::Comparison(column, op, value) => format!("{column} {op:?} {value:?}"),
-            TableConstraint::AnyOf(column, values) => format!("{column} AnyOf {values:?}"),
-            TableConstraint::CastComparison(column, cast, op, value) => {
+        let column = &constraint.column;
+        match &constraint.kind {
+            ColumnConstraintKind::Comparison { op, value } => format!("{column} {op:?} {value:?}"),
+            ColumnConstraintKind::AnyOf(values) => format!("{column} AnyOf {values:?}"),
+            ColumnConstraintKind::CastComparison { cast, op, value } => {
                 format!("{column}::{cast:?} {op:?} {value:?}")
             }
-            TableConstraint::NullTest(column, test) => format!("{column} {test:?}"),
+            ColumnConstraintKind::NullTest(test) => format!("{column} {test:?}"),
         }
     }
 

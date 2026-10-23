@@ -8,7 +8,7 @@
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
-use super::{NullTest, TableConstraint};
+use super::{ColumnConstraintKind, NullTest, TableConstraint};
 use crate::query::ast::{BinaryOp, LiteralValue};
 
 /// One end of a column's value range
@@ -134,12 +134,12 @@ pub(crate) fn column_range_build(constraints: &[&TableConstraint]) -> ColumnRang
     let mut null_test: Option<NullTest> = None;
 
     for tc in constraints {
-        match tc {
-            TableConstraint::Comparison(_, op, value)
-            | TableConstraint::CastComparison(_, _, op, value) => {
+        match &tc.kind {
+            ColumnConstraintKind::Comparison { op, value }
+            | ColumnConstraintKind::CastComparison { op, value, .. } => {
                 comparisons.push((*op, value));
             }
-            TableConstraint::AnyOf(_, values) => {
+            ColumnConstraintKind::AnyOf(values) => {
                 // Multiple AnyOf on same column: intersect sets
                 in_set = Some(match in_set {
                     None => values.as_slice(),
@@ -149,7 +149,7 @@ pub(crate) fn column_range_build(constraints: &[&TableConstraint]) -> ColumnRang
                     }
                 });
             }
-            TableConstraint::NullTest(_, test) => match null_test {
+            ColumnConstraintKind::NullTest(test) => match null_test {
                 None => null_test = Some(*test),
                 Some(existing) if existing == *test => {}
                 Some(_) => return ColumnRange::Empty,
@@ -534,11 +534,22 @@ mod tests {
 
     // ========== ColumnRange unit tests ==========
 
+    fn constraint(kind: ColumnConstraintKind) -> TableConstraint {
+        TableConstraint {
+            column: "col".into(),
+            kind,
+        }
+    }
+
+    fn comparison(op: BinaryOp, value: LiteralValue) -> TableConstraint {
+        constraint(ColumnConstraintKind::Comparison { op, value })
+    }
+
     /// Helper: build a ColumnRange from comparison tuples (convenience for tests)
     fn range_from_comparisons(comparisons: &[(BinaryOp, LiteralValue)]) -> ColumnRange {
         let tcs: Vec<TableConstraint> = comparisons
             .iter()
-            .map(|(op, val)| TableConstraint::Comparison("col".into(), *op, val.clone()))
+            .map(|(op, val)| comparison(*op, val.clone()))
             .collect();
         let refs: Vec<&TableConstraint> = tcs.iter().collect();
         column_range_build(&refs)
@@ -660,9 +671,8 @@ mod tests {
     /// `IS NULL` leaves nothing and `IS NOT NULL` changes nothing (PGC-533).
     #[test]
     fn test_column_range_build_null_tests() {
-        let null_test = |test| TableConstraint::NullTest("col".into(), test);
-        let comparison =
-            |op, v| TableConstraint::Comparison("col".into(), op, LiteralValue::Integer(v));
+        let null_test = |test| constraint(ColumnConstraintKind::NullTest(test));
+        let comparison = |op, v| comparison(op, LiteralValue::Integer(v));
         let build = |constraints: &[TableConstraint]| {
             column_range_build(&constraints.iter().collect::<Vec<_>>())
         };
@@ -681,7 +691,7 @@ mod tests {
         assert!(matches!(
             build(&[
                 null_test(NullTest::IsNull),
-                TableConstraint::AnyOf("col".into(), vec![LiteralValue::Integer(1)])
+                constraint(ColumnConstraintKind::AnyOf(vec![LiteralValue::Integer(1)]))
             ]),
             ColumnRange::Empty
         ));

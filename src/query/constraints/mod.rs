@@ -1,4 +1,5 @@
-//! Column constraints by name and the value-domain range algebra over them.
+//! The column constraint vocabulary and the value-domain range algebra over
+//! it.
 //!
 //! * [`range`] — reduces a column's constraints to a [`ColumnRange`] and
 //!   decides containment between ranges, also consumed by
@@ -29,24 +30,70 @@ pub(crate) use range::{
 };
 #[cfg(feature = "proxy")]
 pub(crate) use range_overlap::{
-    column_range_contains, column_ranges_disjoint, column_ranges_from_comparisons,
-    table_column_ranges,
+    column_range_contains, column_ranges_disjoint, table_column_ranges,
 };
 
-/// A constraint clause organized for per-table CDC matching and subsumption.
-/// All clauses within a table's Vec are AND-connected.
+/// A constraint on one column, keyed by `C`: a column binding inside the
+/// predicate model, a column name once projected for a table's consumers.
+/// The constraints in one list are AND-connected.
 #[derive(Debug, Clone, PartialEq)]
-pub enum TableConstraint {
-    /// Single comparison: column op value
-    Comparison(EcoString, BinaryOp, LiteralValue),
-    /// At least one must match (IN semantics): column = v1 OR column = v2 OR ...
-    AnyOf(EcoString, Vec<LiteralValue>),
-    /// Cast-output comparison: `column::cast op value`. Stored separately so
-    /// subsumption buckets it by `(column, cast)` independently of bare
-    /// `Comparison` constraints on the same column.
-    CastComparison(EcoString, CastTarget, BinaryOp, LiteralValue),
+pub struct Constraint<C> {
+    pub column: C,
+    pub kind: ColumnConstraintKind,
+}
+
+impl<C> Constraint<C> {
+    /// The same constraint keyed by `f(column)`.
+    pub fn map_column<D>(self, f: impl FnOnce(C) -> D) -> Constraint<D> {
+        Constraint {
+            column: f(self.column),
+            kind: self.kind,
+        }
+    }
+}
+
+/// A constraint by column name, as subsumption, the constraint index,
+/// read-after-write and CDC row matching see it.
+pub type TableConstraint = Constraint<EcoString>;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ColumnConstraintKind {
+    /// `column op value`.
+    Comparison { op: BinaryOp, value: LiteralValue },
+    /// Set membership; the values are sorted and distinct.
+    AnyOf(Vec<LiteralValue>),
+    /// A comparison in the cast's output domain, so subsumption buckets it by
+    /// `(column, cast)` apart from bare comparisons on the same column.
+    CastComparison {
+        cast: CastTarget,
+        op: BinaryOp,
+        value: LiteralValue,
+    },
     /// `column IS [NOT] NULL`.
-    NullTest(EcoString, NullTest),
+    NullTest(NullTest),
+}
+
+impl ColumnConstraintKind {
+    /// The cast whose output domain the constraint compares in.
+    pub fn cast_target(&self) -> Option<&CastTarget> {
+        match self {
+            ColumnConstraintKind::CastComparison { cast, .. } => Some(cast),
+            ColumnConstraintKind::Comparison { .. }
+            | ColumnConstraintKind::AnyOf(_)
+            | ColumnConstraintKind::NullTest(_) => None,
+        }
+    }
+
+    /// Every literal the constraint compares against.
+    pub fn literals_mut(&mut self) -> impl Iterator<Item = &mut LiteralValue> {
+        let (single, many): (Option<&mut LiteralValue>, &mut [LiteralValue]) = match self {
+            ColumnConstraintKind::Comparison { value, .. }
+            | ColumnConstraintKind::CastComparison { value, .. } => (Some(value), &mut []),
+            ColumnConstraintKind::AnyOf(values) => (None, values.as_mut_slice()),
+            ColumnConstraintKind::NullTest(_) => (None, &mut []),
+        };
+        single.into_iter().chain(many)
+    }
 }
 
 /// The polarity of a null test. `IsNull` is the one recognized conjunct that

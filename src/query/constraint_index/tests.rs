@@ -5,7 +5,7 @@ use super::classify::{Classification, classify, column_set_powerset};
 use super::*;
 use crate::query::ast::{BinaryOp, LiteralValue};
 use crate::query::cast::CastTarget;
-use crate::query::constraints::{NullTest, TableConstraint};
+use crate::query::constraints::{ColumnConstraintKind, NullTest, TableConstraint};
 use crate::query::{Fingerprint, FingerprintSet};
 
 fn col(s: &str) -> EcoString {
@@ -24,16 +24,27 @@ fn int(n: i64) -> LiteralValue {
     LiteralValue::Integer(n)
 }
 
+fn constraint(c: &str, kind: ColumnConstraintKind) -> TableConstraint {
+    TableConstraint {
+        column: col(c),
+        kind,
+    }
+}
+
+fn comparison(c: &str, op: BinaryOp, value: LiteralValue) -> TableConstraint {
+    constraint(c, ColumnConstraintKind::Comparison { op, value })
+}
+
 fn eq(c: &str, v: LiteralValue) -> TableConstraint {
-    TableConstraint::Comparison(col(c), BinaryOp::Equal, v)
+    comparison(c, BinaryOp::Equal, v)
 }
 
 fn gt(c: &str, v: LiteralValue) -> TableConstraint {
-    TableConstraint::Comparison(col(c), BinaryOp::GreaterThan, v)
+    comparison(c, BinaryOp::GreaterThan, v)
 }
 
 fn lt(c: &str, v: LiteralValue) -> TableConstraint {
-    TableConstraint::Comparison(col(c), BinaryOp::LessThan, v)
+    comparison(c, BinaryOp::LessThan, v)
 }
 
 fn text(s: &str) -> LiteralValue {
@@ -41,15 +52,22 @@ fn text(s: &str) -> LiteralValue {
 }
 
 fn any_of(c: &str, vs: Vec<LiteralValue>) -> TableConstraint {
-    TableConstraint::AnyOf(col(c), vs)
+    constraint(c, ColumnConstraintKind::AnyOf(vs))
 }
 
 fn cast_eq(c: &str, cast: CastTarget, v: LiteralValue) -> TableConstraint {
-    TableConstraint::CastComparison(col(c), cast, BinaryOp::Equal, v)
+    constraint(
+        c,
+        ColumnConstraintKind::CastComparison {
+            cast,
+            op: BinaryOp::Equal,
+            value: v,
+        },
+    )
 }
 
 fn null_test(c: &str, test: NullTest) -> TableConstraint {
-    TableConstraint::NullTest(col(c), test)
+    constraint(c, ColumnConstraintKind::NullTest(test))
 }
 
 /// A null test is a complex constraint on its column: a parent testing a

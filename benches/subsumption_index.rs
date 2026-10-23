@@ -21,7 +21,7 @@ use ecow::EcoString;
 use pgcache_lib::query::Fingerprint;
 use pgcache_lib::query::ast::{BinaryOp, LiteralValue};
 use pgcache_lib::query::constraint_index::ConstraintIndex;
-use pgcache_lib::query::constraints::TableConstraint;
+use pgcache_lib::query::constraints::{ColumnConstraintKind, TableConstraint};
 
 const SIZES: [usize; 4] = [64, 256, 1024, 4096];
 
@@ -33,14 +33,21 @@ fn int(n: i64) -> LiteralValue {
     LiteralValue::Integer(n)
 }
 
+fn comparison(c: &str, op: BinaryOp, value: LiteralValue) -> TableConstraint {
+    TableConstraint {
+        column: col(c),
+        kind: ColumnConstraintKind::Comparison { op, value },
+    }
+}
+
 /// `WHERE <c> > v` — single-sided lower-bound range, lands in the complex bucket.
 fn gt(c: &str, v: i64) -> TableConstraint {
-    TableConstraint::Comparison(col(c), BinaryOp::GreaterThan, int(v))
+    comparison(c, BinaryOp::GreaterThan, int(v))
 }
 
 /// `WHERE <c> < v` — single-sided upper-bound range.
 fn lt(c: &str, v: i64) -> TableConstraint {
-    TableConstraint::Comparison(col(c), BinaryOp::LessThan, int(v))
+    comparison(c, BinaryOp::LessThan, int(v))
 }
 
 /// Build an index of `n` single-sided range parents, all in class `{id}`.
@@ -81,11 +88,7 @@ fn bench_candidates_selective(c: &mut Criterion) {
     for n in SIZES {
         let idx = index_single_class(n);
         // id = 3 — subsumed only by parents `id > 0/1/2`, i.e. 3 of them.
-        let query = [TableConstraint::Comparison(
-            col("id"),
-            BinaryOp::Equal,
-            int(3),
-        )];
+        let query = [comparison("id", BinaryOp::Equal, int(3))];
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter(|| black_box(idx.candidates(black_box(&query))));
         });
@@ -100,11 +103,7 @@ fn bench_candidates_midpoint(c: &mut Criterion) {
     let mut group = c.benchmark_group("subsumption/candidates_midpoint");
     for n in SIZES {
         let idx = index_single_class(n);
-        let query = [TableConstraint::Comparison(
-            col("id"),
-            BinaryOp::Equal,
-            int((n / 2) as i64),
-        )];
+        let query = [comparison("id", BinaryOp::Equal, int((n / 2) as i64))];
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter(|| black_box(idx.candidates(black_box(&query))));
         });
@@ -133,11 +132,7 @@ fn bench_two_sided_point(c: &mut Criterion) {
         let idx = index_two_sided_class(n);
         // Probe the middle of the parent-center distribution, so the result
         // set isn't artificially clipped by being near an endpoint.
-        let query = [TableConstraint::Comparison(
-            col("id"),
-            BinaryOp::Equal,
-            int((n / 2) as i64),
-        )];
+        let query = [comparison("id", BinaryOp::Equal, int((n / 2) as i64))];
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter(|| black_box(idx.candidates(black_box(&query))));
         });

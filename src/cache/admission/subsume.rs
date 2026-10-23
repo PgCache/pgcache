@@ -76,6 +76,7 @@ mod tests {
     use super::*;
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
     use crate::oid::TypeOid;
+    use crate::query::constraints::ColumnConstraintKind;
 
     fn column(name: &str, position: i16, data_type: Type, type_name: &str) -> ColumnMetadata {
         ColumnMetadata {
@@ -117,7 +118,20 @@ mod tests {
         let mut lines: Vec<String> = subsumption_references(&bound)
             .expect("references")
             .iter()
-            .map(|(oid, filters)| format!("{oid:?} {filters:?}"))
+            .map(|(oid, filters)| {
+                let filters: Vec<String> = filters
+                    .iter()
+                    .map(|constraint| match &constraint.kind {
+                        ColumnConstraintKind::Comparison { op, value } => {
+                            format!("Comparison({:?}, {op:?}, {value:?})", constraint.column)
+                        }
+                        ColumnConstraintKind::AnyOf(_)
+                        | ColumnConstraintKind::CastComparison { .. }
+                        | ColumnConstraintKind::NullTest(_) => format!("{constraint:?}"),
+                    })
+                    .collect();
+                format!("{oid:?} [{}]", filters.join(", "))
+            })
             .collect();
         lines.sort();
         lines

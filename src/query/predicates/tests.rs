@@ -15,7 +15,8 @@ use crate::query::ast::rope::Select;
 use crate::query::ast::{BinaryOp, LiteralValue};
 use crate::query::cast::CastTarget;
 use crate::query::constraints::{
-    ColumnRange, TableConstraint, column_range_build, table_constraints_subsumed,
+    ColumnConstraintKind, ColumnRange, TableConstraint, column_range_build,
+    table_constraints_subsumed,
 };
 use crate::query::decorrelate::query_decorrelate;
 use crate::query::resolve::{ResolvedQuery, TableSlot};
@@ -112,13 +113,39 @@ fn table_constraints_sorted(constraints: &TableFilters) -> Vec<(ecow::EcoString,
         .table_constraints
         .iter()
         .map(|(table, list)| {
-            let mut list: Vec<String> = list.iter().map(|c| format!("{c:?}")).collect();
+            let mut list: Vec<String> = list.iter().map(constraint_line).collect();
             list.sort();
             (table.clone(), list)
         })
         .collect();
     tables.sort();
     tables
+}
+
+/// A constraint as `Kind("column", …)`, the shape the expectations spell.
+fn constraint_line(constraint: &TableConstraint) -> String {
+    let column = &constraint.column;
+    match &constraint.kind {
+        ColumnConstraintKind::Comparison { op, value } => {
+            format!("Comparison({column:?}, {op:?}, {value:?})")
+        }
+        ColumnConstraintKind::AnyOf(values) => format!("AnyOf({column:?}, {values:?})"),
+        ColumnConstraintKind::CastComparison { cast, op, value } => {
+            format!("CastComparison({column:?}, {cast:?}, {op:?}, {value:?})")
+        }
+        ColumnConstraintKind::NullTest(test) => format!("NullTest({column:?}, {test:?})"),
+    }
+}
+
+fn constraint(column: &str, kind: ColumnConstraintKind) -> TableConstraint {
+    TableConstraint {
+        column: column.into(),
+        kind,
+    }
+}
+
+fn comparison(column: &str, op: BinaryOp, value: LiteralValue) -> TableConstraint {
+    constraint(column, ColumnConstraintKind::Comparison { op, value })
 }
 
 /// What each shape yields: the per-table filters and whether every WHERE
@@ -237,14 +264,14 @@ fn has_table_constraint(
 }
 
 fn has_constraint(constraints: &TableFilters, spec: &ComparisonSpec) -> bool {
-    let expected = TableConstraint::Comparison(spec.column.into(), spec.op, spec.value.clone());
+    let expected = comparison(spec.column, spec.op, spec.value.clone());
     has_table_constraint(constraints, spec.table, &expected)
 }
 
 fn has_in_constraint(constraints: &TableFilters, spec: &InSetSpec) -> bool {
     table_constraint_any(constraints, spec.table, |tc| {
-        matches!(tc, TableConstraint::AnyOf(c, vs)
-            if c == spec.column
+        matches!(&tc.kind, ColumnConstraintKind::AnyOf(vs)
+            if tc.column == spec.column
                 && spec.values.iter().all(|v| vs.contains(v))
                 && vs.len() == spec.values.len())
     })
@@ -879,8 +906,7 @@ fn reference_filter_lines(bound: &ResolvedQuery, select: Select<'_>) -> Vec<(Str
             let relation = predicates
                 .relation_predicates(bindings, reference.slot)
                 .expect("relation predicates");
-            let mut filters: Vec<String> =
-                relation.filters.iter().map(|c| format!("{c:?}")).collect();
+            let mut filters: Vec<String> = relation.filters.iter().map(constraint_line).collect();
             filters.sort();
             let qualifier = bindings.slot(reference.slot).expect("slot").qualifier();
             (qualifier.to_owned(), filters)
@@ -1013,11 +1039,14 @@ fn test_in_with_parameter_skipped() {
 
 /// An `id` constraint for the narrowing table.
 fn id_in(values: &[i64]) -> TableConstraint {
-    TableConstraint::AnyOf("id".into(), values.iter().copied().map(int).collect())
+    constraint(
+        "id",
+        ColumnConstraintKind::AnyOf(values.iter().copied().map(int).collect()),
+    )
 }
 
 fn id_is(op: BinaryOp, value: i64) -> TableConstraint {
-    TableConstraint::Comparison("id".into(), op, int(value))
+    comparison("id", op, int(value))
 }
 
 /// A narrowed range spelled for comparison, its IN members sorted.
@@ -1095,7 +1124,7 @@ fn test_in_clause_is_recognized() {
 #[test]
 fn test_any_eq_clause_extracts_inset() {
     // PGC-106 (option C): `WHERE col = ANY(<array>)` is set membership;
-    // extracted as `ColumnConstraint::InSet` so cached ANY-queries can
+    // extracted as `ColumnConstraintKind::AnyOf` so cached ANY-queries can
     // subsume narrower ANY-queries on the same column.
     let tables = catalog(&["users"]);
     let resolved = resolve_sql(
@@ -1115,9 +1144,8 @@ fn test_any_eq_clause_extracts_inset() {
         .expect("constraint extracted for users");
     assert_eq!(users_cs.len(), 1);
     assert!(matches!(
-        users_cs[0],
-        TableConstraint::AnyOf(ref col, ref vs)
-            if col == "id" && vs.len() == 3
+        &users_cs[0].kind,
+        ColumnConstraintKind::AnyOf(vs) if users_cs[0].column == "id" && vs.len() == 3
     ));
 }
 
@@ -1209,7 +1237,10 @@ fn cast_comparison(
     op: BinaryOp,
     value: LiteralValue,
 ) -> TableConstraint {
-    TableConstraint::CastComparison(column.into(), cast, op, value)
+    constraint(
+        column,
+        ColumnConstraintKind::CastComparison { cast, op, value },
+    )
 }
 
 /// A cast on a compared column: an identity cast extracts the plain
@@ -1221,9 +1252,9 @@ fn test_cast_extraction_cases() {
     #[rustfmt::skip]
     let cases = [
         ("identity text cast on text column", "SELECT * FROM users WHERE name::text = 'alice'", true,
-         Some(TableConstraint::Comparison("name".into(), BinaryOp::Equal, text("alice")))),
+         Some(comparison("name", BinaryOp::Equal, text("alice")))),
         ("identity text cast on int column",  "SELECT * FROM users WHERE id::text = '42'", true,
-         Some(TableConstraint::Comparison("id".into(), BinaryOp::Equal, text("42")))),
+         Some(comparison("id", BinaryOp::Equal, text("42")))),
         ("text to int4",                      "SELECT * FROM users WHERE name::int4 = 42", true,
          Some(cast_comparison("name", CastTarget::Int4, BinaryOp::Equal, int(42)))),
         ("text to numeric",                   "SELECT * FROM users WHERE name::numeric = 42", false, None),

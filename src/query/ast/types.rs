@@ -67,7 +67,7 @@ impl LiteralValue {
             (Some(_), LiteralValue::Null) => false,
             (Some(_), LiteralValue::NullWithCast(_)) => false,
             (Some(_), LiteralValue::Parameter(_)) => false, // Parameters shouldn't appear in constraints
-            // Array constraints flow through `ColumnConstraint::InSet` not
+            // Array constraints flow through `ColumnConstraintKind::AnyOf` not
             // `Comparison`, so a row-vs-array equality test is never the
             // right question; reject defensively.
             (Some(_), LiteralValue::Array(_, _)) => false,

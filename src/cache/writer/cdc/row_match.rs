@@ -5,7 +5,7 @@ use crate::catalog::TableMetadata;
 use crate::pg::protocol::ByteString;
 use crate::query::ast::BinaryOp;
 use crate::query::cast::cast_target_coerce_text;
-use crate::query::constraints::{NullTest, TableConstraint};
+use crate::query::constraints::{ColumnConstraintKind, NullTest, TableConstraint};
 use crate::query::evaluate::literal_compare;
 use crate::query::typed_compare::typed_compare;
 
@@ -56,7 +56,7 @@ pub(super) fn delete_filters_match(
         DeleteImage::Partial { row, known } => filters.iter().all(|constraint| {
             let position = table_metadata
                 .columns
-                .get(constraint_column(constraint))
+                .get(constraint.column.as_str())
                 .map(|column_meta| column_meta.index());
             !position.is_some_and(|position| known.contains(&position))
                 || constraint_row_matches(constraint, table_metadata, row)
@@ -72,48 +72,42 @@ fn constraint_row_matches(
     table_metadata: &TableMetadata,
     row_data: &[Option<ByteString>],
 ) -> bool {
-    let Some(row_value) = table_metadata
-        .columns
-        .get(constraint_column(constraint))
-        .and_then(|column_meta| row_data.get(column_meta.index()))
-    else {
+    let Some(column_meta) = table_metadata.columns.get(constraint.column.as_str()) else {
         return true;
     };
-    let Some(column_meta) = table_metadata.columns.get(constraint_column(constraint)) else {
+    let Some(row_value) = row_data.get(column_meta.index()) else {
         return true;
     };
     match row_value {
-        Some(row_str) => constraint_value_matches(constraint, &column_meta.data_type, row_str),
+        Some(row_str) => {
+            constraint_value_matches(&constraint.kind, &column_meta.data_type, row_str)
+        }
         // NULL satisfies no comparison, only the null test for it.
-        None => matches!(constraint, TableConstraint::NullTest(_, NullTest::IsNull)),
-    }
-}
-
-fn constraint_column(constraint: &TableConstraint) -> &str {
-    match constraint {
-        TableConstraint::Comparison(col, ..)
-        | TableConstraint::AnyOf(col, ..)
-        | TableConstraint::CastComparison(col, ..)
-        | TableConstraint::NullTest(col, ..) => col.as_str(),
+        None => matches!(
+            constraint.kind,
+            ColumnConstraintKind::NullTest(NullTest::IsNull)
+        ),
     }
 }
 
 /// Every consumer of a constraint match invalidates, evicts or includes on a
 /// match, so a value the comparator cannot decide counts as matching: over-
 /// returning costs work, under-returning serves stale data (PGC-478).
-fn constraint_value_matches(constraint: &TableConstraint, data_type: &Type, row_str: &str) -> bool {
-    match constraint {
-        TableConstraint::Comparison(_, op, val) => {
-            typed_compare(data_type, val, row_str, *op).unwrap_or(true)
+fn constraint_value_matches(kind: &ColumnConstraintKind, data_type: &Type, row_str: &str) -> bool {
+    match kind {
+        ColumnConstraintKind::Comparison { op, value } => {
+            typed_compare(data_type, value, row_str, *op).unwrap_or(true)
         }
-        TableConstraint::AnyOf(_, values) => values
+        ColumnConstraintKind::AnyOf(values) => values
             .iter()
             .any(|v| typed_compare(data_type, v, row_str, BinaryOp::Equal).unwrap_or(true)),
         // Coercion failure (e.g. `'abc'::int4`): the row would error at origin
         // and never match — safe to treat as non-matching here.
-        TableConstraint::CastComparison(_, cast, op, val) => cast_target_coerce_text(cast, row_str)
-            .is_some_and(|coerced| literal_compare(&coerced, *op, val)),
-        TableConstraint::NullTest(_, test) => *test == NullTest::IsNotNull,
+        ColumnConstraintKind::CastComparison { cast, op, value } => {
+            cast_target_coerce_text(cast, row_str)
+                .is_some_and(|coerced| literal_compare(&coerced, *op, value))
+        }
+        ColumnConstraintKind::NullTest(test) => *test == NullTest::IsNotNull,
     }
 }
 
@@ -293,8 +287,21 @@ mod tests {
         row_constraints_match(&[constraint], &fixture_table(), row)
     }
 
+    fn constraint(column: &str, kind: ColumnConstraintKind) -> TableConstraint {
+        TableConstraint {
+            column: column.into(),
+            kind,
+        }
+    }
+
     fn id_equals(value: i64) -> TableConstraint {
-        TableConstraint::Comparison("id".into(), BinaryOp::Equal, LiteralValue::Integer(value))
+        constraint(
+            "id",
+            ColumnConstraintKind::Comparison {
+                op: BinaryOp::Equal,
+                value: LiteralValue::Integer(value),
+            },
+        )
     }
 
     fn cast(
@@ -303,7 +310,14 @@ mod tests {
         op: BinaryOp,
         value: LiteralValue,
     ) -> TableConstraint {
-        TableConstraint::CastComparison(column.into(), target, op, value)
+        constraint(
+            column,
+            ColumnConstraintKind::CastComparison {
+                cast: target,
+                op,
+                value,
+            },
+        )
     }
 
     fn name_int4(op: BinaryOp, value: i64) -> TableConstraint {
@@ -316,10 +330,12 @@ mod tests {
     #[test]
     fn test_delete_filters_match_by_image() {
         let table = fixture_table();
-        let name_is_alice = TableConstraint::Comparison(
-            "name".into(),
-            BinaryOp::Equal,
-            LiteralValue::String("alice".into()),
+        let name_is_alice = constraint(
+            "name",
+            ColumnConstraintKind::Comparison {
+                op: BinaryOp::Equal,
+                value: LiteralValue::String("alice".into()),
+            },
         );
         let filters = [name_is_alice];
         let alice = row(Some("alice"), None);
@@ -384,8 +400,8 @@ mod tests {
     /// column may have met either (PGC-533).
     #[test]
     fn test_null_test_matches_by_nullness() {
-        let is_null = TableConstraint::NullTest("name".into(), NullTest::IsNull);
-        let is_not_null = TableConstraint::NullTest("name".into(), NullTest::IsNotNull);
+        let is_null = constraint("name", ColumnConstraintKind::NullTest(NullTest::IsNull));
+        let is_not_null = constraint("name", ColumnConstraintKind::NullTest(NullTest::IsNotNull));
         let null_name = row(None, None);
         let alice = row(Some("alice"), None);
         assert!(constraint_matches(is_null.clone(), &null_name));

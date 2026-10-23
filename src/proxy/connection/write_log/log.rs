@@ -15,9 +15,7 @@ use super::{DisjointKinds, RawBlocker, RawDecision, RawForwardReason};
 use crate::cache::WriteAliasMap;
 use crate::pg::Lsn;
 use crate::query::ast::rope::QueryTree;
-use crate::query::constraints::{
-    ColumnRange, column_ranges_disjoint, column_ranges_from_comparisons,
-};
+use crate::query::constraints::{ColumnRange, column_ranges_disjoint, table_column_ranges};
 use crate::query::resolve::ColumnsByTable;
 use crate::query::write::{RelationRef, WriteClass};
 
@@ -184,8 +182,7 @@ impl WriteLog {
                             agg.merged_predicates > MERGED_PREDICATE_CAP
                         }
                         None => {
-                            agg.deletes
-                                .push(column_ranges_from_comparisons(&delete.comparisons));
+                            agg.deletes.push(table_column_ranges(&delete.comparisons));
                             agg.deletes.len() + agg.updates.len() > UPDATE_DELETE_PREDICATE_CAP
                         }
                     };

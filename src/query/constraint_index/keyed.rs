@@ -7,7 +7,7 @@
 
 use crate::catalog::TableMetadata;
 use crate::query::ast::LiteralValue;
-use crate::query::constraints::TableConstraint;
+use crate::query::constraints::{ColumnConstraintKind, TableConstraint};
 use crate::query::typed_compare::{ValueKind, literal_index_key};
 
 /// Rewrite `constraints` on `table`'s columns into their index-key forms.
@@ -22,28 +22,32 @@ pub(crate) fn table_constraints_keyed(
 }
 
 fn constraint_keyed(constraint: &TableConstraint, table: &TableMetadata) -> TableConstraint {
-    let kind = |column: &str| {
-        table
-            .columns
-            .get(column)
-            .map_or(ValueKind::Unsupported, |meta| {
-                ValueKind::of_type(&meta.data_type)
-            })
-    };
-    match constraint {
-        TableConstraint::Comparison(column, op, value) => {
-            TableConstraint::Comparison(column.clone(), *op, literal_keyed(kind(column), value))
-        }
-        TableConstraint::AnyOf(column, values) => TableConstraint::AnyOf(
-            column.clone(),
+    let kind = table
+        .columns
+        .get(constraint.column.as_str())
+        .map_or(ValueKind::Unsupported, |meta| {
+            ValueKind::of_type(&meta.data_type)
+        });
+    let keyed = match &constraint.kind {
+        ColumnConstraintKind::Comparison { op, value } => ColumnConstraintKind::Comparison {
+            op: *op,
+            value: literal_keyed(kind, value),
+        },
+        ColumnConstraintKind::AnyOf(values) => ColumnConstraintKind::AnyOf(
             values
                 .iter()
-                .map(|value| literal_keyed(kind(column), value))
+                .map(|value| literal_keyed(kind, value))
                 .collect(),
         ),
         // A cast comparison lives in the cast's domain, which the index
         // already treats as unkeyable; a null test has no literal.
-        TableConstraint::CastComparison(..) | TableConstraint::NullTest(..) => constraint.clone(),
+        ColumnConstraintKind::CastComparison { .. } | ColumnConstraintKind::NullTest(_) => {
+            constraint.kind.clone()
+        }
+    };
+    TableConstraint {
+        column: constraint.column.clone(),
+        kind: keyed,
     }
 }
 
