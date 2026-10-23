@@ -213,8 +213,8 @@ pub struct CacheableAnalysis {
     /// request's window unless the shape forces unbounded population.
     pub max_limit: Option<u64>,
     /// The table references of the original (pre-decorrelation) resolved
-    /// form with their filters — the subsumed-side input; `None` for
-    /// set-operation queries (rejected by subsumption outright).
+    /// form with their filters, one per reference of every branch — the
+    /// subsumed-side input; `None` when a table is no branch's reference.
     pub references: Option<Vec<SubsumptionReference>>,
     /// One entry per admitted update query (the subsumer side).
     pub admissions: Vec<FitAdmission>,

@@ -26,7 +26,7 @@ Examples:
 
 - **Cached queries with LIMIT**: May not have loaded all matching rows
 - **Tables a cached query didn't load in full**: a cached query is a candidate for a table only through a reference the predicate model marks `exact` (ADR-059). Every join on the reference's path must preserve it (an unreduced LEFT join with it on the left, or RIGHT with it on the right), and every WHERE conjunct must be a recognized constraint on it alone. Its region is the reference's `filters`. Inner and cross joins, the NULL-filled side of an outer join, a WHERE conjunct the analyzer can't read, and one on another reference (a same-reference `a = b` included) disqualify it; ON clauses never do. A table in a derived table, CTE or subquery is judged in its own branch. A relation referenced from more than one branch is not a candidate, because its cached rows are the union of the branches' (PGC-511 lifts this)
-- **Set operations** (UNION/INTERSECT/EXCEPT): Per-branch constraint analysis not yet implemented
+- **Set operations** (UNION/INTERSECT/EXCEPT): each arm contributes its own references, and the new query is covered when every arm's are. INTERSECT and EXCEPT need every arm too, since a row missing on either side changes the result (PGC-495)
 - **OR predicates**: Constraint extraction treats these as opaque
 - **Inequality constraints in cached query**: Implication checking (e.g. `id > 10` implies `id > 5`) not yet implemented
 

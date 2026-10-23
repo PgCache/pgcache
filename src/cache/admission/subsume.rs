@@ -23,11 +23,14 @@ pub struct SubsumptionReference {
 }
 
 /// Every base table reference of `bound` across its SELECT branches (root,
-/// subqueries, derived tables, CTE bodies), each with its own branch's
-/// filters. `None` for a set operation, or when a table the query reads is
-/// no branch's reference, so coverage can't skip one.
+/// set-operation arms, subqueries, derived tables, CTE bodies), each with
+/// its own branch's filters. `None` when a table the query reads is no
+/// branch's reference, so coverage can't skip one.
+///
+/// A set operation is covered when every arm is: each UNION row comes from
+/// one arm, and INTERSECT/EXCEPT read both sides in full, so a missing row
+/// on either would change the result (PGC-495).
 pub fn subsumption_references(bound: &ResolvedQuery) -> Option<Vec<SubsumptionReference>> {
-    bound.select()?;
     let bindings = bound.bindings();
     let mut references = Vec::new();
     let mut seen = HashSet::new();
@@ -197,16 +200,34 @@ mod tests {
         }
     }
 
-    /// A set operation is left to the caller to reject.
+    /// Each arm of a set operation is a reference of its own with its own
+    /// filters, a repeated table included (PGC-495).
     #[test]
-    fn test_subsumption_references_set_operation_none() {
-        let tables = catalog();
-        let bound = ResolvedQuery::parse_resolve(
-            "SELECT id FROM t UNION SELECT id FROM u",
-            &tables,
-            &["public"],
-        )
-        .expect("resolve");
-        assert!(subsumption_references(&bound).is_none());
+    fn test_subsumption_references_set_operation_per_arm() {
+        let t = format!("{:?}", Oid::from_raw(1001));
+        let u = format!("{:?}", Oid::from_raw(1002));
+        let name = |value: &str| format!(r#"[Comparison("name", Equal, String("{value}"))]"#);
+        assert_eq!(
+            reference_lines(
+                "SELECT id FROM t WHERE name = 'x' UNION SELECT id FROM u WHERE name = 'y'"
+            ),
+            vec![format!("{t} {}", name("x")), format!("{u} {}", name("y"))],
+        );
+        assert_eq!(
+            reference_lines(
+                "SELECT id FROM t WHERE name = 'x' INTERSECT SELECT id FROM t WHERE name = 'y'"
+            ),
+            vec![format!("{t} {}", name("x")), format!("{t} {}", name("y"))],
+        );
+        assert_eq!(
+            reference_lines(
+                "(SELECT id FROM t WHERE name = 'x' EXCEPT SELECT id FROM u) UNION SELECT id FROM t"
+            ),
+            vec![
+                format!("{t} {}", name("x")),
+                format!("{t} []"),
+                format!("{u} []")
+            ],
+        );
     }
 }

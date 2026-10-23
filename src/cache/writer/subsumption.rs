@@ -87,7 +87,7 @@ impl WriterRegistration {
             return false;
         }
 
-        // Set operations (UNION/INTERSECT/EXCEPT) are rejected for now.
+        // A set operation is covered when every arm is (PGC-495).
         let Some(references) = subsumption_references(bound) else {
             return false;
         };

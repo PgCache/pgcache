@@ -1,7 +1,8 @@
 use std::io::Error;
 
 use crate::util::{
-    TestContext, assert_cache_miss, assert_not_subsumed, assert_row_at, assert_subsume_hit,
+    TestContext, assert_cache_hit, assert_cache_miss, assert_not_subsumed, assert_row_at,
+    assert_subsume_hit,
 };
 
 mod util;
@@ -818,5 +819,89 @@ async fn test_subsumption_cte_reference_covered_on_own_filters() -> Result<(), E
     assert_row_at(&res, 2, &[("id", "3")])?;
     let _m = assert_subsume_hit(&mut ctx, m).await?;
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Set-operation children: covered when every arm is (PGC-495)
+// ---------------------------------------------------------------------------
+
+async fn setup_set_operation_tables(ctx: &mut TestContext) -> Result<(), Error> {
+    for table in ["sub_setop_a", "sub_setop_b"] {
+        ctx.query(
+            &format!("CREATE TABLE {table} (id integer PRIMARY KEY, tenant_id integer)"),
+            &[],
+        )
+        .await?;
+    }
+    ctx.query("INSERT INTO sub_setop_a VALUES (1, 1), (2, 1), (3, 2)", &[])
+        .await?;
+    ctx.query("INSERT INTO sub_setop_b VALUES (2, 1), (4, 1), (5, 2)", &[])
+        .await?;
+    ctx.cdc_decode_settle().await
+}
+
+/// Warm a single-table parent: a miss, then settled.
+async fn parent_warm(ctx: &mut TestContext, sql: &str) -> Result<(), Error> {
+    let m = ctx.metrics().await?;
+    ctx.simple_query(sql).await?;
+    assert_cache_miss(ctx, m).await?;
+    ctx.cache_settle().await
+}
+
+/// UNION, INTERSECT and EXCEPT children are served from parents that cover
+/// every arm, and keep following CDC afterwards.
+#[tokio::test]
+async fn test_subsumption_set_operation_covered_per_arm() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_set_operation_tables(&mut ctx).await?;
+    parent_warm(&mut ctx, "SELECT * FROM sub_setop_a WHERE tenant_id = 1").await?;
+    parent_warm(&mut ctx, "SELECT * FROM sub_setop_b WHERE tenant_id = 1").await?;
+
+    let children = [
+        "SELECT id FROM sub_setop_a WHERE tenant_id = 1 AND id > 1 \
+         UNION SELECT id FROM sub_setop_b WHERE tenant_id = 1 ORDER BY id",
+        "SELECT id FROM sub_setop_a WHERE tenant_id = 1 \
+         INTERSECT SELECT id FROM sub_setop_b WHERE tenant_id = 1 ORDER BY id",
+        "SELECT id FROM sub_setop_a WHERE tenant_id = 1 \
+         EXCEPT SELECT id FROM sub_setop_b WHERE tenant_id = 1 ORDER BY id",
+    ];
+    // UNION {2, 4}, INTERSECT {2}, EXCEPT {1}.
+    let expected_rows = [2, 1, 1];
+    for (child, expected) in children.iter().zip(expected_rows) {
+        let m = ctx.metrics().await?;
+        let (proxied, origin) = ctx.proxy_and_origin_rows(child).await?;
+        assert_eq!(origin.len(), expected, "{child}");
+        assert_eq!(proxied, origin, "{child}");
+        assert_subsume_hit(&mut ctx, m).await?;
+    }
+
+    // A tenant-1 row joining both tables shifts every arm's result in place.
+    let m = ctx.metrics().await?;
+    ctx.origin_query("INSERT INTO sub_setop_b VALUES (3, 1)", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+    let (proxied, origin) = ctx.proxy_and_origin_rows(children[1]).await?;
+    assert_eq!(origin.len(), 1, "origin intersect after insert");
+    assert_eq!(proxied, origin, "intersect after insert");
+    assert_cache_hit(&mut ctx, m).await?;
+    Ok(())
+}
+
+/// One arm over a relation no parent covers leaves the whole set operation
+/// uncovered.
+#[tokio::test]
+async fn test_subsumption_set_operation_uncovered_arm_not_subsumed() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_set_operation_tables(&mut ctx).await?;
+    parent_warm(&mut ctx, "SELECT * FROM sub_setop_a WHERE tenant_id = 1").await?;
+
+    let m = ctx.metrics().await?;
+    ctx.simple_query(
+        "SELECT id FROM sub_setop_a WHERE tenant_id = 1 \
+         UNION SELECT id FROM sub_setop_b WHERE tenant_id = 1",
+    )
+    .await?;
+    let _m = assert_not_subsumed(&mut ctx, m).await?;
     Ok(())
 }

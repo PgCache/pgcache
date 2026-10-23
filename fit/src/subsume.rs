@@ -178,6 +178,32 @@ mod tests {
         assert!(!registry.query_subsumed(&analyses[1]));
     }
 
+    /// A set-operation child is covered when every arm is, and not when one
+    /// arm reads a relation no parent holds (PGC-495).
+    #[test]
+    fn test_set_operation_child_covered_per_arm() {
+        let analyses = corpus_analyze(&[
+            "SELECT * FROM users WHERE id > 0",
+            "SELECT * FROM orders WHERE total > 0",
+            "SELECT id FROM users WHERE id = 1 UNION SELECT id FROM orders WHERE total = 5",
+            "SELECT id FROM users WHERE id = 1 INTERSECT SELECT id FROM orders WHERE total = 5",
+            "SELECT id FROM users WHERE id = 1 EXCEPT SELECT id FROM orders WHERE total < 0",
+        ]);
+        let mut registry = SubsumerRegistry::new();
+        registry.subsumer_register(&analyses[0]);
+        assert!(
+            !registry.query_subsumed(&analyses[2]),
+            "orders arm uncovered"
+        );
+        registry.subsumer_register(&analyses[1]);
+        assert!(registry.query_subsumed(&analyses[2]));
+        assert!(registry.query_subsumed(&analyses[3]));
+        assert!(
+            !registry.query_subsumed(&analyses[4]),
+            "total < 0 is outside total > 0"
+        );
+    }
+
     #[test]
     fn test_limit_parent_not_admitted() {
         let analyses = corpus_analyze(&[

@@ -1,6 +1,8 @@
 use std::io::Error;
 
-use crate::util::{TestContext, assert_cache_hit, assert_cache_miss, assert_row_at};
+use crate::util::{
+    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, assert_subsume_hit,
+};
 
 mod util;
 
@@ -308,13 +310,15 @@ async fn test_set_op_union_all() -> Result<(), Error> {
                            SELECT value FROM list_b \
                            ORDER BY value";
 
+    // Both arms read tables the UNION's arms loaded in full, so it is
+    // subsumed rather than populated (PGC-495).
     let res = ctx.simple_query(query_union_all).await?;
     assert_eq!(res.len(), 6); // 4 rows (not deduplicated)
     assert_row_at(&res, 1, &[("value", "X")])?;
     assert_row_at(&res, 2, &[("value", "Y")])?;
     assert_row_at(&res, 3, &[("value", "Y")])?; // duplicate
     assert_row_at(&res, 4, &[("value", "Z")])?;
-    let m = assert_cache_miss(&mut ctx, m).await?;
+    let m = assert_subsume_hit(&mut ctx, m).await?;
 
     ctx.cache_settle().await?;
 
