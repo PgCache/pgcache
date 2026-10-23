@@ -176,7 +176,8 @@ fn command_histogram(cmd: &QueryCommand) -> &'static Histogram {
 /// documented "forwarded silently" path); a query the resolver can't model
 /// (ambiguous self-join columns, USING/NATURAL qualifiers, etc.) as a
 /// `ResolveError`; a correlated subquery that can't be decorrelated as a
-/// `DecorrelateError`. A forwarded query still returns the correct result; a
+/// `DecorrelateError`; a table with row-level security enabled as
+/// `RowSecurityEnabled` (PGC-112). A forwarded query still returns the correct result; a
 /// wrong cached result is caught by the result-diff path, and "should have
 /// cached" by routing assertions — neither relies on this error log.
 fn register_failure_log(key: impl std::fmt::Display, error: &CacheError) {
@@ -185,6 +186,7 @@ fn register_failure_log(key: impl std::fmt::Display, error: &CacheError) {
         CacheError::DecorrelateError(_)
             | CacheError::ResolveError(_)
             | CacheError::UnknownTable { .. }
+            | CacheError::RowSecurityEnabled { .. }
     ) {
         debug!(
             "query {key} forwarded (not cacheable): {}",

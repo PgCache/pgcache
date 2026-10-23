@@ -196,16 +196,15 @@ pub(super) fn row_level_security_evaluate(relations: &[Relation]) -> CheckResult
     if secured.is_empty() {
         return CheckResult::pass(name, "no tables have row-level security enabled");
     }
-    CheckResult::fail(
+    CheckResult::warn(
         name,
         format!(
-            "{} tables have row-level security enabled, which pgcache does not support yet: {}",
+            "{} tables have row-level security enabled and will not be cached: {}",
             secured.len(),
             names_list(&secured)
         ),
-        "pgcache populates the cache as its own role and would serve those rows to every client, \
-         bypassing the policies. Exclude these tables with ALLOWED_TABLES (--allowed_tables), \
-         listing only the tables to cache.",
+        "pgcache populates the cache as its own role and cannot apply the policies, so queries \
+         over these tables are forwarded to origin (pgcache.queries.rls_skipped counts them).",
     )
 }
 
@@ -255,12 +254,12 @@ mod tests {
     }
 
     #[test]
-    fn test_row_level_security_evaluate_fails_on_secured_table() {
+    fn test_row_level_security_evaluate_warns_on_secured_table() {
         let mut tenants = relation("tenants", RelationKind::Table);
         tenants.row_security = true;
         let relations = vec![relation("users", RelationKind::Table), tenants];
         let result = row_level_security_evaluate(&relations);
-        assert_eq!(result.verdict, Verdict::Fail);
+        assert_eq!(result.verdict, Verdict::Warn);
         assert!(result.finding.contains("public.tenants"));
         assert_eq!(
             row_level_security_evaluate(&relations[..1]).verdict,

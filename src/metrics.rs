@@ -41,6 +41,9 @@ pub mod names {
     pub const QUERIES_CACHE_MISS: &str = "pgcache.queries.cache_miss";
     pub const QUERIES_CACHE_ERROR: &str = "pgcache.queries.cache_error";
     pub const QUERIES_ALLOWLIST_SKIPPED: &str = "pgcache.queries.allowlist_skipped";
+    /// Registrations refused because a table has row-level security enabled
+    /// (PGC-112); each such read forwards.
+    pub const QUERIES_RLS_SKIPPED: &str = "pgcache.queries.rls_skipped";
 
     // Read-after-write tracking (PGC-124)
     /// Writes folded into a connection's read-after-write log.
@@ -584,6 +587,7 @@ pub struct QueryHandles {
     pub cache_miss: Counter,
     pub cache_error: Counter,
     pub allowlist_skipped: Counter,
+    pub rls_skipped: Counter,
     pub cache_latency: Histogram,
     pub origin_latency: Histogram,
     pub origin_execution: Histogram,
@@ -594,8 +598,8 @@ impl QueryHandles {
         use names::{
             CACHE_QUERY_LATENCY_SECONDS, ORIGIN_EXECUTION_SECONDS, ORIGIN_QUERY_LATENCY_SECONDS,
             QUERIES_ALLOWLIST_SKIPPED, QUERIES_CACHE_ERROR, QUERIES_CACHE_HIT, QUERIES_CACHE_MISS,
-            QUERIES_CACHEABLE, QUERIES_INVALID, QUERIES_TOTAL, QUERIES_UNCACHEABLE,
-            QUERIES_UNSUPPORTED,
+            QUERIES_CACHEABLE, QUERIES_INVALID, QUERIES_RLS_SKIPPED, QUERIES_TOTAL,
+            QUERIES_UNCACHEABLE, QUERIES_UNSUPPORTED,
         };
         Self {
             total: metrics::counter!(QUERIES_TOTAL),
@@ -607,6 +611,7 @@ impl QueryHandles {
             cache_miss: metrics::counter!(QUERIES_CACHE_MISS),
             cache_error: metrics::counter!(QUERIES_CACHE_ERROR),
             allowlist_skipped: metrics::counter!(QUERIES_ALLOWLIST_SKIPPED),
+            rls_skipped: metrics::counter!(QUERIES_RLS_SKIPPED),
             cache_latency: metrics::histogram!(CACHE_QUERY_LATENCY_SECONDS),
             origin_latency: metrics::histogram!(ORIGIN_QUERY_LATENCY_SECONDS),
             origin_execution: metrics::histogram!(ORIGIN_EXECUTION_SECONDS),

@@ -300,6 +300,24 @@ impl WriterCdc {
             .attach_loc("resolving a Relation message's primary key")?;
         core.frame_relation_oids.insert(table_metadata.relation_oid);
         let relation_oid = table_metadata.relation_oid;
+        // Row-level security enabled since registration (PGC-112): without
+        // the schema-change signal this re-sent Relation is the only notice.
+        if core
+            .query_row_security_get(relation_oid)
+            .await
+            .attach_loc("reading a Relation message's row security")?
+        {
+            if core.cache.tables.contains_key1(&relation_oid) {
+                info!(
+                    relation_oid = %relation_oid,
+                    "origin enabled row-level security on a cached table: evicting its queries"
+                );
+                self.cached_relation_forget(core, relation_oid)
+                    .await
+                    .attach_loc("row-level security enabled on a cached table")?;
+            }
+            return Ok(());
+        }
         // A mid-frame Relation message whose metadata CHANGED (intra-txn
         // DDL): the relation's buffered events were captured under the
         // old column layout, so replaying them after the recreate

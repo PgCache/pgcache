@@ -126,6 +126,14 @@ impl WriterCore {
             Some(schema) => schema,
             None => first.get("table_schema"),
         };
+        if first.get::<_, bool>("row_security") {
+            crate::metrics::handles().query.rls_skipped.increment(1);
+            return Err(CacheError::RowSecurityEnabled {
+                schema: schema.to_owned(),
+                name: table.to_owned(),
+            }
+            .into());
+        }
 
         let mut columns: Vec<ColumnMetadata> = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -457,6 +465,22 @@ impl WriterCore {
             "n" => ReplicaIdentity::Nothing,
             _ => ReplicaIdentity::Default,
         })
+    }
+
+    /// Whether `pg_class.relrowsecurity` is set on the origin relation. An
+    /// absent row (dropped mid-stream) reads as not secured.
+    pub(super) async fn query_row_security_get(&self, relation_oid: Oid) -> CacheResult<bool> {
+        let rows = self
+            .db_origin
+            .query(
+                "SELECT relrowsecurity FROM pg_class WHERE oid = $1",
+                &[&relation_oid],
+            )
+            .await
+            .map_into_report::<CacheError>()?;
+        rows.first()
+            .map(|row| row.try_get(0).map_into_report::<CacheError>())
+            .unwrap_or(Ok(false))
     }
 
     pub(super) async fn query_table_indexes_get(
@@ -839,7 +863,8 @@ const TABLE_COLUMNS_SELECT: &str = r"
         RANK() OVER (order by a.attnum) AS position,
         a.atttypid AS type_oid,
         pg_catalog.format_type(a.atttypid, a.atttypmod) as type_name,
-        a.attnum = any(pgc.conkey) as is_primary_key
+        a.attnum = any(pgc.conkey) as is_primary_key,
+        c.relrowsecurity AS row_security
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
     JOIN pg_attribute a ON a.attrelid = c.oid

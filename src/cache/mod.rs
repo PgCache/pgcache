@@ -179,6 +179,14 @@ error_set! {
         },
         UnknownSchema,
         NoPrimaryKey,
+        /// The table has row-level security enabled: pgcache populates as
+        /// its own role and cannot apply the policies (PGC-112), so a query
+        /// over it forwards.
+        #[display("Table '{schema}.{name}' has row-level security enabled")]
+        RowSecurityEnabled {
+            schema: String,
+            name: String,
+        },
     }
 
     QueryResolutionError := {
