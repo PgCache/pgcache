@@ -331,9 +331,9 @@ pub fn statement_classify(
         AdmissionQuery {
             bound: &bound,
             decorrelated: decorrelated.as_ref(),
+            fingerprint,
+            has_limit,
         },
-        fingerprint,
-        has_limit,
         &builtins.aggregates,
         catalog,
         AdmissionDepth::DecisionOnly,

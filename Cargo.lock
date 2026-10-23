@@ -1738,18 +1738,6 @@ dependencies = [
 
 [[package]]
 name = "iddqd"
-version = "0.4.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8450e1521a7518a32addf0b805ffcfbc8f9c558d2ad5769f068f2aeef5a81126"
-dependencies = [
- "allocator-api2",
- "equivalent",
- "foldhash",
- "hashbrown 0.17.1",
-]
-
-[[package]]
-name = "iddqd"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c9c6a3a37e36cfd4170bf01265cb987a40993369198fb072c1a0041c0cc485cf"
@@ -2583,7 +2571,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
- "iddqd 0.5.0",
+ "iddqd",
  "itoa",
  "jiff",
  "lexopt",
@@ -2675,7 +2663,7 @@ dependencies = [
  "clap",
  "csv",
  "ecow",
- "iddqd 0.4.6",
+ "iddqd",
  "pg_query",
  "pgcache",
  "postgres-types",
