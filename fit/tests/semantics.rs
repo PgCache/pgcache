@@ -227,6 +227,30 @@ mod stable {
     }
 
     #[test]
+    fn test_check_passthrough_reason_ties_ordered_by_label() {
+        let report = check_json(
+            "stable_reason_ties.sql",
+            "SELECT * FROM pg_class;\n\
+             SELECT * FROM events WHERE created_at > now();\n\
+             SELECT * FROM t TABLESAMPLE SYSTEM (10);\n",
+        );
+        let labels: Vec<&str> = report["passthrough"]
+            .as_array()
+            .expect("passthrough array")
+            .iter()
+            .map(|reason| reason["label"].as_str().expect("label string"))
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "non-immutable function",
+                "system catalog reference",
+                "unsupported SQL feature"
+            ]
+        );
+    }
+
+    #[test]
     fn test_check_text_lists_statements_only_on_request() {
         let trace: String = (1..=7)
             .map(|i| format!("SELECT * FROM pg_class WHERE oid = {i};\n"))

@@ -278,8 +278,11 @@ pub fn check_report_build(
             bucket,
         })
         .collect();
-    passthrough
-        .sort_by_key(|reason| std::cmp::Reverse((reason.bucket.statements, reason.bucket.calls)));
+    passthrough.sort_by(|a, b| {
+        (b.bucket.statements, b.bucket.calls)
+            .cmp(&(a.bucket.statements, a.bucket.calls))
+            .then(a.label.cmp(b.label))
+    });
 
     let mut writes_sorted: Vec<TableWrites> = writes_by_table
         .into_iter()
