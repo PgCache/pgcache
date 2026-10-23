@@ -20,7 +20,7 @@ use crate::query::constraint_index::ColumnForms;
 use crate::query::constraint_index::ConstraintIndex;
 #[cfg(feature = "proxy")]
 use crate::query::constraint_index::table_constraints_keyed;
-use crate::query::constraints::TableConstraint;
+use crate::query::constraints::TableRanges;
 use crate::query::predicates::RelationPredicates;
 use crate::query::resolve::{QueryBranch, ResolvedQuery};
 use crate::query::transform::PgEvalTemplate;
@@ -255,16 +255,16 @@ impl UpdateQuery {
 #[derive(Debug, Clone)]
 pub struct SubsumerRegion {
     /// As the parent's filters read, for the precise coverage check.
-    pub filters: Vec<TableConstraint>,
+    pub ranges: TableRanges,
     /// In their key forms, for the candidate index (PGC-478).
-    pub keyed: Vec<TableConstraint>,
+    pub keyed_ranges: TableRanges,
 }
 
 /// An update query to register, with what the relation's indexes take.
 pub struct UpdateQueryRegistration {
     pub update_query: UpdateQuery,
-    /// Constraints to index under, in their key forms.
-    pub index_constraints: Vec<TableConstraint>,
+    /// Its filters' ranges to index under, in their key forms.
+    pub index_ranges: TableRanges,
     /// Its region when it could parent a subsumption but for a LIMIT, which
     /// can change after registration.
     pub subsumer_region: Option<SubsumerRegion>,
@@ -280,17 +280,18 @@ impl UpdateQueryRegistration {
         table: Option<&TableMetadata>,
     ) -> Self {
         let filters = &update_query.predicates.filters;
-        let index_constraints = table.map_or_else(
+        let keyed = table.map_or_else(
             || filters.clone(),
             |table| table_constraints_keyed(filters, table),
         );
+        let index_ranges = TableRanges::build(&keyed);
         let subsumer_region = subsumer_shape.then(|| SubsumerRegion {
-            keyed: index_constraints.clone(),
-            filters: filters.clone(),
+            ranges: update_query.predicates.ranges.clone(),
+            keyed_ranges: index_ranges.clone(),
         });
         Self {
             update_query,
-            index_constraints,
+            index_ranges,
             subsumer_region,
         }
     }
@@ -408,9 +409,9 @@ impl UpdateQueries {
         self.eval_index.columns()
     }
 
-    /// Subsumption parents whose constraints might cover `keyed`, the new
-    /// query's constraints in their key forms.
-    pub fn subsumption_candidates(&self, keyed: &[TableConstraint]) -> FingerprintSet {
+    /// Subsumption parents whose region might cover `keyed`, the new
+    /// query's ranges in their key forms.
+    pub fn subsumption_candidates(&self, keyed: &TableRanges) -> FingerprintSet {
         self.subsumption.candidates(keyed).into_iter().collect()
     }
 
@@ -538,13 +539,13 @@ impl UpdateQueries {
             update_query.fingerprint = fingerprint;
             update_query.ordinal = entries.len();
             self.eval_index
-                .insert(update_query.key(), &registration.index_constraints);
+                .insert(update_query.key(), &registration.index_ranges);
             self.change_dependent_account(update_query.change_dependent, true);
             entries.push(update_query);
         }
         if let Some(region) = subsumer {
             if entries.iter().all(|entry| !entry.has_limit) {
-                self.subsumption.insert(fingerprint, &region.keyed);
+                self.subsumption.insert(fingerprint, &region.keyed_ranges);
             }
             self.subsumer_regions.insert(fingerprint, region);
         }
@@ -588,7 +589,7 @@ impl UpdateQueries {
         self.queries.insert(fingerprint, entries);
         self.subsumption.remove(fingerprint);
         if !has_limit && let Some(region) = self.subsumer_regions.get(&fingerprint) {
-            self.subsumption.insert(fingerprint, &region.keyed);
+            self.subsumption.insert(fingerprint, &region.keyed_ranges);
         }
     }
 
@@ -630,6 +631,7 @@ mod tests {
     use crate::oid::TypeOid;
     use crate::pg::protocol::ByteString;
     use crate::query::constraint_index::row_value_forms;
+    use crate::query::constraints::TableConstraint;
 
     const FINGERPRINT: Fingerprint = Fingerprint::from_raw(0x5eed);
     const ITEMS_OID: u32 = 1001;
@@ -709,15 +711,17 @@ mod tests {
     }
 
     fn subsumer(queries: &UpdateQueries) -> bool {
-        queries.subsumption_candidates(&[]).contains(&FINGERPRINT)
+        queries
+            .subsumption_candidates(&TableRanges::default())
+            .contains(&FINGERPRINT)
             || queries
-                .subsumption_candidates(&[TableConstraint {
+                .subsumption_candidates(&TableRanges::build(&[TableConstraint {
                     column: "kind".into(),
                     kind: crate::query::constraints::ColumnConstraintKind::Comparison {
                         op: crate::query::ast::BinaryOp::Equal,
                         value: crate::query::ast::LiteralValue::String("x".into()),
                     },
-                }])
+                }]))
                 .contains(&FINGERPRINT)
     }
 

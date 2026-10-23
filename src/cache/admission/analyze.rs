@@ -589,10 +589,10 @@ mod tests {
         let tables = catalog();
         let bound = ResolvedQuery::parse_resolve(new, &tables, &["public"]).expect("resolve");
         let references = subsumption_references(&bound).expect("references");
-        let [(_, filters)] = references.as_slice() else {
+        let [reference] = references.as_slice() else {
             panic!("one reference in {new}");
         };
-        region.is_some_and(|region| table_constraints_subsumed(filters, &region))
+        region.is_some_and(|region| table_constraints_subsumed(&reference.filters, &region))
     }
 
     /// A cached `x = y` loaded only the rows where the two columns agree, so

@@ -7,14 +7,20 @@ use std::collections::HashSet;
 
 use super::{SubsumerCandidate, SubsumerSource};
 use crate::oid::Oid;
-use crate::query::constraints::{TableConstraint, table_constraints_subsumed};
+use crate::query::constraints::{TableConstraint, TableRanges, table_ranges_subsumed};
 use crate::query::predicates::query_branch_predicates_build;
 use crate::query::resolve::{ResolvedQuery, TableSlot};
 use crate::query::update::select_branches_with_source;
 
 /// One table reference of a new query: its relation and the filters every
-/// row it reads satisfies.
-pub type SubsumptionReference = (Oid, Vec<TableConstraint>);
+/// row it reads satisfies, as constraints for the source to key and as
+/// ranges for the coverage check.
+#[derive(Debug, Clone)]
+pub struct SubsumptionReference {
+    pub relation_oid: Oid,
+    pub filters: Vec<TableConstraint>,
+    pub ranges: TableRanges,
+}
 
 /// Every base table reference of `bound` across its SELECT branches (root,
 /// subqueries, derived tables, CTE bodies), each with its own branch's
@@ -36,7 +42,11 @@ pub fn subsumption_references(bound: &ResolvedQuery) -> Option<Vec<SubsumptionRe
                 continue;
             }
             let relation = predicates.relation_predicates(bindings, reference.slot)?;
-            references.push((table.relation_oid, relation.filters));
+            references.push(SubsumptionReference {
+                relation_oid: table.relation_oid,
+                filters: relation.filters,
+                ranges: relation.ranges,
+            });
         }
     }
     let base_slots = bindings
@@ -56,14 +66,14 @@ pub fn subsumption_covered(
     source: &impl SubsumerSource,
 ) -> bool {
     !references.is_empty()
-        && references.iter().all(|(relation_oid, filters)| {
-            source.candidates(*relation_oid, filters).any(|candidate| {
+        && references.iter().all(|reference| {
+            source.candidates(reference).any(|candidate| {
                 let SubsumerCandidate {
-                    filters: region,
+                    region,
                     has_limit,
                     ready,
                 } = candidate;
-                !has_limit && ready && table_constraints_subsumed(filters, region)
+                !has_limit && ready && table_ranges_subsumed(&reference.ranges, region)
             })
         })
 }
@@ -118,8 +128,10 @@ mod tests {
         let mut lines: Vec<String> = subsumption_references(&bound)
             .expect("references")
             .iter()
-            .map(|(oid, filters)| {
-                let filters: Vec<String> = filters
+            .map(|reference| {
+                let oid = reference.relation_oid;
+                let filters: Vec<String> = reference
+                    .filters
                     .iter()
                     .map(|constraint| match &constraint.kind {
                         ColumnConstraintKind::Comparison { op, value } => {

@@ -10,8 +10,7 @@ use super::column_index::ComplexIndex;
 use super::value_key::ValueKey;
 use super::{ColumnSet, ConstraintIndex, IdSet};
 use crate::id_hash::IdHashable;
-use crate::query::constraints::ColumnRange;
-use crate::query::constraints::TableConstraint;
+use crate::query::constraints::{ColumnRange, TableRanges};
 
 #[derive(Debug)]
 pub(super) struct SubsumptionClass<K> {
@@ -51,17 +50,17 @@ impl<K: IdHashable + Copy> ConstraintIndex<K> {
         Self::default()
     }
 
-    /// Index a query's constraints on a single table.
+    /// Index a query's ranges on a single table.
     ///
     /// Caller is responsible for skipping queries that should never be
     /// considered for subsumption (e.g. `has_limit=true`, multi-table
     /// parents). Those should not reach this method. Idempotent on the same
     /// `fingerprint`: previous membership is removed before re-indexing.
-    pub fn insert(&mut self, fingerprint: K, table_constraints: &[TableConstraint]) {
+    pub fn insert(&mut self, fingerprint: K, table_ranges: &TableRanges) {
         if self.membership.contains_key(&fingerprint) {
             self.remove(fingerprint);
         }
-        match classify(table_constraints) {
+        match classify(table_ranges) {
             Classification::EqualityPure { columns, values } => {
                 let bucket = self
                     .classes
@@ -81,7 +80,7 @@ impl<K: IdHashable + Copy> ConstraintIndex<K> {
                 );
             }
             Classification::Complex { columns } => {
-                let ranges = column_ranges(table_constraints, &columns);
+                let ranges = column_ranges(table_ranges, &columns);
                 let bucket = self
                     .classes
                     .entry(columns.clone())
@@ -141,22 +140,22 @@ impl<K: IdHashable + Copy> ConstraintIndex<K> {
     /// set is a subset of new's. Cost is `min(2^n, |classes| × n)`, so a
     /// wide generated WHERE stays cheap against the handful of shapes
     /// actually registered.
-    pub fn candidates(&self, new_constraints: &[TableConstraint]) -> IdSet<K> {
+    pub fn candidates(&self, new_ranges: &TableRanges) -> IdSet<K> {
         let mut candidates = IdSet::default();
-        let new_columns = classify(new_constraints).into_columns();
+        let new_columns = classify(new_ranges).into_columns();
         let n = new_columns.len();
 
         let powerset_is_smaller = n < u32::BITS as usize && (1usize << n) <= self.classes.len();
         if powerset_is_smaller {
             for subset in column_set_powerset(&new_columns) {
                 if let Some(bucket) = self.classes.get(&subset) {
-                    self.subset_probe(new_constraints, &subset, bucket, &mut candidates);
+                    self.subset_probe(new_ranges, &subset, bucket, &mut candidates);
                 }
             }
         } else {
             for (subset, bucket) in &self.classes {
                 if subset.is_subset_of(&new_columns) {
-                    self.subset_probe(new_constraints, subset, bucket, &mut candidates);
+                    self.subset_probe(new_ranges, subset, bucket, &mut candidates);
                 }
             }
         }
@@ -168,12 +167,12 @@ impl<K: IdHashable + Copy> ConstraintIndex<K> {
     /// constrains every column of it and the ranges are fully populated.
     fn subset_probe(
         &self,
-        new_constraints: &[TableConstraint],
+        new_ranges: &TableRanges,
         subset: &ColumnSet,
         bucket: &SubsumptionClass<K>,
         candidates: &mut IdSet<K>,
     ) {
-        let ranges = column_ranges(new_constraints, subset);
+        let ranges = column_ranges(new_ranges, subset);
         // Equality probe: when new reduces to a keyable `Equal(v)` on
         // every column of `subset`, parents with exactly that value tuple
         // are candidates — regardless of what new does on columns outside

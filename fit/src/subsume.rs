@@ -6,11 +6,13 @@
 
 use std::collections::HashMap;
 
-use pgcache_lib::cache::admission::{SubsumerCandidate, SubsumerSource, subsumption_covered};
+use pgcache_lib::cache::admission::{
+    SubsumerCandidate, SubsumerSource, SubsumptionReference, subsumption_covered,
+};
 use pgcache_lib::oid::Oid;
 use pgcache_lib::query::Fingerprint;
 use pgcache_lib::query::constraint_index::ConstraintIndex;
-use pgcache_lib::query::constraints::TableConstraint;
+use pgcache_lib::query::constraints::TableRanges;
 
 use crate::classify::CacheableAnalysis;
 
@@ -25,7 +27,7 @@ struct RelationSubsumers {
 }
 
 struct AdmittedSubsumer {
-    filters: Vec<TableConstraint>,
+    region: TableRanges,
     has_limit: bool,
 }
 
@@ -48,7 +50,7 @@ impl SubsumerRegistry {
     /// the remaining gates run per lookup in `subsumption_covered`.
     pub fn subsumer_register(&mut self, analysis: &CacheableAnalysis) {
         for admission in &analysis.admissions {
-            let (true, Some(filters)) = (admission.subsumer_eligible, &admission.subsumer_region)
+            let (true, Some(region)) = (admission.subsumer_eligible, &admission.subsumer_region)
             else {
                 continue;
             };
@@ -56,11 +58,11 @@ impl SubsumerRegistry {
                 .by_relation
                 .entry(admission.relation_oid)
                 .or_insert_with(RelationSubsumers::new);
-            relation.index.insert(analysis.fingerprint, filters);
+            relation.index.insert(analysis.fingerprint, region);
             relation.admitted.insert(
                 analysis.fingerprint,
                 AdmittedSubsumer {
-                    filters: filters.clone(),
+                    region: region.clone(),
                     has_limit: analysis.has_limit,
                 },
             );
@@ -80,23 +82,22 @@ impl SubsumerRegistry {
 impl SubsumerSource for SubsumerRegistry {
     fn candidates(
         &self,
-        relation_oid: Oid,
-        table_constraints: &[TableConstraint],
+        reference: &SubsumptionReference,
     ) -> impl Iterator<Item = SubsumerCandidate<'_>> {
         self.by_relation
-            .get(&relation_oid)
+            .get(&reference.relation_oid)
             .into_iter()
             .flat_map(move |relation| {
                 relation
                     .index
-                    .candidates(table_constraints)
+                    .candidates(&reference.ranges)
                     .into_iter()
                     .filter_map(move |fingerprint| {
                         relation
                             .admitted
                             .get(&fingerprint)
                             .map(|subsumer| SubsumerCandidate {
-                                filters: &subsumer.filters,
+                                region: &subsumer.region,
                                 has_limit: subsumer.has_limit,
                                 ready: true,
                             })

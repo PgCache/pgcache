@@ -11,11 +11,13 @@ use ecow::EcoString;
 #[cfg(test)]
 use super::ColumnConstraintKind;
 use super::TableConstraint;
+#[cfg(test)]
+use super::range::column_range_build;
 use super::range::{
-    BoundSide, ColumnRange, RangeBound, RangeView, column_range_build,
-    literal_value_is_incomparable, literal_value_order,
+    BoundSide, ColumnRange, RangeBound, RangeView, literal_value_is_incomparable,
+    literal_value_order,
 };
-use super::subsume::constraints_group_by_column;
+use super::subsume::TableRanges;
 use crate::query::ast::LiteralValue;
 
 /// Reduce a table's constraints to a per-column [`ColumnRange`]: a
@@ -27,11 +29,7 @@ use crate::query::ast::LiteralValue;
 /// inserted value. A column absent from the result is unconstrained (and so
 /// can't exclude any row).
 pub(crate) fn table_column_ranges(filters: &[TableConstraint]) -> HashMap<EcoString, ColumnRange> {
-    constraints_group_by_column(filters)
-        .into_iter()
-        .filter(|((_, cast), _)| cast.is_none())
-        .map(|((col, _), cs)| (EcoString::from(col), column_range_build(cs.as_slice())))
-        .collect()
+    TableRanges::build(filters).bare_columns()
 }
 
 /// Exact three-way comparison between an integer and a float value, without the

@@ -1,11 +1,53 @@
+#[cfg(feature = "proxy")]
+use std::collections::HashMap;
+
+#[cfg(feature = "proxy")]
+use ecow::EcoString;
+
 use crate::cache::{SubqueryKind, UpdateQuerySource};
 use crate::oid::Oid;
 use crate::query::ast::rope::{
     Body, JoinQual, Query, Scalar, ScalarKind, Select, SelectItem, Source, Table, Where, WhereKind,
 };
 use crate::query::ast::{SubLinkType, UnaryOp};
+#[cfg(feature = "proxy")]
+use crate::query::constraints::ColumnRange;
 use crate::query::predicates::{OuterJoinRole, RelationPredicates, query_branch_predicates_build};
+
+#[cfg(feature = "proxy")]
+use crate::query::resolve::TableSlot;
 use crate::query::resolve::{QueryBranch, ResolvedQuery};
+
+/// The per-column ranges of a single-table read's root reference, for the
+/// read-after-write gate's row-level disjointness: `None` for a join,
+/// self-join, subquery or CTE (a write to any table read can affect the
+/// result) or a WHERE the model couldn't fully read; empty when the root
+/// reads its one table only through a derived table.
+#[cfg(feature = "proxy")]
+pub(crate) fn read_ranges(bound: &ResolvedQuery) -> Option<HashMap<EcoString, ColumnRange>> {
+    let bindings = bound.bindings();
+    let mut base_slots = bindings
+        .slots()
+        .iter()
+        .enumerate()
+        .filter(|(_, slot)| matches!(slot, TableSlot::Base { .. }));
+    let (Some((slot_index, _)), None) = (base_slots.next(), base_slots.next()) else {
+        return None;
+    };
+    let predicates = query_branch_predicates_build(bound, bound.select()?);
+    if !predicates.where_recognized() {
+        return None;
+    }
+    let reference = predicates
+        .table_references()
+        .iter()
+        .find(|reference| reference.slot.index() == slot_index);
+    let Some(reference) = reference else {
+        return Some(HashMap::new());
+    };
+    let relation = predicates.relation_predicates(bindings, reference.slot)?;
+    Some(relation.ranges.bare_columns())
+}
 
 /// One table's update query: the branch it sits in, as the cache
 /// evaluates a changed row of the table against it.
@@ -303,6 +345,67 @@ mod tests {
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
     use crate::oid::TypeOid;
     use crate::query::ast::query_tree_parse;
+
+    #[cfg(feature = "proxy")]
+    fn read_ranges_of(sql: &str) -> Option<Vec<(String, String)>> {
+        let int_column = |name: &str, position: i16| ColumnMetadata {
+            name: name.into(),
+            position: ColumnPosition::from_raw(position),
+            type_oid: TypeOid::from_raw(23),
+            data_type: Type::INT4,
+            type_name: "int4".into(),
+            cache_type_name: "int4".into(),
+            is_primary_key: position == 1,
+        };
+        let mut tables = BiHashMap::new();
+        for (oid, name) in [(1001, "t"), (1002, "u")] {
+            tables.insert_overwrite(
+                TableMetadata::for_test(name, oid, [int_column("id", 1), int_column("x", 2)])
+                    .into(),
+            );
+        }
+        let bound = ResolvedQuery::parse_resolve(sql, &tables, &["public"]).expect("resolve");
+        read_ranges(&bound).map(|ranges| {
+            let mut ranges: Vec<(String, String)> = ranges
+                .iter()
+                .map(|(column, range)| (column.to_string(), format!("{range:?}")))
+                .collect();
+            ranges.sort();
+            ranges
+        })
+    }
+
+    /// A single-table read's ranges come from its reference's filters when
+    /// every WHERE conjunct is recognized; a read through a derived table
+    /// proves nothing, and a read of more than one table reference has none.
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn test_read_ranges() {
+        assert_eq!(
+            read_ranges_of("SELECT * FROM t WHERE id = 5"),
+            Some(vec![("id".to_owned(), "Equal(Integer(5))".to_owned())])
+        );
+        assert_eq!(
+            read_ranges_of("SELECT * FROM t WHERE id = 5 AND x + 1 = 2"),
+            None
+        );
+        assert_eq!(
+            read_ranges_of("SELECT * FROM (SELECT * FROM t WHERE id = 1) d"),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            read_ranges_of("SELECT * FROM t JOIN u ON u.id = t.id WHERE t.id = 5"),
+            None
+        );
+        assert_eq!(
+            read_ranges_of("SELECT * FROM t a JOIN t b ON b.id = a.x WHERE a.id = 5"),
+            None
+        );
+        assert_eq!(
+            read_ranges_of("SELECT * FROM t WHERE x IN (SELECT id FROM u)"),
+            None
+        );
+    }
 
     /// Helper to parse SQL and return a CacheableQuery
     fn parse_cacheable(sql: &str) -> CacheableQuery {

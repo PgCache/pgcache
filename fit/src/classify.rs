@@ -16,7 +16,7 @@ use pgcache_lib::catalog::Catalog;
 use pgcache_lib::oid::Oid;
 use pgcache_lib::query::ast::rope::QueryTree;
 use pgcache_lib::query::ast::{AstError, RawStatement, WhereParseError, statement_convert_raw};
-use pgcache_lib::query::constraints::TableConstraint;
+use pgcache_lib::query::constraints::TableRanges;
 use pgcache_lib::query::literal_settings::LiteralSettings;
 use pgcache_lib::query::transform::query_tree_parameters_replace;
 use pgcache_lib::query::write::{TransactionBoundary, WriteClass};
@@ -225,7 +225,7 @@ pub struct FitAdmission {
     pub relation_oid: Oid,
     /// The rows the update query's reference holds in full, when it can
     /// parent a subsumption but for a LIMIT.
-    pub subsumer_region: Option<Vec<TableConstraint>>,
+    pub subsumer_region: Option<TableRanges>,
     pub subsumer_eligible: bool,
 }
 
@@ -361,7 +361,7 @@ pub fn statement_classify(
             relation_oid: table.relation_oid,
             subsumer_region: table
                 .subsumer_shape
-                .then(|| table.update_query.predicates.filters.clone()),
+                .then(|| table.update_query.predicates.ranges.clone()),
             subsumer_eligible: table.subsumer_eligible,
         })
         .collect();
@@ -565,7 +565,7 @@ mod tests {
         let references = analysis.references.as_ref().expect("select references");
         assert_eq!(references.len(), 1);
         assert_eq!(
-            references.first().map(|(_, filters)| filters.len()),
+            references.first().map(|reference| reference.filters.len()),
             Some(1)
         );
     }

@@ -4,8 +4,9 @@
 //! * [`range`] — reduces a column's constraints to a [`ColumnRange`] and
 //!   decides containment between ranges, also consumed by
 //!   `query::constraint_index`.
-//! * [`subsume`] — whether a parent's region holds every row a reference's
-//!   filters admit, column by column.
+//! * [`subsume`] — a table's constraints reduced once to per-column
+//!   [`TableRanges`], and whether a parent's region holds every row a
+//!   reference's ranges admit.
 //! * `range_overlap` — read-after-write containment/disjointness over the same
 //!   ranges; proxy-only.
 //!
@@ -22,11 +23,15 @@ mod range;
 mod range_overlap;
 mod subsume;
 
-pub use subsume::table_constraints_subsumed;
+pub use subsume::{TableRanges, table_ranges_subsumed};
 
+#[cfg(test)]
+pub(crate) use subsume::table_constraints_subsumed;
+
+#[cfg(test)]
+pub(crate) use range::column_range_build;
 pub(crate) use range::{
-    ColumnRange, column_range_build, literal_value_canonical_order, literal_value_is_incomparable,
-    literal_value_order,
+    ColumnRange, literal_value_canonical_order, literal_value_is_incomparable, literal_value_order,
 };
 #[cfg(feature = "proxy")]
 pub(crate) use range_overlap::{

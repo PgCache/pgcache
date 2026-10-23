@@ -8,7 +8,7 @@ use super::{
     TableReference, TableReferencePredicates,
 };
 use crate::catalog::{ColumnPosition, TableMetadata};
-use crate::query::constraints::{ColumnConstraintKind, NullTest};
+use crate::query::constraints::{ColumnConstraintKind, NullTest, TableRanges};
 use crate::query::resolve::{Bindings, ColumnBinding, SlotId, TableSlot};
 
 impl FromJoin {
@@ -117,6 +117,7 @@ impl RelationPredicates {
     pub(crate) fn unknown(table: &TableMetadata) -> Self {
         Self {
             filters: Vec::new(),
+            ranges: TableRanges::default(),
             link_columns: table
                 .columns
                 .iter()
@@ -171,6 +172,7 @@ impl QueryBranchPredicates {
             })
             .collect::<Option<Vec<_>>>()?;
         Some(RelationPredicates {
+            ranges: TableRanges::build(&filters),
             filters,
             link_columns,
             unrecognized: predicates.unrecognized,

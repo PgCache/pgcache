@@ -9,7 +9,7 @@ use ecow::EcoString;
 
 use super::update_query::UpdateQuery;
 use crate::oid::Oid;
-use crate::query::constraints::TableConstraint;
+use crate::query::constraints::TableRanges;
 
 mod analyze;
 mod subsume;
@@ -50,8 +50,8 @@ pub struct AdmissionAnalysis {
 
 /// One registered subsumption candidate as seen at lookup time.
 pub struct SubsumerCandidate<'a> {
-    /// The parent's region: it holds every row these filters describe.
-    pub filters: &'a [TableConstraint],
+    /// The parent's region: it holds every row these ranges describe.
+    pub region: &'a TableRanges,
     pub has_limit: bool,
     /// The parent is Ready: populated, not invalidated. Always true for
     /// pgcache-fit's infinite-cache model.
@@ -64,7 +64,6 @@ pub struct SubsumerCandidate<'a> {
 pub trait SubsumerSource {
     fn candidates(
         &self,
-        relation_oid: Oid,
-        table_constraints: &[TableConstraint],
+        reference: &SubsumptionReference,
     ) -> impl Iterator<Item = SubsumerCandidate<'_>>;
 }

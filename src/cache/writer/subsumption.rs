@@ -13,7 +13,8 @@ use super::registration::{
     QueryResolution, RegistrationIdentity, WriterRegistration, cached_query_insert,
 };
 use crate::cache::admission::{
-    SubsumerCandidate, SubsumerSource, subsumption_covered, subsumption_references,
+    SubsumerCandidate, SubsumerSource, SubsumptionReference, subsumption_covered,
+    subsumption_references,
 };
 use crate::cache::messages::SubsumptionResult;
 use crate::cache::types::Cache;
@@ -21,7 +22,7 @@ use crate::cache::{CacheError, CacheResult, MapIntoReport};
 use crate::oid::Oid;
 use crate::query::Fingerprint;
 use crate::query::constraint_index::table_constraints_keyed;
-use crate::query::constraints::TableConstraint;
+use crate::query::constraints::TableRanges;
 use crate::query::resolve::ResolvedQuery;
 use crate::result::error_chain_format;
 use crate::timing::duration_to_ns_u64;
@@ -35,15 +36,15 @@ struct WriterSubsumerSource<'a> {
 impl SubsumerSource for WriterSubsumerSource<'_> {
     fn candidates(
         &self,
-        relation_oid: Oid,
-        table_constraints: &[TableConstraint],
+        reference: &SubsumptionReference,
     ) -> impl Iterator<Item = SubsumerCandidate<'_>> {
+        let relation_oid = reference.relation_oid;
         // Probe with the new query's constraints in their key forms, the way
         // the index was built (PGC-478).
-        let keyed = self.cache.tables.get1(&relation_oid).map_or_else(
-            || table_constraints.to_vec(),
-            |t| table_constraints_keyed(table_constraints, t),
-        );
+        let keyed = TableRanges::build(&self.cache.tables.get1(&relation_oid).map_or_else(
+            || reference.filters.clone(),
+            |t| table_constraints_keyed(&reference.filters, t),
+        ));
         self.cache
             .update_queries
             .get(&relation_oid)
@@ -59,7 +60,7 @@ impl SubsumerSource for WriterSubsumerSource<'_> {
                         let region = update_queries.subsumer_region(fingerprint)?;
                         let parent = self.cache.cached_queries.get1(&fingerprint);
                         Some(SubsumerCandidate {
-                            filters: &region.filters,
+                            region: &region.ranges,
                             has_limit: update_queries
                                 .queries_of(fingerprint)
                                 .iter()

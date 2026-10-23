@@ -12,7 +12,7 @@ use ecow::EcoString;
 
 use crate::catalog::ColumnPosition;
 use crate::query::ast::NodeId;
-use crate::query::constraints::{Constraint, TableConstraint};
+use crate::query::constraints::{Constraint, TableConstraint, TableRanges};
 use crate::query::resolve::{ColumnBinding, SlotId};
 
 mod branch;
@@ -141,6 +141,9 @@ pub struct TableReferencePredicates {
 #[derive(Debug, Clone)]
 pub struct RelationPredicates {
     pub filters: Vec<TableConstraint>,
+    /// `filters` reduced once to per-column ranges, for subsumption and
+    /// read-after-write.
+    pub ranges: TableRanges,
     pub link_columns: Vec<EcoString>,
     pub unrecognized: bool,
     pub exact: bool,

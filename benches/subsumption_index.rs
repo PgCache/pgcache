@@ -21,7 +21,7 @@ use ecow::EcoString;
 use pgcache_lib::query::Fingerprint;
 use pgcache_lib::query::ast::{BinaryOp, LiteralValue};
 use pgcache_lib::query::constraint_index::ConstraintIndex;
-use pgcache_lib::query::constraints::{ColumnConstraintKind, TableConstraint};
+use pgcache_lib::query::constraints::{ColumnConstraintKind, TableConstraint, TableRanges};
 
 const SIZES: [usize; 4] = [64, 256, 1024, 4096];
 
@@ -31,6 +31,10 @@ fn col(s: &str) -> EcoString {
 
 fn int(n: i64) -> LiteralValue {
     LiteralValue::Integer(n)
+}
+
+fn ranges(constraints: &[TableConstraint]) -> TableRanges {
+    TableRanges::build(constraints)
 }
 
 fn comparison(c: &str, op: BinaryOp, value: LiteralValue) -> TableConstraint {
@@ -54,7 +58,10 @@ fn lt(c: &str, v: i64) -> TableConstraint {
 fn index_single_class(n: usize) -> ConstraintIndex<Fingerprint> {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     for k in 0..n {
-        idx.insert(Fingerprint::from_raw(k as u64), &[gt("id", k as i64)]);
+        idx.insert(
+            Fingerprint::from_raw(k as u64),
+            &ranges(&[gt("id", k as i64)]),
+        );
     }
     idx
 }
@@ -73,7 +80,7 @@ fn index_two_sided_class(n: usize) -> ConstraintIndex<Fingerprint> {
         let k = k as i64;
         idx.insert(
             Fingerprint::from_raw(k as u64),
-            &[gt("id", k), lt("id", k + TWO_SIDED_WINDOW)],
+            &ranges(&[gt("id", k), lt("id", k + TWO_SIDED_WINDOW)]),
         );
     }
     idx
@@ -90,7 +97,7 @@ fn bench_candidates_selective(c: &mut Criterion) {
         // id = 3 — subsumed only by parents `id > 0/1/2`, i.e. 3 of them.
         let query = [comparison("id", BinaryOp::Equal, int(3))];
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
-            b.iter(|| black_box(idx.candidates(black_box(&query))));
+            b.iter(|| black_box(idx.candidates(&ranges(black_box(&query)))));
         });
     }
     group.finish();
@@ -105,7 +112,7 @@ fn bench_candidates_midpoint(c: &mut Criterion) {
         let idx = index_single_class(n);
         let query = [comparison("id", BinaryOp::Equal, int((n / 2) as i64))];
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
-            b.iter(|| black_box(idx.candidates(black_box(&query))));
+            b.iter(|| black_box(idx.candidates(&ranges(black_box(&query)))));
         });
     }
     group.finish();
@@ -134,7 +141,7 @@ fn bench_two_sided_point(c: &mut Criterion) {
         // set isn't artificially clipped by being near an endpoint.
         let query = [comparison("id", BinaryOp::Equal, int((n / 2) as i64))];
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
-            b.iter(|| black_box(idx.candidates(black_box(&query))));
+            b.iter(|| black_box(idx.candidates(&ranges(black_box(&query)))));
         });
     }
     group.finish();
@@ -151,7 +158,7 @@ fn bench_two_sided_range(c: &mut Criterion) {
         let mid = (n / 2) as i64;
         let query = [gt("id", mid - 5), lt("id", mid + 5)];
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
-            b.iter(|| black_box(idx.candidates(black_box(&query))));
+            b.iter(|| black_box(idx.candidates(&ranges(black_box(&query)))));
         });
     }
     group.finish();

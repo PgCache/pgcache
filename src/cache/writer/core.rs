@@ -33,6 +33,7 @@ use crate::pg;
 use crate::pg::Lsn;
 use crate::pg::cdc::MESSAGE_PREFIX;
 use crate::pg::protocol::ByteString;
+use crate::query::update::read_ranges;
 use crate::query::{Fingerprint, FingerprintSet};
 use crate::settings::{PgSettings, Settings};
 
@@ -664,6 +665,7 @@ impl WriterCore {
             .is_some_and(|q| q.reference_only);
         let read_columns = Arc::new(serving.bound.columns_by_table());
         let privilege_needs = Arc::new(serving.bound.privilege_needs());
+        let read_ranges = read_ranges(&serving.bound).map(Arc::new);
         self.state_view
             .cached_queries
             .entry(fingerprint)
@@ -673,6 +675,7 @@ impl WriterCore {
                 v.bound = Some(Arc::clone(&serving.bound));
                 v.read_columns = Some(Arc::clone(&read_columns));
                 v.privilege_needs = Some(Arc::clone(&privilege_needs));
+                v.read_ranges.clone_from(&read_ranges);
                 v.serve_shape = Some(Arc::clone(&serving.serve_shape));
                 v.max_limit = serving.max_limit;
                 v.reference_only = reference_only;
@@ -684,6 +687,7 @@ impl WriterCore {
                 bound: Some(Arc::clone(&serving.bound)),
                 read_columns: Some(read_columns),
                 privilege_needs: Some(privilege_needs),
+                read_ranges,
                 serve_shape: Some(Arc::clone(&serving.serve_shape)),
                 max_limit: serving.max_limit,
                 reference_only,

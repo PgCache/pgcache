@@ -59,6 +59,7 @@ impl CacheDispatch {
                     bound: None,
                     read_columns: None,
                     privilege_needs: None,
+                    read_ranges: None,
                     serve_shape: None,
                     max_limit: None,
                     reference_only: false,
