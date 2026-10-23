@@ -56,6 +56,7 @@ Conventions: files are `ADR-XXX-brief-title.md` with the next sequential number;
 - [ADR-036](ADR-036-response-memoization.md) — In-process response memoization (third tier; serves client-ready wire bytes)
 - [ADR-040](ADR-040-shape-keyed-serving.md) — Shape-keyed prepared-statement serving (collapse per-literal plan churn)
 - [ADR-060](ADR-060-limit-capped-population.md) — LIMIT-capped population: the cache holds a superset of a capped query's top N; root-only, ordered capped read; CDC keeps the superset
+- [ADR-061](ADR-061-hit-path-privilege-verdicts.md) — Hit-path privilege verdicts: per-(role, object) read privileges asked of origin by role name, cached in the state view, gated at the hit and the coalesce drain, flushed by every DDL signal
 
 ## CDC & cache consistency
 - [ADR-018](ADR-018-dynamic-publication-management.md) — Dynamic publication management (filter CDC at source via ALTER PUBLICATION)

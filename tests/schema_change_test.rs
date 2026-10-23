@@ -300,6 +300,8 @@ async fn test_partition_created_after_registration_is_tracked() -> Result<(), Er
     ctx.query("insert into events (id, day) values (2, 15)", &[])
         .await?;
     ctx.cdc_apply_settle().await?;
+    // The partition's DDL postdates the role's verdict (PGC-463).
+    ctx.verdict_warm(q).await?;
     let m = ctx.metrics().await?;
     let res = ctx.simple_query(q).await?;
     assert_eq!(

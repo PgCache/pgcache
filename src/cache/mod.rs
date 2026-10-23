@@ -40,6 +40,8 @@ pub(crate) mod mv_shape;
 pub(crate) mod output_settings;
 #[cfg(feature = "proxy")]
 mod population_pool;
+#[cfg(feature = "proxy")]
+pub(crate) mod privileges;
 pub mod query;
 #[cfg(feature = "proxy")]
 mod query_cache;
@@ -98,7 +100,7 @@ pub use update_query::{
 };
 
 error_set! {
-    CacheError := WriteError || ReadError || DbError || ParseError || TableError || SendError || QueryResolutionError || SetupError
+    CacheError := WriteError || ReadError || DbError || ParseError || TableError || SendError || QueryResolutionError || SetupError || PrivilegeError
 
     ReadError := {
         IoError(io::Error),
@@ -186,6 +188,13 @@ error_set! {
         RowSecurityEnabled {
             schema: String,
             name: String,
+        },
+    }
+
+    PrivilegeError := {
+        #[display("Unparseable pg_current_snapshot() text '{text}'")]
+        PrivilegeSnapshot {
+            text: String,
         },
     }
 

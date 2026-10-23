@@ -392,6 +392,7 @@ async fn handle_connection(
                     keying,
                     session_key,
                     output_settings: state.session_settings.output_settings(in_block),
+                    effective_role: state.session_settings.effective_role(in_block),
                     timing,
                     pipeline: state.extended.pipeline_take(),
                     transaction_status: state.transaction_status,

@@ -1024,3 +1024,58 @@ fn test_resolver_follows_the_search_path() {
     assert!(query_tree_resolve(&tree, &tables, &["public"]).is_ok());
     assert!(query_tree_resolve(&tree, &tables, &["other"]).is_err());
 }
+
+#[test]
+fn test_privilege_needs_lists_referenced_columns_per_relation_and_functions() {
+    let tables = catalog_with_columns(&[
+        ("orders", &["id", "customer_id", "total"]),
+        ("customers", &["id", "name"]),
+    ]);
+    let query = bound(
+        "SELECT upper(c.name) FROM orders o JOIN customers c ON c.id = o.customer_id \
+         WHERE o.total > 10 ORDER BY lower(c.name)",
+        &tables,
+    );
+    let needs = query.privilege_needs();
+    let columns = |oid: u32| {
+        let mut columns: Vec<&str> = needs.relations[&Oid::from_raw(oid)]
+            .iter()
+            .map(EcoString::as_str)
+            .collect();
+        columns.sort_unstable();
+        columns
+    };
+    assert_eq!(
+        columns(1001),
+        ["customer_id", "total"],
+        "orders: join and WHERE"
+    );
+    assert_eq!(
+        columns(1002),
+        ["id", "name"],
+        "customers: join, select and ORDER BY"
+    );
+    assert_eq!(needs.functions, ["lower", "upper"]);
+
+    let count = bound("SELECT count(*) FROM orders", &tables).privilege_needs();
+    assert!(
+        count.relations[&Oid::from_raw(1001)].is_empty(),
+        "no column referenced"
+    );
+    assert_eq!(count.functions, ["count"]);
+
+    // A CTE or FROM subquery is no relation at origin: only the base
+    // columns its body reads count.
+    let cte = bound(
+        "WITH big AS (SELECT id, total FROM orders WHERE total > 10) SELECT total FROM big",
+        &tables,
+    )
+    .privilege_needs();
+    assert_eq!(cte.relations.len(), 1);
+    let mut cte_columns: Vec<&str> = cte.relations[&Oid::from_raw(1001)]
+        .iter()
+        .map(EcoString::as_str)
+        .collect();
+    cte_columns.sort_unstable();
+    assert_eq!(cte_columns, ["id", "total"]);
+}

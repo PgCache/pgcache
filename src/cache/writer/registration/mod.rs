@@ -164,6 +164,7 @@ fn command_histogram(cmd: &QueryCommand) -> &'static Histogram {
         QueryCommand::Failed { .. } => &reg.cmd_failed,
         QueryCommand::LimitBump { .. } => &reg.cmd_limit_bump,
         QueryCommand::Readmit { .. } => &reg.cmd_readmit,
+        QueryCommand::PrivilegeResolve(_) => &reg.cmd_privilege_resolve,
         QueryCommand::MvBuild { .. } => &reg.cmd_mv_build,
         QueryCommand::MvBuildComplete { .. } => &reg.cmd_mv_build_complete,
     }
@@ -308,6 +309,7 @@ impl WriterRegistration {
         let handle_start = Instant::now();
         match cmd {
             QueryCommand::Resolve(request) => resolve_command(core, request).await,
+            QueryCommand::PrivilegeResolve(lookup) => core.privilege_lookup(&lookup).await,
             QueryCommand::Register(request) => self.register_command(core, request).await,
             QueryCommand::Merge(merge) => {
                 // Queue the merge; the writer loop drains it once no CDC frame

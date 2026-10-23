@@ -8,6 +8,7 @@ use tokio::sync::oneshot;
 use tokio_util::bytes::BytesMut;
 
 use crate::cache::Generation;
+use crate::cache::privileges::PrivilegeLookup;
 use crate::cache::serve_decision::AdmitAction;
 use crate::cache::types::{SharedQueryShape, SharedResolvedQuery};
 use crate::cache::{
@@ -123,6 +124,10 @@ pub struct RegisterRequest {
     pub admit_action: AdmitAction,
     /// Pinned queries are protected from eviction and auto-readmitted after invalidation.
     pub pinned: bool,
+    /// The registering client's role, whose privilege verdicts the writer
+    /// fetches before Ready so its first hit is not forwarded (PGC-463).
+    /// `None` for a pinned query, which no client registers.
+    pub effective_role: Option<EcoString>,
 }
 
 /// Commands for query registration lifecycle, sent to the writer thread
@@ -150,6 +155,10 @@ pub enum QueryCommand {
         /// New max_limit value (None = unlimited)
         max_limit: Option<u64>,
     },
+
+    /// Look up a role's read privileges on the objects a check found no
+    /// verdict for (PGC-463); the writer records them in the state view.
+    PrivilegeResolve(PrivilegeLookup),
 
     /// Readmit a pinned query after CDC invalidation.
     /// Deferred via the writer's internal channel to avoid inline population during CDC processing.
@@ -207,6 +216,11 @@ impl std::fmt::Debug for QueryCommand {
                 .field("fingerprint", fingerprint)
                 .field("max_limit", max_limit)
                 .finish(),
+            Self::PrivilegeResolve(lookup) => f
+                .debug_struct("PrivilegeResolve")
+                .field("relations", &lookup.relations.len())
+                .field("functions", &lookup.functions.len())
+                .finish_non_exhaustive(),
             Self::Readmit { fingerprint } => f
                 .debug_struct("Readmit")
                 .field("fingerprint", fingerprint)

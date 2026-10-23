@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use ecow::EcoString;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::bytes::{Bytes, BytesMut};
 
@@ -63,6 +64,8 @@ pub struct QueryRequest {
     pub session_key: Option<SessionKey>,
     /// The client's rendering settings at this read's scope (PGC-287).
     pub output_settings: Arc<OutputSettings>,
+    /// The role in force at this read's scope (PGC-463).
+    pub effective_role: EcoString,
     /// Per-query timing data
     pub timing: QueryTiming,
     /// Pipeline context from the proxy (None for simple queries and cold-path extended)

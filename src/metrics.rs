@@ -44,6 +44,9 @@ pub mod names {
     /// Registrations refused because a table has row-level security enabled
     /// (PGC-112); each such read forwards.
     pub const QUERIES_RLS_SKIPPED: &str = "pgcache.queries.rls_skipped";
+    /// Cache hits forwarded on the role's privileges (PGC-463), by reason:
+    /// `pending` (verdict being looked up) or `denied`.
+    pub const QUERIES_PRIVILEGE_FORWARDS: &str = "pgcache.queries.privilege_forwards";
 
     // Read-after-write tracking (PGC-124)
     /// Writes folded into a connection's read-after-write log.
@@ -588,6 +591,8 @@ pub struct QueryHandles {
     pub cache_error: Counter,
     pub allowlist_skipped: Counter,
     pub rls_skipped: Counter,
+    pub privilege_forward_pending: Counter,
+    pub privilege_forward_denied: Counter,
     pub cache_latency: Histogram,
     pub origin_latency: Histogram,
     pub origin_execution: Histogram,
@@ -598,8 +603,8 @@ impl QueryHandles {
         use names::{
             CACHE_QUERY_LATENCY_SECONDS, ORIGIN_EXECUTION_SECONDS, ORIGIN_QUERY_LATENCY_SECONDS,
             QUERIES_ALLOWLIST_SKIPPED, QUERIES_CACHE_ERROR, QUERIES_CACHE_HIT, QUERIES_CACHE_MISS,
-            QUERIES_CACHEABLE, QUERIES_INVALID, QUERIES_RLS_SKIPPED, QUERIES_TOTAL,
-            QUERIES_UNCACHEABLE, QUERIES_UNSUPPORTED,
+            QUERIES_CACHEABLE, QUERIES_INVALID, QUERIES_PRIVILEGE_FORWARDS, QUERIES_RLS_SKIPPED,
+            QUERIES_TOTAL, QUERIES_UNCACHEABLE, QUERIES_UNSUPPORTED,
         };
         Self {
             total: metrics::counter!(QUERIES_TOTAL),
@@ -612,6 +617,8 @@ impl QueryHandles {
             cache_error: metrics::counter!(QUERIES_CACHE_ERROR),
             allowlist_skipped: metrics::counter!(QUERIES_ALLOWLIST_SKIPPED),
             rls_skipped: metrics::counter!(QUERIES_RLS_SKIPPED),
+            privilege_forward_pending: metrics::counter!(QUERIES_PRIVILEGE_FORWARDS, "reason" => "pending"),
+            privilege_forward_denied: metrics::counter!(QUERIES_PRIVILEGE_FORWARDS, "reason" => "denied"),
             cache_latency: metrics::histogram!(CACHE_QUERY_LATENCY_SECONDS),
             origin_latency: metrics::histogram!(ORIGIN_QUERY_LATENCY_SECONDS),
             origin_execution: metrics::histogram!(ORIGIN_EXECUTION_SECONDS),
@@ -912,6 +919,7 @@ pub struct RegHandles {
     pub cmd_readmit: Histogram,
     pub cmd_mv_build: Histogram,
     pub cmd_mv_build_complete: Histogram,
+    pub cmd_privilege_resolve: Histogram,
     pub register_resolve: Histogram,
     pub register_subsumption_check: Histogram,
     pub register_subsume: Histogram,
@@ -963,6 +971,7 @@ impl RegHandles {
             cmd_limit_bump: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "limit_bump"),
             cmd_readmit: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "readmit"),
             cmd_mv_build: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "mv_build"),
+            cmd_privilege_resolve: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "privilege_resolve"),
             cmd_mv_build_complete: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "mv_build_complete"),
             register_resolve: metrics::histogram!(CACHE_WRITER_REGISTER_RESOLVE_SECONDS),
             register_subsumption_check: metrics::histogram!(

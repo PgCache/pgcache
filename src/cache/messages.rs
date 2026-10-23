@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use ecow::EcoString;
 use smallvec::SmallVec;
 use tokio_util::bytes::{Bytes, BytesMut};
 
@@ -185,6 +186,9 @@ pub struct ProxyMessage {
     pub session_key: Option<SessionKey>,
     /// The client's rendering settings at this read's scope (PGC-287).
     pub output_settings: Arc<OutputSettings>,
+    /// The role in force at this read's scope, whose privileges a hit is
+    /// checked against (PGC-463).
+    pub effective_role: EcoString,
     /// Per-query timing data
     pub timing: QueryTiming,
     /// Pipeline context for atomic extended query dispatch.

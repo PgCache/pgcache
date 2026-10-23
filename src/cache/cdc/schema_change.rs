@@ -69,6 +69,7 @@ pub(super) fn schema_change_parse(content: &[u8]) -> Result<SchemaChange, serde_
     let mut change = SchemaChange::default();
     match serde_json::from_slice::<Payload>(content)? {
         Payload::Ddl { objects } => {
+            change.privileges_changed = true;
             for object in objects {
                 let tag = object.tag.as_str();
                 let object_type = object.object_type.as_str();
@@ -93,6 +94,7 @@ pub(super) fn schema_change_parse(content: &[u8]) -> Result<SchemaChange, serde_
             }
         }
         Payload::Drop { objects } => {
+            change.privileges_changed = true;
             for object in objects {
                 if object.object_type == VIEW {
                     change.views_changed = true;
@@ -188,7 +190,13 @@ mod tests {
 
         let grant = br#"{"kind":"ddl","objects":[
             {"tag":"GRANT","type":"TABLE","oid":null,"identity":null,"parent":null}]}"#;
-        assert!(!schema_change_parse(grant).expect("parse").views_changed);
+        let change = schema_change_parse(grant).expect("parse");
+        assert!(!change.views_changed);
+        assert!(
+            change.privileges_changed,
+            "a GRANT reaches the writer to flush verdicts"
+        );
+        assert!(!change.is_empty());
     }
 
     #[test]

@@ -70,6 +70,15 @@ impl WriterRegistration {
             .register_resolve
             .record(resolve_start.elapsed().as_secs_f64());
 
+        // The registering role's verdicts, before Ready: its first hit then
+        // serves instead of forwarding while a lookup runs (PGC-463).
+        if let Some(role) = &request.effective_role
+            && request.admit_action != AdmitAction::CheckOnly
+        {
+            core.privilege_prefetch(role, &resolution.bound.privilege_needs())
+                .await;
+        }
+
         // Classify shape for MV eligibility. Sticky — readmit/limit-bump
         // preserve the result through state_view_write. Classification was
         // done in `query_resolve`; reuse here.

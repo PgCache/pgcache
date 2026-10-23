@@ -100,6 +100,23 @@ impl TestContext {
         Ok(Self::assemble(dbs, origin, connected))
     }
 
+    /// Read `sql` until it is served from cache. A role's first read of a
+    /// relation after a verdict gap (a pinned query it never registered, a
+    /// DDL its verdict predates) forwards while the writer looks the
+    /// privilege verdicts up (PGC-463); the reads after serve.
+    pub(crate) async fn verdict_warm(&mut self, sql: &str) -> Result<(), Error> {
+        for _ in 0..40 {
+            let before = self.metrics().await?;
+            self.simple_query(sql).await?;
+            let after = self.metrics_after_outcomes(&before, 1).await?;
+            if after.queries_cache_hit > before.queries_cache_hit {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Err(Error::other(format!("`{sql}` never served from cache")))
+    }
+
     /// A fresh direct connection to origin: a session started now, with the
     /// role defaults in force now.
     pub(crate) async fn origin_connect(&self) -> Result<Client, Error> {

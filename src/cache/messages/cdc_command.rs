@@ -67,6 +67,10 @@ pub(crate) struct SchemaChange {
     /// A view was created, replaced, altered or dropped: the write-alias
     /// lists of the cached tables are reloaded (ADR-048).
     pub(crate) views_changed: bool,
+    /// Any DDL or drop at all, a `GRANT` or an owner change included: who
+    /// may read what may have changed, so the privilege verdicts are
+    /// flushed (PGC-463). A truncate cannot change privileges.
+    pub(crate) privileges_changed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +87,7 @@ impl SchemaChange {
             && self.truncated_tables.is_empty()
             && self.partitions_created.is_empty()
             && !self.views_changed
+            && !self.privileges_changed
     }
 }
 

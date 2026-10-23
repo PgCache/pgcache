@@ -413,6 +413,11 @@ impl WriterCdc {
         core: &mut WriterCore,
         change: SchemaChange,
     ) -> CacheResult<()> {
+        // Any DDL may change who reads what: an owner or schema change as
+        // much as a GRANT, and tags are not worth enumerating (PGC-463).
+        if change.privileges_changed {
+            core.state_view.privileges.ddl_applied(core.frame_xid);
+        }
         for created in change.partitions_created {
             core.table_partition_add(created)
                 .await

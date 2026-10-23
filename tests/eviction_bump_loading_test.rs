@@ -70,6 +70,9 @@ async fn test_eviction_does_not_strand_a_pinned_query_mid_population() -> Result
             ))
         })?;
 
+    // A pinned query registers with no client role: the first read fetches
+    // the role's verdict (PGC-463).
+    ctx.verdict_warm(pinned).await?;
     let before = ctx.metrics().await?;
     ctx.simple_query(pinned).await?;
     let after = ctx.metrics_after_outcomes(&before, 1).await?;

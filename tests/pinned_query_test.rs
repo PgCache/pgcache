@@ -34,7 +34,9 @@ async fn test_pinned_query_cache_hit_on_first_request() -> Result<(), Error> {
     // Wait for pinned query to finish populating
     ctx.cache_settle().await?;
 
-    // First client request — should be a cache hit (pinned query already populated)
+    // The first client request after the verdict is a cache hit (pinned
+    // query already populated).
+    ctx.verdict_warm("SELECT id, name FROM pin_table").await?;
     let m = ctx.metrics().await?;
     let res = ctx.simple_query("SELECT id, name FROM pin_table").await?;
     assert_row_at(&res, 1, &[("id", "1"), ("name", "alice")])?;
@@ -91,7 +93,8 @@ async fn test_pinned_query_auto_readmit_after_cdc() -> Result<(), Error> {
     // Wait for pinned query population
     ctx.cache_settle().await?;
 
-    // First request — cache hit from pinned pre-population
+    // First request after the verdict: cache hit from pinned pre-population
+    ctx.verdict_warm(pinned_sql).await?;
     let m = ctx.metrics().await?;
     let res = ctx.simple_query(pinned_sql).await?;
     assert_row_at(
@@ -205,6 +208,7 @@ async fn test_pinned_query_survives_eviction() -> Result<(), Error> {
     ctx.cache_settle().await?;
 
     // Verify pinned query is serving hits
+    ctx.verdict_warm(pinned_sql).await?;
     let m = ctx.metrics().await?;
     ctx.simple_query(pinned_sql).await?;
     let _m = assert_cache_hit(&mut ctx, m).await?;

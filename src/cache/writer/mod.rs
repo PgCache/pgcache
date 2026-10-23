@@ -8,6 +8,7 @@ mod merge_queue;
 mod mv;
 mod mv_build;
 mod population;
+mod privileges;
 mod publication;
 mod registration;
 mod staging;

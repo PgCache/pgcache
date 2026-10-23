@@ -58,6 +58,7 @@ impl CacheDispatch {
                     generation: Generation::ZERO,
                     bound: None,
                     read_columns: None,
+                    privilege_needs: None,
                     serve_shape: None,
                     max_limit: None,
                     reference_only: false,
@@ -81,6 +82,7 @@ impl CacheDispatch {
                 subsumption_tx,
                 admit_action: AdmitAction::Admit,
                 pinned: true,
+                effective_role: None,
             })?;
         }
         Ok(())
@@ -117,6 +119,7 @@ impl CacheDispatch {
             subsumption_tx,
             admit_action,
             pinned: false,
+            effective_role: Some(msg.effective_role.clone()),
         };
         if self.register_send(request).is_err() {
             // Writer channel closed (cache subsystem torn down or restarting):

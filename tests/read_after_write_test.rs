@@ -1204,6 +1204,8 @@ async fn test_gate_learns_view_created_after_registration() -> Result<(), Error>
     ctx.query("CREATE VIEW vl_view AS SELECT id, v FROM vl", &[])
         .await?;
     ctx.cdc_apply_settle().await?;
+    // The view's DDL postdates the role's verdict (PGC-463).
+    ctx.verdict_warm(q).await?;
     let m = ctx.metrics().await?;
     let _ = ctx.simple_query(q).await?;
     let _ = assert_cache_hit(&mut ctx, m).await?;

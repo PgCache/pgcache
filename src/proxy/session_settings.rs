@@ -302,6 +302,9 @@ struct ScopeViews {
     keying: Result<Arc<KeyingSettings>, SettingsForwardReason>,
     label: Arc<KeyingSettings>,
     output: Arc<OutputSettings>,
+    /// The role in force: `role` unless `none`, else `session_authorization`,
+    /// else the startup user; empty while unknown (`keying` then forwards).
+    role: EcoString,
 }
 
 impl ScopeViews {
@@ -314,6 +317,7 @@ impl ScopeViews {
             keying: Err(SettingsForwardReason::SettingUnknown(Guc::SearchPath)),
             label,
             output: Arc::new(OutputSettings::default()),
+            role: EcoString::new(),
         }
     }
 }
@@ -392,6 +396,13 @@ impl SessionSettings {
         Arc::clone(&self.scope(in_block).output)
     }
 
+    /// The role whose privileges a read at this scope runs under at origin
+    /// (PGC-463). The caller has checked [`Self::serve_keying`], so it is
+    /// known; empty otherwise.
+    pub(crate) fn effective_role(&self, in_block: bool) -> EcoString {
+        self.scope(in_block).role.clone()
+    }
+
     fn scope_views_build(&self, in_block: bool) -> ScopeViews {
         let literals = self.literal_settings(in_block);
         ScopeViews {
@@ -406,6 +417,10 @@ impl SessionSettings {
                 literals,
             }),
             output: Arc::new(self.output_settings_build(in_block)),
+            role: self
+                .role_in_force(in_block)
+                .map(EcoString::from)
+                .unwrap_or_default(),
         }
     }
 
@@ -578,16 +593,19 @@ impl SessionSettings {
     /// session authorization, else the startup user. Each at the value in
     /// force: the open block's override when it has one.
     fn user_for_search_path(&self) -> Option<&str> {
-        let in_force = |guc: Guc| {
-            let state = self.state(guc);
-            state.block.as_ref().unwrap_or(&state.session).known()
-        };
-        if let Some(role) = in_force(Guc::Role)
+        self.role_in_force(true)
+    }
+
+    /// The role origin runs a statement as at this scope: the current role
+    /// when one is set, else the session authorization, else the startup user.
+    fn role_in_force(&self, in_block: bool) -> Option<&str> {
+        let known = |guc: Guc| self.effective(guc, in_block).known();
+        if let Some(role) = known(Guc::Role)
             && !role.eq_ignore_ascii_case("none")
         {
             return Some(role);
         }
-        in_force(Guc::SessionAuthorization).or(self.startup_user.as_deref())
+        known(Guc::SessionAuthorization).or(self.startup_user.as_deref())
     }
 
     fn views_rederive(&mut self) {

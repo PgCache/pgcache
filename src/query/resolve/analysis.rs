@@ -10,6 +10,7 @@ use postgres_types::Type;
 
 use super::bindings::{Bindings, ColumnBinding, ColumnTarget, ResolvedQuery, StarItem, TableSlot};
 use crate::catalog::TableMetadata;
+use crate::oid::Oid;
 use crate::query::ast::NodeId;
 use crate::query::ast::rope::{
     Body, NodeKind, Query, Scalar, ScalarKind, Select, SelectItem, View,
@@ -17,6 +18,19 @@ use crate::query::ast::rope::{
 
 /// The columns a query reads from each table, by table name.
 pub type ColumnsByTable = HashMap<EcoString, HashSet<EcoString>>;
+
+/// What origin checks before it runs a read (PGC-463): `SELECT` on every
+/// column referenced per base relation (or, with none referenced, on the
+/// relation or any one column), `USAGE` on each relation's schema, and
+/// `EXECUTE` on every function called, by name.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrivilegeNeeds {
+    pub relations: HashMap<Oid, HashSet<EcoString>>,
+    /// Lowercased function names, schema-qualified or not: `EXECUTE` is
+    /// required on every overload of the name, as the volatility map takes
+    /// the worst case over overloads.
+    pub functions: Vec<EcoString>,
+}
 
 impl ResolvedQuery {
     /// The root SELECT, when the query is one.
@@ -65,11 +79,40 @@ impl ResolvedQuery {
     /// tables of one name in different schemas share an entry, which only
     /// over-approximates.
     pub fn columns_by_table(&self) -> ColumnsByTable {
+        self.columns_collect(|table| table.name.clone())
+    }
+
+    /// The privileges a read of this query needs at origin: the columns it
+    /// references per base relation, keyed by OID so same-named tables in
+    /// two schemas stay apart, and the functions it calls.
+    pub fn privilege_needs(&self) -> PrivilegeNeeds {
+        let relations = self.columns_collect(|table| table.relation_oid);
+        let mut functions: Vec<EcoString> = self
+            .tree()
+            .nodes()
+            .filter_map(|node| match &node.kind {
+                NodeKind::Function { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        functions.sort_unstable();
+        functions.dedup();
+        PrivilegeNeeds {
+            relations,
+            functions,
+        }
+    }
+
+    /// The columns read from each base table, keyed by `key` of the table.
+    fn columns_collect<K: std::hash::Hash + Eq>(
+        &self,
+        key: impl Fn(&TableMetadata) -> K,
+    ) -> HashMap<K, HashSet<EcoString>> {
         let bindings = self.bindings();
-        let mut columns: ColumnsByTable = HashMap::new();
+        let mut columns: HashMap<K, HashSet<EcoString>> = HashMap::new();
         for slot in bindings.slots() {
             if let TableSlot::Base { table, .. } = slot {
-                columns.entry(table.name.clone()).or_default();
+                columns.entry(key(table)).or_default();
             }
         }
         for position in self.tree().root().node_ref().subtree() {
@@ -78,7 +121,7 @@ impl ResolvedQuery {
                     if let Some(ColumnTarget::Column(binding)) =
                         bindings.column_by_id(position.id())
                     {
-                        self.column_add(&mut columns, binding);
+                        column_add(bindings, &mut columns, &key, binding);
                     }
                     // A merged-column reference reads the join's side columns, which
                     // the merged-column loop below already adds.
@@ -86,7 +129,7 @@ impl ResolvedQuery {
                 NodeKind::Star { .. } => {
                     for item in bindings.star_by_id(position.id()).unwrap_or(&[]) {
                         if let StarItem::Column(binding) = item {
-                            self.column_add(&mut columns, binding);
+                            column_add(bindings, &mut columns, &key, binding);
                         }
                     }
                 }
@@ -94,8 +137,8 @@ impl ResolvedQuery {
             }
         }
         for merged in bindings.merged_columns() {
-            self.column_add(&mut columns, &merged.left);
-            self.column_add(&mut columns, &merged.right);
+            column_add(bindings, &mut columns, &key, &merged.left);
+            column_add(bindings, &mut columns, &key, &merged.right);
         }
         columns
     }
@@ -157,18 +200,25 @@ impl ResolvedQuery {
             ColumnTarget::Output => None,
         }
     }
+}
 
-    fn column_add(&self, columns: &mut ColumnsByTable, binding: &ColumnBinding) {
-        let bindings = self.bindings();
-        if let (Some(slot), Some(column)) = (
-            bindings.slot(binding.slot),
-            bindings.binding_column(binding),
-        ) {
-            columns
-                .entry(slot.table().name.clone())
-                .or_default()
-                .insert(column.name.clone());
-        }
+/// Add the column `binding` names to its base table's entry, keyed by
+/// `key`. A derived table's column is not a read of any relation: the
+/// base columns its body reads are references of their own.
+fn column_add<K: std::hash::Hash + Eq>(
+    bindings: &Bindings,
+    columns: &mut HashMap<K, HashSet<EcoString>>,
+    key: &impl Fn(&TableMetadata) -> K,
+    binding: &ColumnBinding,
+) {
+    if let (Some(TableSlot::Base { table, .. }), Some(column)) = (
+        bindings.slot(binding.slot),
+        bindings.binding_column(binding),
+    ) {
+        columns
+            .entry(key(table))
+            .or_default()
+            .insert(column.name.clone());
     }
 }
 

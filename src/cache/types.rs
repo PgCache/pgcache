@@ -13,6 +13,7 @@ use rootcause::Report;
 
 use super::generation::Generation;
 use super::population_pool::PopulationPool;
+use super::privileges::PrivilegeVerdicts;
 use super::reg_gate::RegGate;
 use super::serve_pool_state::ServePool;
 use super::update_query::UpdateQueries;
@@ -22,7 +23,7 @@ use crate::{
     catalog::{Catalog, RelationName, TableMetadata},
     query::{
         Fingerprint, FingerprintDashMap, QueryShape, SessionKeyDashMap,
-        resolve::{ColumnsByTable, ResolvedQuery},
+        resolve::{ColumnsByTable, PrivilegeNeeds, ResolvedQuery},
     },
     settings::{DynamicConfigHandle, Settings},
 };
@@ -307,6 +308,10 @@ pub struct CacheStateView {
     /// In-process hot-result cache (PGC-236). Captured by the serve pool, served by
     /// dispatch, evicted (slot-bumped) by the writer's CDC path.
     pub memo: ResultMemo,
+    /// Per-(role, object) read privileges origin has confirmed (PGC-463).
+    /// Looked up by the writer on dispatch's request, read by the hit path,
+    /// flushed by the writer on every schema-change signal.
+    pub privileges: PrivilegeVerdicts,
     /// Set by the memory monitor when used memory crosses the registration
     /// budget high-water mark. While set, dispatch forwards brand-new (and
     /// in-flight Loading) queries to origin instead of registering them, and
@@ -406,6 +411,7 @@ impl CacheStateView {
             received_lsn: Arc::new(AtomicU64::new(0)),
             write_aliases: ArcSwap::from_pointee(WriteAliasMap::default()),
             memo: ResultMemo::new(dynamic),
+            privileges: PrivilegeVerdicts::default(),
             latency_template,
         })
     }
@@ -438,6 +444,9 @@ pub struct CachedQueryView {
     /// The columns `bound` reads per table, for the read-after-write gate;
     /// set with `bound`.
     pub read_columns: Option<Arc<ColumnsByTable>>,
+    /// What a role must be allowed to read for a hit on `bound` (PGC-463);
+    /// set with `bound`.
+    pub privilege_needs: Option<Arc<PrivilegeNeeds>>,
     /// Parameterized serve shape (mirrors `CachedQuery.serve_shape`, PGC-294).
     /// None while Loading; Some once the view transitions to Ready.
     pub serve_shape: Option<SharedQueryShape>,

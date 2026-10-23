@@ -10,6 +10,7 @@ use crate::cache::query::{limit_is_sufficient, limit_rows_needed};
 use crate::cache::reference_settings::{self, ReferenceSettings};
 use crate::cache::types::{SharedQueryShape, SharedResolvedQuery};
 use crate::query::Fingerprint;
+use crate::query::resolve::PrivilegeNeeds;
 use crate::result::error_chain_format;
 
 /// What a Ready entry serves its drained waiters, read once per drain.
@@ -21,6 +22,8 @@ struct DrainServing {
     max_limit: Option<u64>,
     /// `Some` for a reference-only entry: the settings a waiter must be on.
     reference: Option<Arc<ReferenceSettings>>,
+    /// What a waiter's role must be allowed to read (PGC-463).
+    privilege_needs: Option<Arc<PrivilegeNeeds>>,
 }
 
 /// The gate a direct hit applies in `ready_hit`, for a reference-only entry:
@@ -69,11 +72,13 @@ impl CacheDispatch {
             return;
         };
 
-        let reference_only = self
+        let (reference_only, privilege_needs) = self
             .state_view
             .cached_queries
             .get(&fingerprint)
-            .is_some_and(|v| v.reference_only);
+            .map_or((false, None), |v| {
+                (v.reference_only, v.privilege_needs.clone())
+            });
         let serving = DrainServing {
             fingerprint,
             generation,
@@ -81,6 +86,7 @@ impl CacheDispatch {
             serve_shape,
             max_limit,
             reference: reference_only.then(reference_settings::current),
+            privilege_needs,
         };
 
         let served: u64 = groups
@@ -101,6 +107,23 @@ impl CacheDispatch {
             .set(self.waiting_count() as f64);
     }
 
+    /// The gate a direct hit applies in `ready_hit`, for the waiters' roles
+    /// (PGC-463): a waiter whose role lacks a verdict or is denied is
+    /// forwarded; the rest are returned to be served.
+    fn waiters_privileged(
+        &self,
+        waiters: Vec<QueryRequest>,
+        needs: Option<&PrivilegeNeeds>,
+    ) -> Vec<QueryRequest> {
+        let (served, forwarded): (Vec<_>, Vec<_>) = waiters
+            .into_iter()
+            .partition(|w| self.privilege_gate(&w.effective_role, needs));
+        for msg in forwarded {
+            let _ = msg.forward();
+        }
+        served
+    }
+
     /// Serve one coalescing group from `serving`: one serve request whose
     /// response bytes are broadcast to every waiter. Returns the number of
     /// waiters served beyond the primary.
@@ -113,6 +136,7 @@ impl CacheDispatch {
             w.timing.drain_started_at = Some(drain_started);
         }
         waiters = waiters_on_reference(waiters, serving.reference.as_deref());
+        waiters = self.waiters_privileged(waiters, serving.privilege_needs.as_deref());
         if waiters.is_empty() {
             return 0;
         }
