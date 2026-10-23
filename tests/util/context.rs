@@ -223,10 +223,16 @@ impl TestContext {
 
     /// Create an additional client connection through the pgcache proxy.
     pub(crate) async fn proxy_client_connect(&self) -> Result<Client, Error> {
+        self.proxy_client_connect_as("postgres").await
+    }
+
+    /// Connect through the pgcache proxy as `user`: a login role origin
+    /// authenticates (pgtemp trusts every role), so forwards run as it.
+    pub(crate) async fn proxy_client_connect_as(&self, user: &str) -> Result<Client, Error> {
         let (client, connection) = Config::new()
             .host("127.0.0.1")
             .port(self.cache_port)
-            .user("postgres")
+            .user(user)
             .dbname("origin_test")
             .connect(NoTls)
             .await
