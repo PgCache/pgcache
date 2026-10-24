@@ -1216,3 +1216,190 @@ async fn test_gate_learns_view_created_after_registration() -> Result<(), Error>
     assert_row_at(&res, 1, &[("id", "1"), ("v", "99")])?;
     Ok(())
 }
+
+/// PGC-512: a conjunct the predicate model can't read (`v + 0 = 10`) does not
+/// discard the ranges the recognized conjuncts give: every row the read
+/// returns still satisfies `id = 1`, so a pending insert of another id is
+/// provably disjoint and the read serves from cache; an insert of the read's
+/// own id forwards and is seen.
+#[tokio::test]
+async fn test_gate_unrecognized_conjunct_keeps_recognized_ranges() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&RAW_LAG).await?;
+    ctx.query("CREATE TABLE uc (id int primary key, v int)", &[])
+        .await?;
+    ctx.query("INSERT INTO uc VALUES (1, 10), (2, 20)", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+
+    let present = "SELECT v FROM uc WHERE id = 1 AND v + 0 = 10";
+    let absent = "SELECT v FROM uc WHERE id = 3 AND v + 0 = 30";
+    for sql in [present, absent] {
+        let m0 = ctx.metrics().await?;
+        let _ = ctx.simple_query(sql).await?;
+        let _ = assert_cache_miss(&mut ctx, m0).await?;
+        ctx.cache_settle().await?;
+    }
+
+    ctx.simple_query("INSERT INTO uc (id, v) VALUES (3, 30)")
+        .await?;
+
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(present).await?;
+    assert_row_at(&res, 1, &[("v", "10")])?;
+    let after = ctx.metrics_after_outcomes(&m, 1).await?;
+    let delta = metrics_delta(&m, &after);
+    assert_eq!(
+        delta.queries_cache_hit, 1,
+        "read disjoint from the pending insert must serve from cache"
+    );
+    assert!(
+        delta.raw_serve_disjoint_insert >= 1,
+        "row-level disjointness proof expected"
+    );
+
+    let res = ctx.simple_query(absent).await?;
+    assert_row_at(&res, 1, &[("v", "30")])?;
+
+    Ok(())
+}
+
+/// PGC-512: a join read carries ranges per table reference. A pending insert
+/// into the filtered table outside its filter (`k = 1`) cannot reach the
+/// result, so the read serves from cache; an insert inside the filter grows
+/// the join and forwards.
+#[tokio::test]
+async fn test_gate_join_read_disjoint_insert_served() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&RAW_LAG).await?;
+    ctx.query("CREATE TABLE jra (id int primary key, bid int, k int)", &[])
+        .await?;
+    ctx.query("CREATE TABLE jrb (id int primary key, label text)", &[])
+        .await?;
+    ctx.query("INSERT INTO jra VALUES (1, 10, 1), (2, 10, 2)", &[])
+        .await?;
+    ctx.query("INSERT INTO jrb VALUES (10, 'x')", &[]).await?;
+    ctx.cdc_apply_settle().await?;
+
+    let q = "SELECT jra.id FROM jra JOIN jrb ON jra.bid = jrb.id WHERE jra.k = 1 ORDER BY jra.id";
+    register(&mut ctx, q).await?;
+
+    // k = 2 is outside the read's filter on jra → disjoint → cache hit.
+    ctx.simple_query("INSERT INTO jra (id, bid, k) VALUES (3, 10, 2)")
+        .await?;
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(q).await?;
+    assert_eq!(row_count(&res), 1);
+    let after = ctx.metrics_after_outcomes(&m, 1).await?;
+    let delta = metrics_delta(&m, &after);
+    assert_eq!(
+        delta.queries_cache_hit, 1,
+        "join read disjoint from the pending insert must serve from cache"
+    );
+    assert!(
+        delta.raw_serve_disjoint_insert >= 1,
+        "row-level disjointness proof expected"
+    );
+
+    // k = 1 joins jrb(10) inside the filter → the read forwards and sees it.
+    ctx.simple_query("INSERT INTO jra (id, bid, k) VALUES (4, 10, 1)")
+        .await?;
+    let res = ctx.simple_query(q).await?;
+    assert_eq!(
+        row_count(&res),
+        2,
+        "join read must forward the grown result"
+    );
+
+    Ok(())
+}
+
+/// PGC-512: the NULL-filled side of an anti-join takes no filter from the
+/// WHERE (`ajb.id IS NULL` holds on the padding), only what the preserved
+/// side's filter carries over the ON equality. A pending insert there is
+/// proven disjoint only when it can't match a preserved row in the result;
+/// one that can removes that row, and the read forwards and sees it gone.
+#[tokio::test]
+async fn test_gate_anti_join_left_join_insert_forwards() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&RAW_LAG).await?;
+    ctx.query("CREATE TABLE aja (id int primary key, k int)", &[])
+        .await?;
+    ctx.query("CREATE TABLE ajb (id int primary key, aid int)", &[])
+        .await?;
+    ctx.query("INSERT INTO aja VALUES (1, 1), (2, 1)", &[])
+        .await?;
+    ctx.query("INSERT INTO ajb VALUES (10, 1)", &[]).await?;
+    ctx.cdc_apply_settle().await?;
+
+    // `by_k` gives ajb no range (aja.id is unconstrained); `by_id` gives it
+    // `aid = 2` through the ON equality.
+    let by_k = "SELECT aja.id FROM aja LEFT JOIN ajb ON ajb.aid = aja.id \
+                WHERE ajb.id IS NULL AND aja.k = 1 ORDER BY aja.id";
+    let by_id = "SELECT aja.id FROM aja LEFT JOIN ajb ON ajb.aid = aja.id \
+                 WHERE ajb.id IS NULL AND aja.id = 2";
+    for q in [by_k, by_id] {
+        register(&mut ctx, q).await?;
+        let res = ctx.simple_query(q).await?;
+        assert_row_at(&res, 1, &[("id", "2")])?;
+    }
+
+    // aid = 1 can only match aja(1), which `by_id` never returns → cache hit.
+    ctx.simple_query("INSERT INTO ajb (id, aid) VALUES (12, 1)")
+        .await?;
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(by_id).await?;
+    assert_row_at(&res, 1, &[("id", "2")])?;
+    let after = ctx.metrics_after_outcomes(&m, 1).await?;
+    let delta = metrics_delta(&m, &after);
+    assert_eq!(
+        delta.queries_cache_hit, 1,
+        "anti-join read disjoint from the pending insert must serve from cache"
+    );
+    assert!(
+        delta.raw_serve_disjoint_insert >= 1,
+        "row-level disjointness proof expected"
+    );
+
+    // aid = 2 matches aja(2), the last row of both reads → both forward.
+    ctx.simple_query("INSERT INTO ajb (id, aid) VALUES (11, 2)")
+        .await?;
+    for q in [by_k, by_id] {
+        let res = ctx.simple_query(q).await?;
+        assert_eq!(
+            row_count(&res),
+            0,
+            "anti-join read must forward once the pending insert matches its last row"
+        );
+    }
+
+    Ok(())
+}
+
+/// PGC-512: the `NOT EXISTS` spelling of the anti-join forwards the same way.
+#[tokio::test]
+async fn test_gate_anti_join_not_exists_insert_forwards() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&RAW_LAG).await?;
+    ctx.query("CREATE TABLE nea (id int primary key, k int)", &[])
+        .await?;
+    ctx.query("CREATE TABLE neb (id int primary key, aid int)", &[])
+        .await?;
+    ctx.query("INSERT INTO nea VALUES (1, 1), (2, 1)", &[])
+        .await?;
+    ctx.query("INSERT INTO neb VALUES (10, 1)", &[]).await?;
+    ctx.cdc_apply_settle().await?;
+
+    let q = "SELECT nea.id FROM nea WHERE nea.k = 1 \
+             AND NOT EXISTS (SELECT 1 FROM neb WHERE neb.aid = nea.id) ORDER BY nea.id";
+    register(&mut ctx, q).await?;
+    let res = ctx.simple_query(q).await?;
+    assert_row_at(&res, 1, &[("id", "2")])?;
+
+    ctx.simple_query("INSERT INTO neb (id, aid) VALUES (11, 2)")
+        .await?;
+    let res = ctx.simple_query(q).await?;
+    assert_eq!(
+        row_count(&res),
+        0,
+        "anti-join read must forward once the pending insert matches its last row"
+    );
+
+    Ok(())
+}

@@ -7,8 +7,8 @@ use ecow::EcoString;
 
 use super::aggregate::{
     MERGED_PREDICATE_CAP, TableAggregate, UPDATE_DELETE_PREDICATE_CAP, equality_tuple_build,
-    merged_tuples_disjoint, merged_updates_disjoint, set_unreferenced, update_predicate_build,
-    update_tuple_build,
+    merged_tuples_disjoint, merged_updates_disjoint, references_disjoint, set_unreferenced,
+    update_predicate_build, update_tuple_build,
 };
 use super::tiers::{ConnectionTiers, TableTiers};
 use super::{DisjointKinds, RawBlocker, RawDecision, RawForwardReason};
@@ -17,6 +17,7 @@ use crate::pg::Lsn;
 use crate::query::ast::rope::QueryTree;
 use crate::query::constraints::{ColumnRange, column_ranges_disjoint, table_column_ranges};
 use crate::query::resolve::ColumnsByTable;
+use crate::query::update::ReadRanges;
 use crate::query::write::{RelationRef, WriteClass};
 
 /// The schema variants of one table name with pending writes. Keyed by bare
@@ -289,14 +290,15 @@ impl WriteLog {
     /// than served from cache. Conservative — any uncertainty forwards. Call
     /// [`Self::purge`] first so applied writes don't force needless forwards.
     ///
-    /// `read_ranges` are the read's per-column value ranges for its single table
-    /// (PGC-369), used for row-level INSERT disjointness; `None` (a multi-table
-    /// read, or one whose ranges couldn't be derived) makes any pending insert
-    /// forward conservatively.
+    /// `read_ranges` are the read's per-column value ranges per table reference
+    /// (PGC-369, PGC-512), used for row-level disjointness: a pending write is
+    /// ruled out when every reference of its table is disjoint from it. `None`
+    /// (an unregistered read), a table without an entry, or a reference without
+    /// ranges makes any pending row write on that table forward conservatively.
     pub(crate) fn decide(
         &self,
         query: &QueryTree,
-        read_ranges: Option<&HashMap<EcoString, ColumnRange>>,
+        read_ranges: Option<&ReadRanges>,
         read_columns: Option<&ColumnsByTable>,
     ) -> RawDecision {
         // A connection-scoped pending write (unknown table) poisons every read.
@@ -313,7 +315,9 @@ impl WriteLog {
             self.table_intersects(
                 schema,
                 name,
-                read_ranges,
+                read_ranges
+                    .and_then(|ranges| ranges.get(name))
+                    .map(Vec::as_slice),
                 read_columns.and_then(|columns| columns.get(name)),
                 &mut kinds,
             )
@@ -336,7 +340,7 @@ impl WriteLog {
         &self,
         table_schema: Option<&str>,
         table_name: &str,
-        read_ranges: Option<&HashMap<EcoString, ColumnRange>>,
+        read_ranges: Option<&[HashMap<EcoString, ColumnRange>]>,
         read_columns: Option<&HashSet<EcoString>>,
         kinds: &mut DisjointKinds,
     ) -> Option<RawBlocker> {
@@ -358,12 +362,12 @@ impl WriteLog {
 
     /// Whether the read intersects one tier aggregate's pending writes. An
     /// opaque write always intersects; pending INSERTs/DELETEs/UPDATEs
-    /// intersect unless the read is provably disjoint from every one (the
-    /// proven-disjoint kinds fold into `kinds`), or, for an UPDATE, never
-    /// references a column it assigns.
+    /// intersect unless every reference of the table is provably disjoint from
+    /// every one (the proven-disjoint kinds fold into `kinds`), or, for an
+    /// UPDATE, the read never references a column it assigns.
     fn aggregate_intersects(
         agg: &TableAggregate,
-        read_ranges: Option<&HashMap<EcoString, ColumnRange>>,
+        read_ranges: Option<&[HashMap<EcoString, ColumnRange>]>,
         read_columns: Option<&HashSet<EcoString>>,
         kinds: &mut DisjointKinds,
     ) -> bool {
@@ -371,22 +375,23 @@ impl WriteLog {
             return true;
         }
         if let Some(inserts) = &agg.inserts {
-            if read_ranges.is_some_and(|ranges| inserts.disjoint(ranges)) {
+            if references_disjoint(read_ranges, |ranges| inserts.disjoint(ranges)) {
                 kinds.insert = true;
             } else {
                 return true;
             }
         }
         if !agg.merged_deletes.is_empty() {
-            if read_ranges.is_some_and(|ranges| merged_tuples_disjoint(&agg.merged_deletes, ranges))
-            {
+            if references_disjoint(read_ranges, |ranges| {
+                merged_tuples_disjoint(&agg.merged_deletes, ranges)
+            }) {
                 kinds.delete = true;
             } else {
                 return true;
             }
         }
         for delete in &agg.deletes {
-            if read_ranges.is_some_and(|ranges| column_ranges_disjoint(ranges, delete)) {
+            if references_disjoint(read_ranges, |ranges| column_ranges_disjoint(ranges, delete)) {
                 kinds.delete = true;
             } else {
                 return true;
@@ -404,7 +409,7 @@ impl WriteLog {
             // touches neither the updated rows (WHERE) nor their post-update
             // image (grow).
             let disjoint = set_unreferenced(&update.set_columns, read_columns)
-                || read_ranges.is_some_and(|ranges| {
+                || references_disjoint(read_ranges, |ranges| {
                     column_ranges_disjoint(ranges, &update.where_ranges)
                         && column_ranges_disjoint(ranges, &update.image_ranges)
                 });

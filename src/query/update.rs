@@ -1,5 +1,5 @@
 #[cfg(feature = "proxy")]
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[cfg(feature = "proxy")]
 use ecow::EcoString;
@@ -18,35 +18,58 @@ use crate::query::predicates::{OuterJoinRole, RelationPredicates, query_branch_p
 use crate::query::resolve::TableSlot;
 use crate::query::resolve::{QueryBranch, ResolvedQuery};
 
-/// The per-column ranges of a single-table read's root reference, for the
-/// read-after-write gate's row-level disjointness: `None` for a join,
-/// self-join, subquery or CTE (a write to any table read can affect the
-/// result) or a WHERE the model couldn't fully read; empty when the root
-/// reads its one table only through a derived table.
+/// The per-column ranges of every base-table reference of a read, by table
+/// name, for the read-after-write gate's row-level disjointness: a
+/// reference's filters are a necessary condition on the rows that reach its
+/// branch's result, so a pending write disjoint from every reference of a
+/// table can't change the read (PGC-512). A table with a reference the model
+/// can't project to column names is left out; a reference without filters
+/// is an empty map; both prove nothing. The NULL-filled side of an outer
+/// join takes no filter from the WHERE (an insert there can remove preserved
+/// rows), only what the preserved side's filters carry over the ON equality.
 #[cfg(feature = "proxy")]
-pub(crate) fn read_ranges(bound: &ResolvedQuery) -> Option<HashMap<EcoString, ColumnRange>> {
+pub(crate) type ReadRanges = HashMap<EcoString, Vec<HashMap<EcoString, ColumnRange>>>;
+
+#[cfg(feature = "proxy")]
+pub(crate) fn read_ranges(bound: &ResolvedQuery) -> ReadRanges {
     let bindings = bound.bindings();
-    let mut base_slots = bindings
-        .slots()
-        .iter()
-        .enumerate()
-        .filter(|(_, slot)| matches!(slot, TableSlot::Base { .. }));
-    let (Some((slot_index, _)), None) = (base_slots.next(), base_slots.next()) else {
-        return None;
-    };
-    let predicates = query_branch_predicates_build(bound, bound.select()?);
-    if !predicates.where_recognized() {
-        return None;
+    let mut ranges = ReadRanges::new();
+    let mut seen = HashSet::new();
+    let mut unknown = HashSet::new();
+    for (select, _) in select_branches_with_source(bound.tree().root()) {
+        let predicates = query_branch_predicates_build(bound, select);
+        for reference in predicates.table_references() {
+            let Some(TableSlot::Base { table, .. }) = bindings.slot(reference.slot) else {
+                continue;
+            };
+            // A CTE body is a branch once per reference to it.
+            if !seen.insert(reference.slot.index()) {
+                continue;
+            }
+            match predicates.relation_predicates(bindings, reference.slot) {
+                Some(relation) => ranges
+                    .entry(table.name.clone())
+                    .or_default()
+                    .push(relation.ranges.bare_columns()),
+                None => {
+                    unknown.insert(table.name.clone());
+                }
+            }
+        }
     }
-    let reference = predicates
-        .table_references()
-        .iter()
-        .find(|reference| reference.slot.index() == slot_index);
-    let Some(reference) = reference else {
-        return Some(HashMap::new());
-    };
-    let relation = predicates.relation_predicates(bindings, reference.slot)?;
-    Some(relation.ranges.bare_columns())
+    // A base table no branch lists as a reference is read some way the
+    // model doesn't cover.
+    for (index, slot) in bindings.slots().iter().enumerate() {
+        if let TableSlot::Base { table, .. } = slot
+            && !seen.contains(&index)
+        {
+            unknown.insert(table.name.clone());
+        }
+    }
+    for table in unknown {
+        ranges.remove(&table);
+    }
+    ranges
 }
 
 /// One table's update query: the branch it sits in, as the cache
@@ -346,8 +369,17 @@ mod tests {
     use crate::oid::TypeOid;
     use crate::query::ast::query_tree_parse;
 
+    /// One reference's sorted (column, range) pairs.
     #[cfg(feature = "proxy")]
-    fn read_ranges_of(sql: &str) -> Option<Vec<(String, String)>> {
+    type ReferenceLines = Vec<(String, String)>;
+    /// Sorted (table, references) lines of a read.
+    #[cfg(feature = "proxy")]
+    type ReadLines = Vec<(String, Vec<ReferenceLines>)>;
+
+    /// `read_ranges` as sorted (table, references) lines, each reference its
+    /// sorted (column, range) pairs.
+    #[cfg(feature = "proxy")]
+    fn read_ranges_of(sql: &str) -> ReadLines {
         let int_column = |name: &str, position: i16| ColumnMetadata {
             name: name.into(),
             position: ColumnPosition::from_raw(position),
@@ -365,46 +397,116 @@ mod tests {
             );
         }
         let bound = ResolvedQuery::parse_resolve(sql, &tables, &["public"]).expect("resolve");
-        read_ranges(&bound).map(|ranges| {
-            let mut ranges: Vec<(String, String)> = ranges
-                .iter()
-                .map(|(column, range)| (column.to_string(), format!("{range:?}")))
-                .collect();
-            ranges.sort();
-            ranges
-        })
+        let mut tables: ReadLines = read_ranges(&bound)
+            .iter()
+            .map(|(table, references)| {
+                let mut references: Vec<ReferenceLines> = references
+                    .iter()
+                    .map(|ranges| {
+                        let mut ranges: ReferenceLines = ranges
+                            .iter()
+                            .map(|(column, range)| (column.to_string(), format!("{range:?}")))
+                            .collect();
+                        ranges.sort();
+                        ranges
+                    })
+                    .collect();
+                references.sort();
+                (table.to_string(), references)
+            })
+            .collect();
+        tables.sort();
+        tables
     }
 
-    /// A single-table read's ranges come from its reference's filters when
-    /// every WHERE conjunct is recognized; a read through a derived table
-    /// proves nothing, and a read of more than one table reference has none.
+    /// Every base-table reference of a read contributes its own filters'
+    /// ranges under its table, whatever else the read does: an unrecognized
+    /// conjunct, a derived table, a join or self-join, a subquery, a set
+    /// operation or a CTE (its body once per reference to it). The
+    /// NULL-filled side of an anti-join takes nothing from the WHERE (its
+    /// `IS NULL` holds on the padding) but does carry the preserved side's
+    /// filter over the ON equality: only a row matching a preserved row in
+    /// the result can change it (PGC-512).
     #[cfg(feature = "proxy")]
     #[test]
     fn test_read_ranges() {
-        assert_eq!(
-            read_ranges_of("SELECT * FROM t WHERE id = 5"),
-            Some(vec![("id".to_owned(), "Equal(Integer(5))".to_owned())])
-        );
-        assert_eq!(
-            read_ranges_of("SELECT * FROM t WHERE id = 5 AND x + 1 = 2"),
-            None
-        );
-        assert_eq!(
-            read_ranges_of("SELECT * FROM (SELECT * FROM t WHERE id = 1) d"),
-            Some(Vec::new())
-        );
-        assert_eq!(
-            read_ranges_of("SELECT * FROM t JOIN u ON u.id = t.id WHERE t.id = 5"),
-            None
-        );
-        assert_eq!(
-            read_ranges_of("SELECT * FROM t a JOIN t b ON b.id = a.x WHERE a.id = 5"),
-            None
-        );
-        assert_eq!(
-            read_ranges_of("SELECT * FROM t WHERE x IN (SELECT id FROM u)"),
-            None
-        );
+        let equal = |column: &str, value: i64| {
+            vec![(column.to_owned(), format!("Equal(Integer({value}))"))]
+        };
+        let none: ReferenceLines = Vec::new();
+        let expected = |tables: Vec<(&str, Vec<ReferenceLines>)>| {
+            let mut tables: ReadLines = tables
+                .into_iter()
+                .map(|(table, mut references)| {
+                    references.sort();
+                    (table.to_owned(), references)
+                })
+                .collect();
+            tables.sort();
+            tables
+        };
+        let cases = [
+            (
+                "SELECT * FROM t WHERE id = 5",
+                expected(vec![("t", vec![equal("id", 5)])]),
+            ),
+            (
+                "SELECT * FROM t WHERE id = 5 AND x + 1 = 2",
+                expected(vec![("t", vec![equal("id", 5)])]),
+            ),
+            (
+                "SELECT * FROM (SELECT * FROM t WHERE id = 1) d",
+                expected(vec![("t", vec![equal("id", 1)])]),
+            ),
+            (
+                "SELECT * FROM t JOIN u ON u.id = t.id WHERE t.id = 5",
+                expected(vec![
+                    ("t", vec![equal("id", 5)]),
+                    ("u", vec![equal("id", 5)]),
+                ]),
+            ),
+            (
+                "SELECT * FROM t a JOIN t b ON b.id = a.x WHERE a.id = 5",
+                expected(vec![("t", vec![equal("id", 5), none.clone()])]),
+            ),
+            (
+                "SELECT * FROM t WHERE id = 5 AND x IN (SELECT id FROM u WHERE id = 7)",
+                expected(vec![
+                    ("t", vec![equal("id", 5)]),
+                    ("u", vec![equal("id", 7)]),
+                ]),
+            ),
+            (
+                "SELECT * FROM t LEFT JOIN u ON u.id = t.id WHERE u.id IS NULL AND t.id = 5",
+                expected(vec![
+                    ("t", vec![equal("id", 5)]),
+                    ("u", vec![equal("id", 5)]),
+                ]),
+            ),
+            (
+                "SELECT * FROM t LEFT JOIN u ON u.id = t.x WHERE u.id IS NULL",
+                expected(vec![("t", vec![none.clone()]), ("u", vec![none])]),
+            ),
+            (
+                "SELECT id FROM t WHERE id = 1 UNION SELECT id FROM t WHERE id = 2",
+                expected(vec![("t", vec![equal("id", 1), equal("id", 2)])]),
+            ),
+            (
+                "SELECT id FROM t WHERE id = 1 EXCEPT SELECT id FROM u WHERE x = 2",
+                expected(vec![
+                    ("t", vec![equal("id", 1)]),
+                    ("u", vec![equal("x", 2)]),
+                ]),
+            ),
+            (
+                "WITH c AS (SELECT id FROM t WHERE id = 1) \
+                 SELECT id FROM c UNION ALL SELECT id FROM c",
+                expected(vec![("t", vec![equal("id", 1), equal("id", 1)])]),
+            ),
+        ];
+        for (sql, expected) in cases {
+            assert_eq!(read_ranges_of(sql), expected, "{sql}");
+        }
     }
 
     /// Helper to parse SQL and return a CacheableQuery

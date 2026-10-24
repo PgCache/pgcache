@@ -18,7 +18,7 @@ use super::reg_gate::RegGate;
 use super::serve_pool_state::ServePool;
 use super::update_query::UpdateQueries;
 use crate::oid::Oid;
-use crate::query::constraints::ColumnRange;
+use crate::query::update::ReadRanges;
 use crate::{
     cache::{CacheError, CacheResult, memo::ResultMemo, mv::MvMeta, query::CacheableQuery},
     catalog::{Catalog, RelationName, TableMetadata},
@@ -430,10 +430,9 @@ impl CacheStateView {
 /// reasons about it.
 #[derive(Debug, Clone)]
 pub struct CachedReadForm {
-    /// The read's per-column ranges on its single table, for row-level
-    /// disjointness; `None` for a join or other multi-table shape, or a
-    /// WHERE the model couldn't fully read.
-    pub(crate) ranges: Option<Arc<HashMap<EcoString, ColumnRange>>>,
+    /// The read's per-column ranges per table reference, for row-level
+    /// disjointness (PGC-512).
+    pub(crate) ranges: Arc<ReadRanges>,
     pub columns: Arc<ColumnsByTable>,
 }
 
@@ -451,10 +450,9 @@ pub struct CachedQueryView {
     /// What a role must be allowed to read for a hit on `bound` (PGC-463);
     /// set with `bound`.
     pub privilege_needs: Option<Arc<PrivilegeNeeds>>,
-    /// `bound`'s per-column ranges on its single table, for the gate's
-    /// row-level disjointness; derived once with `bound`, `None` when the
-    /// shape gives it none.
-    pub(crate) read_ranges: Option<Arc<HashMap<EcoString, ColumnRange>>>,
+    /// `bound`'s per-column ranges per table reference, for the gate's
+    /// row-level disjointness (PGC-512); set with `bound`.
+    pub(crate) read_ranges: Option<Arc<ReadRanges>>,
     /// Parameterized serve shape (mirrors `CachedQuery.serve_shape`, PGC-294).
     /// None while Loading; Some once the view transitions to Ready.
     pub serve_shape: Option<SharedQueryShape>,

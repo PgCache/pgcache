@@ -39,10 +39,10 @@ use crate::proxy::session_settings::SessionSettings;
 use crate::proxy::{ConnectionError, ConnectionResult, ProxyMode, ProxyStatus};
 use crate::query::SessionKey;
 use crate::query::ast::rope::QueryTree;
-use crate::query::constraints::ColumnRange;
 use crate::query::guc::Guc;
 use crate::query::keying_settings::KeyingSettings;
 use crate::query::resolve::ColumnsByTable;
+use crate::query::update::ReadRanges;
 use crate::query::write::StatementEffects;
 use crate::result::ReportExt;
 use crate::{
@@ -542,14 +542,6 @@ pub async fn connection_task(
     debug!("task done");
 }
 
-/// The read's per-column value ranges for row-level INSERT/DELETE/UPDATE
-/// disjointness (PGC-369/381/382), or `None` when row precision can't apply: a
-/// multi-table read (a write to any referenced table can affect the result), a
-/// read whose single table has no pending row-enumerable write (nothing to prove
-/// disjoint from),
-/// an unregistered query (no resolved form to derive constraints from), or a
-/// WHERE the analyzer couldn't fully reduce. The pending-write check comes first
-/// so unrelated reads skip the resolve + constraint analysis entirely.
 /// The read query with bind values substituted, for an extended-protocol
 /// (`QueryParameterized`) read that still holds `$n` placeholders. `None` when
 /// there is nothing to substitute (simple protocol / no parameters) or the
@@ -566,15 +558,16 @@ fn read_query_bound(msg: &CacheMessage) -> Option<CacheableQuery> {
 }
 
 /// What the read-after-write gate can prove with: the read's per-column
-/// ranges on its single table (`None` for a join or other multi-table shape),
-/// and the columns it references per table. Both come from the read's
-/// registered resolved form, so an unregistered read yields neither and
-/// forwards conservatively.
+/// ranges per table reference (PGC-369/381/382/512) and the columns it
+/// references per table. Both come from the read's registered resolved form,
+/// so an unregistered read yields neither and forwards conservatively.
 struct ReadShape {
-    ranges: Option<Arc<HashMap<EcoString, ColumnRange>>>,
+    ranges: Option<Arc<ReadRanges>>,
     columns: Option<Arc<ColumnsByTable>>,
 }
 
+/// Neither when no table of the read has a pending row-enumerable write, so
+/// unrelated reads skip the registered-form lookup.
 fn read_shape(
     query: &QueryTree,
     session_key: Option<SessionKey>,
@@ -597,7 +590,7 @@ fn read_shape(
         return none;
     };
     ReadShape {
-        ranges: form.ranges,
+        ranges: Some(form.ranges),
         columns: Some(form.columns),
     }
 }

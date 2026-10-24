@@ -143,7 +143,7 @@ impl CacheDispatch {
             return None;
         }
         Some(CachedReadForm {
-            ranges: view.read_ranges.clone(),
+            ranges: view.read_ranges.clone()?,
             columns: view.read_columns.clone()?,
         })
     }

@@ -351,73 +351,91 @@ pub(super) fn update_tuple_build(
     Some(((where_columns, set_columns), (where_values, set_values)))
 }
 
+/// Whether `disjoint` holds for every table reference's ranges; without any
+/// reference nothing is provable (PGC-512).
+pub(super) fn references_disjoint(
+    read_ranges: Option<&[HashMap<EcoString, ColumnRange>]>,
+    disjoint: impl Fn(&HashMap<EcoString, ColumnRange>) -> bool,
+) -> bool {
+    read_ranges.is_some_and(|references| !references.is_empty() && references.iter().all(disjoint))
+}
+
 /// Whether the read is provably unaffected by every merged UPDATE: a shape
 /// assigning only columns the read never references cannot change it
-/// ([`set_unreferenced`]); otherwise the read must be disjoint from both the
-/// WHERE tuple (the rows it touches) and the post-update image (the WHERE
-/// values with SET overrides applied; an unknown SET value constrains
-/// nothing). The tuple-level equivalent of checking [`UpdatePredicate`]'s two
-/// range maps.
+/// ([`set_unreferenced`]); otherwise every table reference of the read must be
+/// disjoint from both the WHERE tuple (the rows it touches) and the post-update
+/// image (the WHERE values with SET overrides applied; an unknown SET value
+/// constrains nothing). The tuple-level equivalent of checking
+/// [`UpdatePredicate`]'s two range maps.
 pub(super) fn merged_updates_disjoint(
     merged: &MergedUpdates,
-    read_ranges: Option<&HashMap<EcoString, ColumnRange>>,
+    read_ranges: Option<&[HashMap<EcoString, ColumnRange>]>,
     read_columns: Option<&HashSet<EcoString>>,
 ) -> bool {
-    let unsatisfiable = read_ranges.is_some_and(|ranges| {
-        ranges
-            .values()
-            .any(|range| matches!(range, ColumnRange::Empty))
-    });
     merged.iter().all(|((where_columns, set_columns), tuples)| {
-        if set_unreferenced(set_columns, read_columns) || unsatisfiable {
-            return true;
-        }
-        let Some(read_ranges) = read_ranges else {
+        set_unreferenced(set_columns, read_columns)
+            || references_disjoint(read_ranges, |ranges| {
+                merged_update_shape_disjoint(where_columns, set_columns, tuples, ranges)
+            })
+    })
+}
+
+/// Whether one reference's ranges exclude every tuple of one UPDATE shape, on
+/// both the WHERE side and the image side.
+fn merged_update_shape_disjoint(
+    where_columns: &[EcoString],
+    set_columns: &[EcoString],
+    tuples: &[(EqualityTuple, SetTuple)],
+    read_ranges: &HashMap<EcoString, ColumnRange>,
+) -> bool {
+    if read_ranges
+        .values()
+        .any(|range| matches!(range, ColumnRange::Empty))
+    {
+        return true;
+    }
+    // Resolve the shape's columns against the read once.
+    let where_constrained: SmallVec<[(usize, &ColumnRange); 2]> = where_columns
+        .iter()
+        .enumerate()
+        .filter_map(|(position, column)| read_ranges.get(column).map(|range| (position, range)))
+        .collect();
+    // Image side: WHERE columns keep their value unless a SET overrides
+    // them; SET columns carry their new value.
+    let where_in_image: SmallVec<[(usize, &ColumnRange); 2]> = where_constrained
+        .iter()
+        .filter(|(position, _)| {
+            where_columns
+                .get(*position)
+                .is_some_and(|column| !set_columns.contains(column))
+        })
+        .copied()
+        .collect();
+    let set_constrained: SmallVec<[(usize, &ColumnRange); 4]> = set_columns
+        .iter()
+        .enumerate()
+        .filter_map(|(position, column)| read_ranges.get(column).map(|range| (position, range)))
+        .collect();
+    tuples.iter().all(|(where_values, set_values)| {
+        let where_excluded = where_constrained.iter().any(|(position, range)| {
+            matches!(
+                where_values.get(*position),
+                Some(value) if column_range_contains(range, value) == Some(false)
+            )
+        });
+        if !where_excluded {
             return false;
-        };
-        // Resolve the shape's columns against the read once.
-        let where_constrained: SmallVec<[(usize, &ColumnRange); 2]> = where_columns
-            .iter()
-            .enumerate()
-            .filter_map(|(position, column)| read_ranges.get(column).map(|range| (position, range)))
-            .collect();
-        // Image side: WHERE columns keep their value unless a SET overrides
-        // them; SET columns carry their new value.
-        let where_in_image: SmallVec<[(usize, &ColumnRange); 2]> = where_constrained
-            .iter()
-            .filter(|(position, _)| {
-                where_columns
-                    .get(*position)
-                    .is_some_and(|column| !set_columns.contains(column))
-            })
-            .copied()
-            .collect();
-        let set_constrained: SmallVec<[(usize, &ColumnRange); 4]> = set_columns
-            .iter()
-            .enumerate()
-            .filter_map(|(position, column)| read_ranges.get(column).map(|range| (position, range)))
-            .collect();
-        tuples.iter().all(|(where_values, set_values)| {
-            let where_excluded = where_constrained.iter().any(|(position, range)| {
-                matches!(
-                    where_values.get(*position),
-                    Some(value) if column_range_contains(range, value) == Some(false)
-                )
-            });
-            if !where_excluded {
-                return false;
-            }
-            where_in_image.iter().any(|(position, range)| {
-                matches!(
-                    where_values.get(*position),
-                    Some(value) if column_range_contains(range, value) == Some(false)
-                )
-            }) || set_constrained.iter().any(|(position, range)| {
-                matches!(
-                    set_values.get(*position),
-                    Some(Some(value)) if column_range_contains(range, value) == Some(false)
-                )
-            })
+        }
+        where_in_image.iter().any(|(position, range)| {
+            matches!(
+                where_values.get(*position),
+                Some(value) if column_range_contains(range, value) == Some(false)
+            )
+        }) || set_constrained.iter().any(|(position, range)| {
+            matches!(
+                set_values.get(*position),
+                Some(Some(value)) if column_range_contains(range, value) == Some(false)
+            )
         })
     })
 }

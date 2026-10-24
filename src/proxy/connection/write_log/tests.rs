@@ -15,6 +15,7 @@ use crate::query::ast::rope::QueryTree;
 use crate::query::ast::{BinaryOp, LiteralValue};
 use crate::query::constraints::{ColumnConstraintKind, ColumnRange, TableConstraint};
 use crate::query::resolve::ColumnsByTable;
+use crate::query::update::ReadRanges;
 use crate::query::write::{
     DeleteStatement, InsertRow, InsertStatement, RelationRef, UpdateStatement, WriteClass,
 };
@@ -156,8 +157,21 @@ fn insert_int(table: &str, col: &str, values: &[i64]) -> WriteClass {
     }))
 }
 
-fn ranges(col: &str, range: ColumnRange) -> HashMap<EcoString, ColumnRange> {
-    HashMap::from([(col.into(), range)])
+/// The read's ranges: one reference of `orders` constraining `col`.
+fn ranges(col: &str, range: ColumnRange) -> ReadRanges {
+    read_ranges("orders", vec![HashMap::from([(col.into(), range)])])
+}
+
+/// The read's ranges on `table`: one map per reference of it.
+fn read_ranges(table: &str, references: Vec<HashMap<EcoString, ColumnRange>>) -> ReadRanges {
+    HashMap::from([(table.into(), references)])
+}
+
+fn id_equal(value: i64) -> HashMap<EcoString, ColumnRange> {
+    HashMap::from([(
+        EcoString::from("id"),
+        ColumnRange::Equal(LiteralValue::Integer(value)),
+    )])
 }
 
 #[test]
@@ -381,16 +395,19 @@ fn test_insert_diverging_column_lists() {
         RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
     );
     // Read constraining both columns: each row excluded via its own column.
-    let rab = HashMap::from([
-        (
-            EcoString::from("a"),
-            ColumnRange::Equal(LiteralValue::Integer(5)),
-        ),
-        (
-            EcoString::from("b"),
-            ColumnRange::Equal(LiteralValue::Integer(5)),
-        ),
-    ]);
+    let rab = read_ranges(
+        "orders",
+        vec![HashMap::from([
+            (
+                EcoString::from("a"),
+                ColumnRange::Equal(LiteralValue::Integer(5)),
+            ),
+            (
+                EcoString::from("b"),
+                ColumnRange::Equal(LiteralValue::Integer(5)),
+            ),
+        ])],
+    );
     assert_eq!(
         log.decide(&q, Some(&rab), None),
         RawDecision::ServeDisjoint(DisjointKinds {
@@ -590,16 +607,19 @@ fn test_delete_multi_column_equality_tuples() {
     log.record(&delete_ab(2, 20), None);
     let q = query("SELECT * FROM orders WHERE a = 2 AND b = 10");
     // a = 2 excludes the first tuple, b = 10 excludes the second.
-    let r = HashMap::from([
-        (
-            EcoString::from("a"),
-            ColumnRange::Equal(LiteralValue::Integer(2)),
-        ),
-        (
-            EcoString::from("b"),
-            ColumnRange::Equal(LiteralValue::Integer(10)),
-        ),
-    ]);
+    let r = read_ranges(
+        "orders",
+        vec![HashMap::from([
+            (
+                EcoString::from("a"),
+                ColumnRange::Equal(LiteralValue::Integer(2)),
+            ),
+            (
+                EcoString::from("b"),
+                ColumnRange::Equal(LiteralValue::Integer(10)),
+            ),
+        ])],
+    );
     assert_eq!(
         log.decide(&q, Some(&r), None),
         RawDecision::ServeDisjoint(DisjointKinds {
@@ -608,16 +628,19 @@ fn test_delete_multi_column_equality_tuples() {
         })
     );
     // a = 2, b = 20 matches the second tuple exactly → forward.
-    let r_hit = HashMap::from([
-        (
-            EcoString::from("a"),
-            ColumnRange::Equal(LiteralValue::Integer(2)),
-        ),
-        (
-            EcoString::from("b"),
-            ColumnRange::Equal(LiteralValue::Integer(20)),
-        ),
-    ]);
+    let r_hit = read_ranges(
+        "orders",
+        vec![HashMap::from([
+            (
+                EcoString::from("a"),
+                ColumnRange::Equal(LiteralValue::Integer(2)),
+            ),
+            (
+                EcoString::from("b"),
+                ColumnRange::Equal(LiteralValue::Integer(20)),
+            ),
+        ])],
+    );
     assert_eq!(
         log.decide(&q, Some(&r_hit), None),
         RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
@@ -1489,4 +1512,98 @@ fn test_write_without_alias_map_records_own_name_only() {
     log.record(&insert("t_lo"), None);
     assert!(table_pending(&log, "t_lo"));
     assert!(!table_pending(&log, "t"));
+}
+
+/// PGC-512: a read with several references of the written table is disjoint
+/// from a pending write only when every reference is; a reference without
+/// filters proves nothing.
+#[test]
+fn test_intersects_every_table_reference() {
+    let mut log = WriteLog::with_enabled(true);
+    log.record(&insert_int("orders", "id", &[2]), None);
+    let q = query("SELECT * FROM orders a JOIN orders b ON b.id = a.parent WHERE a.id = 5");
+    let disjoint = read_ranges("orders", vec![id_equal(5), id_equal(7)]);
+    assert_eq!(
+        log.decide(&q, Some(&disjoint), None),
+        RawDecision::ServeDisjoint(DisjointKinds {
+            insert: true,
+            ..Default::default()
+        })
+    );
+    let hit = read_ranges("orders", vec![id_equal(5), id_equal(2)]);
+    assert_eq!(
+        log.decide(&q, Some(&hit), None),
+        RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
+    );
+    let unfiltered = read_ranges("orders", vec![id_equal(5), HashMap::new()]);
+    assert_eq!(
+        log.decide(&q, Some(&unfiltered), None),
+        RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
+    );
+}
+
+/// PGC-512: a join read's ranges are per table: the written table's own
+/// references decide, a table absent from the map or with no references
+/// proves nothing.
+#[test]
+fn test_intersects_join_read_per_table() {
+    let mut log = WriteLog::with_enabled(true);
+    log.record(&insert_int("orders", "id", &[2]), None);
+    let q = query("SELECT * FROM users u JOIN orders o ON u.id = o.uid WHERE o.id = 5");
+    let orders = read_ranges("orders", vec![id_equal(5)]);
+    assert_eq!(
+        log.decide(&q, Some(&orders), None),
+        RawDecision::ServeDisjoint(DisjointKinds {
+            insert: true,
+            ..Default::default()
+        })
+    );
+    let users = read_ranges("users", vec![id_equal(5)]);
+    assert_eq!(
+        log.decide(&q, Some(&users), None),
+        RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
+    );
+    let empty = read_ranges("orders", Vec::new());
+    assert_eq!(
+        log.decide(&q, Some(&empty), None),
+        RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
+    );
+}
+
+/// PGC-512: merged UPDATE tuples and DELETE tuples are checked against every
+/// reference of the written table too.
+#[test]
+fn test_update_delete_intersect_every_table_reference() {
+    let q = query("SELECT * FROM orders a JOIN orders b ON b.id = a.parent WHERE a.id = 5");
+    let columns = columns_by_table(&[("orders", &["id", "v", "parent"])]);
+    let disjoint = read_ranges("orders", vec![id_equal(5), id_equal(7)]);
+    let hit = read_ranges("orders", vec![id_equal(5), id_equal(2)]);
+
+    let mut log = WriteLog::with_enabled(true);
+    log.record(&update_eq("orders", "id", 2, &[("v", Some(1))]), None);
+    assert_eq!(
+        log.decide(&q, Some(&disjoint), Some(&columns)),
+        RawDecision::ServeDisjoint(DisjointKinds {
+            update: true,
+            ..Default::default()
+        })
+    );
+    assert_eq!(
+        log.decide(&q, Some(&hit), Some(&columns)),
+        RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
+    );
+
+    let mut log = WriteLog::with_enabled(true);
+    log.record(&delete_eq("orders", "id", 2), None);
+    assert_eq!(
+        log.decide(&q, Some(&disjoint), Some(&columns)),
+        RawDecision::ServeDisjoint(DisjointKinds {
+            delete: true,
+            ..Default::default()
+        })
+    );
+    assert_eq!(
+        log.decide(&q, Some(&hit), Some(&columns)),
+        RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
+    );
 }
