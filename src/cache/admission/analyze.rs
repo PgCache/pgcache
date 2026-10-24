@@ -1,7 +1,7 @@
 //! The per-table admission derivation, extracted verbatim from the writer's
 //! registration path (PGC-391) so pgcache-fit runs the identical analysis.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use ecow::EcoString;
@@ -20,7 +20,6 @@ use crate::cache::{CacheError, CacheResult};
 use crate::catalog::Catalog;
 use crate::oid::Oid;
 use crate::query::Fingerprint;
-use crate::query::ast::NodeId;
 use crate::query::ast::rope::{Body, NodeKind, QueryTree, TreeBuilder, View};
 use crate::query::compiled_predicate::CompiledPredicate;
 use crate::query::decorrelate::query_decorrelate;
@@ -160,23 +159,6 @@ pub fn query_decorrelate_checked(
         .attach_loc("decorrelating correlated subqueries")
 }
 
-/// The relations whose every reference sits in one SELECT branch. Several
-/// branches load the union of their rows, which one region doesn't describe.
-fn single_branch_relations(update_queries: &[TableUpdateQuery<'_>]) -> HashSet<Oid> {
-    let mut branches: HashMap<Oid, HashSet<NodeId>> = HashMap::new();
-    for update_query in update_queries {
-        branches
-            .entry(update_query.relation_oid)
-            .or_default()
-            .insert(update_query.branch.select.id());
-    }
-    branches
-        .into_iter()
-        .filter(|(_, branches)| branches.len() == 1)
-        .map(|(relation_oid, _)| relation_oid)
-        .collect()
-}
-
 /// Classify a query's shape for MV eligibility on its decorrelated form
 /// when it has one, so the shape classified is the shape population and
 /// rebuild see.
@@ -214,7 +196,6 @@ pub fn query_admission_analyze(
     let context = AdmissionContext {
         query: &query,
         update_source,
-        single_branch: single_branch_relations(&update_queries),
         aggregate_functions,
         tables,
         depth,
@@ -235,7 +216,6 @@ struct AdmissionContext<'a> {
     /// The query the update queries are read from: the decorrelated form
     /// when there is one.
     update_source: &'a Arc<ResolvedQuery>,
-    single_branch: HashSet<Oid>,
     aggregate_functions: &'a HashSet<EcoString>,
     tables: &'a Catalog,
     depth: AdmissionDepth,
@@ -281,8 +261,9 @@ impl AdmissionContext<'_> {
         if self.full() {
             update_query.change_dependent = update_query.update_invalidation_possible();
         }
-        let subsumer_shape =
-            self.single_branch.contains(&relation_oid) && update_query.predicates.exact;
+        // Population loads each exact reference's region in full whatever
+        // the relation's other references load, so each parents on its own.
+        let subsumer_shape = update_query.predicates.exact;
         TableAdmission {
             relation_oid,
             table_name: table_node.name().clone(),
@@ -364,10 +345,13 @@ mod tests {
     use postgres_types::Type;
 
     use super::*;
-    use crate::cache::admission::subsumption_references;
+    use crate::cache::admission::{
+        SubsumerCandidate, SubsumerSource, SubsumptionReference, subsumption_covered,
+        subsumption_references,
+    };
     use crate::catalog::{ColumnMetadata, ColumnPosition, TableMetadata};
     use crate::oid::TypeOid;
-    use crate::query::constraints::table_constraints_subsumed;
+    use crate::query::constraints::{TableRanges, table_constraints_subsumed};
 
     fn catalog() -> Catalog {
         let int_column = |name: &str, position: i16| ColumnMetadata {
@@ -470,8 +454,26 @@ mod tests {
          &[("a", false), ("b", true)]),
         ("SELECT id FROM a WHERE x = 1 UNION SELECT id FROM b WHERE x = 2",
          &[("a", true), ("b", true)]),
+        // Each exact reference of a relation is loaded in full, whatever its
+        // other references load (PGC-511).
         ("SELECT id FROM a WHERE x = 1 UNION SELECT id FROM a WHERE x = 2",
-         &[("a", false), ("a", false)]),
+         &[("a", true), ("a", true)]),
+        ("SELECT id FROM a WHERE x = 1 UNION ALL SELECT id FROM a WHERE x = 2 \
+          UNION ALL SELECT id FROM a WHERE x = 3",
+         &[("a", true), ("a", true), ("a", true)]),
+        ("SELECT id FROM a WHERE x = 1 EXCEPT SELECT id FROM a WHERE y = 2",
+         &[("a", true), ("a", true)]),
+        ("SELECT id FROM a WHERE x = 1 UNION ALL SELECT id FROM a WHERE x = 2 OR y = 2",
+         &[("a", false), ("a", true)]),
+        ("SELECT a.id FROM a JOIN b ON b.id = a.id WHERE a.x = 2 \
+          UNION ALL SELECT id FROM a WHERE x = 1",
+         &[("a", false), ("a", true), ("b", false)]),
+        // The IN narrows the outer reference; the subquery reads its own whole.
+        ("SELECT * FROM a WHERE x = 1 AND id IN (SELECT id FROM a WHERE y = 2)",
+         &[("a", false), ("a", true)]),
+        ("WITH c AS (SELECT id FROM a WHERE y = 2) \
+          SELECT * FROM a WHERE x = 1 AND id IN (SELECT id FROM c)",
+         &[("a", false), ("a", true)]),
     ];
 
     /// A table is a subsumer only where population loads every row its
@@ -620,6 +622,93 @@ mod tests {
         for (cached, new, expected) in cases {
             assert_eq!(
                 parent_covers(cached, new),
+                expected,
+                "cached {cached:?} covers new {new:?}"
+            );
+        }
+    }
+
+    /// Every subsumer-shaped reference of the cached queries, as a source.
+    struct Parents(Vec<(Oid, TableRanges)>);
+
+    impl SubsumerSource for Parents {
+        fn candidates(
+            &self,
+            reference: &SubsumptionReference,
+        ) -> impl Iterator<Item = SubsumerCandidate<'_>> {
+            self.0
+                .iter()
+                .filter(move |(relation_oid, _)| *relation_oid == reference.relation_oid)
+                .map(|(_, region)| SubsumerCandidate {
+                    region,
+                    has_limit: false,
+                    ready: true,
+                })
+        }
+    }
+
+    /// Whether the exact references of `cached` cover every reference of
+    /// `new`.
+    fn parents_cover(cached: &str, new: &str) -> bool {
+        let parents = Parents(
+            admission_analysis(cached)
+                .tables
+                .into_iter()
+                .filter(|admission| admission.subsumer_shape)
+                .map(|admission| {
+                    (
+                        admission.relation_oid,
+                        admission.update_query.predicates.ranges,
+                    )
+                })
+                .collect(),
+        );
+        let tables = catalog();
+        let bound = ResolvedQuery::parse_resolve(new, &tables, &["public"]).expect("resolve");
+        let references = subsumption_references(&bound).expect("references");
+        subsumption_covered(&references, &parents)
+    }
+
+    /// Each exact reference of a relation parents a child under it on its
+    /// own. A child spanning two references waits on the union of regions
+    /// (PGC-494); a reference a join, an OR or an IN narrows is no parent
+    /// (PGC-511).
+    #[test]
+    fn test_repeated_reference_parents_cover() {
+        const UNION_ARMS: &str =
+            "SELECT id FROM a WHERE x = 1 UNION ALL SELECT id FROM a WHERE x = 2";
+        const MIXED_ARMS: &str =
+            "SELECT id FROM a WHERE x = 1 UNION ALL SELECT id FROM a WHERE x = 2 OR y = 2";
+        const JOIN_ARM: &str = "SELECT a.id FROM a JOIN b ON b.id = a.id WHERE a.x = 2 \
+                                UNION ALL SELECT id FROM a WHERE x = 1";
+        const SUBQUERY: &str =
+            "SELECT * FROM a WHERE x = 1 AND id IN (SELECT id FROM a WHERE y = 2)";
+        let cases = [
+            (UNION_ARMS, "SELECT * FROM a WHERE x = 1 AND y = 3", true),
+            (UNION_ARMS, "SELECT * FROM a WHERE x = 2", true),
+            (UNION_ARMS, "SELECT * FROM a WHERE x = 3", false),
+            (UNION_ARMS, "SELECT * FROM a WHERE x IN (1, 2)", false),
+            (UNION_ARMS, "SELECT * FROM a WHERE x > 0", false),
+            (
+                UNION_ARMS,
+                "SELECT id FROM a WHERE x = 2 UNION SELECT id FROM a WHERE x = 1 AND y = 1",
+                true,
+            ),
+            (
+                UNION_ARMS,
+                "SELECT id FROM a WHERE x = 1 UNION SELECT id FROM a WHERE x = 3",
+                false,
+            ),
+            (MIXED_ARMS, "SELECT * FROM a WHERE x = 1 AND y = 3", true),
+            (MIXED_ARMS, "SELECT * FROM a WHERE x = 2", false),
+            (JOIN_ARM, "SELECT * FROM a WHERE x = 1", true),
+            (JOIN_ARM, "SELECT * FROM a WHERE x = 2", false),
+            (SUBQUERY, "SELECT * FROM a WHERE y = 2 AND x = 5", true),
+            (SUBQUERY, "SELECT * FROM a WHERE x = 1", false),
+        ];
+        for (cached, new, expected) in cases {
+            assert_eq!(
+                parents_cover(cached, new),
                 expected,
                 "cached {cached:?} covers new {new:?}"
             );

@@ -56,8 +56,9 @@ impl SubsumerSource for WriterSubsumerSource<'_> {
                 update_queries
                     .subsumption_candidates(&keyed)
                     .into_iter()
-                    .filter_map(move |fingerprint| {
-                        let region = update_queries.subsumer_region(fingerprint)?;
+                    .filter_map(move |key| {
+                        let region = update_queries.subsumer_region(key)?;
+                        let fingerprint = key.fingerprint;
                         let parent = self.cache.cached_queries.get1(&fingerprint);
                         Some(SubsumerCandidate {
                             region: &region.ranges,

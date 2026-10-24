@@ -905,3 +905,129 @@ async fn test_subsumption_set_operation_uncovered_arm_not_subsumed() -> Result<(
     let _m = assert_not_subsumed(&mut ctx, m).await?;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Same-relation parents: each exact reference is a parent (PGC-511)
+// ---------------------------------------------------------------------------
+
+/// Each arm of a same-table UNION ALL is loaded in full, so each parents a
+/// child under it on its own; a child under neither arm, or spanning both
+/// (PGC-494), is not covered. The covered child then follows CDC.
+#[tokio::test]
+async fn test_subsumption_same_table_union_arms_each_parent() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_set_operation_tables(&mut ctx).await?;
+    parent_warm(
+        &mut ctx,
+        "SELECT id, tenant_id FROM sub_setop_a WHERE tenant_id = 1 \
+         UNION ALL SELECT id, tenant_id FROM sub_setop_a WHERE tenant_id = 2",
+    )
+    .await?;
+
+    let under_arm = "SELECT id FROM sub_setop_a WHERE tenant_id = 1 AND id > 1 ORDER BY id";
+    let m = ctx.metrics().await?;
+    let (proxied, origin) = ctx.proxy_and_origin_rows(under_arm).await?;
+    assert_eq!(origin.len(), 1, "row 2");
+    assert_eq!(proxied, origin);
+    assert_subsume_hit(&mut ctx, m).await?;
+
+    for child in [
+        "SELECT id FROM sub_setop_a WHERE tenant_id = 3",
+        "SELECT id FROM sub_setop_a WHERE tenant_id IN (1, 2) ORDER BY id",
+    ] {
+        let m = ctx.metrics().await?;
+        let (proxied, origin) = ctx.proxy_and_origin_rows(child).await?;
+        assert_eq!(proxied, origin, "{child}");
+        ctx.cache_settle().await?;
+        assert_not_subsumed(&mut ctx, m).await?;
+    }
+
+    let m = ctx.metrics().await?;
+    ctx.origin_query("INSERT INTO sub_setop_a VALUES (6, 1)", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+    let (proxied, origin) = ctx.proxy_and_origin_rows(under_arm).await?;
+    assert_eq!(origin.len(), 2, "rows 2 and 6");
+    assert_eq!(proxied, origin, "after insert");
+    assert_cache_hit(&mut ctx, m).await?;
+    Ok(())
+}
+
+/// A UNION ALL arm that joins loads only the rows with a partner, so it is
+/// no parent, while the single-table arm beside it is.
+#[tokio::test]
+async fn test_subsumption_union_join_arm_not_parent() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_set_operation_tables(&mut ctx).await?;
+    parent_warm(
+        &mut ctx,
+        "SELECT id FROM sub_setop_a WHERE tenant_id = 1 \
+         UNION ALL SELECT a.id FROM sub_setop_a a \
+         JOIN sub_setop_b b ON b.id = a.id WHERE a.tenant_id = 2",
+    )
+    .await?;
+
+    // Row 3 is tenant 2 with no partner in b, so the join arm never loaded it.
+    let m = ctx.metrics().await?;
+    let (proxied, origin) = ctx
+        .proxy_and_origin_rows("SELECT id FROM sub_setop_a WHERE tenant_id = 2 ORDER BY id")
+        .await?;
+    assert_eq!(origin.len(), 1, "row 3");
+    assert_eq!(proxied, origin);
+    ctx.cache_settle().await?;
+    assert_not_subsumed(&mut ctx, m).await?;
+
+    let m = ctx.metrics().await?;
+    let (proxied, origin) = ctx
+        .proxy_and_origin_rows(
+            "SELECT id FROM sub_setop_a WHERE tenant_id = 1 AND id > 1 ORDER BY id",
+        )
+        .await?;
+    assert_eq!(origin.len(), 1, "row 2");
+    assert_eq!(proxied, origin);
+    assert_subsume_hit(&mut ctx, m).await?;
+    Ok(())
+}
+
+/// A table read in an uncorrelated subquery is loaded in full on the
+/// subquery's own filters, so that reference parents a child under it; the
+/// outer reference, narrowed by the IN, does not. The child then follows CDC
+/// on its own.
+#[tokio::test]
+async fn test_subsumption_subquery_reference_parent() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_set_operation_tables(&mut ctx).await?;
+    parent_warm(
+        &mut ctx,
+        "SELECT id FROM sub_setop_a WHERE tenant_id = 1 \
+         AND id IN (SELECT id FROM sub_setop_a WHERE tenant_id = 2)",
+    )
+    .await?;
+
+    // No tenant-1 id is a tenant-2 id, so the outer reference loaded no row.
+    let m = ctx.metrics().await?;
+    let (proxied, origin) = ctx
+        .proxy_and_origin_rows("SELECT id FROM sub_setop_a WHERE tenant_id = 1 ORDER BY id")
+        .await?;
+    assert_eq!(origin.len(), 2, "rows 1 and 2");
+    assert_eq!(proxied, origin);
+    ctx.cache_settle().await?;
+    assert_not_subsumed(&mut ctx, m).await?;
+
+    let under_subquery = "SELECT id FROM sub_setop_a WHERE tenant_id = 2 AND id > 0 ORDER BY id";
+    let m = ctx.metrics().await?;
+    let (proxied, origin) = ctx.proxy_and_origin_rows(under_subquery).await?;
+    assert_eq!(origin.len(), 1, "row 3");
+    assert_eq!(proxied, origin);
+    assert_subsume_hit(&mut ctx, m).await?;
+
+    let m = ctx.metrics().await?;
+    ctx.origin_query("INSERT INTO sub_setop_a VALUES (7, 2)", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+    let (proxied, origin) = ctx.proxy_and_origin_rows(under_subquery).await?;
+    assert_eq!(origin.len(), 2, "rows 3 and 7");
+    assert_eq!(proxied, origin, "after insert");
+    assert_cache_hit(&mut ctx, m).await?;
+    Ok(())
+}

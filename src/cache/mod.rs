@@ -96,7 +96,7 @@ pub use status::{
 #[cfg(feature = "proxy")]
 pub use types::{Cache, CachedQuery, CachedQueryView, PinnedQuery, WriteAliasMap};
 pub use update_query::{
-    SubqueryKind, UpdateEvalStrategy, UpdateQueries, UpdateQuery, UpdateQuerySource,
+    SubqueryKind, UpdateEvalStrategy, UpdateQueries, UpdateQuery, UpdateQueryKey, UpdateQuerySource,
 };
 
 error_set! {

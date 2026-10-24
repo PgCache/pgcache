@@ -9,9 +9,7 @@ use rootcause::Report;
 use crate::cache::{CacheError, CacheResult};
 #[cfg(feature = "proxy")]
 use crate::catalog::TableMetadata;
-#[cfg(feature = "proxy")]
-use crate::id_hash::BuildIdHasher;
-use crate::id_hash::impl_id_hashable;
+use crate::id_hash::{BuildIdHasher, impl_id_hashable};
 use crate::oid::Oid;
 use crate::query::ast::NodeId;
 use crate::query::compiled_predicate::CompiledPredicate;
@@ -131,6 +129,9 @@ impl_id_hashable!(UpdateQueryKey);
 /// `HashSet` of `UpdateQueryKey` with the passthrough hasher.
 #[cfg(feature = "proxy")]
 pub(crate) type UpdateQueryKeySet = HashSet<UpdateQueryKey, BuildIdHasher<UpdateQueryKey>>;
+
+/// `HashMap` keyed by `UpdateQueryKey` with the passthrough hasher.
+type UpdateQueryKeyMap<V> = HashMap<UpdateQueryKey, V, BuildIdHasher<UpdateQueryKey>>;
 
 /// Query used to update cached results when data changes
 #[derive(Debug, Clone)]
@@ -308,11 +309,13 @@ pub struct UpdateQueries {
     pub relation_oid: Oid,
     queries: FingerprintMap<Vec<UpdateQuery>>,
     /// Typed index over subsumption parents' regions, for sub-linear
-    /// candidate lookup (PGC-119). Holds the `subsumer_regions` fingerprints
-    /// without a LIMIT.
-    subsumption: ConstraintIndex<Fingerprint>,
-    /// The region of each fingerprint that could parent a subsumption.
-    subsumer_regions: FingerprintMap<SubsumerRegion>,
+    /// candidate lookup (PGC-119). Holds the `subsumer_regions` keys whose
+    /// fingerprint has no LIMIT.
+    subsumption: ConstraintIndex<UpdateQueryKey>,
+    /// The region each exact reference holds in full, one per update query
+    /// that could parent a subsumption: population loads it whatever the
+    /// fingerprint's other references on the relation load (PGC-511).
+    subsumer_regions: UpdateQueryKeyMap<SubsumerRegion>,
     /// Per-table constraint index over the *full* update-query population of
     /// this relation — LocalEval and PgEval alike (PGC-292). Probed point-wise
     /// (`eval_candidates_into`) to narrow CDC per-row work: the upsert matcher
@@ -409,16 +412,16 @@ impl UpdateQueries {
         self.eval_index.columns()
     }
 
-    /// Subsumption parents whose region might cover `keyed`, the new
-    /// query's ranges in their key forms.
-    pub fn subsumption_candidates(&self, keyed: &TableRanges) -> FingerprintSet {
+    /// Update queries whose region might cover `keyed`, the new query's
+    /// ranges in their key forms. Each exact reference is a parent on its own.
+    pub fn subsumption_candidates(&self, keyed: &TableRanges) -> Vec<UpdateQueryKey> {
         self.subsumption.candidates(keyed).into_iter().collect()
     }
 
-    /// The region `fingerprint` holds in full, when it can parent a
-    /// subsumption on this relation.
-    pub fn subsumer_region(&self, fingerprint: Fingerprint) -> Option<&SubsumerRegion> {
-        self.subsumer_regions.get(&fingerprint)
+    /// The region the update query `key` holds in full, when it can parent
+    /// a subsumption on this relation.
+    pub fn subsumer_region(&self, key: UpdateQueryKey) -> Option<&SubsumerRegion> {
+        self.subsumer_regions.get(&key)
     }
 
     /// Carve-out membership for a query: `(always_check, has_limit_fromclause)`.
@@ -521,7 +524,8 @@ impl UpdateQueries {
     }
 
     /// Register `fingerprint`'s update queries on this relation, replacing
-    /// any it had: one entry per table reference.
+    /// any it had: one entry per table reference, each exact one a
+    /// subsumption parent of its own.
     pub fn fingerprint_insert(
         &mut self,
         fingerprint: Fingerprint,
@@ -530,24 +534,25 @@ impl UpdateQueries {
         self.fingerprint_remove(fingerprint);
         self.epoch += 1;
         let mut entries: Vec<UpdateQuery> = Vec::with_capacity(registrations.len());
-        let mut subsumer = None;
+        let mut regions = Vec::new();
         for registration in registrations {
-            if subsumer.is_none() {
-                subsumer = registration.subsumer_region;
-            }
             let mut update_query = registration.update_query;
             update_query.fingerprint = fingerprint;
             update_query.ordinal = entries.len();
             self.eval_index
                 .insert(update_query.key(), &registration.index_ranges);
             self.change_dependent_account(update_query.change_dependent, true);
+            if let Some(region) = registration.subsumer_region {
+                regions.push((update_query.key(), region));
+            }
             entries.push(update_query);
         }
-        if let Some(region) = subsumer {
-            if entries.iter().all(|entry| !entry.has_limit) {
-                self.subsumption.insert(fingerprint, &region.keyed_ranges);
+        let unlimited = entries.iter().all(|entry| !entry.has_limit);
+        for (key, region) in regions {
+            if unlimited {
+                self.subsumption.insert(key, &region.keyed_ranges);
             }
-            self.subsumer_regions.insert(fingerprint, region);
+            self.subsumer_regions.insert(key, region);
         }
         self.carveout_account(fingerprint, &entries, true);
         self.queries.insert(fingerprint, entries);
@@ -556,13 +561,13 @@ impl UpdateQueries {
     /// Remove every update query of `fingerprint` on this relation, with its
     /// index entries. Returns whether it had any.
     pub fn fingerprint_remove(&mut self, fingerprint: Fingerprint) -> bool {
-        self.subsumption.remove(fingerprint);
-        self.subsumer_regions.remove(&fingerprint);
         let Some(entries) = self.queries.remove(&fingerprint) else {
             return false;
         };
         self.epoch += 1;
         for entry in &entries {
+            self.subsumption.remove(entry.key());
+            self.subsumer_regions.remove(&entry.key());
             self.eval_index.remove(entry.key());
             self.change_dependent_account(entry.change_dependent, false);
         }
@@ -586,11 +591,14 @@ impl UpdateQueries {
             self.change_dependent_account(entry.change_dependent, true);
         }
         self.carveout_account(fingerprint, &entries, true);
-        self.queries.insert(fingerprint, entries);
-        self.subsumption.remove(fingerprint);
-        if !has_limit && let Some(region) = self.subsumer_regions.get(&fingerprint) {
-            self.subsumption.insert(fingerprint, &region.keyed_ranges);
+        for entry in &entries {
+            let key = entry.key();
+            self.subsumption.remove(key);
+            if !has_limit && let Some(region) = self.subsumer_regions.get(&key) {
+                self.subsumption.insert(key, &region.keyed_ranges);
+            }
         }
+        self.queries.insert(fingerprint, entries);
     }
 
     /// Account for a query being added to / removed from the set. `added`
@@ -710,19 +718,27 @@ mod tests {
         candidates.contains(&FINGERPRINT)
     }
 
+    /// Whether the subsumption index offers the fingerprint to a child
+    /// reading the `items` rows of `kind`.
+    fn subsumer_for(queries: &UpdateQueries, kind: &str) -> bool {
+        queries
+            .subsumption_candidates(&TableRanges::build(&[TableConstraint {
+                column: "kind".into(),
+                kind: crate::query::constraints::ColumnConstraintKind::Comparison {
+                    op: crate::query::ast::BinaryOp::Equal,
+                    value: crate::query::ast::LiteralValue::String(kind.into()),
+                },
+            }]))
+            .iter()
+            .any(|key| key.fingerprint == FINGERPRINT)
+    }
+
     fn subsumer(queries: &UpdateQueries) -> bool {
         queries
             .subsumption_candidates(&TableRanges::default())
-            .contains(&FINGERPRINT)
-            || queries
-                .subsumption_candidates(&TableRanges::build(&[TableConstraint {
-                    column: "kind".into(),
-                    kind: crate::query::constraints::ColumnConstraintKind::Comparison {
-                        op: crate::query::ast::BinaryOp::Equal,
-                        value: crate::query::ast::LiteralValue::String("x".into()),
-                    },
-                }]))
-                .contains(&FINGERPRINT)
+            .iter()
+            .any(|key| key.fingerprint == FINGERPRINT)
+            || subsumer_for(queries, "x")
     }
 
     const UNION: &str = "SELECT id FROM items WHERE kind = 'x' \
@@ -805,15 +821,40 @@ mod tests {
         assert!(!subsumer(&queries));
     }
 
-    /// A fingerprint with several update queries on the relation never
-    /// parents a subsumption, with or without a LIMIT.
+    /// Each exact reference of a fingerprint is a parent on its own: a child
+    /// under either arm finds the fingerprint, one under neither does not,
+    /// and a LIMIT or removal takes every arm out together (PGC-511).
     #[test]
-    fn test_update_queries_several_never_subsumer() {
+    fn test_update_queries_each_exact_reference_subsumer() {
         let mut queries = registered(UNION, false);
-        assert!(!subsumer(&queries));
+        assert!(subsumer_for(&queries, "x"));
+        assert!(subsumer_for(&queries, "y"));
+        assert!(!subsumer_for(&queries, "z"));
+
         queries.has_limit_set(FINGERPRINT, true);
+        assert!(!subsumer_for(&queries, "x"));
+        assert!(!subsumer_for(&queries, "y"));
         queries.has_limit_set(FINGERPRINT, false);
-        assert!(!subsumer(&queries));
+        assert!(subsumer_for(&queries, "x"));
+        assert!(subsumer_for(&queries, "y"));
+
+        assert!(queries.fingerprint_remove(FINGERPRINT));
+        assert!(!subsumer_for(&queries, "x"));
+        assert!(!subsumer_for(&queries, "y"));
+    }
+
+    /// Only an exact arm is indexed: one whose WHERE the model can't read
+    /// whole describes no region (PGC-511).
+    #[test]
+    fn test_update_queries_inexact_arm_not_subsumer() {
+        let queries = registered(
+            "SELECT id FROM items WHERE kind = 'x' \
+             UNION ALL SELECT id FROM items WHERE kind = 'y' OR id = 3",
+            false,
+        );
+        assert_eq!(queries.queries_of(FINGERPRINT).len(), 2);
+        assert!(subsumer_for(&queries, "x"));
+        assert!(!subsumer_for(&queries, "y"));
     }
 
     /// Update queries of one fingerprint hash apart; the first hashes as its

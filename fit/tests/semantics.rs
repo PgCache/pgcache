@@ -475,18 +475,17 @@ mod target {
         assert_eq!(count(&report, "in_transaction_calls"), 0);
     }
 
-    /// A same-table UNION parent registers one update query per branch, so
-    /// the writer's single-relation gate (duplicate-preserving relation_oids)
-    /// rejects it as a subsumer even though only one distinct table appears.
+    /// A same-table UNION parent registers one update query per arm, each
+    /// a subsumer on its own (PGC-511), so a child under one arm hits.
     #[test]
-    fn test_same_table_union_parent_never_subsumes() {
+    fn test_same_table_union_parent_subsumes_per_arm() {
         let report = hitrate_json(
             "target_union_parent.sql",
             "SELECT * FROM users WHERE id = 1 UNION SELECT * FROM users WHERE name = 'a';\n\
              SELECT * FROM users WHERE id = 1;\n",
         );
-        assert_eq!(count(&report, "subsumption_hits"), 0);
-        assert_eq!(count(&report, "cold_misses"), 2);
+        assert_eq!(count(&report, "subsumption_hits"), 1);
+        assert_eq!(count(&report, "cold_misses"), 1);
     }
 
     /// The replay runs the proxy's own serve decision (PGC-392), so its

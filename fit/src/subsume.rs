@@ -1,16 +1,17 @@
 //! Offline subsumption registry. Admission gating and the coverage decision
 //! are the proxy's own (`pgcache_lib::cache::admission`); this module only
-//! stores admitted candidates per relation — indexed through the same
-//! `ConstraintIndex` the writer uses (ADR-037) — and answers lookups with
-//! `ready` always true (infinite cache, nothing ever invalidates).
+//! stores admitted candidates per relation, one per exact reference as the
+//! writer does — indexed through the same `ConstraintIndex` (ADR-037) — and
+//! answers lookups with `ready` always true (infinite cache, nothing ever
+//! invalidates).
 
 use std::collections::HashMap;
 
+use pgcache_lib::cache::UpdateQueryKey;
 use pgcache_lib::cache::admission::{
     SubsumerCandidate, SubsumerSource, SubsumptionReference, subsumption_covered,
 };
 use pgcache_lib::oid::Oid;
-use pgcache_lib::query::Fingerprint;
 use pgcache_lib::query::constraint_index::ConstraintIndex;
 use pgcache_lib::query::constraints::TableRanges;
 
@@ -22,8 +23,8 @@ pub struct SubsumerRegistry {
 }
 
 struct RelationSubsumers {
-    index: ConstraintIndex<Fingerprint>,
-    admitted: HashMap<Fingerprint, AdmittedSubsumer>,
+    index: ConstraintIndex<UpdateQueryKey>,
+    admitted: HashMap<UpdateQueryKey, AdmittedSubsumer>,
 }
 
 struct AdmittedSubsumer {
@@ -46,10 +47,19 @@ impl SubsumerRegistry {
     }
 
     /// Store the query's eligible per-table admissions as subsumption
-    /// candidates. Eligibility was decided by the shared admission analysis;
-    /// the remaining gates run per lookup in `subsumption_covered`.
+    /// candidates, keyed like the writer's update queries: by fingerprint and
+    /// position among the query's references of the relation. Eligibility
+    /// was decided by the shared admission analysis; the remaining gates run
+    /// per lookup in `subsumption_covered`.
     pub fn subsumer_register(&mut self, analysis: &CacheableAnalysis) {
+        let mut ordinals: HashMap<Oid, usize> = HashMap::new();
         for admission in &analysis.admissions {
+            let ordinal = ordinals.entry(admission.relation_oid).or_default();
+            let key = UpdateQueryKey {
+                fingerprint: analysis.fingerprint,
+                ordinal: *ordinal,
+            };
+            *ordinal += 1;
             let (true, Some(region)) = (admission.subsumer_eligible, &admission.subsumer_region)
             else {
                 continue;
@@ -58,9 +68,9 @@ impl SubsumerRegistry {
                 .by_relation
                 .entry(admission.relation_oid)
                 .or_insert_with(RelationSubsumers::new);
-            relation.index.insert(analysis.fingerprint, region);
+            relation.index.insert(key, region);
             relation.admitted.insert(
-                analysis.fingerprint,
+                key,
                 AdmittedSubsumer {
                     region: region.clone(),
                     has_limit: analysis.has_limit,
@@ -92,10 +102,10 @@ impl SubsumerSource for SubsumerRegistry {
                     .index
                     .candidates(&reference.ranges)
                     .into_iter()
-                    .filter_map(move |fingerprint| {
+                    .filter_map(move |key| {
                         relation
                             .admitted
-                            .get(&fingerprint)
+                            .get(&key)
                             .map(|subsumer| SubsumerCandidate {
                                 region: &subsumer.region,
                                 has_limit: subsumer.has_limit,
@@ -165,17 +175,36 @@ mod tests {
         assert!(registry.query_subsumed(&analyses[1]));
     }
 
-    /// Two branches on one relation load the union of their rows, which no
-    /// one region describes, so neither is admitted, as in the writer.
+    /// Each arm of a same-relation set operation is loaded in full, so each
+    /// is a parent on its own, as in the writer. A child spanning both arms
+    /// waits on the union of regions (PGC-494); an arm the model can't read
+    /// whole is no parent (PGC-511).
     #[test]
-    fn test_relation_in_two_branches_not_admitted() {
+    fn test_relation_in_two_branches_each_arm_admitted() {
         let analyses = corpus_analyze(&[
             "SELECT id FROM users WHERE id = 1 UNION SELECT id FROM users WHERE id = 2",
             "SELECT * FROM users WHERE id = 1",
+            "SELECT * FROM users WHERE id = 3",
+            "SELECT * FROM users WHERE id IN (1, 2)",
+            "SELECT id FROM users WHERE id = 2 UNION ALL SELECT id FROM users WHERE id = 1",
+            "SELECT id FROM users WHERE id = 1 \
+             UNION ALL SELECT id FROM users WHERE id = 2 OR name = 'a'",
+            "SELECT * FROM users WHERE id = 2",
         ]);
         let mut registry = SubsumerRegistry::new();
         registry.subsumer_register(&analyses[0]);
-        assert!(!registry.query_subsumed(&analyses[1]));
+        assert!(registry.query_subsumed(&analyses[1]));
+        assert!(!registry.query_subsumed(&analyses[2]));
+        assert!(!registry.query_subsumed(&analyses[3]), "spans both arms");
+        assert!(registry.query_subsumed(&analyses[4]), "each arm covered");
+
+        let mut registry = SubsumerRegistry::new();
+        registry.subsumer_register(&analyses[5]);
+        assert!(registry.query_subsumed(&analyses[1]));
+        assert!(
+            !registry.query_subsumed(&analyses[6]),
+            "the OR arm is no region"
+        );
     }
 
     /// A set-operation child is covered when every arm is, and not when one

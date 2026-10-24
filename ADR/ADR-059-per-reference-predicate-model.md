@@ -68,6 +68,7 @@ Every SELECT branch is described by a `QueryBranchPredicates` (`query/predicates
   * a self-join's references narrow the eval index on their own filters;
   * a reduced outer join is maintained as an inner join;
   * a self-join's preserved reference can be a subsumption parent;
+  * every exact reference of a relation is a subsumption parent on its own, however many times the query reads the relation (PGC-511);
   * a subquery or CTE table can be covered on its own branch's filters.
 * **Removed code.** The name-keyed collector, `ConstraintColumn`, `repeated_tables`, the `self_joined` guards and the terminality walk are gone.
 
