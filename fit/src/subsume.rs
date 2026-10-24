@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use pgcache_lib::cache::UpdateQueryKey;
 use pgcache_lib::cache::admission::{
-    SubsumerCandidate, SubsumerSource, SubsumptionReference, subsumption_covered,
+    SubsumerCandidate, SubsumerSource, SubsumptionCover, SubsumptionReference, subsumption_covered,
 };
 use pgcache_lib::oid::Oid;
 use pgcache_lib::query::constraint_index::ConstraintIndex;
@@ -79,13 +79,15 @@ impl SubsumerRegistry {
         }
     }
 
-    /// Whether every relation the query references is covered by some
-    /// registered subsumer — the writer's `subsumption_check`, offline.
-    pub fn query_subsumed(&self, analysis: &CacheableAnalysis) -> bool {
-        analysis
-            .references
-            .as_ref()
-            .is_some_and(|references| subsumption_covered(references, self))
+    /// Whether every relation the query references is covered by registered
+    /// subsumers, and how — the writer's `subsumption_check`, offline.
+    pub fn query_cover(&self, analysis: &CacheableAnalysis) -> Option<SubsumptionCover> {
+        subsumption_covered(analysis.references.as_ref()?, self)
+    }
+
+    #[cfg(test)]
+    fn query_subsumed(&self, analysis: &CacheableAnalysis) -> bool {
+        self.query_cover(analysis).is_some()
     }
 }
 
@@ -177,7 +179,7 @@ mod tests {
 
     /// Each arm of a same-relation set operation is loaded in full, so each
     /// is a parent on its own, as in the writer. A child spanning both arms
-    /// waits on the union of regions (PGC-494); an arm the model can't read
+    /// is covered value by value (PGC-494); an arm the model can't read
     /// whole is no parent (PGC-511).
     #[test]
     fn test_relation_in_two_branches_each_arm_admitted() {
@@ -195,7 +197,10 @@ mod tests {
         registry.subsumer_register(&analyses[0]);
         assert!(registry.query_subsumed(&analyses[1]));
         assert!(!registry.query_subsumed(&analyses[2]));
-        assert!(!registry.query_subsumed(&analyses[3]), "spans both arms");
+        assert!(
+            registry.query_subsumed(&analyses[3]),
+            "each value under an arm"
+        );
         assert!(registry.query_subsumed(&analyses[4]), "each arm covered");
 
         let mut registry = SubsumerRegistry::new();
@@ -205,6 +210,27 @@ mod tests {
             !registry.query_subsumed(&analyses[6]),
             "the OR arm is no region"
         );
+    }
+
+    /// Per-literal point parents cover an IN-list child value by value; a
+    /// value no parent holds leaves it uncovered (PGC-494).
+    #[test]
+    fn test_point_parents_cover_in_set_child() {
+        let analyses = corpus_analyze(&[
+            "SELECT * FROM users WHERE id = 1",
+            "SELECT * FROM users WHERE id = 2",
+            "SELECT * FROM users WHERE id = 3",
+            "SELECT * FROM users WHERE id IN (1, 2, 3)",
+            "SELECT * FROM users WHERE id IN (1, 4)",
+            "SELECT * FROM users WHERE id IN (3, 1) AND name = 'a'",
+        ]);
+        let mut registry = SubsumerRegistry::new();
+        for parent in &analyses[..3] {
+            registry.subsumer_register(parent);
+        }
+        assert!(registry.query_subsumed(&analyses[3]));
+        assert!(!registry.query_subsumed(&analyses[4]), "4 has no parent");
+        assert!(registry.query_subsumed(&analyses[5]));
     }
 
     /// A set-operation child is covered when every arm is, and not when one

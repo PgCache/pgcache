@@ -13,7 +13,7 @@ use super::registration::{
     QueryResolution, RegistrationIdentity, WriterRegistration, cached_query_insert,
 };
 use crate::cache::admission::{
-    SubsumerCandidate, SubsumerSource, SubsumptionReference, subsumption_covered,
+    SubsumerCandidate, SubsumerSource, SubsumptionCover, SubsumptionReference, subsumption_covered,
     subsumption_references,
 };
 use crate::cache::messages::SubsumptionResult;
@@ -76,22 +76,20 @@ impl SubsumerSource for WriterSubsumerSource<'_> {
 }
 
 impl WriterRegistration {
-    /// Whether every table reference of `bound` is covered by the region of a
-    /// Ready, LIMIT-free cached query on its relation.
+    /// Whether every table reference of `bound` is covered by the regions of
+    /// Ready, LIMIT-free cached queries on its relation, and how.
     pub(super) fn subsumption_check(
         &self,
         core: &WriterCore,
         relation_oids: &[Oid],
         bound: &ResolvedQuery,
-    ) -> bool {
+    ) -> Option<SubsumptionCover> {
         if relation_oids.is_empty() {
-            return false;
+            return None;
         }
 
         // A set operation is covered when every arm is (PGC-495).
-        let Some(references) = subsumption_references(bound) else {
-            return false;
-        };
+        let references = subsumption_references(bound)?;
         subsumption_covered(&references, &WriterSubsumerSource { cache: &core.cache })
     }
 
@@ -103,6 +101,7 @@ impl WriterRegistration {
         core: &mut WriterCore,
         identity: RegistrationIdentity,
         resolution: QueryResolution,
+        cover: SubsumptionCover,
     ) -> CacheResult<SubsumptionResult> {
         let fingerprint = identity.fingerprint;
         let bound = Arc::clone(&resolution.bound);
@@ -121,7 +120,7 @@ impl WriterRegistration {
             serve_shape,
             max_limit,
         };
-        Ok(subsumed_ready_mark(core, fingerprint, serving).await)
+        Ok(subsumed_ready_mark(core, fingerprint, serving, cover).await)
     }
 }
 
@@ -133,6 +132,7 @@ pub(super) async fn subsumed_ready_mark(
     core: &mut WriterCore,
     fingerprint: Fingerprint,
     serving: QueryServing,
+    cover: SubsumptionCover,
 ) -> SubsumptionResult {
     let subsume_start = Instant::now();
     let generation = serving.generation;
@@ -191,10 +191,12 @@ pub(super) async fn subsumed_ready_mark(
         m.subsumption_count += 1;
     }
 
-    crate::metrics::handles().reg.subsumptions.increment(1);
-    crate::metrics::handles()
-        .reg
-        .subsumption_latency
+    let reg = &crate::metrics::handles().reg;
+    reg.subsumptions.increment(1);
+    if cover == SubsumptionCover::Split {
+        reg.subsumptions_split.increment(1);
+    }
+    reg.subsumption_latency
         .record(subsume_start.elapsed().as_secs_f64());
 
     debug!("query subsumed {fingerprint}");

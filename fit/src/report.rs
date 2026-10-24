@@ -686,6 +686,9 @@ pub fn hitrate_report_render(report: &HitrateReport) -> String {
     let _ = writeln!(out, "Cacheable:     {} calls", stats.cacheable_calls);
     let _ = writeln!(out, "  hits              {}", stats.hits);
     let _ = writeln!(out, "  subsumption hits  {}", stats.subsumption_hits);
+    if stats.subsumption_split_hits > 0 {
+        let _ = writeln!(out, "    split on IN     {}", stats.subsumption_split_hits);
+    }
     let _ = writeln!(out, "  cold misses       {}", stats.cold_misses);
     if stats.limit_bumps > 0 {
         let _ = writeln!(out, "  limit bumps       {}", stats.limit_bumps);

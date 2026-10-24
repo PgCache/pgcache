@@ -12,6 +12,7 @@ use super::{
     cached_query_insert,
 };
 use crate::cache::CacheResult;
+use crate::cache::admission::SubsumptionCover;
 use crate::cache::messages::{AdmitAction, RegisterRequest, SubsumptionResult};
 use crate::cache::types::{QueryMetrics, SharedResolvedQuery};
 use crate::cache::writer::core::WriterCore;
@@ -86,20 +87,22 @@ impl WriterRegistration {
 
         // Phase 2: Subsumption check
         let subsumption_start = Instant::now();
-        let subsumed = self.subsumption_check(core, &resolution.relation_oids, &resolution.bound);
+        let cover = self.subsumption_check(core, &resolution.relation_oids, &resolution.bound);
         crate::metrics::handles()
             .reg
             .register_subsumption_check
             .record(subsumption_start.elapsed().as_secs_f64());
 
-        if subsumed {
+        if let Some(cover) = cover {
             // Phase 3a: Subsume — stamp rows, mark Ready
             let fallback = SubsumptionFallback {
                 fingerprint,
                 population: Arc::clone(&resolution.population),
                 max_limit: resolution.max_limit,
             };
-            let result = self.query_subsume_timed(core, identity, resolution).await?;
+            let result = self
+                .query_subsume_timed(core, identity, resolution, cover)
+                .await?;
             let fell_back = matches!(result, SubsumptionResult::NotSubsumed);
             let _ = request.subsumption_tx.send(result);
             if fell_back {
@@ -130,9 +133,12 @@ impl WriterRegistration {
         core: &mut WriterCore,
         identity: RegistrationIdentity,
         resolution: QueryResolution,
+        cover: SubsumptionCover,
     ) -> CacheResult<SubsumptionResult> {
         let subsume_start = Instant::now();
-        let result = self.query_subsume(core, identity, resolution).await?;
+        let result = self
+            .query_subsume(core, identity, resolution, cover)
+            .await?;
         crate::metrics::handles()
             .reg
             .register_subsume

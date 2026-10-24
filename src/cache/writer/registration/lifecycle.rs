@@ -51,13 +51,11 @@ impl WriterRegistration {
 
         // Checked while the entry is still flagged invalidated, so the parent
         // readiness gate never picks the query as its own parent.
-        let covered = core
+        let cover = core
             .cache
             .cached_queries
             .get1(&fingerprint)
-            .is_some_and(|cached| {
-                self.subsumption_check(core, &cached.relation_oids, &cached.bound)
-            });
+            .and_then(|cached| self.subsumption_check(core, &cached.relation_oids, &cached.bound));
 
         let new_generation = core.cache.generation_allocate();
 
@@ -85,8 +83,8 @@ impl WriterRegistration {
 
         let generation = serving.generation;
         let max_limit = serving.max_limit;
-        if covered {
-            let result = subsumed_ready_mark(core, fingerprint, serving).await;
+        if let Some(cover) = cover {
+            let result = subsumed_ready_mark(core, fingerprint, serving, cover).await;
             if matches!(result, SubsumptionResult::Subsumed { .. }) {
                 crate::metrics::handles()
                     .state

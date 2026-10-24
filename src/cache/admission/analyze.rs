@@ -666,11 +666,11 @@ mod tests {
         let tables = catalog();
         let bound = ResolvedQuery::parse_resolve(new, &tables, &["public"]).expect("resolve");
         let references = subsumption_references(&bound).expect("references");
-        subsumption_covered(&references, &parents)
+        subsumption_covered(&references, &parents).is_some()
     }
 
     /// Each exact reference of a relation parents a child under it on its
-    /// own. A child spanning two references waits on the union of regions
+    /// own; a child spanning two references is covered value by value
     /// (PGC-494); a reference a join, an OR or an IN narrows is no parent
     /// (PGC-511).
     #[test]
@@ -687,7 +687,7 @@ mod tests {
             (UNION_ARMS, "SELECT * FROM a WHERE x = 1 AND y = 3", true),
             (UNION_ARMS, "SELECT * FROM a WHERE x = 2", true),
             (UNION_ARMS, "SELECT * FROM a WHERE x = 3", false),
-            (UNION_ARMS, "SELECT * FROM a WHERE x IN (1, 2)", false),
+            (UNION_ARMS, "SELECT * FROM a WHERE x IN (1, 2)", true),
             (UNION_ARMS, "SELECT * FROM a WHERE x > 0", false),
             (
                 UNION_ARMS,
@@ -713,5 +713,90 @@ mod tests {
                 "cached {cached:?} covers new {new:?}"
             );
         }
+    }
+
+    /// A child constraining a column to a finite set is covered when each
+    /// value's piece is held by some parent on its own; set columns split
+    /// together, up to a bounded number of pieces (PGC-494).
+    #[test]
+    fn test_in_set_child_covered_value_by_value() {
+        const POINTS: &str = "SELECT id FROM a WHERE x = 1 UNION ALL SELECT id FROM a WHERE x = 2";
+        const GRID: &str = "SELECT id FROM a WHERE x = 1 AND y = 3 \
+                            UNION ALL SELECT id FROM a WHERE x = 1 AND y = 4 \
+                            UNION ALL SELECT id FROM a WHERE x = 2 AND y = 3 \
+                            UNION ALL SELECT id FROM a WHERE x = 2 AND y = 4";
+        let cases = [
+            (POINTS, "SELECT * FROM a WHERE x IN (1, 2)", true),
+            (POINTS, "SELECT * FROM a WHERE x IN (1, 2, 3)", false),
+            (POINTS, "SELECT * FROM a WHERE x IN (1, 2) AND y = 3", true),
+            (
+                POINTS,
+                "SELECT * FROM a WHERE x IN (1, 2) AND y IN (3, 4)",
+                true,
+            ),
+            (POINTS, "SELECT * FROM a WHERE x IN (1, 2) AND x > 1", true),
+            (POINTS, "SELECT * FROM a WHERE x IN (1, 2) OR y = 1", false),
+            (
+                GRID,
+                "SELECT * FROM a WHERE x IN (1, 2) AND y IN (3, 4)",
+                true,
+            ),
+            (GRID, "SELECT * FROM a WHERE x IN (1, 2) AND y = 3", true),
+            (
+                GRID,
+                "SELECT * FROM a WHERE x IN (1, 2) AND y IN (3, 5)",
+                false,
+            ),
+            (GRID, "SELECT * FROM a WHERE x IN (1, 2)", false),
+        ];
+        for (cached, new, expected) in cases {
+            assert_eq!(
+                parents_cover(cached, new),
+                expected,
+                "cached {cached:?} covers new {new:?}"
+            );
+        }
+
+        // The split is bounded: 64 pieces are probed, 65 fall back to the
+        // single-parent rule and miss.
+        let arms: Vec<String> = (1..=65)
+            .map(|value| format!("SELECT id FROM a WHERE x = {value}"))
+            .collect();
+        let parents = arms.join(" UNION ALL ");
+        let values = |count: usize| {
+            let values: Vec<String> = (1..=count).map(|value| value.to_string()).collect();
+            format!("SELECT * FROM a WHERE x IN ({})", values.join(", "))
+        };
+        assert!(parents_cover(&parents, &values(64)), "64 pieces probed");
+        assert!(
+            !parents_cover(&parents, &values(65)),
+            "65 pieces exceed the cap"
+        );
+    }
+
+    /// When both in-set columns cannot split within the cap, the column that
+    /// has parents is chosen, whichever set is smaller: splitting on `x`
+    /// alone leaves pieces no per-`y` parent holds, splitting on `y` alone
+    /// covers each piece.
+    #[test]
+    fn test_in_set_split_prefers_the_covered_column() {
+        let arms: Vec<String> = (1..=40)
+            .map(|value| format!("SELECT id FROM a WHERE y = {value}"))
+            .collect();
+        let parents = arms.join(" UNION ALL ");
+        let values: Vec<String> = (1..=40).map(|value| value.to_string()).collect();
+        let child = format!(
+            "SELECT * FROM a WHERE x IN (1, 2) AND y IN ({})",
+            values.join(", ")
+        );
+        assert!(parents_cover(&parents, &child), "split on y alone covers");
+        let grid_child = format!(
+            "SELECT * FROM a WHERE x IN (1, 2) AND y IN ({})",
+            values[..32].join(", ")
+        );
+        assert!(
+            parents_cover(&parents, &grid_child),
+            "x and y together fit the cap and y's pieces are covered"
+        );
     }
 }

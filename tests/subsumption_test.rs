@@ -2,7 +2,7 @@ use std::io::Error;
 
 use crate::util::{
     TestContext, assert_cache_hit, assert_cache_miss, assert_not_subsumed, assert_row_at,
-    assert_subsume_hit,
+    assert_subsume_hit, metrics_delta,
 };
 
 mod util;
@@ -909,10 +909,10 @@ async fn test_subsumption_set_operation_uncovered_arm_not_subsumed() -> Result<(
 // ---------------------------------------------------------------------------
 // Same-relation parents: each exact reference is a parent (PGC-511)
 // ---------------------------------------------------------------------------
-
-/// Each arm of a same-table UNION ALL is loaded in full, so each parents a
-/// child under it on its own; a child under neither arm, or spanning both
-/// (PGC-494), is not covered. The covered child then follows CDC.
+/// Each arm of a same-table UNION ALL parent is loaded in full, so each is
+/// a parent on its own (PGC-511): a child under one arm is subsumed, a child
+/// spanning both arms is covered value by value (PGC-494), and a child
+/// outside both is not. The covered child then follows CDC.
 #[tokio::test]
 async fn test_subsumption_same_table_union_arms_each_parent() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
@@ -931,16 +931,19 @@ async fn test_subsumption_same_table_union_arms_each_parent() -> Result<(), Erro
     assert_eq!(proxied, origin);
     assert_subsume_hit(&mut ctx, m).await?;
 
-    for child in [
-        "SELECT id FROM sub_setop_a WHERE tenant_id = 3",
-        "SELECT id FROM sub_setop_a WHERE tenant_id IN (1, 2) ORDER BY id",
-    ] {
-        let m = ctx.metrics().await?;
-        let (proxied, origin) = ctx.proxy_and_origin_rows(child).await?;
-        assert_eq!(proxied, origin, "{child}");
-        ctx.cache_settle().await?;
-        assert_not_subsumed(&mut ctx, m).await?;
-    }
+    let spanning = "SELECT id FROM sub_setop_a WHERE tenant_id IN (1, 2) ORDER BY id";
+    let m = ctx.metrics().await?;
+    let (proxied, origin) = ctx.proxy_and_origin_rows(spanning).await?;
+    assert_eq!(origin.len(), 3, "every row");
+    assert_eq!(proxied, origin, "{spanning}");
+    assert_subsume_hit(&mut ctx, m).await?;
+
+    let outside = "SELECT id FROM sub_setop_a WHERE tenant_id = 3";
+    let m = ctx.metrics().await?;
+    let (proxied, origin) = ctx.proxy_and_origin_rows(outside).await?;
+    assert_eq!(proxied, origin, "{outside}");
+    ctx.cache_settle().await?;
+    assert_not_subsumed(&mut ctx, m).await?;
 
     let m = ctx.metrics().await?;
     ctx.origin_query("INSERT INTO sub_setop_a VALUES (6, 1)", &[])
@@ -1028,6 +1031,62 @@ async fn test_subsumption_subquery_reference_parent() -> Result<(), Error> {
     let (proxied, origin) = ctx.proxy_and_origin_rows(under_subquery).await?;
     assert_eq!(origin.len(), 2, "rows 3 and 7");
     assert_eq!(proxied, origin, "after insert");
+    assert_cache_hit(&mut ctx, m).await?;
+    Ok(())
+}
+
+/// Point parents registered one literal at a time cover an IN-list child
+/// value by value (PGC-494): the child is stamped from their rows, counted
+/// as a split subsumption, and follows CDC afterwards; a value no parent
+/// holds leaves the child to populate.
+#[tokio::test]
+async fn test_subsumption_point_parents_cover_in_set_child() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    ctx.query(
+        "CREATE TABLE sub_points (id integer PRIMARY KEY, v integer)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO sub_points VALUES (1, 10), (2, 20), (3, 30), (4, 40)",
+        &[],
+    )
+    .await?;
+    ctx.cdc_decode_settle().await?;
+    for id in 1..=3 {
+        parent_warm(
+            &mut ctx,
+            &format!("SELECT id, v FROM sub_points WHERE id = {id}"),
+        )
+        .await?;
+    }
+
+    let child = "SELECT id, v FROM sub_points WHERE id IN (1, 2, 3) ORDER BY id";
+    let m = ctx.metrics().await?;
+    let (proxied, origin) = ctx.proxy_and_origin_rows(child).await?;
+    assert_eq!(origin.len(), 3);
+    assert_eq!(proxied, origin);
+    let after = assert_subsume_hit(&mut ctx, m.clone()).await?;
+    assert_eq!(
+        metrics_delta(&m, &after).cache_subsumptions_split,
+        1,
+        "covered by splitting the IN list"
+    );
+
+    let uncovered = "SELECT id, v FROM sub_points WHERE id IN (1, 4) ORDER BY id";
+    let m = ctx.metrics().await?;
+    let (proxied, origin) = ctx.proxy_and_origin_rows(uncovered).await?;
+    assert_eq!(proxied, origin, "{uncovered}");
+    ctx.cache_settle().await?;
+    assert_not_subsumed(&mut ctx, m).await?;
+
+    let m = ctx.metrics().await?;
+    ctx.origin_query("UPDATE sub_points SET v = 21 WHERE id = 2", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+    let (proxied, origin) = ctx.proxy_and_origin_rows(child).await?;
+    assert_eq!(proxied, origin, "after update");
+    assert_eq!(proxied[1], [Some("2".to_owned()), Some("21".to_owned())]);
     assert_cache_hit(&mut ctx, m).await?;
     Ok(())
 }

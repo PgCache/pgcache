@@ -2,12 +2,13 @@
 //! subsumption decision over them: does a cached query's region on a table
 //! hold every row a new query's reference reads?
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ecow::EcoString;
 
 use super::TableConstraint;
 use super::range::{ColumnRange, column_range_build, column_range_subsumes};
+use crate::query::ast::LiteralValue;
 use crate::query::cast::CastTarget;
 
 /// One column's ranges: its bare constraints reduced to one range, and one
@@ -56,6 +57,24 @@ impl TableRanges {
     /// Every column some constraint names.
     pub fn columns(&self) -> impl Iterator<Item = &EcoString> {
         self.columns.keys()
+    }
+
+    /// Every column whose bare range is a finite set of values, with the set.
+    pub(crate) fn set_columns(&self) -> impl Iterator<Item = (&EcoString, &HashSet<LiteralValue>)> {
+        self.columns
+            .iter()
+            .filter_map(|(column, buckets)| match &buckets.bare {
+                Some(ColumnRange::InSet(values)) => Some((column, values)),
+                Some(
+                    ColumnRange::Unknown
+                    | ColumnRange::Unconstrained
+                    | ColumnRange::Empty
+                    | ColumnRange::Equal(_)
+                    | ColumnRange::Null
+                    | ColumnRange::Range { .. },
+                )
+                | None => None,
+            })
     }
 
     /// `column`'s range as the constraint index reasons about it: its bare

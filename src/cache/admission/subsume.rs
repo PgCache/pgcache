@@ -5,9 +5,15 @@
 
 use std::collections::HashSet;
 
+use ecow::EcoString;
+
 use super::{SubsumerCandidate, SubsumerSource};
 use crate::oid::Oid;
-use crate::query::constraints::{TableConstraint, TableRanges, table_ranges_subsumed};
+use crate::query::ast::{BinaryOp, LiteralValue};
+use crate::query::constraints::{
+    ColumnConstraintKind, TableConstraint, TableRanges, literal_value_canonical_order,
+    table_ranges_subsumed,
+};
 use crate::query::predicates::query_branch_predicates_build;
 use crate::query::resolve::{ResolvedQuery, TableSlot};
 use crate::query::update::select_branches_with_source;
@@ -60,25 +66,186 @@ pub fn subsumption_references(bound: &ResolvedQuery) -> Option<Vec<SubsumptionRe
     (seen.len() == base_slots).then_some(references)
 }
 
-/// Whether every reference of the new query is covered by some registered
-/// candidate on its relation whose region holds every row the reference's
-/// filters admit. Candidate gates: no LIMIT, parent Ready. An empty list is
-/// never covered.
+/// Most pieces an in-set split probes; a reference whose split would need
+/// more falls back to the single-parent rule (PGC-494).
+const SUBSUMPTION_SPLIT_CAP: usize = 64;
+
+/// Most in-set columns a split chooses among, smallest sets first. A set
+/// has at least two values, so no more than this many columns can split
+/// together within [`SUBSUMPTION_SPLIT_CAP`].
+const SUBSUMPTION_SPLIT_COLUMNS: usize = SUBSUMPTION_SPLIT_CAP.ilog2() as usize;
+
+/// How the new query's references were covered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubsumptionCover {
+    /// Every reference held by one parent.
+    Whole,
+    /// Some reference was covered value by value: split on its in-set
+    /// columns, each piece held by a parent of its own (PGC-494).
+    Split,
+}
+
+/// Whether every reference of the new query is covered on its relation:
+/// by one registered candidate whose region holds every row the reference's
+/// filters admit, or, failing that, piece by piece once the reference is
+/// split on its in-set columns ([`reference_covered_split`]). Candidate
+/// gates: no LIMIT, parent Ready. An empty list is never covered.
 pub fn subsumption_covered(
     references: &[SubsumptionReference],
     source: &impl SubsumerSource,
-) -> bool {
-    !references.is_empty()
-        && references.iter().all(|reference| {
-            source.candidates(reference).any(|candidate| {
-                let SubsumerCandidate {
-                    region,
-                    has_limit,
-                    ready,
-                } = candidate;
-                !has_limit && ready && table_ranges_subsumed(&reference.ranges, region)
-            })
+) -> Option<SubsumptionCover> {
+    if references.is_empty() {
+        return None;
+    }
+    let mut cover = SubsumptionCover::Whole;
+    for reference in references {
+        if reference_covered(reference, source) {
+            continue;
+        }
+        if !reference_covered_split(reference, source) {
+            return None;
+        }
+        cover = SubsumptionCover::Split;
+    }
+    Some(cover)
+}
+
+/// Whether one candidate on the reference's relation holds its whole region.
+fn reference_covered(reference: &SubsumptionReference, source: &impl SubsumerSource) -> bool {
+    source.candidates(reference).any(|candidate| {
+        let SubsumerCandidate {
+            region,
+            has_limit,
+            ready,
+        } = candidate;
+        !has_limit && ready && table_ranges_subsumed(&reference.ranges, region)
+    })
+}
+
+/// One in-set column a split fixes, with its values in a stable order.
+type SplitColumn<'a> = (&'a EcoString, Vec<&'a LiteralValue>);
+
+/// Whether the reference is covered value by value: split on some of its
+/// in-set columns, every piece held by a candidate. Splitting on more
+/// columns only narrows the pieces, so a piece a parent holds stays held;
+/// each maximal set of columns whose piece count fits the cap is tried, and
+/// the reference is covered when any one of them is.
+fn reference_covered_split(reference: &SubsumptionReference, source: &impl SubsumerSource) -> bool {
+    let mut columns: Vec<SplitColumn<'_>> = reference
+        .ranges
+        .set_columns()
+        .filter(|(_, values)| values.len() > 1)
+        .map(|(column, values)| {
+            let mut values: Vec<&LiteralValue> = values.iter().collect();
+            values.sort_by(|a, b| literal_value_canonical_order(a, b));
+            (column, values)
         })
+        .collect();
+    columns.sort_by(|a, b| a.1.len().cmp(&b.1.len()).then_with(|| a.0.cmp(b.0)));
+    columns.truncate(SUBSUMPTION_SPLIT_COLUMNS);
+    split_maximal_subsets(&columns).into_iter().any(|split| {
+        reference_pieces(reference, &split).all(|piece| reference_covered(&piece, source))
+    })
+}
+
+/// Every subset of `columns` whose piece count fits [`SUBSUMPTION_SPLIT_CAP`]
+/// and that no further column could join within it.
+fn split_maximal_subsets<'a, 'b>(columns: &'b [SplitColumn<'a>]) -> Vec<Vec<&'b SplitColumn<'a>>> {
+    let fits = |count: usize, column: &SplitColumn<'a>| {
+        count
+            .checked_mul(column.1.len())
+            .is_some_and(|count| count <= SUBSUMPTION_SPLIT_CAP)
+    };
+    let mut subsets = Vec::new();
+    let mut chosen: Vec<&'b SplitColumn<'a>> = Vec::new();
+    // Over the bitmasks of a column list this short, a subset is maximal
+    // when every column it leaves out would overflow the cap.
+    for mask in 1u32..1u32 << columns.len() {
+        chosen.clear();
+        let mut count = 1usize;
+        let mut feasible = true;
+        for (index, column) in columns.iter().enumerate() {
+            if mask & (1 << index) == 0 {
+                continue;
+            }
+            if !fits(count, column) {
+                feasible = false;
+                break;
+            }
+            count *= column.1.len();
+            chosen.push(column);
+        }
+        if !feasible {
+            continue;
+        }
+        let maximal = columns
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| mask & (1 << index) == 0)
+            .all(|(_, column)| !fits(count, column));
+        if maximal {
+            subsets.push(chosen.clone());
+        }
+    }
+    subsets
+}
+
+/// The reference split value by value on `split`'s columns: one piece per
+/// combination of values, the reference's filters with those columns fixed
+/// to the combination. Every row of the reference falls in exactly one
+/// piece, so the reference is covered when each piece is. Pieces are built
+/// as they are consumed, so a failing probe stops the work early.
+fn reference_pieces<'a>(
+    reference: &'a SubsumptionReference,
+    split: &'a [&'a SplitColumn<'a>],
+) -> impl Iterator<Item = SubsumptionReference> + 'a {
+    let count: usize = split.iter().map(|(_, values)| values.len()).product();
+    (0..count).map(move |index| {
+        let mut rest = index;
+        let assignment: Vec<(&EcoString, &LiteralValue)> = split
+            .iter()
+            .filter_map(|(column, values)| {
+                let value = values.get(rest % values.len())?;
+                rest /= values.len();
+                Some((*column, *value))
+            })
+            .collect();
+        reference_piece(reference, &assignment)
+    })
+}
+
+/// The reference with each column of `assignment` fixed to its value.
+fn reference_piece(
+    reference: &SubsumptionReference,
+    assignment: &[(&EcoString, &LiteralValue)],
+) -> SubsumptionReference {
+    // The column's bare constraints reduce to the set, so the equality
+    // replaces them; cast constraints stay in their domain.
+    let mut filters: Vec<TableConstraint> = reference
+        .filters
+        .iter()
+        .filter(|constraint| {
+            constraint.kind.cast_target().is_some()
+                || !assignment
+                    .iter()
+                    .any(|(column, _)| **column == constraint.column)
+        })
+        .cloned()
+        .collect();
+    for (column, value) in assignment {
+        filters.push(TableConstraint {
+            column: (*column).clone(),
+            kind: ColumnConstraintKind::Comparison {
+                op: BinaryOp::Equal,
+                value: (*value).clone(),
+            },
+        });
+    }
+    SubsumptionReference {
+        relation_oid: reference.relation_oid,
+        ranges: TableRanges::build(&filters),
+        filters,
+    }
 }
 
 #[cfg(test)]

@@ -488,6 +488,22 @@ mod target {
         assert_eq!(count(&report, "cold_misses"), 1);
     }
 
+    /// Point parents registered one literal at a time cover an IN-list child
+    /// value by value (PGC-494); the hit is counted as a split one.
+    #[test]
+    fn test_point_parents_subsume_in_set_child() {
+        let report = hitrate_json(
+            "target_point_parents_in_set.sql",
+            "SELECT * FROM users WHERE id = 1;\n\
+             SELECT * FROM users WHERE id = 2;\n\
+             SELECT * FROM users WHERE id = 3;\n\
+             SELECT * FROM users WHERE id IN (1, 2, 3);\n",
+        );
+        assert_eq!(count(&report, "cold_misses"), 3);
+        assert_eq!(count(&report, "subsumption_hits"), 1);
+        assert_eq!(count(&report, "subsumption_split_hits"), 1);
+    }
+
     /// The replay runs the proxy's own serve decision (PGC-392), so its
     /// admission gate is available offline: with `--admission-threshold 2`
     /// the first sighting is forwarded without registering, the second

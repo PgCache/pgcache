@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 
+use pgcache_lib::cache::admission::SubsumptionCover;
 use pgcache_lib::cache::serve_decision::{
     AdmitAction, DecisionInput, EntrySnapshot, ServeDecision, serve_decide,
 };
@@ -47,6 +48,9 @@ pub struct HitrateStats {
     /// Fingerprints answered from a subsuming registered query on the sighting
     /// that would otherwise have registered or stayed pending.
     pub subsumption_hits: u64,
+    /// Subsumption hits that covered a reference value by value, split on
+    /// its in-set columns (PGC-494).
+    pub subsumption_split_hits: u64,
     /// Admitted fingerprints that had to populate from origin.
     pub cold_misses: u64,
     /// Repeats asking for more rows than the cached window: a miss plus
@@ -162,8 +166,11 @@ pub fn hitrate_replay(items: &[AnalyzedStatement], config: ReplayConfig) -> Hitr
                     // The writer checks subsumption for both actions and serves
                     // a subsumed query from the parent's rows; only a query that
                     // ends up Ready becomes a subsumer itself.
-                    if registry.query_subsumed(analysis) {
+                    if let Some(cover) = registry.query_cover(analysis) {
                         stats.subsumption_hits += 1;
+                        if cover == SubsumptionCover::Split {
+                            stats.subsumption_split_hits += 1;
+                        }
                         entries
                             .insert(fingerprint, claimed.population_complete(analysis.max_limit));
                         registry.subsumer_register(analysis);

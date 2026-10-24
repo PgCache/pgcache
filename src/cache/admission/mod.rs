@@ -21,7 +21,9 @@ pub use analyze::{
     AdmissionDepth, AdmissionQuery, CanonicalResolution, base_query_prepare, population_max_limit,
     query_admission_analyze, query_decorrelate_checked, query_pushdown, query_resolve_canonical,
 };
-pub use subsume::{SubsumptionReference, subsumption_covered, subsumption_references};
+pub use subsume::{
+    SubsumptionCover, SubsumptionReference, subsumption_covered, subsumption_references,
+};
 
 /// Everything the writer stores (and pgcache-fit simulates) for one table of
 /// an admitted query.
