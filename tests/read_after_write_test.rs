@@ -1413,3 +1413,166 @@ async fn test_gate_anti_join_not_exists_insert_forwards() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// PGC-542: a schema-qualified write is recorded against the relation it
+/// names, so a cached read of a same-named table in another schema keeps
+/// serving while the written table's read forwards and sees the write.
+#[tokio::test]
+async fn test_gate_qualified_write_forwards_only_its_schema() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&RAW_LAG).await?;
+    for schema in ["qw1", "qw2"] {
+        ctx.query(&format!("CREATE SCHEMA {schema}"), &[]).await?;
+        ctx.query(
+            &format!("CREATE TABLE {schema}.orders (id int primary key, v int)"),
+            &[],
+        )
+        .await?;
+        ctx.query(&format!("INSERT INTO {schema}.orders VALUES (1, 10)"), &[])
+            .await?;
+    }
+    ctx.cdc_apply_settle().await?;
+    let q1 = "SELECT v FROM qw1.orders WHERE id = 1";
+    let q2 = "SELECT v FROM qw2.orders WHERE id = 1";
+    register(&mut ctx, q1).await?;
+    register(&mut ctx, q2).await?;
+
+    ctx.simple_query("UPDATE qw1.orders SET v = 11 WHERE id = 1")
+        .await?;
+    let res = ctx.simple_query(q1).await?;
+    assert_row_at(&res, 1, &[("v", "11")])?;
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(q2).await?;
+    assert_row_at(&res, 1, &[("v", "10")])?;
+    let _ = assert_cache_hit(&mut ctx, m).await?;
+    Ok(())
+}
+
+/// PGC-542: an unqualified write resolves along the connection's
+/// `search_path` to the cached relation origin targets, so a same-named table
+/// in a schema off the path keeps serving its cached read while the written
+/// one forwards and sees the write.
+#[tokio::test]
+async fn test_gate_unqualified_write_resolves_along_search_path() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&RAW_LAG).await?;
+    for schema in ["sp1", "sp2"] {
+        ctx.query(&format!("CREATE SCHEMA {schema}"), &[]).await?;
+        ctx.query(
+            &format!("CREATE TABLE {schema}.orders (id int primary key, v int)"),
+            &[],
+        )
+        .await?;
+        ctx.query(&format!("INSERT INTO {schema}.orders VALUES (1, 10)"), &[])
+            .await?;
+    }
+    ctx.cdc_apply_settle().await?;
+
+    // One text, two cached relations: the path picks the schema.
+    let q = "SELECT v FROM orders WHERE id = 1";
+    ctx.simple_query("SET search_path = sp1, public").await?;
+    register(&mut ctx, q).await?;
+    ctx.simple_query("SET search_path = sp2, public").await?;
+    register(&mut ctx, q).await?;
+
+    ctx.simple_query("SET search_path = sp1, public").await?;
+    ctx.simple_query("UPDATE orders SET v = 11 WHERE id = 1")
+        .await?;
+    let res = ctx.simple_query(q).await?;
+    assert_row_at(&res, 1, &[("v", "11")])?;
+
+    // sp2.orders is off the path the write ran under: its read still hits.
+    ctx.simple_query("SET search_path = sp2, public").await?;
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(q).await?;
+    assert_row_at(&res, 1, &[("v", "10")])?;
+    let _ = assert_cache_hit(&mut ctx, m).await?;
+    Ok(())
+}
+
+/// PGC-542: when two schemas on the path hold the name, the proxy cannot tell
+/// which one origin writes (it sees neither uncached relations nor `USAGE`
+/// grants), so the write is recorded under both candidates and both reads
+/// forward.
+#[tokio::test]
+async fn test_gate_unqualified_write_with_two_candidates_forwards_both() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&RAW_LAG).await?;
+    for schema in ["tc1", "tc2"] {
+        ctx.query(&format!("CREATE SCHEMA {schema}"), &[]).await?;
+        ctx.query(
+            &format!("CREATE TABLE {schema}.orders (id int primary key, v int)"),
+            &[],
+        )
+        .await?;
+        ctx.query(&format!("INSERT INTO {schema}.orders VALUES (1, 10)"), &[])
+            .await?;
+    }
+    ctx.cdc_apply_settle().await?;
+    let q1 = "SELECT v FROM tc1.orders WHERE id = 1";
+    let q2 = "SELECT v FROM tc2.orders WHERE id = 1";
+    register(&mut ctx, q1).await?;
+    register(&mut ctx, q2).await?;
+
+    ctx.simple_query("SET search_path = tc1, tc2").await?;
+    ctx.simple_query("UPDATE orders SET v = 11 WHERE id = 1")
+        .await?;
+    let res = ctx.simple_query(q1).await?;
+    assert_row_at(&res, 1, &[("v", "11")])?;
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(q2).await?;
+    assert_row_at(&res, 1, &[("v", "10")])?;
+    let delta = metrics_delta(&m, &ctx.metrics().await?);
+    assert_eq!(
+        delta.raw_forwards_table, 1,
+        "the second candidate's read must forward too"
+    );
+    Ok(())
+}
+
+/// PGC-544: read ranges are kept per relation, so a join across two
+/// same-named tables keeps the filtered side's ranges: a pending insert into
+/// the filtered side that misses its filter serves from cache, one into the
+/// unfiltered side forwards.
+#[tokio::test]
+async fn test_gate_read_ranges_per_relation_across_schemas() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&RAW_LAG).await?;
+    for schema in ["rr1", "rr2"] {
+        ctx.query(&format!("CREATE SCHEMA {schema}"), &[]).await?;
+        ctx.query(
+            &format!("CREATE TABLE {schema}.orders (id int primary key, parent int)"),
+            &[],
+        )
+        .await?;
+    }
+    ctx.query("INSERT INTO rr1.orders VALUES (1, 1)", &[])
+        .await?;
+    ctx.query("INSERT INTO rr2.orders VALUES (1, 0)", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+    let q = "SELECT a.id FROM rr1.orders a JOIN rr2.orders b ON b.id = a.parent \
+             WHERE a.id = 1 ORDER BY a.id";
+    register(&mut ctx, q).await?;
+
+    // rr1's reference is filtered to id = 1: an insert of id = 5 is disjoint.
+    ctx.simple_query("INSERT INTO rr1.orders (id, parent) VALUES (5, 1)")
+        .await?;
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(q).await?;
+    assert_eq!(row_count(&res), 1);
+    let after = ctx.metrics_after_outcomes(&m, 1).await?;
+    let delta = metrics_delta(&m, &after);
+    assert_eq!(
+        delta.queries_cache_hit, 1,
+        "the filtered relation's ranges must survive the unfiltered same-named one"
+    );
+    assert!(delta.raw_serve_disjoint_insert >= 1);
+
+    // rr2's reference carries no filter: any insert there forwards.
+    ctx.cdc_apply_settle().await?;
+    ctx.simple_query("INSERT INTO rr2.orders (id, parent) VALUES (6, 0)")
+        .await?;
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(q).await?;
+    assert_eq!(row_count(&res), 1);
+    let delta = metrics_delta(&m, &ctx.metrics().await?);
+    assert_eq!(delta.raw_forwards_table, 1, "unfiltered side must forward");
+    Ok(())
+}

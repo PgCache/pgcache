@@ -188,10 +188,9 @@ fn builtins_shadowed(resolved: &[EcoString]) -> bool {
 }
 
 impl SearchPathState {
-    /// Build the resolved state from a raw search_path value, expanding
-    /// `$user` to the effective user name.
-    pub(crate) fn resolved(value: &str, user: Option<&str>) -> Self {
-        let search_path = SearchPath::parse(value);
+    /// Build the resolved state from a parsed search_path, expanding `$user`
+    /// to the effective user name.
+    pub(crate) fn resolved(search_path: &SearchPath, user: Option<&str>) -> Self {
         let resolved: Arc<[EcoString]> = search_path.resolve(user).map(EcoString::from).collect();
         if builtins_shadowed(&resolved) {
             debug!("search_path lists pg_catalog after another schema; cacheable queries forward");
@@ -287,6 +286,11 @@ pub(crate) struct SessionSettings {
     /// its injection so its sample fills only values unknown since before it.
     mutation_seq: u64,
     search_path: SearchPathState,
+    /// The path a write's unqualified target resolves along: the resolved
+    /// path, unless a `$user` on it expanded through a fallback (`role` or
+    /// `session_authorization` unknown after a forwarded `SET`) and so may
+    /// name the wrong user's schema; `None` then, meaning any schema.
+    write_search_path: Option<Arc<[EcoString]>>,
     isolation: IsolationState,
     /// The read-scope views for a read outside a block and for one inside,
     /// rebuilt only when a value changes ([`Self::views_rederive`]) so a read
@@ -329,6 +333,7 @@ impl SessionSettings {
             startup_user: None,
             mutation_seq: 0,
             search_path: SearchPathState::Unknown,
+            write_search_path: None,
             isolation: IsolationState::Unknown,
             idle: ScopeViews::unknown(),
             block: ScopeViews::unknown(),
@@ -401,6 +406,14 @@ impl SessionSettings {
     /// known; empty otherwise.
     pub(crate) fn effective_role(&self, in_block: bool) -> EcoString {
         self.scope(in_block).role.clone()
+    }
+
+    /// The resolved search_path an unqualified write's target is resolved
+    /// along (PGC-542); `None` while it is unknown, or while `$user` on it
+    /// cannot be expanded for certain, when origin could resolve the name in
+    /// any schema.
+    pub(crate) fn search_path_resolved(&self) -> Option<Arc<[EcoString]>> {
+        self.write_search_path.clone()
     }
 
     fn scope_views_build(&self, in_block: bool) -> ScopeViews {
@@ -596,6 +609,17 @@ impl SessionSettings {
         self.role_in_force(true)
     }
 
+    /// Whether [`Self::user_for_search_path`] is settled, rather than a
+    /// fallback past an unknown `role` or `session_authorization`.
+    fn user_for_search_path_known(&self) -> bool {
+        let known = |guc: Guc| self.effective(guc, true).known();
+        match known(Guc::Role) {
+            Some(role) if !role.eq_ignore_ascii_case("none") => true,
+            Some(_) => known(Guc::SessionAuthorization).is_some(),
+            None => false,
+        }
+    }
+
     /// The role origin runs a statement as at this scope: the current role
     /// when one is set, else the session authorization, else the startup user.
     fn role_in_force(&self, in_block: bool) -> Option<&str> {
@@ -611,15 +635,21 @@ impl SessionSettings {
     fn views_rederive(&mut self) {
         let in_block_value = self.state(Guc::SearchPath).block.as_ref();
         let effective = in_block_value.unwrap_or(&self.state(Guc::SearchPath).session);
-        let search_path = match effective {
+        let (search_path, write_search_path) = match effective {
             SettingValue::Known(value) => {
-                SearchPathState::resolved(value, self.user_for_search_path())
+                let parsed = SearchPath::parse(value);
+                let state = SearchPathState::resolved(&parsed, self.user_for_search_path());
+                let user_certain =
+                    !parsed.session_user_listed() || self.user_for_search_path_known();
+                let write = user_certain.then(|| state.resolve()).flatten();
+                (state, write)
             }
-            SettingValue::Unknown => SearchPathState::Unknown,
+            SettingValue::Unknown => (SearchPathState::Unknown, None),
         };
         if search_path != self.search_path {
             self.search_path = search_path;
         }
+        self.write_search_path = write_search_path;
         self.isolation = match self.state(Guc::DefaultTransactionIsolation).session.known() {
             Some(value) => match IsolationLevel::parse(value) {
                 Some(level) => IsolationState::Known(level),
@@ -976,6 +1006,54 @@ mod tests {
         row[Guc::Role as usize] = Some("bob".into());
         settings.probe_apply(&row, TransactionStatus::Idle, settings.probe_seq());
         assert_eq!(resolved(&settings), vec!["bob", "public"]);
+    }
+
+    fn resolved_write(settings: &SessionSettings) -> Option<Vec<String>> {
+        settings
+            .search_path_resolved()
+            .map(|path| path.iter().map(ToString::to_string).collect())
+    }
+
+    /// `$user` on the path expands through the role in force, which a
+    /// forwarded `SET ROLE` or `SET SESSION AUTHORIZATION` leaves unknown
+    /// until the probe lands. The path a write resolves along is withheld
+    /// meanwhile: the stale expansion could name the wrong user's schema.
+    #[test]
+    fn test_write_path_withheld_while_user_expansion_is_stale() {
+        let mut settings = all_known(TransactionStatus::Idle);
+        settings.parameter_status(Guc::SearchPath, "$user, public");
+        assert_eq!(
+            resolved_write(&settings),
+            Some(vec!["alice".into(), "public".into()])
+        );
+        settings.effect_apply(SettingsEffect::guc(Guc::SessionAuthorization, false), false);
+        assert_eq!(
+            resolved_write(&settings),
+            None,
+            "session_authorization unknown, role none"
+        );
+        settings.probe_apply(
+            &sample("$user, public"),
+            TransactionStatus::Idle,
+            settings.probe_seq(),
+        );
+        assert_eq!(
+            resolved_write(&settings),
+            Some(vec!["alice".into(), "public".into()])
+        );
+        settings.effect_apply(SettingsEffect::guc(Guc::Role, false), false);
+        assert_eq!(resolved_write(&settings), None, "role unknown");
+        let mut row = sample("$user, public");
+        row[Guc::Role as usize] = Some("bob".into());
+        settings.probe_apply(&row, TransactionStatus::Idle, settings.probe_seq());
+        assert_eq!(
+            resolved_write(&settings),
+            Some(vec!["bob".into(), "public".into()])
+        );
+        // A path without `$user` does not depend on the user at all.
+        settings.parameter_status(Guc::SearchPath, "public");
+        settings.effect_apply(SettingsEffect::guc(Guc::Role, false), false);
+        assert_eq!(resolved_write(&settings), Some(vec!["public".into()]));
     }
 
     #[test]

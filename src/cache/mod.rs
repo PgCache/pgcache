@@ -94,7 +94,7 @@ pub use status::{
     CacheStatusData, CdcStatusData, LatencyStats, QueryStatusData, StatusRequest, StatusResponse,
 };
 #[cfg(feature = "proxy")]
-pub use types::{Cache, CachedQuery, CachedQueryView, PinnedQuery, WriteAliasMap};
+pub use types::{Cache, CachedQuery, CachedQueryView, PinnedQuery, WriteTargetMap};
 pub use update_query::{
     SubqueryKind, UpdateEvalStrategy, UpdateQueries, UpdateQuery, UpdateQueryKey, UpdateQuerySource,
 };

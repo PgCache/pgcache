@@ -70,68 +70,101 @@ pub fn query_base_references(bound: &ResolvedQuery) -> BaseReferences<'_> {
 #[cfg(feature = "proxy")]
 pub(crate) type ReferenceRanges = HashMap<EcoString, ColumnRange>;
 
-/// The per-column ranges of every base-table reference of a read, by table
-/// name, for the read-after-write gate's row-level disjointness: a
-/// reference's filters are a necessary condition on the rows that reach its
-/// branch's result, so a pending write disjoint from every reference of a
-/// table can't change the read (PGC-512). A table is listed only when every
-/// reference of it has ranges the gate can use; one without filters (an
+/// One base relation of a read as the read-after-write gate sees it.
+#[cfg(feature = "proxy")]
+#[derive(Debug)]
+pub(crate) struct ReadRelation {
+    pub(crate) schema: EcoString,
+    pub(crate) name: EcoString,
+    /// The columns the read references on it: an UPDATE assigning none of
+    /// them cannot change the read. `None` when unknown, which proves
+    /// nothing.
+    pub(crate) columns: Option<HashSet<EcoString>>,
+    /// Each reference's per-column ranges, every one with at least one
+    /// column; `None` when the read proves nothing row-wise about the
+    /// relation.
+    pub(crate) ranges: Option<Vec<ReferenceRanges>>,
+}
+
+/// The base relations a read touches, by OID, for the read-after-write
+/// gate (PGC-542): the exact relations the writer resolved the read's names
+/// to, so same-named tables in different schemas stay apart. A reference's
+/// filters are a necessary condition on the rows that reach its branch's
+/// result, so a pending write disjoint from every reference of a relation
+/// can't change the read (PGC-512); a reference without filters (an
 /// unfiltered join side), one whose filters the model can't project to
 /// column names, or one read some way the model doesn't cover proves
-/// nothing and leaves its table out. The NULL-filled side of an outer join
-/// takes no filter from the WHERE (an insert there can remove preserved
-/// rows), only what the preserved side's filters carry over the ON equality.
+/// nothing and drops the relation's ranges. The NULL-filled side of an
+/// outer join takes no filter from the WHERE (an insert there can remove
+/// preserved rows), only what the preserved side's filters carry over the
+/// ON equality.
 #[cfg(feature = "proxy")]
 #[derive(Debug, Default)]
-pub(crate) struct ReadRanges {
-    tables: HashMap<EcoString, Vec<ReferenceRanges>>,
+pub(crate) struct ReadRelations {
+    relations: HashMap<Oid, ReadRelation>,
 }
 
 #[cfg(feature = "proxy")]
-impl ReadRanges {
-    pub(crate) fn build(bound: &ResolvedQuery) -> Self {
+impl ReadRelations {
+    /// `columns` are the read's referenced columns per relation, as
+    /// `privilege_needs` collects them.
+    pub(crate) fn build(bound: &ResolvedQuery, columns: &HashMap<Oid, HashSet<EcoString>>) -> Self {
+        let mut relations: HashMap<Oid, ReadRelation> = HashMap::new();
+        for slot in bound.bindings().slots() {
+            if let TableSlot::Base { table, .. } = slot {
+                relations
+                    .entry(table.relation_oid)
+                    .or_insert_with(|| ReadRelation {
+                        schema: table.schema.clone(),
+                        name: table.name.clone(),
+                        columns: columns.get(&table.relation_oid).cloned(),
+                        ranges: Some(Vec::new()),
+                    });
+            }
+        }
         let base = query_base_references(bound);
-        let mut tables: HashMap<EcoString, Option<Vec<ReferenceRanges>>> = HashMap::new();
         for reference in base.references {
-            let entry = tables
-                .entry(reference.table.name.clone())
-                .or_insert_with(|| Some(Vec::new()));
-            match (reference.predicates, entry) {
-                (Some(relation), Some(references)) => {
-                    references.push(relation.ranges.bare_columns());
+            let Some(relation) = relations.get_mut(&reference.table.relation_oid) else {
+                continue;
+            };
+            match (reference.predicates, &mut relation.ranges) {
+                (Some(predicates), Some(references)) => {
+                    references.push(predicates.ranges.bare_columns());
                 }
                 (Some(_), None) => {}
-                (None, entry) => *entry = None,
+                (None, ranges) => *ranges = None,
             }
         }
         for table in base.uncovered {
-            tables.insert(table.name.clone(), None);
+            if let Some(relation) = relations.get_mut(&table.relation_oid) {
+                relation.ranges = None;
+            }
         }
-        Self::from_tables(
-            tables
-                .into_iter()
-                .filter_map(|(table, references)| Some((table, references?))),
-        )
+        Self::from_relations(relations)
     }
 
-    /// `tables` without those some reference of which has no ranges.
-    pub(crate) fn from_tables(
-        tables: impl IntoIterator<Item = (EcoString, Vec<ReferenceRanges>)>,
-    ) -> Self {
-        Self {
-            tables: tables
-                .into_iter()
-                .filter(|(_, references)| {
-                    !references.is_empty() && references.iter().all(|ranges| !ranges.is_empty())
-                })
-                .collect(),
-        }
+    /// `relations`, dropping the ranges of any whose references don't all
+    /// have one.
+    pub(crate) fn from_relations(relations: impl IntoIterator<Item = (Oid, ReadRelation)>) -> Self {
+        let relations = relations
+            .into_iter()
+            .map(|(oid, mut relation)| {
+                let unusable = relation.ranges.as_ref().is_some_and(|references| {
+                    references.is_empty() || references.iter().any(HashMap::is_empty)
+                });
+                if unusable {
+                    relation.ranges = None;
+                }
+                (oid, relation)
+            })
+            .collect();
+        Self { relations }
     }
 
-    /// The ranges of each reference of `table`, each with at least one
-    /// column; `None` when the read proves nothing about the table.
-    pub(crate) fn references(&self, table: &str) -> Option<&[ReferenceRanges]> {
-        self.tables.get(table).map(Vec::as_slice)
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (Oid, &ReadRelation)> {
+        self.relations
+            .iter()
+            .map(|(oid, relation)| (*oid, relation))
     }
 }
 
@@ -430,6 +463,8 @@ mod tests {
     use crate::cache::query::CacheableQuery;
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
     use crate::oid::TypeOid;
+    #[cfg(feature = "proxy")]
+    use crate::query::ast::LiteralValue;
     use crate::query::ast::query_tree_parse;
 
     /// One reference's sorted (column, range) pairs.
@@ -439,8 +474,8 @@ mod tests {
     #[cfg(feature = "proxy")]
     type ReadLines = Vec<(String, Vec<ReferenceLines>)>;
 
-    /// `read_ranges` as sorted (table, references) lines, each reference its
-    /// sorted (column, range) pairs.
+    /// The relations of a read that have ranges, as sorted (table,
+    /// references) lines, each reference its sorted (column, range) pairs.
     #[cfg(feature = "proxy")]
     fn read_ranges_of(sql: &str) -> ReadLines {
         let int_column = |name: &str, position: i16| ColumnMetadata {
@@ -460,9 +495,10 @@ mod tests {
             );
         }
         let bound = ResolvedQuery::parse_resolve(sql, &tables, &["public"]).expect("resolve");
-        let mut tables: ReadLines = ReadRanges::build(&bound)
-            .tables
-            .iter()
+        let mut tables: ReadLines = ReadRelations::build(&bound, &HashMap::new())
+            .relations
+            .values()
+            .filter_map(|relation| Some((&relation.name, relation.ranges.as_ref()?)))
             .map(|(table, references)| {
                 let mut references: Vec<ReferenceLines> = references
                     .iter()
@@ -571,6 +607,62 @@ mod tests {
         for (sql, expected) in cases {
             assert_eq!(read_ranges_of(sql), expected, "{sql}");
         }
+    }
+
+    /// Relations are keyed by OID, so two same-named tables in different
+    /// schemas keep their own ranges and columns: the filtered one keeps its
+    /// ranges when the other side of the join is unfiltered (PGC-544).
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn test_read_relations_keyed_by_relation() {
+        let int_column = |name: &str, position: i16| ColumnMetadata {
+            name: name.into(),
+            position: ColumnPosition::from_raw(position),
+            type_oid: TypeOid::from_raw(23),
+            data_type: Type::INT4,
+            type_name: "int4".into(),
+            cache_type_name: "int4".into(),
+            is_primary_key: position == 1,
+        };
+        let mut tables = BiHashMap::new();
+        for (oid, schema) in [(2001, "s1"), (2002, "s2")] {
+            let mut table =
+                TableMetadata::for_test("orders", oid, [int_column("id", 1), int_column("x", 2)]);
+            table.schema = schema.into();
+            tables.insert_overwrite(table.into());
+        }
+        let bound = ResolvedQuery::parse_resolve(
+            "SELECT a.id FROM s1.orders a JOIN s2.orders b ON b.id = a.x WHERE a.id = 5",
+            &tables,
+            &["public"],
+        )
+        .expect("resolve");
+        let columns = bound.privilege_needs().relations;
+        let relations = ReadRelations::build(&bound, &columns);
+        let s1 = relations
+            .relations
+            .get(&Oid::from_raw(2001))
+            .expect("s1.orders is a relation of the read");
+        assert_eq!((s1.schema.as_str(), s1.name.as_str()), ("s1", "orders"));
+        let ranges = s1
+            .ranges
+            .as_ref()
+            .expect("the filtered side keeps its ranges");
+        assert_eq!(ranges.len(), 1);
+        assert!(matches!(
+            ranges[0].get("id"),
+            Some(ColumnRange::Equal(LiteralValue::Integer(5)))
+        ));
+        let s1_columns = s1.columns.as_ref().expect("s1.orders columns known");
+        assert!(s1_columns.contains("id") && s1_columns.contains("x"));
+        let s2 = relations
+            .relations
+            .get(&Oid::from_raw(2002))
+            .expect("s2.orders is a relation of the read");
+        assert_eq!(s2.schema.as_str(), "s2");
+        assert!(s2.ranges.is_none(), "the unfiltered side proves nothing");
+        let s2_columns = s2.columns.as_ref().expect("s2.orders columns known");
+        assert!(s2_columns.contains("id") && !s2_columns.contains("x"));
     }
 
     /// Helper to parse SQL and return a CacheableQuery

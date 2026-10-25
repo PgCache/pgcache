@@ -53,6 +53,11 @@ impl SearchPath {
 
     /// Resolve the search path to a list of schema names.
     ///
+    /// Whether the path names `$user` at all.
+    pub fn session_user_listed(&self) -> bool {
+        self.0.contains(&SearchPathEntry::SessionUser)
+    }
+
     /// Expands `SessionUser` to the provided session_user value.
     /// Skips `SessionUser` entries if session_user is `None`.
     pub fn resolve<'a>(&'a self, session_user: Option<&'a str>) -> impl Iterator<Item = &'a str> {

@@ -336,10 +336,9 @@ pub(super) fn update_tuple_build(
 }
 
 /// Whether `disjoint` holds for every table reference's ranges; `None`, a
-/// table [`ReadRanges`](crate::query::update::ReadRanges) leaves out, proves
-/// nothing (PGC-512). A reference
-/// with an unsatisfiable range reads no row, so every write is disjoint
-/// from it.
+/// relation without [`ranges`](crate::query::update::ReadRelation::ranges),
+/// proves nothing (PGC-512). A reference with an unsatisfiable range reads
+/// no row, so every write is disjoint from it.
 pub(super) fn references_disjoint(
     read_ranges: Option<&[ReferenceRanges]>,
     disjoint: impl Fn(&ReferenceRanges) -> bool,
@@ -488,14 +487,6 @@ impl TableAggregate {
         self.merged_updates.clear();
         self.updates.clear();
         self.merged_predicates = 0;
-    }
-
-    pub(super) fn has_row_predicates(&self) -> bool {
-        self.inserts.is_some()
-            || !self.merged_deletes.is_empty()
-            || !self.deletes.is_empty()
-            || !self.merged_updates.is_empty()
-            || !self.updates.is_empty()
     }
 }
 

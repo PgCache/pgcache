@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::sync::watch;
 
 use super::CacheDispatch;
-use crate::cache::types::{CachedReadForm, WriteAliasMap};
+use crate::cache::types::{CachedReadForm, WriteTargetMap};
 use crate::pg::Lsn;
 use crate::query::SessionKey;
 
@@ -38,11 +38,11 @@ impl CacheDispatchHandle {
         self.rx.borrow().as_ref().map(CacheDispatch::received_lsn)
     }
 
-    /// The current generation's write-alias map, or `None` if the cache is
+    /// The current generation's write-target map, or `None` if the cache is
     /// down/restarting (nothing is served from cache then, so a write recorded
     /// under its own name alone cannot be served stale against).
-    pub fn write_aliases(&self) -> Option<Arc<WriteAliasMap>> {
-        self.rx.borrow().as_ref().map(CacheDispatch::write_aliases)
+    pub fn write_targets(&self) -> Option<Arc<WriteTargetMap>> {
+        self.rx.borrow().as_ref().map(CacheDispatch::write_targets)
     }
 
     /// The resolved form of a registered query in the current generation, for the

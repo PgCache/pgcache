@@ -27,7 +27,7 @@ use crate::cache::reg_bucket::RegRateBucket;
 use crate::cache::reply::ReplySender;
 use crate::cache::serve_decision::{DecisionInput, EntrySnapshot, ServeDecision, serve_decide};
 use crate::cache::types::{
-    CacheStateView, CachedQueryState, CachedQueryView, CachedReadForm, QueryMetrics, WriteAliasMap,
+    CacheStateView, CachedQueryState, CachedQueryView, CachedReadForm, QueryMetrics, WriteTargetMap,
 };
 use crate::cache::{CacheError, CacheResult, fast_path};
 use crate::pg::Lsn;
@@ -124,10 +124,10 @@ impl CacheDispatch {
         Lsn::from_raw(self.state_view.received_lsn.load(Ordering::Relaxed))
     }
 
-    /// The write-alias map for this generation: which cached tables a write
-    /// to a partition or a view lands rows in (ADR-048).
-    pub fn write_aliases(&self) -> Arc<WriteAliasMap> {
-        self.state_view.write_aliases.load_full()
+    /// The write-target map for this generation: which cached relations a
+    /// write to a name lands rows in (ADR-048, PGC-542).
+    pub fn write_targets(&self) -> Arc<WriteTargetMap> {
+        self.state_view.write_targets.load_full()
     }
 
     /// The resolved form of a registered (Ready) query, if present. Used by the
@@ -143,8 +143,7 @@ impl CacheDispatch {
             return None;
         }
         Some(CachedReadForm {
-            ranges: view.read_ranges.clone()?,
-            columns: view.read_columns.clone()?,
+            relations: view.read_relations.clone()?,
         })
     }
 
@@ -670,9 +669,8 @@ impl CacheDispatch {
                         state: transition.new,
                         generation: Generation::ZERO,
                         bound: None,
-                        read_columns: None,
                         privilege_needs: None,
-                        read_ranges: None,
+                        read_relations: None,
                         serve_shape: None,
                         max_limit: None,
                         reference_only: false,

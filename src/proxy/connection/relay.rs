@@ -41,8 +41,7 @@ use crate::query::SessionKey;
 use crate::query::ast::rope::QueryTree;
 use crate::query::guc::Guc;
 use crate::query::keying_settings::KeyingSettings;
-use crate::query::resolve::ColumnsByTable;
-use crate::query::update::ReadRanges;
+use crate::query::update::ReadRelations;
 use crate::query::write::StatementEffects;
 use crate::result::ReportExt;
 use crate::{
@@ -299,37 +298,29 @@ async fn handle_connection(
                         state.write_log.purge(watermark);
                     }
                     if let Some(cq) = msg.cacheable_query() {
-                        // Derive the read's shape only when a pending
-                        // INSERT/DELETE/UPDATE could benefit from row-level
-                        // disjointness (PGC-369/381/382); an opaque/connection
-                        // write ignores it, and `read_shape` self-limits to
-                        // reads of a table that actually has such a pending write.
-                        let has_pred = state.write_log.has_row_predicates();
+                        // Look the read's registered form up only when a
+                        // pending write names one of its tables: the form
+                        // gives the gate the exact relations (PGC-542) and the
+                        // row-level ranges (PGC-369/381/382) it decides with.
+                        let concerned = state.write_log.names_pending(cq.tree().table_names());
                         // Under the extended protocol the read still carries `$n`
                         // placeholders here; substitute the bind values so the
-                        // gate's ranges and fingerprint match the post-bind form
-                        // the cache is registered under. Only worthwhile when a
-                        // row predicate is pending.
-                        let bound = has_pred.then(|| read_query_bound(&msg)).flatten();
+                        // gate's fingerprint matches the post-bind form the
+                        // cache is registered under.
+                        let bound = concerned.then(|| read_query_bound(&msg)).flatten();
                         let read_query = bound.as_ref().map_or(cq.tree(), CacheableQuery::tree);
-                        let shape = has_pred.then(|| {
-                            read_shape(
-                                read_query,
-                                session_key,
-                                &keying,
-                                &state.dispatch_handle,
-                                &state.write_log,
-                            )
-                        });
-                        let (read_ranges, read_columns) =
-                            shape.as_ref().map_or((None, None), |shape| {
-                                (shape.ranges.as_deref(), shape.columns.as_deref())
-                            });
+                        let read = concerned
+                            .then(|| {
+                                read_relations(
+                                    read_query,
+                                    session_key,
+                                    &keying,
+                                    &state.dispatch_handle,
+                                )
+                            })
+                            .flatten();
                         let m = crate::metrics::handles();
-                        match state
-                            .write_log
-                            .decide(read_query, read_ranges, read_columns)
-                        {
+                        match state.write_log.decide(read_query, read.as_deref()) {
                             RawDecision::Forward(reason, blocker) => {
                                 // Inside a block the intersecting write is the
                                 // block's own uncommitted one (never stamped until
@@ -557,42 +548,18 @@ fn read_query_bound(msg: &CacheMessage) -> Option<CacheableQuery> {
     cq.parameters_replace(parameters).ok()
 }
 
-/// What the read-after-write gate can prove with: the read's per-column
-/// ranges per table reference (PGC-369/381/382/512) and the columns it
-/// references per table. Both come from the read's registered resolved form,
-/// so an unregistered read yields neither and forwards conservatively.
-struct ReadShape {
-    ranges: Option<Arc<ReadRanges>>,
-    columns: Option<Arc<ColumnsByTable>>,
-}
-
-/// Neither when no table of the read has a pending row-enumerable write, so
-/// unrelated reads skip the registered-form lookup.
-fn read_shape(
+/// What the read-after-write gate decides a registered read with: the exact
+/// relations it touches (PGC-542), the columns it references on each and its
+/// per-reference ranges (PGC-369/381/382/512), from its registered resolved
+/// form. An unregistered read yields nothing and is matched by name.
+fn read_relations(
     query: &QueryTree,
     session_key: Option<SessionKey>,
     keying: &KeyingSettings,
     dispatch_handle: &CacheDispatchHandle,
-    write_log: &WriteLog,
-) -> ReadShape {
-    let none = ReadShape {
-        ranges: None,
-        columns: None,
-    };
-    let pending = query
-        .table_names()
-        .any(|(schema, name)| write_log.table_has_row_predicate(schema, name));
-    if !pending {
-        return none;
-    }
+) -> Option<Arc<ReadRelations>> {
     let key = session_key.unwrap_or_else(|| keying.session_key(query));
-    let Some(form) = dispatch_handle.cached_query_read_form(key) else {
-        return none;
-    };
-    ReadShape {
-        ranges: Some(form.ranges),
-        columns: Some(form.columns),
-    }
+    Some(dispatch_handle.cached_query_read_form(key)?.relations)
 }
 
 /// Test-only forward tag (`PGCACHE_FAULT_FORWARD_NOTICE`): a cacheable read
@@ -699,8 +666,10 @@ impl ConnectionState {
     /// The single apply point for every forward path.
     pub(super) fn forwarded_effects_apply(&mut self, effects: &StatementEffects) {
         if let Some(class) = &effects.write {
-            let aliases = self.dispatch_handle.write_aliases();
-            self.write_log.record(class, aliases.as_deref());
+            let targets = self.dispatch_handle.write_targets();
+            let search_path = self.session_settings.search_path_resolved();
+            self.write_log
+                .record(class, targets.as_deref(), search_path.as_ref());
         }
         let in_block = self.forwarding_into_block();
         let settings = effects.settings;

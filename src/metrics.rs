@@ -51,6 +51,9 @@ pub mod names {
     // Read-after-write tracking (PGC-124)
     /// Writes folded into a connection's read-after-write log.
     pub const RAW_WRITES_RECORDED: &str = "pgcache.raw.writes_recorded";
+    /// Table-scoped writes naming no cached relation, recorded by name alone
+    /// (PGC-542).
+    pub const RAW_WRITES_UNRESOLVED: &str = "pgcache.raw.writes_unresolved";
     /// Waiting-tier merges: a table was stamped again before its previous bound
     /// cleared, coarsening that table's clearance to the later LSN — a signal
     /// that the apply watermark is falling behind the write rate.
@@ -486,6 +489,7 @@ impl TxnHandles {
 
 pub struct RawHandles {
     pub writes_recorded: Counter,
+    pub writes_unresolved: Counter,
     pub tier_merges: Counter,
     pub probes: Counter,
     /// Reads forwarded because they intersect a table-scoped pending write.
@@ -516,10 +520,11 @@ impl RawHandles {
             RAW_CAP_DEGRADED_INSERT, RAW_CAP_DEGRADED_UPDATE_DELETE, RAW_CLEARANCE_SECONDS,
             RAW_FORWARD_BLOCKED, RAW_FORWARDS, RAW_PROBES, RAW_SERVE_DISJOINT_DELETE,
             RAW_SERVE_DISJOINT_INSERT, RAW_SERVE_DISJOINT_UPDATE, RAW_TIER_MERGES,
-            RAW_WRITES_RECORDED,
+            RAW_WRITES_RECORDED, RAW_WRITES_UNRESOLVED,
         };
         Self {
             writes_recorded: metrics::counter!(RAW_WRITES_RECORDED),
+            writes_unresolved: metrics::counter!(RAW_WRITES_UNRESOLVED),
             tier_merges: metrics::counter!(RAW_TIER_MERGES),
             probes: metrics::counter!(RAW_PROBES),
             forwards_table: metrics::counter!(RAW_FORWARDS, "scope" => "table"),

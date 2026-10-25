@@ -18,13 +18,13 @@ use super::reg_gate::RegGate;
 use super::serve_pool_state::ServePool;
 use super::update_query::UpdateQueries;
 use crate::oid::Oid;
-use crate::query::update::ReadRanges;
+use crate::query::update::ReadRelations;
 use crate::{
     cache::{CacheError, CacheResult, memo::ResultMemo, mv::MvMeta, query::CacheableQuery},
     catalog::{Catalog, RelationName, TableMetadata},
     query::{
         Fingerprint, FingerprintDashMap, QueryShape, SessionKeyDashMap,
-        resolve::{ColumnsByTable, PrivilegeNeeds, ResolvedQuery},
+        resolve::{PrivilegeNeeds, ResolvedQuery},
     },
     settings::{DynamicConfigHandle, Settings},
 };
@@ -167,39 +167,70 @@ impl Cache {
 /// Written by the writer thread, read by the CDC processor.
 pub(super) type ActiveRelations = Arc<ArcSwap<HashSet<Oid>>>;
 
-/// A cached table a write to the aliasing relation lands rows in
-/// ([`TableMetadata::write_aliases`], inverted).
+/// A cached relation a forwarded write can land rows in, under one name it
+/// can be written by: the table itself, or one of its write aliases
+/// ([`TableMetadata::write_aliases`]: a partition above or below it, or a
+/// view over any of those).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WriteAliasTarget {
-    /// The aliasing relation's schema; its bare name keys the map.
-    pub alias_schema: EcoString,
+pub struct WriteTarget {
+    /// The schema of the name written.
+    pub schema: EcoString,
+    /// The cached relation the rows land in.
+    pub relation: Oid,
     pub table: RelationName,
-    /// Record the write as opaque on the table (a view alias) rather than
-    /// carrying its rows over (a partition alias).
+    /// Record the write as opaque on the relation (a view alias) rather
+    /// than carrying its rows over (the table itself or a partition alias).
     pub opaque: bool,
 }
 
-/// The relations a forwarded write can name that land rows in a cached table,
-/// each with the tables it lands in: the partition trees and views of every
-/// cached table, inverted and keyed by the alias's bare name. Published by the
-/// writer whenever the cached tables or their alias lists change, read by the
-/// read-after-write gate when it records a write (ADR-048).
-#[derive(Debug, Default)]
-pub struct WriteAliasMap(HashMap<EcoString, Vec<WriteAliasTarget>>);
+impl WriteTarget {
+    /// Whether a write of the target's name under `schema`, or unqualified
+    /// along `search_path`, can land here. Origin resolves a qualified name in
+    /// its schema and an unqualified one in the first schema of the path
+    /// holding the name among those the role has `USAGE` on, neither of which
+    /// the proxy sees in full, so every schema on the path is a candidate; an
+    /// unknown path admits every schema.
+    pub fn lands_in(&self, schema: Option<&str>, search_path: Option<&[EcoString]>) -> bool {
+        match (schema, search_path) {
+            (Some(schema), _) => self.schema == schema,
+            (None, Some(path)) => path.contains(&self.schema),
+            (None, None) => true,
+        }
+    }
+}
 
-impl WriteAliasMap {
+/// Every name a forwarded write can land rows in a cached relation under,
+/// keyed by bare name, with the relations it lands in per schema. Published
+/// by the writer whenever the cached tables or their alias lists change, read
+/// by the read-after-write gate when it records a write, which resolves the
+/// write's target through it the way origin resolves the name (ADR-048,
+/// PGC-542).
+#[derive(Debug, Default)]
+pub struct WriteTargetMap(HashMap<EcoString, Vec<WriteTarget>>);
+
+impl WriteTargetMap {
     pub fn from_tables<'a>(tables: impl Iterator<Item = &'a TableMetadata>) -> Self {
-        let mut map: HashMap<EcoString, Vec<WriteAliasTarget>> = HashMap::new();
+        let mut map: HashMap<EcoString, Vec<WriteTarget>> = HashMap::new();
         for table in tables {
+            let name = RelationName {
+                schema: table.schema.clone(),
+                name: table.name.clone(),
+            };
+            map.entry(table.name.clone())
+                .or_default()
+                .push(WriteTarget {
+                    schema: table.schema.clone(),
+                    relation: table.relation_oid,
+                    table: name.clone(),
+                    opaque: false,
+                });
             for alias in &table.write_aliases {
                 map.entry(alias.relation.name.clone())
                     .or_default()
-                    .push(WriteAliasTarget {
-                        alias_schema: alias.relation.schema.clone(),
-                        table: RelationName {
-                            schema: table.schema.clone(),
-                            name: table.name.clone(),
-                        },
+                    .push(WriteTarget {
+                        schema: alias.relation.schema.clone(),
+                        relation: table.relation_oid,
+                        table: name.clone(),
                         opaque: alias.is_view,
                     });
             }
@@ -207,18 +238,13 @@ impl WriteAliasMap {
         Self(map)
     }
 
-    /// The cached tables a write to `schema.name` lands in. An unqualified
-    /// write matches the alias under any schema, as the gate's read side does.
-    pub fn targets(
-        &self,
-        schema: Option<&str>,
-        name: &str,
-    ) -> impl Iterator<Item = &WriteAliasTarget> {
-        self.0
-            .get(name)
-            .into_iter()
-            .flatten()
-            .filter(move |target| schema.is_none_or(|schema| target.alias_schema == schema))
+    /// Every target a write to the bare `name` can land in, in any schema;
+    /// [`WriteTarget::lands_in`] narrows them to the write's resolution.
+    pub fn named(&self, name: &str) -> &[WriteTarget] {
+        match self.0.get(name) {
+            Some(targets) => targets,
+            None => &[],
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -364,10 +390,10 @@ pub struct CacheStateView {
     /// gate's forward attribution (PGC-440): a forward whose blocking bound is
     /// at or below it is waiting on apply/settle, above it on origin delivery.
     pub received_lsn: Arc<AtomicU64>,
-    /// The write-alias map for the read-after-write gate (ADR-048), published
+    /// The write-target map for the read-after-write gate (ADR-048), published
     /// whole by the writer on every change to the cached tables or their alias
     /// lists; a connection loads it wait-free when it records a write.
-    pub write_aliases: ArcSwap<WriteAliasMap>,
+    pub write_targets: ArcSwap<WriteTargetMap>,
     /// Empty cache-hit latency histogram cloned into each query's metrics, so
     /// the one fallible construction happens at startup. Auto-resizing (starts
     /// at a few hundred bytes, grows on record) rather than fixed-range — a
@@ -410,7 +436,7 @@ impl CacheStateView {
             serve_pool: Arc::new(ServePool::default()),
             settled_lsn: Arc::new(AtomicU64::new(0)),
             received_lsn: Arc::new(AtomicU64::new(0)),
-            write_aliases: ArcSwap::from_pointee(WriteAliasMap::default()),
+            write_targets: ArcSwap::from_pointee(WriteTargetMap::default()),
             memo: ResultMemo::new(dynamic),
             privileges: PrivilegeVerdicts::default(),
             latency_template,
@@ -430,10 +456,9 @@ impl CacheStateView {
 /// reasons about it.
 #[derive(Debug, Clone)]
 pub struct CachedReadForm {
-    /// The read's per-column ranges per table reference, for row-level
-    /// disjointness (PGC-512).
-    pub(crate) ranges: Arc<ReadRanges>,
-    pub columns: Arc<ColumnsByTable>,
+    /// The relations the read touches, with the columns it references and
+    /// its per-reference ranges on each (PGC-512, PGC-542).
+    pub(crate) relations: Arc<ReadRelations>,
 }
 
 /// Lightweight view of a cached query for dispatch lookups.
@@ -444,15 +469,13 @@ pub struct CachedQueryView {
     pub generation: Generation,
     /// The bound query (None for Loading placeholder before writer resolves)
     pub bound: Option<SharedResolvedQuery>,
-    /// The columns `bound` reads per table, for the read-after-write gate;
-    /// set with `bound`.
-    pub read_columns: Option<Arc<ColumnsByTable>>,
     /// What a role must be allowed to read for a hit on `bound` (PGC-463);
     /// set with `bound`.
     pub privilege_needs: Option<Arc<PrivilegeNeeds>>,
-    /// `bound`'s per-column ranges per table reference, for the gate's
-    /// row-level disjointness (PGC-512); set with `bound`.
-    pub(crate) read_ranges: Option<Arc<ReadRanges>>,
+    /// The relations `bound` touches, with the columns it references and its
+    /// per-reference ranges on each, for the read-after-write gate (PGC-512,
+    /// PGC-542); set with `bound`.
+    pub(crate) read_relations: Option<Arc<ReadRelations>>,
     /// Parameterized serve shape (mirrors `CachedQuery.serve_shape`, PGC-294).
     /// None while Loading; Some once the view transitions to Ready.
     pub serve_shape: Option<SharedQueryShape>,

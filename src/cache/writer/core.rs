@@ -33,7 +33,7 @@ use crate::pg;
 use crate::pg::Lsn;
 use crate::pg::cdc::MESSAGE_PREFIX;
 use crate::pg::protocol::ByteString;
-use crate::query::update::ReadRanges;
+use crate::query::update::ReadRelations;
 use crate::query::{Fingerprint, FingerprintSet};
 use crate::settings::{PgSettings, Settings};
 
@@ -663,9 +663,11 @@ impl WriterCore {
             .cached_queries
             .get1(&fingerprint)
             .is_some_and(|q| q.reference_only);
-        let read_columns = Arc::new(serving.bound.columns_by_table());
         let privilege_needs = Arc::new(serving.bound.privilege_needs());
-        let read_ranges = Arc::new(ReadRanges::build(&serving.bound));
+        let read_relations = Arc::new(ReadRelations::build(
+            &serving.bound,
+            &privilege_needs.relations,
+        ));
         self.state_view
             .cached_queries
             .entry(fingerprint)
@@ -673,9 +675,8 @@ impl WriterCore {
                 v.state = state;
                 v.generation = serving.generation;
                 v.bound = Some(Arc::clone(&serving.bound));
-                v.read_columns = Some(Arc::clone(&read_columns));
                 v.privilege_needs = Some(Arc::clone(&privilege_needs));
-                v.read_ranges = Some(Arc::clone(&read_ranges));
+                v.read_relations = Some(Arc::clone(&read_relations));
                 v.serve_shape = Some(Arc::clone(&serving.serve_shape));
                 v.max_limit = serving.max_limit;
                 v.reference_only = reference_only;
@@ -685,9 +686,8 @@ impl WriterCore {
                 state,
                 generation: serving.generation,
                 bound: Some(Arc::clone(&serving.bound)),
-                read_columns: Some(read_columns),
                 privilege_needs: Some(privilege_needs),
-                read_ranges: Some(read_ranges),
+                read_relations: Some(read_relations),
                 serve_shape: Some(Arc::clone(&serving.serve_shape)),
                 max_limit: serving.max_limit,
                 reference_only,

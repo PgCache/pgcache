@@ -16,9 +16,6 @@ use crate::query::ast::rope::{
     Body, NodeKind, Query, Scalar, ScalarKind, Select, SelectItem, View,
 };
 
-/// The columns a query reads from each table, by table name.
-pub type ColumnsByTable = HashMap<EcoString, HashSet<EcoString>>;
-
 /// What origin checks before it runs a read (PGC-463): `SELECT` on every
 /// column referenced per base relation (or, with none referenced, on the
 /// relation or any one column), `USAGE` on each relation's schema, and
@@ -72,19 +69,13 @@ impl ResolvedQuery {
         binding_type(self.bindings(), self.column_binding_at(id)?)
     }
 
-    /// Which columns of each table the query reads anywhere: select list,
-    /// predicates, join conditions (a `USING`/`NATURAL` join through both
-    /// sides of each merged column), grouping, ordering and subqueries, with
-    /// stars expanded. Every base table has an entry, possibly empty; two
-    /// tables of one name in different schemas share an entry, which only
-    /// over-approximates.
-    pub fn columns_by_table(&self) -> ColumnsByTable {
-        self.columns_collect(|table| table.name.clone())
-    }
-
     /// The privileges a read of this query needs at origin: the columns it
     /// references per base relation, keyed by OID so same-named tables in
-    /// two schemas stay apart, and the functions it calls.
+    /// two schemas stay apart, and the functions it calls. The columns are
+    /// read anywhere: select list, predicates, join conditions (a
+    /// `USING`/`NATURAL` join through both sides of each merged column),
+    /// grouping, ordering and subqueries, with stars expanded; every base
+    /// relation has an entry, possibly empty.
     pub fn privilege_needs(&self) -> PrivilegeNeeds {
         let relations = self.columns_collect(|table| table.relation_oid);
         let mut functions: Vec<EcoString> = self

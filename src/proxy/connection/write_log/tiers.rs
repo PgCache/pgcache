@@ -146,6 +146,7 @@ impl ConnectionTiers {
 
 impl TableTiers {
     /// Both tiers' aggregates, waiting first.
+    #[cfg(test)]
     pub(super) fn aggregates(&self) -> impl Iterator<Item = &TableAggregate> {
         self.aggregates_bounded().map(|(_, agg)| agg)
     }

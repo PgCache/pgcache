@@ -68,7 +68,7 @@ error_set! {
 /// Result type with location-tracking error reports for resolution operations.
 pub type ResolveResult<T> = Result<T, Report<ResolveError>>;
 
-pub use analysis::{ColumnsByTable, PrivilegeNeeds};
+pub use analysis::PrivilegeNeeds;
 pub(crate) use bindings::BindingsBuilder;
 pub use bindings::{
     Bindings, ColumnBinding, ColumnTarget, MergedColumnBinding, MergedId, ResolvedQuery, SlotId,

@@ -2,8 +2,10 @@
 //! purging on the settled watermark, and the per-read gate verdict.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use ecow::EcoString;
+use smallvec::SmallVec;
 
 use super::aggregate::{
     MERGED_PREDICATE_CAP, TableAggregate, UPDATE_DELETE_PREDICATE_CAP, equality_tuple_build,
@@ -12,23 +14,122 @@ use super::aggregate::{
 };
 use super::tiers::{ConnectionTiers, TableTiers};
 use super::{DisjointKinds, RawBlocker, RawDecision, RawForwardReason};
-use crate::cache::WriteAliasMap;
+use crate::cache::WriteTargetMap;
+use crate::catalog::RelationName;
+use crate::oid::Oid;
 use crate::pg::Lsn;
 use crate::query::ast::rope::QueryTree;
 use crate::query::constraints::{column_ranges_disjoint, table_column_ranges};
-use crate::query::resolve::ColumnsByTable;
-use crate::query::update::{ReadRanges, ReferenceRanges};
-use crate::query::write::{RelationRef, WriteClass};
+use crate::query::update::{ReadRelation, ReadRelations, ReferenceRanges};
+use crate::query::write::WriteClass;
 
-/// The schema variants of one table name with pending writes. Keyed by bare
-/// name so the gate's fuzzy schema matching (an unqualified side matches any
-/// schema) is one hash probe plus a scan of this — almost always singleton —
-/// bucket, instead of a scan of every logged relation.
-type SchemaBucket = HashMap<Option<EcoString>, TableTiers>;
+/// Pending writes resolved to one cached relation (PGC-542).
+struct RelationTiers {
+    name: RelationName,
+    tiers: TableTiers,
+}
+
+/// The relations of one bare name; inline for a name cached in one or two
+/// schemas.
+type RelationOids = SmallVec<[Oid; 2]>;
+
+/// Pending writes per cached relation, by OID, indexed by bare name for
+/// matching a read's typed names. The index moves with the entries, so
+/// nothing outside can leave the two apart.
+#[derive(Default)]
+struct Relations {
+    by_oid: HashMap<Oid, RelationTiers>,
+    by_name: HashMap<EcoString, RelationOids>,
+}
+
+impl Relations {
+    fn is_empty(&self) -> bool {
+        self.by_oid.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.by_oid.clear();
+        self.by_name.clear();
+    }
+
+    fn get(&self, oid: Oid) -> Option<&RelationTiers> {
+        self.by_oid.get(&oid)
+    }
+
+    fn tiers(&self) -> impl Iterator<Item = &TableTiers> {
+        self.by_oid.values().map(|relation| &relation.tiers)
+    }
+
+    fn tiers_mut(&mut self) -> impl Iterator<Item = &mut TableTiers> {
+        self.by_oid.values_mut().map(|relation| &mut relation.tiers)
+    }
+
+    /// The relations a typed name could denote: those of the bare name, in
+    /// `schema` when the name was qualified.
+    fn named<'a>(
+        &'a self,
+        schema: Option<&'a str>,
+        name: &str,
+    ) -> impl Iterator<Item = &'a RelationTiers> + 'a {
+        self.by_name
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter_map(|oid| self.by_oid.get(oid))
+            .filter(move |relation| schema.is_none_or(|schema| relation.name.schema == schema))
+    }
+
+    /// The active tier of relation `oid`, entered under `name` if new.
+    fn active_mut(&mut self, oid: Oid, name: &RelationName, seq: u64) -> &mut TableAggregate {
+        let relation = self.by_oid.entry(oid).or_insert_with(|| {
+            self.by_name.entry(name.name.clone()).or_default().push(oid);
+            RelationTiers {
+                name: name.clone(),
+                tiers: TableTiers::default(),
+            }
+        });
+        relation.tiers.active_mut(seq)
+    }
+
+    /// Drop every relation whose tiers `keep` rejects.
+    fn retain(&mut self, mut keep: impl FnMut(&mut TableTiers) -> bool) {
+        let by_name = &mut self.by_name;
+        self.by_oid.retain(|oid, relation| {
+            if keep(&mut relation.tiers) {
+                return true;
+            }
+            if let Some(oids) = by_name.get_mut(&relation.name.name) {
+                oids.retain(|candidate| candidate != oid);
+                if oids.is_empty() {
+                    by_name.remove(&relation.name.name);
+                }
+            }
+            false
+        });
+    }
+}
+
+/// The schemas origin could have resolved an unresolved write's name in: the
+/// one written, the path in force, or any (`None`).
+type UnresolvedScope = Option<Arc<[EcoString]>>;
+
+/// Pending writes to a name that resolved to no cached relation, or to an
+/// unqualified name whose real target may be an uncached relation earlier on
+/// the path. Matched by name against a relation cached after the write, so a
+/// read of it still forwards.
+struct UnresolvedTiers {
+    /// The cached relations of the name at record time: origin wrote one of
+    /// them (recorded by OID) or none of them, so a read of one proves
+    /// nothing here.
+    known: RelationOids,
+    tiers: TableTiers,
+}
 
 /// Per-connection write log. See the module docs for the model.
 pub(crate) struct WriteLog {
-    pub(super) tables: HashMap<EcoString, SchemaBucket>,
+    relations: Relations,
+    /// Keyed by the name as written, then by the scope it was written under.
+    unresolved: HashMap<EcoString, HashMap<UnresolvedScope, UnresolvedTiers>>,
     pub(super) connection: ConnectionTiers,
     pub(super) next_seq: u64,
     /// Recording is off entirely when the feature is disabled or the connection
@@ -57,7 +158,8 @@ impl WriteLog {
 
     pub(crate) fn with_enabled(enabled: bool) -> Self {
         Self {
-            tables: HashMap::new(),
+            relations: Relations::default(),
+            unresolved: HashMap::new(),
             connection: ConnectionTiers::default(),
             next_seq: 0,
             enabled,
@@ -68,33 +170,91 @@ impl WriteLog {
     /// cache is off for its lifetime).
     pub(crate) fn disable(&mut self) {
         self.enabled = false;
-        self.tables.clear();
+        self.tables_clear();
         self.connection = ConnectionTiers::default();
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.tables.is_empty() && self.connection.is_empty()
+        self.relations.is_empty() && self.unresolved.is_empty() && self.connection.is_empty()
     }
 
-    /// Whether any pending write is row-enumerable (an INSERT, DELETE, or
-    /// UPDATE) — the cases that benefit from deriving the read's per-column
-    /// ranges (PGC-369/381/382). Opaque/connection writes ignore them.
-    pub(crate) fn has_row_predicates(&self) -> bool {
-        self.tiers()
-            .any(|tiers| tiers.aggregates().any(TableAggregate::has_row_predicates))
+    fn tables_clear(&mut self) {
+        self.relations.clear();
+        self.unresolved.clear();
     }
 
-    fn tiers(&self) -> impl Iterator<Item = &TableTiers> {
-        self.tables.values().flat_map(HashMap::values)
+    pub(super) fn tiers(&self) -> impl Iterator<Item = &TableTiers> {
+        let unresolved = self
+            .unresolved
+            .values()
+            .flat_map(|scopes| scopes.values())
+            .map(|entry| &entry.tiers);
+        self.relations.tiers().chain(unresolved)
     }
 
-    /// Record a forwarded write into its table's (or the connection's) active
-    /// tier. No-op when disabled.
+    fn tiers_mut(&mut self) -> impl Iterator<Item = &mut TableTiers> {
+        let unresolved = self
+            .unresolved
+            .values_mut()
+            .flat_map(|scopes| scopes.values_mut())
+            .map(|entry| &mut entry.tiers);
+        self.relations.tiers_mut().chain(unresolved)
+    }
+
+    /// The unresolved entries of `name` whose scope admits `schema`.
+    fn unresolved_named<'a>(
+        &'a self,
+        name: &str,
+        schema: Option<&'a str>,
+    ) -> impl Iterator<Item = &'a UnresolvedTiers> + 'a {
+        self.unresolved
+            .get(name)
+            .into_iter()
+            .flat_map(|scopes| scopes.iter())
+            .filter(move |(scope, _)| scope_admits(scope, schema))
+            .map(|(_, entry)| entry)
+    }
+
+    /// The tiers of every pending write on a relation the typed name could
+    /// denote: the relations of that name and the unresolved entries
+    /// admitting it.
+    pub(super) fn pending_named<'a>(
+        &'a self,
+        schema: Option<&'a str>,
+        name: &str,
+    ) -> impl Iterator<Item = &'a TableTiers> + 'a {
+        let relations = self
+            .relations
+            .named(schema, name)
+            .map(|relation| &relation.tiers);
+        let unresolved = self
+            .unresolved_named(name, schema)
+            .map(|entry| &entry.tiers);
+        relations.chain(unresolved)
+    }
+
+    /// Record a forwarded write into its relations' (or the connection's)
+    /// active tier. No-op when disabled.
     ///
-    /// A write to a partition or through a view lands rows in the cached
-    /// tables `aliases` maps it to (ADR-048), so it is recorded under each of
-    /// those as well: with its rows for a partition, opaque for a view.
-    pub(crate) fn record(&mut self, class: &WriteClass, aliases: Option<&WriteAliasMap>) {
+    /// A table-scoped write is resolved through `targets` the way origin
+    /// resolves its name (PGC-542): a qualified name in its schema, an
+    /// unqualified one in every schema of `search_path` (origin takes the
+    /// first holding the name among those the role has `USAGE` on, neither
+    /// of which the proxy sees in full), an unknown path in any. Each cached
+    /// relation it can land in records the write: with its rows for the table
+    /// itself or a partition of it, opaque through a view (ADR-048). A name
+    /// resolving to nothing, and an unqualified name whose real target may be
+    /// an uncached relation earlier on the path, is recorded by name too, so
+    /// a read of a relation cached after the write still forwards. The name
+    /// entry keeps the rows only when no relation does: it matches nothing
+    /// but a relation cached later, where an opaque mark costs little, while
+    /// duplicating every unqualified write's rows would not.
+    pub(crate) fn record(
+        &mut self,
+        class: &WriteClass,
+        targets: Option<&WriteTargetMap>,
+        search_path: Option<&Arc<[EcoString]>>,
+    ) {
         if !self.enabled {
             return;
         }
@@ -116,7 +276,7 @@ impl WriteLog {
                 self.connection.active = None;
                 self.connection.waiting = None;
                 // Every read forwards until close; per-table state is moot.
-                self.tables.clear();
+                self.tables_clear();
             }
             WriteClass::InsertRows(_)
             | WriteClass::DeleteRows(_)
@@ -125,118 +285,69 @@ impl WriteLog {
                 let Some(relation) = class.relation() else {
                     return;
                 };
-                self.table_record(relation, class, seq);
-                let targets: Vec<(RelationRef, bool)> = aliases
+                let path = search_path.map(|path| path.as_ref());
+                let mut resolved = false;
+                let mut known = RelationOids::new();
+                let named = targets
                     .into_iter()
-                    .flat_map(|aliases| aliases.targets(relation.schema.as_deref(), &relation.name))
-                    .map(|target| {
-                        let table = RelationRef {
-                            schema: Some(target.table.schema.clone()),
-                            name: target.table.name.clone(),
-                        };
-                        (table, target.opaque)
-                    })
-                    .collect();
-                for (table, opaque) in &targets {
-                    if *opaque {
-                        self.table_active(table, seq).degrade_opaque();
+                    .flat_map(|targets| targets.named(&relation.name));
+                for target in named {
+                    if !known.contains(&target.relation) {
+                        known.push(target.relation);
+                    }
+                    if !target.lands_in(relation.schema.as_deref(), path) {
+                        continue;
+                    }
+                    resolved = true;
+                    let agg = self
+                        .relations
+                        .active_mut(target.relation, &target.table, seq);
+                    if target.opaque {
+                        agg.degrade_opaque();
                     } else {
-                        self.table_record(table, class, seq);
+                        aggregate_record(agg, class);
+                    }
+                }
+                if !resolved {
+                    crate::metrics::handles().raw.writes_unresolved.increment(1);
+                }
+                if !resolved || relation.schema.is_none() {
+                    let scope = match &relation.schema {
+                        Some(schema) => Some(Arc::from([schema.clone()])),
+                        None => search_path.cloned(),
+                    };
+                    let agg = self.unresolved_active(&relation.name, scope, &known, seq);
+                    if resolved {
+                        agg.degrade_opaque();
+                    } else {
+                        aggregate_record(agg, class);
                     }
                 }
             }
         }
     }
 
-    /// Record a table-scoped write under `relation`, which may be the write's
-    /// own target or a cached table it aliases.
-    fn table_record(&mut self, relation: &RelationRef, class: &WriteClass, seq: u64) {
-        match class {
-            // Row-enumerable INSERT: keep the rows for row-level disjointness
-            // (PGC-369), unless the table is already opaque or the rows overflow
-            // the cap (then degrade to opaque).
-            WriteClass::InsertRows(insert) => {
-                let agg = self.table_active(relation, seq);
-                if !agg.opaque {
-                    let mut inserts = agg.inserts.take().unwrap_or_default();
-                    if inserts.fold(insert) {
-                        agg.inserts = Some(inserts);
-                    } else {
-                        agg.degrade_opaque();
-                        crate::metrics::handles()
-                            .raw
-                            .cap_degraded_insert
-                            .increment(1);
-                    }
-                }
-            }
-            // Row-enumerable DELETE: keep the predicate for row-level
-            // disjointness (PGC-381), unless the table is already opaque or the
-            // predicate count overflows the cap (then degrade to opaque).
-            WriteClass::DeleteRows(delete) => {
-                let agg = self.table_active(relation, seq);
-                if !agg.opaque {
-                    let overflow = match equality_tuple_build(&delete.comparisons) {
-                        Some((columns, values)) => {
-                            agg.merged_deletes.entry(columns).or_default().push(values);
-                            agg.merged_predicates += 1;
-                            agg.merged_predicates > MERGED_PREDICATE_CAP
-                        }
-                        None => {
-                            agg.deletes.push(table_column_ranges(&delete.comparisons));
-                            agg.deletes.len() + agg.updates.len() > UPDATE_DELETE_PREDICATE_CAP
-                        }
-                    };
-                    if overflow {
-                        agg.degrade_opaque();
-                        crate::metrics::handles()
-                            .raw
-                            .cap_degraded_update_delete
-                            .increment(1);
-                    }
-                }
-            }
-            // Row-enumerable UPDATE: keep the WHERE predicate and the post-update
-            // image for the two-sided disjointness check (PGC-382), unless the
-            // table is opaque or the predicate count overflows the cap.
-            WriteClass::UpdateRows(update) => {
-                let agg = self.table_active(relation, seq);
-                if !agg.opaque {
-                    let overflow = match update_tuple_build(update) {
-                        Some((shape, tuple)) => {
-                            agg.merged_updates.entry(shape).or_default().push(tuple);
-                            agg.merged_predicates += 1;
-                            agg.merged_predicates > MERGED_PREDICATE_CAP
-                        }
-                        None => {
-                            agg.updates.push(update_predicate_build(update));
-                            agg.deletes.len() + agg.updates.len() > UPDATE_DELETE_PREDICATE_CAP
-                        }
-                    };
-                    if overflow {
-                        agg.degrade_opaque();
-                        crate::metrics::handles()
-                            .raw
-                            .cap_degraded_update_delete
-                            .increment(1);
-                    }
-                }
-            }
-            WriteClass::Table(_) => {
-                self.table_active(relation, seq).degrade_opaque();
-            }
-            WriteClass::Connection | WriteClass::ConnectionUnstampable => {}
-        }
-    }
-
-    fn table_active(&mut self, relation: &RelationRef, seq: u64) -> &mut TableAggregate {
-        // Recording routes by exact identity; fuzzy matching is read-side only.
-        self.tables
-            .entry(relation.name.clone())
+    /// The active tier of the unresolved entry for `name` under `scope`,
+    /// narrowing its `known` set to the relations known at every write it
+    /// folds, so none that a later write could have reached is excluded.
+    fn unresolved_active(
+        &mut self,
+        name: &EcoString,
+        scope: UnresolvedScope,
+        known: &[Oid],
+        seq: u64,
+    ) -> &mut TableAggregate {
+        let entry = self
+            .unresolved
+            .entry(name.clone())
             .or_default()
-            .entry(relation.schema.clone())
-            .or_default()
-            .active_mut(seq)
+            .entry(scope)
+            .or_insert_with(|| UnresolvedTiers {
+                known: known.iter().copied().collect(),
+                tiers: TableTiers::default(),
+            });
+        entry.known.retain(|oid| known.contains(oid));
+        entry.tiers.active_mut(seq)
     }
 
     /// The sequence to hand the probe at injection: writes recorded up to and
@@ -255,7 +366,7 @@ impl WriteLog {
     /// may predate that write's commit) and a subsequent probe retries it;
     /// every other table still stamps.
     pub(crate) fn stamp(&mut self, stamp_seq: u64, lsn: Lsn) {
-        for tiers in self.tables.values_mut().flat_map(HashMap::values_mut) {
+        for tiers in self.tiers_mut() {
             tiers.stamp(stamp_seq, lsn);
         }
         self.connection.stamp(stamp_seq, lsn);
@@ -267,18 +378,20 @@ impl WriteLog {
     /// writes — no derived fast-path state to keep consistent.
     pub(crate) fn purge(&mut self, watermark: Lsn) {
         let clearance = &crate::metrics::handles().raw.clearance;
-        self.tables.retain(|_, bucket| {
-            bucket.retain(|_, tiers| {
-                tiers.waiting.retain(|tier| {
-                    if tier.bound > watermark {
-                        return true;
-                    }
-                    clearance.record(tier.stamped_at.elapsed());
-                    false
-                });
-                !tiers.is_empty()
+        let tiers_purge = |tiers: &mut TableTiers| {
+            tiers.waiting.retain(|tier| {
+                if tier.bound > watermark {
+                    return true;
+                }
+                clearance.record(tier.stamped_at.elapsed());
+                false
             });
-            !bucket.is_empty()
+            !tiers.is_empty()
+        };
+        self.relations.retain(|tiers| tiers_purge(tiers));
+        self.unresolved.retain(|_, scopes| {
+            scopes.retain(|_, entry| tiers_purge(&mut entry.tiers));
+            !scopes.is_empty()
         });
         if matches!(self.connection.waiting, Some(lsn) if lsn <= watermark) {
             self.connection.waiting = None;
@@ -290,36 +403,31 @@ impl WriteLog {
     /// than served from cache. Conservative — any uncertainty forwards. Call
     /// [`Self::purge`] first so applied writes don't force needless forwards.
     ///
-    /// `read_ranges` are the read's per-column value ranges per table reference
-    /// (PGC-369, PGC-512), used for row-level disjointness: a pending write is
-    /// ruled out when every reference of its table is disjoint from it. `None`
-    /// is an unregistered read; a table [`ReadRanges`] leaves out forwards on
-    /// any pending row write.
-    pub(crate) fn decide(
-        &self,
-        query: &QueryTree,
-        read_ranges: Option<&ReadRanges>,
-        read_columns: Option<&ColumnsByTable>,
-    ) -> RawDecision {
+    /// `read` is the registered read's form: its relations by OID, each with
+    /// the columns it references and its per-reference ranges, which rule a
+    /// pending write out when every reference of its relation is disjoint
+    /// from it (PGC-369, PGC-512, PGC-542). `None` is an unregistered read,
+    /// matched by the names it types: any pending write on a relation of that
+    /// name forwards it.
+    pub(crate) fn decide(&self, query: &QueryTree, read: Option<&ReadRelations>) -> RawDecision {
         // A connection-scoped pending write (unknown table) poisons every read.
         if !self.connection.is_empty() {
             return RawDecision::Forward(RawForwardReason::Connection, self.connection.blocker());
         }
-        // Otherwise a read forwards iff it references a table with a pending
-        // write it can't rule out. The walk covers joins, subqueries, and CTEs.
-        // The break payload is the first blocking table's clearance constraint;
-        // a later table could in principle carry a still-later bound, but one
-        // blocking table suffices for attribution (PGC-440).
+        // Otherwise a read forwards iff it references a relation with a pending
+        // write it can't rule out. The break payload is the first blocking
+        // relation's clearance constraint; a later one could in principle
+        // carry a still-later bound, but one blocking relation suffices for
+        // attribution (PGC-440).
         let mut kinds = DisjointKinds::default();
-        let blocked = query.table_names().find_map(|(schema, name)| {
-            self.table_intersects(
-                schema,
-                name,
-                read_ranges.and_then(|ranges| ranges.references(name)),
-                read_columns.and_then(|columns| columns.get(name)),
-                &mut kinds,
-            )
-        });
+        let blocked = match read {
+            Some(read) => read
+                .iter()
+                .find_map(|(oid, relation)| self.relation_intersects(oid, relation, &mut kinds)),
+            None => query
+                .table_names()
+                .find_map(|(schema, name)| self.name_intersects(schema, name, &mut kinds)),
+        };
         if let Some(blocker) = blocked {
             RawDecision::Forward(RawForwardReason::Table, blocker)
         } else if kinds.any() {
@@ -329,30 +437,72 @@ impl WriteLog {
         }
     }
 
-    /// Fold the read's disjointness from `table`'s pending writes into `kinds`;
-    /// returns the table's clearance constraint if the read intersects a pending
-    /// write it can't rule out (`None` = no intersection). All of the table's
-    /// tiers are checked — not just the first blocking one — so the returned
-    /// blocker is the slowest-to-clear constraint (PGC-440 attribution).
-    fn table_intersects(
+    /// Whether any pending table-scoped write is on a relation one of
+    /// `names` could denote, so unrelated reads skip the registered-form
+    /// lookup.
+    pub(crate) fn names_pending<'a>(
         &self,
-        table_schema: Option<&str>,
-        table_name: &str,
+        names: impl Iterator<Item = (Option<&'a str>, &'a str)>,
+    ) -> bool {
+        let mut names = names;
+        names.any(|(schema, name)| self.pending_named(schema, name).next().is_some())
+    }
+
+    /// Fold a registered read relation's disjointness from its pending writes
+    /// into `kinds`: the writes resolved to it, and the unresolved writes of
+    /// its name whose scope admits its schema and that did not know it. Returns
+    /// the clearance constraint if some write can't be ruled out (`None` = no
+    /// intersection), the slowest-to-clear across every tier (PGC-440).
+    fn relation_intersects(
+        &self,
+        oid: Oid,
+        relation: &ReadRelation,
+        kinds: &mut DisjointKinds,
+    ) -> Option<RawBlocker> {
+        let ranges = relation.ranges.as_deref();
+        let columns = relation.columns.as_ref();
+        let resolved = self.relations.get(oid).map(|entry| &entry.tiers);
+        let unresolved = self
+            .unresolved_named(&relation.name, Some(&relation.schema))
+            .filter(|entry| !entry.known.contains(&oid))
+            .map(|entry| &entry.tiers);
+        resolved
+            .into_iter()
+            .chain(unresolved)
+            .fold(None, |blocker, tiers| {
+                Self::tiers_intersects(tiers, ranges, columns, kinds, blocker)
+            })
+    }
+
+    /// [`Self::relation_intersects`] for an unregistered read, which has
+    /// nothing to prove with: every pending write on a relation the typed name
+    /// could denote intersects.
+    fn name_intersects(
+        &self,
+        schema: Option<&str>,
+        name: &str,
+        kinds: &mut DisjointKinds,
+    ) -> Option<RawBlocker> {
+        self.pending_named(schema, name)
+            .fold(None, |blocker, tiers| {
+                Self::tiers_intersects(tiers, None, None, kinds, blocker)
+            })
+    }
+
+    /// Merge into `blocker` the constraint of every tier of `tiers` the read
+    /// intersects. All tiers are checked, not just the first blocking one, so
+    /// the result is the slowest-to-clear constraint (PGC-440 attribution).
+    fn tiers_intersects(
+        tiers: &TableTiers,
         read_ranges: Option<&[ReferenceRanges]>,
         read_columns: Option<&HashSet<EcoString>>,
         kinds: &mut DisjointKinds,
+        mut blocker: Option<RawBlocker>,
     ) -> Option<RawBlocker> {
-        let bucket = self.tables.get(table_name)?;
-        let mut blocker: Option<RawBlocker> = None;
-        for (schema, tiers) in bucket {
-            if !schema_matches(schema, table_schema) {
-                continue;
-            }
-            for (bound, agg) in tiers.aggregates_bounded() {
-                if Self::aggregate_intersects(agg, read_ranges, read_columns, kinds) {
-                    let tier = bound.map_or(RawBlocker::Unstamped, RawBlocker::Stamped);
-                    blocker = Some(blocker.map_or(tier, |prior| prior.merge(tier)));
-                }
+        for (bound, agg) in tiers.aggregates_bounded() {
+            if Self::aggregate_intersects(agg, read_ranges, read_columns, kinds) {
+                let tier = bound.map_or(RawBlocker::Unstamped, RawBlocker::Stamped);
+                blocker = Some(blocker.map_or(tier, |prior| prior.merge(tier)));
             }
         }
         blocker
@@ -419,31 +569,88 @@ impl WriteLog {
         }
         false
     }
+}
 
-    /// Whether a table the read references has a pending row-enumerable write (an
-    /// INSERT, DELETE, or UPDATE). Cheap gate so the read-after-write gate skips
-    /// the expensive per-column range derivation for reads no such write could
-    /// affect (PGC-369, PGC-381, PGC-382).
-    pub(crate) fn table_has_row_predicate(
-        &self,
-        table_schema: Option<&str>,
-        table_name: &str,
-    ) -> bool {
-        self.tables.get(table_name).is_some_and(|bucket| {
-            bucket.iter().any(|(schema, tiers)| {
-                schema_matches(schema, table_schema)
-                    && tiers.aggregates().any(TableAggregate::has_row_predicates)
-            })
-        })
+/// Fold a table-scoped write into one relation's active aggregate.
+fn aggregate_record(agg: &mut TableAggregate, class: &WriteClass) {
+    match class {
+        // Row-enumerable INSERT: keep the rows for row-level disjointness
+        // (PGC-369), unless the table is already opaque or the rows overflow
+        // the cap (then degrade to opaque).
+        WriteClass::InsertRows(insert) => {
+            if !agg.opaque {
+                let mut inserts = agg.inserts.take().unwrap_or_default();
+                if inserts.fold(insert) {
+                    agg.inserts = Some(inserts);
+                } else {
+                    agg.degrade_opaque();
+                    crate::metrics::handles()
+                        .raw
+                        .cap_degraded_insert
+                        .increment(1);
+                }
+            }
+        }
+        // Row-enumerable DELETE: keep the predicate for row-level
+        // disjointness (PGC-381), unless the table is already opaque or the
+        // predicate count overflows the cap (then degrade to opaque).
+        WriteClass::DeleteRows(delete) => {
+            if !agg.opaque {
+                let overflow = match equality_tuple_build(&delete.comparisons) {
+                    Some((columns, values)) => {
+                        agg.merged_deletes.entry(columns).or_default().push(values);
+                        agg.merged_predicates += 1;
+                        agg.merged_predicates > MERGED_PREDICATE_CAP
+                    }
+                    None => {
+                        agg.deletes.push(table_column_ranges(&delete.comparisons));
+                        agg.deletes.len() + agg.updates.len() > UPDATE_DELETE_PREDICATE_CAP
+                    }
+                };
+                if overflow {
+                    agg.degrade_opaque();
+                    crate::metrics::handles()
+                        .raw
+                        .cap_degraded_update_delete
+                        .increment(1);
+                }
+            }
+        }
+        // Row-enumerable UPDATE: keep the WHERE predicate and the post-update
+        // image for the two-sided disjointness check (PGC-382), unless the
+        // table is opaque or the predicate count overflows the cap.
+        WriteClass::UpdateRows(update) => {
+            if !agg.opaque {
+                let overflow = match update_tuple_build(update) {
+                    Some((shape, tuple)) => {
+                        agg.merged_updates.entry(shape).or_default().push(tuple);
+                        agg.merged_predicates += 1;
+                        agg.merged_predicates > MERGED_PREDICATE_CAP
+                    }
+                    None => {
+                        agg.updates.push(update_predicate_build(update));
+                        agg.deletes.len() + agg.updates.len() > UPDATE_DELETE_PREDICATE_CAP
+                    }
+                };
+                if overflow {
+                    agg.degrade_opaque();
+                    crate::metrics::handles()
+                        .raw
+                        .cap_degraded_update_delete
+                        .increment(1);
+                }
+            }
+        }
+        WriteClass::Table(_) => agg.degrade_opaque(),
+        WriteClass::Connection | WriteClass::ConnectionUnstampable => {}
     }
 }
-/// Whether a logged write's schema matches a read table's, given equal names
-/// (the bucket key). Compared only when *both* sides are schema-qualified — an
-/// unqualified name on either side conservatively matches, since the proxy
-/// can't resolve `search_path` to a concrete schema.
-fn schema_matches(relation: &Option<EcoString>, table: Option<&str>) -> bool {
-    match (relation, table) {
-        (Some(a), Some(b)) => a == b,
+
+/// Whether an unresolved write's scope admits a read relation's schema: an
+/// unknown scope or an unqualified typed name conservatively does.
+fn scope_admits(scope: &UnresolvedScope, schema: Option<&str>) -> bool {
+    match (scope, schema) {
+        (Some(scope), Some(schema)) => scope.iter().any(|s| s == schema),
         _ => true,
     }
 }

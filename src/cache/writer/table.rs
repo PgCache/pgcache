@@ -10,7 +10,7 @@ use tracing::{debug, error, info, instrument, warn};
 
 use super::core::WriterCore;
 use crate::cache::messages::PartitionCreated;
-use crate::cache::types::WriteAliasMap;
+use crate::cache::types::WriteTargetMap;
 use crate::cache::{CacheError, CacheResult, MapIntoReport};
 use crate::catalog::{
     CatalogTable, ColumnMetadata, ColumnPosition, ColumnStore, IndexMetadata, RelationName,
@@ -347,12 +347,12 @@ impl WriterCore {
         Ok(aliases)
     }
 
-    /// Republish the write-alias map the read-after-write gate expands a
-    /// forwarded write with (ADR-048). Called after every change to the
-    /// cached tables or their alias lists.
-    pub(super) fn write_aliases_publish(&self) {
-        let map = WriteAliasMap::from_tables(self.cache.tables.iter().map(|table| &**table));
-        self.state_view.write_aliases.store(Arc::new(map));
+    /// Republish the write-target map the read-after-write gate resolves a
+    /// forwarded write with (ADR-048, PGC-542). Called after every change to
+    /// the cached tables or their alias lists.
+    pub(super) fn write_targets_publish(&self) {
+        let map = WriteTargetMap::from_tables(self.cache.tables.iter().map(|table| &**table));
+        self.state_view.write_targets.store(Arc::new(map));
     }
 
     /// Reload the alias lists of the cached tables in `roots` from the origin
@@ -371,7 +371,7 @@ impl WriterCore {
             table.write_aliases = write_aliases;
             self.cache.tables.insert_overwrite(table.into());
         }
-        self.write_aliases_publish();
+        self.write_targets_publish();
         Ok(())
     }
 
@@ -648,7 +648,7 @@ impl WriterCore {
             .filter_map(|oid| self.cache.tables.remove1(*oid))
             .collect();
         if !tables.is_empty() {
-            self.write_aliases_publish();
+            self.write_targets_publish();
         }
         self.cache_table_objects_drop(&tables).await;
     }
@@ -837,7 +837,7 @@ impl WriterCore {
             .await?;
 
         self.cache.tables.insert_overwrite(table_metadata.into());
-        self.write_aliases_publish();
+        self.write_targets_publish();
 
         Ok(())
     }

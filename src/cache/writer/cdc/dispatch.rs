@@ -497,7 +497,7 @@ impl WriterCdc {
         if let Some(table) = core.cache.tables.remove1(relation_oid) {
             core.forgotten_tables.push(table);
             core.relations_dirty = true;
-            core.write_aliases_publish();
+            core.write_targets_publish();
         }
         Ok(())
     }
