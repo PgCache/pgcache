@@ -12,6 +12,7 @@ use crate::query::ast::{BinaryOp, LiteralValue};
 use crate::query::constraints::{
     ColumnConstraintKind, ColumnRange, TableConstraint, column_range_contains, table_column_ranges,
 };
+use crate::query::update::ReferenceRanges;
 use crate::query::write::{InsertRow, InsertStatement, UpdateStatement};
 
 /// Cap on the combined update + delete predicate maps a single table may hold in
@@ -204,14 +205,7 @@ impl InsertAggregate {
     /// range provably excludes ([`column_range_contains`] `== Some(false)`) —
     /// the same per-column test the map-based [`column_ranges_disjoint`] check
     /// applies, minus the per-row maps.
-    pub(super) fn disjoint(&self, read_ranges: &HashMap<EcoString, ColumnRange>) -> bool {
-        // An unsatisfiable read matches no row at all.
-        if read_ranges
-            .values()
-            .any(|range| matches!(range, ColumnRange::Empty))
-        {
-            return true;
-        }
+    pub(super) fn disjoint(&self, read_ranges: &ReferenceRanges) -> bool {
         // Resolve the read's constrained columns to positions once.
         let constrained: Vec<(usize, &ColumnRange)> = self
             .columns
@@ -271,17 +265,7 @@ pub(super) fn equality_tuple_build(
 /// check [`column_ranges_disjoint`] applies to a per-column `Equal` map, minus
 /// the maps: a tuple is excluded when some column the read constrains carries
 /// a value the read's range provably excludes.
-pub(super) fn merged_tuples_disjoint(
-    merged: &MergedTuples,
-    read_ranges: &HashMap<EcoString, ColumnRange>,
-) -> bool {
-    // An unsatisfiable read matches no row at all.
-    if read_ranges
-        .values()
-        .any(|range| matches!(range, ColumnRange::Empty))
-    {
-        return true;
-    }
+pub(super) fn merged_tuples_disjoint(merged: &MergedTuples, read_ranges: &ReferenceRanges) -> bool {
     merged.iter().all(|(columns, tuples)| {
         // Resolve the shape's columns against the read once.
         let constrained: SmallVec<[(usize, &ColumnRange); 2]> = columns
@@ -351,13 +335,23 @@ pub(super) fn update_tuple_build(
     Some(((where_columns, set_columns), (where_values, set_values)))
 }
 
-/// Whether `disjoint` holds for every table reference's ranges; without any
-/// reference nothing is provable (PGC-512).
+/// Whether `disjoint` holds for every table reference's ranges; `None`, a
+/// table [`ReadRanges`](crate::query::update::ReadRanges) leaves out, proves
+/// nothing (PGC-512). A reference
+/// with an unsatisfiable range reads no row, so every write is disjoint
+/// from it.
 pub(super) fn references_disjoint(
-    read_ranges: Option<&[HashMap<EcoString, ColumnRange>]>,
-    disjoint: impl Fn(&HashMap<EcoString, ColumnRange>) -> bool,
+    read_ranges: Option<&[ReferenceRanges]>,
+    disjoint: impl Fn(&ReferenceRanges) -> bool,
 ) -> bool {
-    read_ranges.is_some_and(|references| !references.is_empty() && references.iter().all(disjoint))
+    read_ranges.is_some_and(|references| {
+        references.iter().all(|ranges| {
+            ranges
+                .values()
+                .any(|range| matches!(range, ColumnRange::Empty))
+                || disjoint(ranges)
+        })
+    })
 }
 
 /// Whether the read is provably unaffected by every merged UPDATE: a shape
@@ -369,14 +363,20 @@ pub(super) fn references_disjoint(
 /// [`UpdatePredicate`]'s two range maps.
 pub(super) fn merged_updates_disjoint(
     merged: &MergedUpdates,
-    read_ranges: Option<&[HashMap<EcoString, ColumnRange>]>,
+    read_ranges: Option<&[ReferenceRanges]>,
     read_columns: Option<&HashSet<EcoString>>,
 ) -> bool {
-    merged.iter().all(|((where_columns, set_columns), tuples)| {
-        set_unreferenced(set_columns, read_columns)
-            || references_disjoint(read_ranges, |ranges| {
-                merged_update_shape_disjoint(where_columns, set_columns, tuples, ranges)
-            })
+    let shapes: SmallVec<[_; 4]> = merged
+        .iter()
+        .filter(|((_, set_columns), _)| !set_unreferenced(set_columns, read_columns))
+        .collect();
+    if shapes.is_empty() {
+        return true;
+    }
+    references_disjoint(read_ranges, |ranges| {
+        shapes.iter().all(|((where_columns, set_columns), tuples)| {
+            merged_update_shape_disjoint(where_columns, set_columns, tuples, ranges)
+        })
     })
 }
 
@@ -386,14 +386,8 @@ fn merged_update_shape_disjoint(
     where_columns: &[EcoString],
     set_columns: &[EcoString],
     tuples: &[(EqualityTuple, SetTuple)],
-    read_ranges: &HashMap<EcoString, ColumnRange>,
+    read_ranges: &ReferenceRanges,
 ) -> bool {
-    if read_ranges
-        .values()
-        .any(|range| matches!(range, ColumnRange::Empty))
-    {
-        return true;
-    }
     // Resolve the shape's columns against the read once.
     let where_constrained: SmallVec<[(usize, &ColumnRange); 2]> = where_columns
         .iter()

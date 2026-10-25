@@ -33,7 +33,7 @@ use crate::pg;
 use crate::pg::Lsn;
 use crate::pg::cdc::MESSAGE_PREFIX;
 use crate::pg::protocol::ByteString;
-use crate::query::update::read_ranges;
+use crate::query::update::ReadRanges;
 use crate::query::{Fingerprint, FingerprintSet};
 use crate::settings::{PgSettings, Settings};
 
@@ -665,7 +665,7 @@ impl WriterCore {
             .is_some_and(|q| q.reference_only);
         let read_columns = Arc::new(serving.bound.columns_by_table());
         let privilege_needs = Arc::new(serving.bound.privilege_needs());
-        let read_ranges = Arc::new(read_ranges(&serving.bound));
+        let read_ranges = Arc::new(ReadRanges::build(&serving.bound));
         self.state_view
             .cached_queries
             .entry(fingerprint)

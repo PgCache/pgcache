@@ -15,9 +15,9 @@ use super::{DisjointKinds, RawBlocker, RawDecision, RawForwardReason};
 use crate::cache::WriteAliasMap;
 use crate::pg::Lsn;
 use crate::query::ast::rope::QueryTree;
-use crate::query::constraints::{ColumnRange, column_ranges_disjoint, table_column_ranges};
+use crate::query::constraints::{column_ranges_disjoint, table_column_ranges};
 use crate::query::resolve::ColumnsByTable;
-use crate::query::update::ReadRanges;
+use crate::query::update::{ReadRanges, ReferenceRanges};
 use crate::query::write::{RelationRef, WriteClass};
 
 /// The schema variants of one table name with pending writes. Keyed by bare
@@ -293,8 +293,8 @@ impl WriteLog {
     /// `read_ranges` are the read's per-column value ranges per table reference
     /// (PGC-369, PGC-512), used for row-level disjointness: a pending write is
     /// ruled out when every reference of its table is disjoint from it. `None`
-    /// (an unregistered read), a table without an entry, or a reference without
-    /// ranges makes any pending row write on that table forward conservatively.
+    /// is an unregistered read; a table [`ReadRanges`] leaves out forwards on
+    /// any pending row write.
     pub(crate) fn decide(
         &self,
         query: &QueryTree,
@@ -315,9 +315,7 @@ impl WriteLog {
             self.table_intersects(
                 schema,
                 name,
-                read_ranges
-                    .and_then(|ranges| ranges.get(name))
-                    .map(Vec::as_slice),
+                read_ranges.and_then(|ranges| ranges.references(name)),
                 read_columns.and_then(|columns| columns.get(name)),
                 &mut kinds,
             )
@@ -340,7 +338,7 @@ impl WriteLog {
         &self,
         table_schema: Option<&str>,
         table_name: &str,
-        read_ranges: Option<&[HashMap<EcoString, ColumnRange>]>,
+        read_ranges: Option<&[ReferenceRanges]>,
         read_columns: Option<&HashSet<EcoString>>,
         kinds: &mut DisjointKinds,
     ) -> Option<RawBlocker> {
@@ -367,7 +365,7 @@ impl WriteLog {
     /// UPDATE, the read never references a column it assigns.
     fn aggregate_intersects(
         agg: &TableAggregate,
-        read_ranges: Option<&[HashMap<EcoString, ColumnRange>]>,
+        read_ranges: Option<&[ReferenceRanges]>,
         read_columns: Option<&HashSet<EcoString>>,
         kinds: &mut DisjointKinds,
     ) -> bool {

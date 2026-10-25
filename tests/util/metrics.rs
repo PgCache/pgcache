@@ -65,6 +65,8 @@ pub(crate) struct MetricsSnapshot {
     pub raw_writes_recorded: u64,
     /// Commit-LSN probes injected to bound pending writes (PGC-124).
     pub raw_probes: u64,
+    /// Reads the read-after-write gate forwarded over a pending write to a table they reference.
+    pub raw_forwards_table: u64,
     /// Pending-INSERT aggregates the gate proved a read disjoint from (PGC-124).
     pub raw_serve_disjoint_insert: u64,
     pub raw_serve_disjoint_delete: u64,
@@ -129,6 +131,7 @@ const SAMPLES: &[Sample] = samples! {
     "pgcache_queries_privilege_forwards{reason=\"denied\"}" => queries_privilege_forward_denied,
     "pgcache_raw_writes_recorded" => raw_writes_recorded,
     "pgcache_raw_probes" => raw_probes,
+    "pgcache_raw_forwards{scope=\"table\"}" => raw_forwards_table,
     "pgcache_raw_serve_disjoint_insert" => raw_serve_disjoint_insert,
     "pgcache_raw_serve_disjoint_delete" => raw_serve_disjoint_delete,
     "pgcache_raw_serve_disjoint_update" => raw_serve_disjoint_update,

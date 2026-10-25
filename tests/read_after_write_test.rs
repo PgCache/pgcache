@@ -1357,6 +1357,16 @@ async fn test_gate_anti_join_left_join_insert_forwards() -> Result<(), Error> {
         delta.raw_serve_disjoint_insert >= 1,
         "row-level disjointness proof expected"
     );
+    // `by_k` has no range on ajb, so the same pending insert forwards it.
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(by_k).await?;
+    assert_row_at(&res, 1, &[("id", "2")])?;
+    let delta = metrics_delta(&m, &ctx.metrics().await?);
+    assert_eq!(
+        delta.raw_forwards_table, 1,
+        "anti-join read without a range on the inserted table must forward"
+    );
+    assert_eq!(delta.queries_cache_hit, 0, "unexpected cache hit");
 
     // aid = 2 matches aja(2), the last row of both reads → both forward.
     ctx.simple_query("INSERT INTO ajb (id, aid) VALUES (11, 2)")

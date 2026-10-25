@@ -164,7 +164,7 @@ fn ranges(col: &str, range: ColumnRange) -> ReadRanges {
 
 /// The read's ranges on `table`: one map per reference of it.
 fn read_ranges(table: &str, references: Vec<HashMap<EcoString, ColumnRange>>) -> ReadRanges {
-    HashMap::from([(table.into(), references)])
+    ReadRanges::from_tables([(table.into(), references)])
 }
 
 fn id_equal(value: i64) -> HashMap<EcoString, ColumnRange> {

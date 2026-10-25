@@ -1,10 +1,12 @@
 #[cfg(feature = "proxy")]
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::collections::HashSet;
 
 #[cfg(feature = "proxy")]
 use ecow::EcoString;
 
 use crate::cache::{SubqueryKind, UpdateQuerySource};
+use crate::catalog::TableMetadata;
 use crate::oid::Oid;
 use crate::query::ast::rope::{
     Body, JoinQual, Query, Scalar, ScalarKind, Select, SelectItem, Source, Table, Where, WhereKind,
@@ -13,63 +15,124 @@ use crate::query::ast::{SubLinkType, UnaryOp};
 #[cfg(feature = "proxy")]
 use crate::query::constraints::ColumnRange;
 use crate::query::predicates::{OuterJoinRole, RelationPredicates, query_branch_predicates_build};
+use crate::query::resolve::{QueryBranch, ResolvedQuery, TableSlot};
 
-#[cfg(feature = "proxy")]
-use crate::query::resolve::TableSlot;
-use crate::query::resolve::{QueryBranch, ResolvedQuery};
+/// One base-table reference of a read with what its branch's predicate
+/// model says about it: `None` when the model can't project the reference's
+/// filters onto the table's columns.
+pub struct BaseReference<'a> {
+    pub table: &'a TableMetadata,
+    pub predicates: Option<RelationPredicates>,
+}
 
-/// The per-column ranges of every base-table reference of a read, by table
-/// name, for the read-after-write gate's row-level disjointness: a
-/// reference's filters are a necessary condition on the rows that reach its
-/// branch's result, so a pending write disjoint from every reference of a
-/// table can't change the read (PGC-512). A table with a reference the model
-/// can't project to column names is left out; a reference without filters
-/// is an empty map; both prove nothing. The NULL-filled side of an outer
-/// join takes no filter from the WHERE (an insert there can remove preserved
-/// rows), only what the preserved side's filters carry over the ON equality.
-#[cfg(feature = "proxy")]
-pub(crate) type ReadRanges = HashMap<EcoString, Vec<HashMap<EcoString, ColumnRange>>>;
+/// The base-table references of a read across its SELECT branches: the
+/// root, every subquery, and a CTE body once per reference to it.
+pub struct BaseReferences<'a> {
+    pub references: Vec<BaseReference<'a>>,
+    /// Base tables no branch lists as a reference: read some way the model
+    /// doesn't cover.
+    pub uncovered: Vec<&'a TableMetadata>,
+}
 
-#[cfg(feature = "proxy")]
-pub(crate) fn read_ranges(bound: &ResolvedQuery) -> ReadRanges {
+pub fn query_base_references(bound: &ResolvedQuery) -> BaseReferences<'_> {
     let bindings = bound.bindings();
-    let mut ranges = ReadRanges::new();
+    let mut references = Vec::new();
     let mut seen = HashSet::new();
-    let mut unknown = HashSet::new();
     for (select, _) in select_branches_with_source(bound.tree().root()) {
         let predicates = query_branch_predicates_build(bound, select);
         for reference in predicates.table_references() {
             let Some(TableSlot::Base { table, .. }) = bindings.slot(reference.slot) else {
                 continue;
             };
-            // A CTE body is a branch once per reference to it.
-            if !seen.insert(reference.slot.index()) {
-                continue;
-            }
-            match predicates.relation_predicates(bindings, reference.slot) {
-                Some(relation) => ranges
-                    .entry(table.name.clone())
-                    .or_default()
-                    .push(relation.ranges.bare_columns()),
-                None => {
-                    unknown.insert(table.name.clone());
+            seen.insert(reference.slot.index());
+            references.push(BaseReference {
+                table,
+                predicates: predicates.relation_predicates(bindings, reference.slot),
+            });
+        }
+    }
+    let uncovered = bindings
+        .slots()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, slot)| match slot {
+            TableSlot::Base { table, .. } if !seen.contains(&index) => Some(table.as_ref()),
+            TableSlot::Base { .. } | TableSlot::Derived { .. } => None,
+        })
+        .collect();
+    BaseReferences {
+        references,
+        uncovered,
+    }
+}
+
+/// One table reference's per-column ranges.
+#[cfg(feature = "proxy")]
+pub(crate) type ReferenceRanges = HashMap<EcoString, ColumnRange>;
+
+/// The per-column ranges of every base-table reference of a read, by table
+/// name, for the read-after-write gate's row-level disjointness: a
+/// reference's filters are a necessary condition on the rows that reach its
+/// branch's result, so a pending write disjoint from every reference of a
+/// table can't change the read (PGC-512). A table is listed only when every
+/// reference of it has ranges the gate can use; one without filters (an
+/// unfiltered join side), one whose filters the model can't project to
+/// column names, or one read some way the model doesn't cover proves
+/// nothing and leaves its table out. The NULL-filled side of an outer join
+/// takes no filter from the WHERE (an insert there can remove preserved
+/// rows), only what the preserved side's filters carry over the ON equality.
+#[cfg(feature = "proxy")]
+#[derive(Debug, Default)]
+pub(crate) struct ReadRanges {
+    tables: HashMap<EcoString, Vec<ReferenceRanges>>,
+}
+
+#[cfg(feature = "proxy")]
+impl ReadRanges {
+    pub(crate) fn build(bound: &ResolvedQuery) -> Self {
+        let base = query_base_references(bound);
+        let mut tables: HashMap<EcoString, Option<Vec<ReferenceRanges>>> = HashMap::new();
+        for reference in base.references {
+            let entry = tables
+                .entry(reference.table.name.clone())
+                .or_insert_with(|| Some(Vec::new()));
+            match (reference.predicates, entry) {
+                (Some(relation), Some(references)) => {
+                    references.push(relation.ranges.bare_columns());
                 }
+                (Some(_), None) => {}
+                (None, entry) => *entry = None,
             }
         }
+        for table in base.uncovered {
+            tables.insert(table.name.clone(), None);
+        }
+        Self::from_tables(
+            tables
+                .into_iter()
+                .filter_map(|(table, references)| Some((table, references?))),
+        )
     }
-    // A base table no branch lists as a reference is read some way the
-    // model doesn't cover.
-    for (index, slot) in bindings.slots().iter().enumerate() {
-        if let TableSlot::Base { table, .. } = slot
-            && !seen.contains(&index)
-        {
-            unknown.insert(table.name.clone());
+
+    /// `tables` without those some reference of which has no ranges.
+    pub(crate) fn from_tables(
+        tables: impl IntoIterator<Item = (EcoString, Vec<ReferenceRanges>)>,
+    ) -> Self {
+        Self {
+            tables: tables
+                .into_iter()
+                .filter(|(_, references)| {
+                    !references.is_empty() && references.iter().all(|ranges| !ranges.is_empty())
+                })
+                .collect(),
         }
     }
-    for table in unknown {
-        ranges.remove(&table);
+
+    /// The ranges of each reference of `table`, each with at least one
+    /// column; `None` when the read proves nothing about the table.
+    pub(crate) fn references(&self, table: &str) -> Option<&[ReferenceRanges]> {
+        self.tables.get(table).map(Vec::as_slice)
     }
-    ranges
 }
 
 /// One table's update query: the branch it sits in, as the cache
@@ -397,7 +460,8 @@ mod tests {
             );
         }
         let bound = ResolvedQuery::parse_resolve(sql, &tables, &["public"]).expect("resolve");
-        let mut tables: ReadLines = read_ranges(&bound)
+        let mut tables: ReadLines = ReadRanges::build(&bound)
+            .tables
             .iter()
             .map(|(table, references)| {
                 let mut references: Vec<ReferenceLines> = references
@@ -421,19 +485,19 @@ mod tests {
 
     /// Every base-table reference of a read contributes its own filters'
     /// ranges under its table, whatever else the read does: an unrecognized
-    /// conjunct, a derived table, a join or self-join, a subquery, a set
-    /// operation or a CTE (its body once per reference to it). The
-    /// NULL-filled side of an anti-join takes nothing from the WHERE (its
-    /// `IS NULL` holds on the padding) but does carry the preserved side's
-    /// filter over the ON equality: only a row matching a preserved row in
-    /// the result can change it (PGC-512).
+    /// conjunct, a derived table, a join, a subquery, a set operation or a
+    /// CTE (its body once per reference to it). A table with an unfiltered
+    /// reference, a self-join's other side, is left out. The NULL-filled
+    /// side of an anti-join takes nothing from the WHERE (its `IS NULL`
+    /// holds on the padding) but does carry the preserved side's filter over
+    /// the ON equality: only a row matching a preserved row in the result
+    /// can change it (PGC-512).
     #[cfg(feature = "proxy")]
     #[test]
     fn test_read_ranges() {
         let equal = |column: &str, value: i64| {
             vec![(column.to_owned(), format!("Equal(Integer({value}))"))]
         };
-        let none: ReferenceLines = Vec::new();
         let expected = |tables: Vec<(&str, Vec<ReferenceLines>)>| {
             let mut tables: ReadLines = tables
                 .into_iter()
@@ -467,7 +531,7 @@ mod tests {
             ),
             (
                 "SELECT * FROM t a JOIN t b ON b.id = a.x WHERE a.id = 5",
-                expected(vec![("t", vec![equal("id", 5), none.clone()])]),
+                expected(vec![]),
             ),
             (
                 "SELECT * FROM t WHERE id = 5 AND x IN (SELECT id FROM u WHERE id = 7)",
@@ -485,7 +549,7 @@ mod tests {
             ),
             (
                 "SELECT * FROM t LEFT JOIN u ON u.id = t.x WHERE u.id IS NULL",
-                expected(vec![("t", vec![none.clone()]), ("u", vec![none])]),
+                expected(vec![]),
             ),
             (
                 "SELECT id FROM t WHERE id = 1 UNION SELECT id FROM t WHERE id = 2",

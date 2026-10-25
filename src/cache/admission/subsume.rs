@@ -3,8 +3,6 @@
 //! supplies candidates from its per-relation index plus parent state,
 //! pgcache-fit from its offline registry.
 
-use std::collections::HashSet;
-
 use ecow::EcoString;
 
 use super::{SubsumerCandidate, SubsumerSource};
@@ -14,9 +12,8 @@ use crate::query::constraints::{
     ColumnConstraintKind, TableConstraint, TableRanges, literal_value_canonical_order,
     table_ranges_subsumed,
 };
-use crate::query::predicates::query_branch_predicates_build;
-use crate::query::resolve::{ResolvedQuery, TableSlot};
-use crate::query::update::select_branches_with_source;
+use crate::query::resolve::ResolvedQuery;
+use crate::query::update::query_base_references;
 
 /// One table reference of a new query: its relation and the filters every
 /// row it reads satisfies, as constraints for the source to key and as
@@ -37,33 +34,21 @@ pub struct SubsumptionReference {
 /// one arm, and INTERSECT/EXCEPT read both sides in full, so a missing row
 /// on either would change the result (PGC-495).
 pub fn subsumption_references(bound: &ResolvedQuery) -> Option<Vec<SubsumptionReference>> {
-    let bindings = bound.bindings();
-    let mut references = Vec::new();
-    let mut seen = HashSet::new();
-    for (select, _) in select_branches_with_source(bound.tree().root()) {
-        let predicates = query_branch_predicates_build(bound, select);
-        for reference in predicates.table_references() {
-            let Some(TableSlot::Base { table, .. }) = bindings.slot(reference.slot) else {
-                continue;
-            };
-            // A CTE body is a branch once per reference to it.
-            if !seen.insert(reference.slot) {
-                continue;
-            }
-            let relation = predicates.relation_predicates(bindings, reference.slot)?;
-            references.push(SubsumptionReference {
-                relation_oid: table.relation_oid,
+    let base = query_base_references(bound);
+    if !base.uncovered.is_empty() {
+        return None;
+    }
+    base.references
+        .into_iter()
+        .map(|reference| {
+            let relation = reference.predicates?;
+            Some(SubsumptionReference {
+                relation_oid: reference.table.relation_oid,
                 filters: relation.filters,
                 ranges: relation.ranges,
-            });
-        }
-    }
-    let base_slots = bindings
-        .slots()
-        .iter()
-        .filter(|slot| matches!(slot, TableSlot::Base { .. }))
-        .count();
-    (seen.len() == base_slots).then_some(references)
+            })
+        })
+        .collect()
 }
 
 /// Most pieces an in-set split probes; a reference whose split would need
