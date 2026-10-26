@@ -105,6 +105,7 @@ impl WriterRegistration {
     ) -> CacheResult<SubsumptionResult> {
         let fingerprint = identity.fingerprint;
         let bound = Arc::clone(&resolution.bound);
+        let read_facts = Arc::clone(&resolution.read_facts);
         let serve_shape = Arc::clone(&resolution.serve_shape);
         let max_limit = resolution.max_limit;
 
@@ -117,6 +118,7 @@ impl WriterRegistration {
         let serving = QueryServing {
             generation,
             bound,
+            read_facts,
             serve_shape,
             max_limit,
         };

@@ -37,11 +37,7 @@ use crate::proxy::client_stream::{ClientSocket, ClientStream, OwnedClientReadHal
 use crate::proxy::query::{Action, ForwardReason, handle_query};
 use crate::proxy::session_settings::SessionSettings;
 use crate::proxy::{ConnectionError, ConnectionResult, ProxyMode, ProxyStatus};
-use crate::query::SessionKey;
-use crate::query::ast::rope::QueryTree;
 use crate::query::guc::Guc;
-use crate::query::keying_settings::KeyingSettings;
-use crate::query::update::ReadRelations;
 use crate::query::write::StatementEffects;
 use crate::result::ReportExt;
 use crate::{
@@ -311,16 +307,14 @@ async fn handle_connection(
                         let read_query = bound.as_ref().map_or(cq.tree(), CacheableQuery::tree);
                         let read = concerned
                             .then(|| {
-                                read_relations(
-                                    read_query,
-                                    session_key,
-                                    &keying,
-                                    &state.dispatch_handle,
-                                )
+                                let key =
+                                    session_key.unwrap_or_else(|| keying.session_key(read_query));
+                                state.dispatch_handle.cached_query_read_facts(key)
                             })
                             .flatten();
                         let m = crate::metrics::handles();
-                        match state.write_log.decide(read_query, read.as_deref()) {
+                        let relations = read.as_ref().map(|facts| &facts.relations);
+                        match state.write_log.decide(read_query, relations) {
                             RawDecision::Forward(reason, blocker) => {
                                 // Inside a block the intersecting write is the
                                 // block's own uncommitted one (never stamped until
@@ -546,20 +540,6 @@ fn read_query_bound(msg: &CacheMessage) -> Option<CacheableQuery> {
         return None;
     }
     cq.parameters_replace(parameters).ok()
-}
-
-/// What the read-after-write gate decides a registered read with: the exact
-/// relations it touches (PGC-542), the columns it references on each and its
-/// per-reference ranges (PGC-369/381/382/512), from its registered resolved
-/// form. An unregistered read yields nothing and is matched by name.
-fn read_relations(
-    query: &QueryTree,
-    session_key: Option<SessionKey>,
-    keying: &KeyingSettings,
-    dispatch_handle: &CacheDispatchHandle,
-) -> Option<Arc<ReadRelations>> {
-    let key = session_key.unwrap_or_else(|| keying.session_key(query));
-    Some(dispatch_handle.cached_query_read_form(key)?.relations)
 }
 
 /// Test-only forward tag (`PGCACHE_FAULT_FORWARD_NOTICE`): a cacheable read

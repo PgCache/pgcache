@@ -16,7 +16,7 @@ use crate::cache::admission::{
 };
 use crate::cache::messages::RegisterRequest;
 use crate::cache::mv::{query_has_join, query_has_window};
-use crate::cache::types::SharedQueryShape;
+use crate::cache::types::{ReadFacts, SharedQueryShape};
 use crate::cache::update_query::{UpdateQueries, UpdateQueryRegistration};
 use crate::cache::writer::core::WriterCore;
 use crate::cache::{CacheError, CacheResult, ReportExt};
@@ -189,10 +189,12 @@ impl WriterRegistration {
             .record(uq_start.elapsed().as_secs_f64());
 
         let population = decorrelated.unwrap_or_else(|| Arc::clone(&bound));
+        let read_facts = Arc::new(ReadFacts::build(&bound));
         Ok(QueryResolution {
             serve_shape,
             relation_oids,
             bound,
+            read_facts,
             population,
             max_limit,
             mv_limit,

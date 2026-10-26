@@ -24,7 +24,7 @@ use crate::cache::{
     mv_shape::ShapeGate,
     types::{
         ActiveRelations, Cache, CacheStateView, CachedQueryState, CachedQueryView,
-        SharedQueryShape, SharedResolvedQuery,
+        SharedQueryShape, SharedReadFacts, SharedResolvedQuery,
     },
 };
 use crate::catalog::CatalogTable;
@@ -33,7 +33,6 @@ use crate::pg;
 use crate::pg::Lsn;
 use crate::pg::cdc::MESSAGE_PREFIX;
 use crate::pg::protocol::ByteString;
-use crate::query::update::ReadRelations;
 use crate::query::{Fingerprint, FingerprintSet};
 use crate::settings::{PgSettings, Settings};
 
@@ -123,6 +122,7 @@ pub(crate) struct WriterShared {
 pub(super) struct QueryServing {
     pub(super) generation: Generation,
     pub(super) bound: SharedResolvedQuery,
+    pub(super) read_facts: SharedReadFacts,
     pub(super) serve_shape: SharedQueryShape,
     pub(super) max_limit: Option<u64>,
 }
@@ -663,11 +663,6 @@ impl WriterCore {
             .cached_queries
             .get1(&fingerprint)
             .is_some_and(|q| q.reference_only);
-        let privilege_needs = Arc::new(serving.bound.privilege_needs());
-        let read_relations = Arc::new(ReadRelations::build(
-            &serving.bound,
-            &privilege_needs.relations,
-        ));
         self.state_view
             .cached_queries
             .entry(fingerprint)
@@ -675,8 +670,7 @@ impl WriterCore {
                 v.state = state;
                 v.generation = serving.generation;
                 v.bound = Some(Arc::clone(&serving.bound));
-                v.privilege_needs = Some(Arc::clone(&privilege_needs));
-                v.read_relations = Some(Arc::clone(&read_relations));
+                v.read_facts = Some(Arc::clone(&serving.read_facts));
                 v.serve_shape = Some(Arc::clone(&serving.serve_shape));
                 v.max_limit = serving.max_limit;
                 v.reference_only = reference_only;
@@ -686,8 +680,7 @@ impl WriterCore {
                 state,
                 generation: serving.generation,
                 bound: Some(Arc::clone(&serving.bound)),
-                privilege_needs: Some(privilege_needs),
-                read_relations: Some(read_relations),
+                read_facts: Some(Arc::clone(&serving.read_facts)),
                 serve_shape: Some(Arc::clone(&serving.serve_shape)),
                 max_limit: serving.max_limit,
                 reference_only,

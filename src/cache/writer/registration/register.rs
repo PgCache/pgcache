@@ -76,7 +76,7 @@ impl WriterRegistration {
         if let Some(role) = &request.effective_role
             && request.admit_action != AdmitAction::CheckOnly
         {
-            core.privilege_prefetch(role, &resolution.bound.privilege_needs())
+            core.privilege_prefetch(role, &resolution.read_facts.privilege_needs)
                 .await;
         }
 

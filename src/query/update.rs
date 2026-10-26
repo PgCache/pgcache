@@ -637,8 +637,8 @@ mod tests {
             &["public"],
         )
         .expect("resolve");
-        let columns = bound.privilege_needs().relations;
-        let relations = ReadRelations::build(&bound, &columns);
+        let needs = bound.privilege_needs();
+        let relations = ReadRelations::build(&bound, &needs.relations);
         let s1 = relations
             .relations
             .get(&Oid::from_raw(2001))

@@ -57,6 +57,8 @@ pub struct CachedQuery {
     pub generation: Generation,
     pub relation_oids: Vec<Oid>,
     pub bound: SharedResolvedQuery,
+    /// What a hit on `bound` must prove, built once with it.
+    pub(crate) read_facts: SharedReadFacts,
     /// The tree population reads: the decorrelated form of `bound`, or
     /// `bound` itself when nothing was correlated.
     pub population: SharedResolvedQuery,
@@ -452,14 +454,31 @@ impl CacheStateView {
     }
 }
 
-/// A Ready cached query's registered form as the read-after-write gate
-/// reasons about it.
-#[derive(Debug, Clone)]
-pub struct CachedReadForm {
+/// What a hit on a cached query must prove, derived once from its bound
+/// query at registration and shared by the entry, its view and every
+/// serving handoff (PGC-543).
+#[derive(Debug)]
+pub(crate) struct ReadFacts {
+    /// What a role must be allowed to read for a hit (PGC-463).
+    pub(crate) privilege_needs: PrivilegeNeeds,
     /// The relations the read touches, with the columns it references and
-    /// its per-reference ranges on each (PGC-512, PGC-542).
-    pub(crate) relations: Arc<ReadRelations>,
+    /// its per-reference ranges on each, for the read-after-write gate
+    /// (PGC-512, PGC-542).
+    pub(crate) relations: ReadRelations,
 }
+
+impl ReadFacts {
+    pub(crate) fn build(bound: &ResolvedQuery) -> Self {
+        let privilege_needs = bound.privilege_needs();
+        let relations = ReadRelations::build(bound, &privilege_needs.relations);
+        Self {
+            privilege_needs,
+            relations,
+        }
+    }
+}
+
+pub(super) type SharedReadFacts = Arc<ReadFacts>;
 
 /// Lightweight view of a cached query for dispatch lookups.
 #[derive(Debug, Clone)]
@@ -469,13 +488,8 @@ pub struct CachedQueryView {
     pub generation: Generation,
     /// The bound query (None for Loading placeholder before writer resolves)
     pub bound: Option<SharedResolvedQuery>,
-    /// What a role must be allowed to read for a hit on `bound` (PGC-463);
-    /// set with `bound`.
-    pub privilege_needs: Option<Arc<PrivilegeNeeds>>,
-    /// The relations `bound` touches, with the columns it references and its
-    /// per-reference ranges on each, for the read-after-write gate (PGC-512,
-    /// PGC-542); set with `bound`.
-    pub(crate) read_relations: Option<Arc<ReadRelations>>,
+    /// What a hit on `bound` must prove; set with `bound`.
+    pub(crate) read_facts: Option<SharedReadFacts>,
     /// Parameterized serve shape (mirrors `CachedQuery.serve_shape`, PGC-294).
     /// None while Loading; Some once the view transitions to Ready.
     pub serve_shape: Option<SharedQueryShape>,

@@ -26,7 +26,9 @@ use crate::cache::Generation;
 use crate::cache::messages::{QueryCommand, RegisterRequest, ResolveRequest, ResolveResult};
 use crate::cache::mv_shape::ShapeGate;
 use crate::cache::population_pool::PopulationPool;
-use crate::cache::types::{Alias, CachedQuery, SharedQueryShape, SharedResolvedQuery};
+use crate::cache::types::{
+    Alias, CachedQuery, SharedQueryShape, SharedReadFacts, SharedResolvedQuery,
+};
 use crate::cache::{CacheError, CacheResult, MapIntoReport, ReportExt};
 use crate::catalog::{TableMetadata, aggregate_functions_load};
 use crate::oid::Oid;
@@ -69,6 +71,8 @@ pub(super) struct QueryResolution {
     pub(super) relation_oids: Vec<Oid>,
     /// The canonical plain tree with its bindings (ADR-057).
     pub(super) bound: SharedResolvedQuery,
+    /// See `CachedQuery.read_facts`.
+    pub(super) read_facts: SharedReadFacts,
     /// See `CachedQuery.population`.
     pub(super) population: SharedResolvedQuery,
     pub(super) max_limit: Option<u64>,
@@ -122,6 +126,7 @@ pub(super) fn cached_query_insert(
         generation,
         relation_oids: resolution.relation_oids,
         bound: resolution.bound,
+        read_facts: resolution.read_facts,
         population: resolution.population,
         serve_shape: resolution.serve_shape,
         max_limit: resolution.max_limit,

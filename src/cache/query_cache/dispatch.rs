@@ -27,14 +27,13 @@ use crate::cache::reg_bucket::RegRateBucket;
 use crate::cache::reply::ReplySender;
 use crate::cache::serve_decision::{DecisionInput, EntrySnapshot, ServeDecision, serve_decide};
 use crate::cache::types::{
-    CacheStateView, CachedQueryState, CachedQueryView, CachedReadForm, QueryMetrics, WriteTargetMap,
+    CacheStateView, CachedQueryState, CachedQueryView, QueryMetrics, ReadFacts, WriteTargetMap,
 };
 use crate::cache::{CacheError, CacheResult, fast_path};
 use crate::pg::Lsn;
 use crate::proxy::ClientSocket;
 use crate::query::ast::LimitClause;
 use crate::query::keying_settings::KeyingSettings;
-use crate::query::resolve::PrivilegeNeeds;
 use crate::query::{Fingerprint, SessionKey};
 use crate::result::error_chain_format;
 use crate::settings::{CachePolicy, DynamicConfig, Settings};
@@ -136,15 +135,13 @@ impl CacheDispatch {
     /// node the writer produced at registration. `None` for unregistered or
     /// still-loading queries, or a session key with no alias yet (the gate
     /// then forwards conservatively).
-    pub fn cached_query_read_form(&self, key: SessionKey) -> Option<CachedReadForm> {
+    pub(crate) fn cached_query_read_facts(&self, key: SessionKey) -> Option<Arc<ReadFacts>> {
         let fingerprint = self.fingerprint_for_key(key)?;
         let view = self.state_view.cached_queries.get(&fingerprint)?;
         if !matches!(view.state, CachedQueryState::Ready) {
             return None;
         }
-        Some(CachedReadForm {
-            relations: view.read_relations.clone()?,
-        })
+        view.read_facts.clone()
     }
 
     /// The fingerprint the alias map has for a session key; `None` is an
@@ -443,9 +440,9 @@ impl CacheDispatch {
     /// Whether `role` may be served a read needing `needs` (PGC-463). A
     /// missing verdict forwards the read and asks the writer to look it up;
     /// a denied one forwards it to origin's own error.
-    pub(super) fn privilege_gate(&self, role: &EcoString, needs: Option<&PrivilegeNeeds>) -> bool {
+    pub(super) fn privilege_gate(&self, role: &EcoString, facts: Option<&ReadFacts>) -> bool {
         let m = crate::metrics::handles();
-        let Some(needs) = needs else {
+        let Some(needs) = facts.map(|facts| &facts.privilege_needs) else {
             debug_assert!(false, "Ready entry without privilege needs");
             m.query.privilege_forward_pending.increment(1);
             return false;
@@ -522,7 +519,7 @@ impl CacheDispatch {
             bound: Some(bound),
             serve_shape: Some(serve_shape),
             reference_only,
-            privilege_needs,
+            read_facts,
             ..
         }) = entry
         else {
@@ -542,7 +539,7 @@ impl CacheDispatch {
                 .increment(1);
             return msg.forward();
         }
-        if !self.privilege_gate(&msg.effective_role, privilege_needs.as_deref()) {
+        if !self.privilege_gate(&msg.effective_role, read_facts.as_deref()) {
             return msg.forward();
         }
         self.metrics_hit_record(fingerprint);
@@ -669,8 +666,7 @@ impl CacheDispatch {
                         state: transition.new,
                         generation: Generation::ZERO,
                         bound: None,
-                        privilege_needs: None,
-                        read_relations: None,
+                        read_facts: None,
                         serve_shape: None,
                         max_limit: None,
                         reference_only: false,

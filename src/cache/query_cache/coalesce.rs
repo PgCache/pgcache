@@ -8,9 +8,8 @@ use crate::cache::Generation;
 use crate::cache::messages::slices_concat;
 use crate::cache::query::{limit_is_sufficient, limit_rows_needed};
 use crate::cache::reference_settings::{self, ReferenceSettings};
-use crate::cache::types::{SharedQueryShape, SharedResolvedQuery};
+use crate::cache::types::{ReadFacts, SharedQueryShape, SharedResolvedQuery};
 use crate::query::Fingerprint;
-use crate::query::resolve::PrivilegeNeeds;
 use crate::result::error_chain_format;
 
 /// What a Ready entry serves its drained waiters, read once per drain.
@@ -22,8 +21,9 @@ struct DrainServing {
     max_limit: Option<u64>,
     /// `Some` for a reference-only entry: the settings a waiter must be on.
     reference: Option<Arc<ReferenceSettings>>,
-    /// What a waiter's role must be allowed to read (PGC-463).
-    privilege_needs: Option<Arc<PrivilegeNeeds>>,
+    /// The read's facts; a waiter's role is checked against its privilege
+    /// needs (PGC-463).
+    read_facts: Option<Arc<ReadFacts>>,
 }
 
 /// The gate a direct hit applies in `ready_hit`, for a reference-only entry:
@@ -72,13 +72,11 @@ impl CacheDispatch {
             return;
         };
 
-        let (reference_only, privilege_needs) = self
+        let (reference_only, read_facts) = self
             .state_view
             .cached_queries
             .get(&fingerprint)
-            .map_or((false, None), |v| {
-                (v.reference_only, v.privilege_needs.clone())
-            });
+            .map_or((false, None), |v| (v.reference_only, v.read_facts.clone()));
         let serving = DrainServing {
             fingerprint,
             generation,
@@ -86,7 +84,7 @@ impl CacheDispatch {
             serve_shape,
             max_limit,
             reference: reference_only.then(reference_settings::current),
-            privilege_needs,
+            read_facts,
         };
 
         let served: u64 = groups
@@ -113,11 +111,11 @@ impl CacheDispatch {
     fn waiters_privileged(
         &self,
         waiters: Vec<QueryRequest>,
-        needs: Option<&PrivilegeNeeds>,
+        facts: Option<&ReadFacts>,
     ) -> Vec<QueryRequest> {
         let (served, forwarded): (Vec<_>, Vec<_>) = waiters
             .into_iter()
-            .partition(|w| self.privilege_gate(&w.effective_role, needs));
+            .partition(|w| self.privilege_gate(&w.effective_role, facts));
         for msg in forwarded {
             let _ = msg.forward();
         }
@@ -136,7 +134,7 @@ impl CacheDispatch {
             w.timing.drain_started_at = Some(drain_started);
         }
         waiters = waiters_on_reference(waiters, serving.reference.as_deref());
-        waiters = self.waiters_privileged(waiters, serving.privilege_needs.as_deref());
+        waiters = self.waiters_privileged(waiters, serving.read_facts.as_deref());
         if waiters.is_empty() {
             return 0;
         }
