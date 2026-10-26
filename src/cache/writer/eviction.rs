@@ -17,6 +17,16 @@ use crate::settings::CachePolicy;
 /// are referenced.
 const MAX_BUMPS: usize = 5;
 
+/// Pending inserts per unit of safety decay. A Pending entry loses one
+/// credit per this many inserts, counted across ticks, so it is gone once
+/// `divisor * credit` more first-sight queries have arrived however they
+/// are paced, and the set never exceeds `divisor` times the largest stamp:
+/// with the 100 floor of `dispatch::MIN_PENDING_CREDIT`, 10,000 entries in
+/// cold start. The term outweighs the hit decay only when inserts exceed
+/// `divisor` times the hits, so a merely high miss rate still decays on hits
+/// alone (PGC-547).
+pub(super) const PENDING_SAFETY_DIVISOR: u32 = 100;
+
 /// What eviction does with one candidate.
 enum CandidateAction {
     /// Pinned and Ready: bump past it (never evicted).
@@ -335,11 +345,27 @@ impl WriterCore {
         Ok(())
     }
 
+    /// Pending credit lost per tick: the tick's hits, or when the Pending set's
+    /// own growth dwarfs them, that growth over [`PENDING_SAFETY_DIVISOR`].
+    /// The hit term is the design (a high miss rate keeps candidates longer);
+    /// the growth term only bounds the set where hits never come. Inserts
+    /// below one unit carry over, so a trickle is charged exactly, not
+    /// rounded up to a credit per tick.
+    fn pending_decay(&mut self, hit_delta: u32, insert_delta: u32) -> u32 {
+        let divisor = PENDING_SAFETY_DIVISOR;
+        #[cfg(feature = "fault-injection")]
+        let divisor = fault::pending_safety_divisor().unwrap_or(divisor);
+        let inserts = self.pending_insert_carry.saturating_add(insert_delta);
+        self.pending_insert_carry = inserts % divisor;
+        hit_delta.max(inserts / divisor)
+    }
+
     /// GC dead entries across writer state and the shared state view.
     ///
     /// Four passes:
-    /// - Snapshot the hit counter into `last_hits_per_gc`; the delta seeds
-    ///   dispatch-side Pending-credit sizing and decays existing credits.
+    /// - Snapshot the hit and Pending-insert counters; the hit delta seeds
+    ///   dispatch-side Pending-credit sizing, and [`Self::pending_decay`]
+    ///   of the two decays existing credits.
     /// - Invalidated, non-pinned entries in `cache.cached_queries` whose
     ///   generation is below the purge threshold (CLOCK-policy carryover
     ///   after CDC invalidation that wasn't readmitted).
@@ -358,6 +384,11 @@ impl WriterCore {
         self.state_view
             .last_hits_per_gc
             .store(hit_delta, Ordering::Relaxed);
+        let insert_delta = self
+            .state_view
+            .pending_inserts_since_gc
+            .swap(0, Ordering::Relaxed);
+        let decay = self.pending_decay(hit_delta, insert_delta);
 
         // Remove invalidated entries from cached_queries that are below threshold
         let stale_fingerprints: Vec<Fingerprint> = self
@@ -381,7 +412,7 @@ impl WriterCore {
             .cached_queries
             .retain(|_fp, entry| match &mut entry.state {
                 CachedQueryState::Pending { credit, .. } => {
-                    *credit = credit.saturating_sub(hit_delta);
+                    *credit = credit.saturating_sub(decay);
                     *credit > 0
                 }
                 CachedQueryState::Invalidated => entry.generation >= cleanup_threshold,

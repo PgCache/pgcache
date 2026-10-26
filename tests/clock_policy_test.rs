@@ -3,6 +3,8 @@ use std::time::{Duration, Instant};
 
 use tokio::time::sleep;
 
+#[cfg(feature = "fault-injection")]
+use crate::util::http_put;
 use crate::util::{
     MetricsSnapshot, TestContext, assert_cache_hit, assert_cache_miss, assert_row_at,
 };
@@ -229,6 +231,61 @@ async fn test_pending_miss_holds_no_memo_slot() -> Result<(), Error> {
     ctx.simple_query(query_str).await?;
     ctx.cache_settle().await?;
     gauges_wait(&mut ctx, timeout, |m| m.cache_memo_slots == 1).await?;
+
+    Ok(())
+}
+
+/// The Pending set is bounded without hits (PGC-547). A stream of distinct
+/// one-off queries at threshold 2 never hits, so hit-only decay would hold
+/// every one of them forever. The growth-keyed safety term purges an entry
+/// once `divisor * credit` later inserts have arrived; with the divisor
+/// forced to 1 and the 100-credit floor, fewer than 100 entries can survive
+/// however many were inserted. The first 50 cannot drain a credit of 100,
+/// so the gauge reading 50 proves the queries take the Pending path before
+/// the bound is asserted.
+#[cfg(feature = "fault-injection")]
+#[tokio::test]
+async fn test_pending_set_bounded_without_hits() -> Result<(), Error> {
+    let mut ctx =
+        TestContext::setup_fault_clock(&[("PGCACHE_FAULT_PENDING_SAFETY_DIVISOR", "1")]).await?;
+    let (status, body) = http_put(
+        ctx.metrics_port,
+        "/config",
+        r#"{"cache_policy": "clock", "admission_threshold": 2}"#,
+    )
+    .await?;
+    assert_eq!(status, 200, "PUT /config failed: {body}");
+    let timeout = Duration::from_secs(10);
+
+    ctx.query(
+        "CREATE TABLE test_pending_bound (id INTEGER PRIMARY KEY, data TEXT)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO test_pending_bound (id, data) VALUES (1, 'foo')",
+        &[],
+    )
+    .await?;
+
+    for id in 0..50 {
+        ctx.simple_query(&format!(
+            "SELECT id, data FROM test_pending_bound WHERE id = {id}"
+        ))
+        .await?;
+    }
+    gauges_wait(&mut ctx, timeout, |m| m.cache_queries_pending == 50).await?;
+
+    for id in 50..400 {
+        ctx.simple_query(&format!(
+            "SELECT id, data FROM test_pending_bound WHERE id = {id}"
+        ))
+        .await?;
+    }
+    // The gauge is published on the writer's 1s tick: let one run after the
+    // inserts so the read below is not phase 1's value of 50.
+    sleep(Duration::from_millis(1500)).await;
+    gauges_wait(&mut ctx, timeout, |m| m.cache_queries_pending < 100).await?;
 
     Ok(())
 }

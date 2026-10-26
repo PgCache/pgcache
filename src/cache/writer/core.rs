@@ -61,6 +61,16 @@ pub(crate) mod fault {
         });
     }
 
+    /// Test override for the Pending safety-decay divisor
+    /// (`PGCACHE_FAULT_PENDING_SAFETY_DIVISOR`): shrinks the Pending set's
+    /// cold-start bound so a test can drive it with a few hundred queries.
+    pub(crate) fn pending_safety_divisor() -> Option<u32> {
+        std::env::var("PGCACHE_FAULT_PENDING_SAFETY_DIVISOR")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|divisor| *divisor > 0)
+    }
+
     /// Test override for the eviction count cap
     /// (`PGCACHE_FAULT_EVICTION_COUNT_CAP`): forces count-driven eviction down to
     /// N cached queries, so eviction tests don't need a disk byte-cap (PGC-276).
@@ -369,6 +379,10 @@ pub(super) struct WriterCore {
     /// refreshes, so the rest of the writer compares against a concrete value
     /// rather than re-defaulting an `Option` (PGC-276).
     pub(super) disk_limit_effective: u64,
+    /// Pending inserts not yet charged as safety decay: the remainder below
+    /// `eviction::PENDING_SAFETY_DIVISOR`, carried across GC ticks so the
+    /// bound counts inserts exactly whatever their pacing (PGC-547).
+    pub(super) pending_insert_carry: u32,
     /// Consecutive 1 s ticks the cache volume has been under disk pressure,
     /// driving the escalating reclaim ladder (purge → MV sweep → drop the
     /// fewest-queries source table). Reset to 0 when pressure clears (PGC-276).
@@ -530,6 +544,7 @@ impl WriterCore {
             disk_total: disk.total,
             disk_available: disk.available,
             disk_limit_effective: disk.limit_effective,
+            pending_insert_carry: 0,
             disk_pressure_ticks: 0,
             disk_drop_backoff: false,
         })

@@ -334,6 +334,11 @@ pub struct CacheStateView {
     /// Previous GC tick's hit count, used by the dispatch to size the
     /// initial credit stamped on new Pending entries (or on Pending re-hits).
     pub last_hits_per_gc: AtomicU32,
+    /// Pending entries inserted during the current GC interval: the growth
+    /// of the Pending set. Bumped by the dispatch on each cold claim that
+    /// lands in Pending; snapshot-and-zeroed by the writer on the GC tick,
+    /// where it bounds the set when hits alone would never drain it.
+    pub pending_inserts_since_gc: AtomicU32,
     /// In-process hot-result cache (PGC-236). Captured by the serve pool, served by
     /// dispatch, evicted (slot-bumped) by the writer's CDC path.
     pub memo: ResultMemo,
@@ -427,6 +432,7 @@ impl CacheStateView {
             started_at: Instant::now(),
             hits_since_gc: AtomicU32::new(0),
             last_hits_per_gc: AtomicU32::new(0),
+            pending_inserts_since_gc: AtomicU32::new(0),
             registration_throttled: Arc::new(AtomicBool::new(false)),
             disk_throttle: Arc::new(AtomicBool::new(false)),
             registered_count: Arc::new(AtomicUsize::new(0)),

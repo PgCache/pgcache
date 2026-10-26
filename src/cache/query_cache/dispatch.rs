@@ -39,8 +39,11 @@ use crate::result::error_chain_format;
 use crate::settings::{CachePolicy, DynamicConfig, Settings};
 use crate::timing::{QueryTiming, duration_to_ns_u64};
 
-/// Minimum credit stamped on a Pending entry. Provides a survival floor during
-/// cold start (when `last_hits_per_gc` is zero) and for low-traffic workloads.
+/// Minimum credit stamped on a Pending entry when the previous tick saw fewer
+/// hits (cold start, low traffic). Without hits a candidate survives this
+/// many units of Pending-set growth, each `eviction::PENDING_SAFETY_DIVISOR`
+/// inserts, which also bounds the set in cold start at floor times divisor
+/// entries.
 const MIN_PENDING_CREDIT: u32 = 100;
 
 /// Test-only deterministic fault injection for the coalesce enqueue/drain race.
@@ -619,9 +622,11 @@ impl CacheDispatch {
 
     /// Credit stamped on a Pending entry at insert and on each re-hit. Sized to
     /// the previous GC tick's hit count (floored at `MIN_PENDING_CREDIT`) so
-    /// candidates survive ~1 GC interval of activity unless re-hit. The writer
-    /// decays `credit` by the current tick's hit delta on every GC pass and
-    /// purges entries that drain to zero.
+    /// candidates survive ~1 GC interval of hits unless re-hit: a high miss
+    /// rate keeps them longer on purpose. The writer decays `credit` by the
+    /// current tick's hit delta (or, when that is dwarfed by the set's own
+    /// growth, by a fraction of the tick's Pending inserts) on every GC pass
+    /// and purges entries that drain to zero.
     fn pending_initial_credit(&self) -> u32 {
         self.state_view
             .last_hits_per_gc
@@ -662,6 +667,11 @@ impl CacheDispatch {
             match self.state_view.cached_queries.entry(fingerprint) {
                 Entry::Occupied(_) => return None,
                 Entry::Vacant(slot) => {
+                    if matches!(transition.new, CachedQueryState::Pending { .. }) {
+                        self.state_view
+                            .pending_inserts_since_gc
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     slot.insert(CachedQueryView {
                         state: transition.new,
                         generation: Generation::ZERO,
