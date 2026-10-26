@@ -11,7 +11,8 @@ use super::{PopulationTarget, WriterRegistration};
 use crate::cache::CacheResult;
 use crate::cache::coalesce_queue::fetch_stage_ewma_update;
 use crate::cache::messages::{PopulationMerge, SubsumptionResult};
-use crate::cache::writer::core::{QueryServing, WriterCore};
+use crate::cache::types::{QueryServing, ServingAt};
+use crate::cache::writer::core::WriterCore;
 use crate::cache::writer::subsumption::subsumed_ready_mark;
 use crate::oid::Oid;
 use crate::query::Fingerprint;
@@ -64,12 +65,15 @@ impl WriterRegistration {
             return Ok(SubsumptionResult::NotSubsumed);
         };
 
-        let serving = QueryServing {
+        let at = ServingAt {
             generation: new_generation,
-            bound: Arc::clone(&cached.bound),
-            read_facts: Arc::clone(&cached.read_facts),
-            serve_shape: Arc::clone(&cached.serve_shape),
-            max_limit: cached.max_limit,
+            serving: Arc::new(QueryServing {
+                bound: Arc::clone(&cached.bound),
+                read_facts: Arc::clone(&cached.read_facts),
+                serve_shape: Arc::clone(&cached.serve_shape),
+                max_limit: cached.max_limit,
+                reference_only: cached.reference_only,
+            }),
         };
 
         cached.generation = new_generation;
@@ -80,12 +84,11 @@ impl WriterRegistration {
         // Refcount unchanged — readmit reuses the existing relation_oids set.
         core.cache.cached_queries.insert_overwrite(cached);
 
-        core.state_loading_transition(fingerprint, &serving);
+        core.state_loading_transition(fingerprint, &at);
 
-        let generation = serving.generation;
-        let max_limit = serving.max_limit;
+        let max_limit = at.serving.max_limit;
         if let Some(cover) = cover {
-            let result = subsumed_ready_mark(core, fingerprint, serving, cover).await;
+            let result = subsumed_ready_mark(core, fingerprint, at, cover).await;
             if matches!(result, SubsumptionResult::Subsumed { .. }) {
                 crate::metrics::handles()
                     .state
@@ -100,7 +103,7 @@ impl WriterRegistration {
             core,
             PopulationTarget {
                 fingerprint,
-                generation,
+                generation: new_generation,
                 population: &population,
                 max_limit,
             },
@@ -121,16 +124,19 @@ impl WriterRegistration {
             .map(|mut query| {
                 query.cached_bytes = merge.cached_bytes;
                 let started_at = query.registration_started_at.take();
-                let serving = QueryServing {
+                let at = ServingAt {
                     generation: query.generation,
-                    bound: Arc::clone(&query.bound),
-                    read_facts: Arc::clone(&query.read_facts),
-                    serve_shape: Arc::clone(&query.serve_shape),
-                    max_limit: query.max_limit,
+                    serving: Arc::new(QueryServing {
+                        bound: Arc::clone(&query.bound),
+                        read_facts: Arc::clone(&query.read_facts),
+                        serve_shape: Arc::clone(&query.serve_shape),
+                        max_limit: query.max_limit,
+                        reference_only: query.reference_only,
+                    }),
                 };
-                (serving, started_at)
+                (at, started_at)
             });
-        let Some((serving, started_at)) = update_info else {
+        let Some((at, started_at)) = update_info else {
             return;
         };
 
@@ -157,7 +163,7 @@ impl WriterRegistration {
             ));
         }
 
-        core.state_ready_transition(fingerprint, serving);
+        core.state_ready_transition(fingerprint, at);
 
         // One unit of drained registration work, for the adaptive-gate
         // drain-rate (capacity) estimate (PGC-277).
@@ -213,6 +219,7 @@ impl WriterRegistration {
         let read_facts = Arc::clone(&cached_query.read_facts);
         let population = Arc::clone(&cached_query.population);
         let serve_shape = Arc::clone(&cached_query.serve_shape);
+        let reference_only = cached_query.reference_only;
         let relation_oids = cached_query.relation_oids.clone();
         let old_generation = cached_query.generation;
 
@@ -229,22 +236,25 @@ impl WriterRegistration {
 
         update_queries_limit_set(core, fingerprint, &relation_oids, new_max_limit.is_some());
 
-        let serving = QueryServing {
+        let at = ServingAt {
             generation: new_generation,
-            bound,
-            read_facts,
-            serve_shape,
-            max_limit: new_max_limit,
+            serving: Arc::new(QueryServing {
+                bound,
+                read_facts,
+                serve_shape,
+                max_limit: new_max_limit,
+                reference_only,
+            }),
         };
-        core.state_loading_transition(fingerprint, &serving);
+        core.state_loading_transition(fingerprint, &at);
 
         self.population_start(
             core,
             PopulationTarget {
                 fingerprint,
-                generation: serving.generation,
+                generation: new_generation,
                 population: &population,
-                max_limit: serving.max_limit,
+                max_limit: new_max_limit,
             },
         )?;
         trace!("limit bump population queued for query {fingerprint}");

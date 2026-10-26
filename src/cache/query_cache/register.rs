@@ -56,11 +56,7 @@ impl CacheDispatch {
                 CachedQueryView {
                     state: CachedQueryState::Loading,
                     generation: Generation::ZERO,
-                    bound: None,
-                    read_facts: None,
-                    serve_shape: None,
-                    max_limit: None,
-                    reference_only: false,
+                    serving: None,
                     referenced: false,
                     // Writer fills this in after resolution/classification.
                     mv: MvMeta::new(ShapeGate::Skip, None),

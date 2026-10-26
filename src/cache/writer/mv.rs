@@ -215,8 +215,8 @@ impl WriterCore {
                             .cached_queries
                             .get_mut(&fingerprint)
                             .map(|mut view| {
-                                let plan = view.bound.as_deref().and_then(|bound| {
-                                    MvServePlan::new(fingerprint, bound, output_columns)
+                                let plan = view.serving.as_ref().and_then(|serving| {
+                                    MvServePlan::new(fingerprint, &serving.bound, output_columns)
                                 });
                                 let installed = plan.is_some();
                                 if let Some(plan) = plan {
@@ -291,10 +291,10 @@ impl WriterCore {
         if view.state != CachedQueryState::Ready {
             return None;
         }
-        let bound = view.bound.as_ref().map(Arc::clone)?;
+        let bound = Arc::clone(&view.serving.as_ref()?.bound);
         let shape_gate = view.mv.shape_gate;
         // MV body uses its own cap (joins only); independent of the
-        // source-row population cap `view.max_limit`.
+        // source-row population cap in the view's serving.
         let max_limit = view.mv.limit;
         let generation = view.generation;
         let output_columns = view

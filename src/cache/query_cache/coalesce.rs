@@ -4,26 +4,21 @@ use std::time::Instant;
 use tracing::error;
 
 use super::{CacheDispatch, CoalescedClient, QueryRequest};
-use crate::cache::Generation;
 use crate::cache::messages::slices_concat;
 use crate::cache::query::{limit_is_sufficient, limit_rows_needed};
 use crate::cache::reference_settings::{self, ReferenceSettings};
-use crate::cache::types::{ReadFacts, SharedQueryShape, SharedResolvedQuery};
+use crate::cache::types::{CachedQueryState, QueryServing, ServingAt};
 use crate::query::Fingerprint;
+use crate::query::resolve::PrivilegeNeeds;
 use crate::result::error_chain_format;
 
-/// What a Ready entry serves its drained waiters, read once per drain.
-struct DrainServing {
+/// A Ready entry's drain: the serving the writer published with Ready, at
+/// its generation, and for a reference-only entry the settings a waiter
+/// must be on.
+struct Drain {
     fingerprint: Fingerprint,
-    generation: Generation,
-    bound: SharedResolvedQuery,
-    serve_shape: SharedQueryShape,
-    max_limit: Option<u64>,
-    /// `Some` for a reference-only entry: the settings a waiter must be on.
+    at: ServingAt,
     reference: Option<Arc<ReferenceSettings>>,
-    /// The read's facts; a waiter's role is checked against its privilege
-    /// needs (PGC-463).
-    read_facts: Option<Arc<ReadFacts>>,
 }
 
 /// The gate a direct hit applies in `ready_hit`, for a reference-only entry:
@@ -60,36 +55,35 @@ impl CacheDispatch {
     /// Drain all coalesced waiters for a fingerprint that became Ready.
     /// Each coalescing group dispatches a single serve request that broadcasts
     /// response bytes to all clients in the group.
-    pub fn waiting_drain_ready(
-        &self,
-        fingerprint: Fingerprint,
-        generation: Generation,
-        bound: SharedResolvedQuery,
-        serve_shape: SharedQueryShape,
-        max_limit: Option<u64>,
-    ) {
+    pub(crate) fn waiting_drain_ready(&self, fingerprint: Fingerprint, at: ServingAt) {
         let Some(groups) = self.waiting.drain(fingerprint) else {
             return;
         };
 
-        let (reference_only, read_facts) = self
+        // The writer may have evicted, invalidated or readmitted the entry
+        // since it sent Ready; the rows the serving reads are then no longer
+        // its to serve, so the waiters go to origin.
+        let current = self
             .state_view
             .cached_queries
             .get(&fingerprint)
-            .map_or((false, None), |v| (v.reference_only, v.read_facts.clone()));
-        let serving = DrainServing {
+            .is_some_and(|view| {
+                view.state == CachedQueryState::Ready && view.generation == at.generation
+            });
+        if !current {
+            self.groups_forward(groups.into_values());
+            return;
+        }
+
+        let drain = Drain {
             fingerprint,
-            generation,
-            bound,
-            serve_shape,
-            max_limit,
-            reference: reference_only.then(reference_settings::current),
-            read_facts,
+            reference: at.serving.reference_only.then(reference_settings::current),
+            at,
         };
 
         let served: u64 = groups
             .into_values()
-            .map(|waiters| self.coalesced_group_serve(waiters, &serving))
+            .map(|waiters| self.coalesced_group_serve(waiters, &drain))
             .sum();
 
         if served > 0 {
@@ -111,21 +105,22 @@ impl CacheDispatch {
     fn waiters_privileged(
         &self,
         waiters: Vec<QueryRequest>,
-        facts: Option<&ReadFacts>,
+        needs: &PrivilegeNeeds,
     ) -> Vec<QueryRequest> {
         let (served, forwarded): (Vec<_>, Vec<_>) = waiters
             .into_iter()
-            .partition(|w| self.privilege_gate(&w.effective_role, facts));
+            .partition(|w| self.privilege_gate(&w.effective_role, needs));
         for msg in forwarded {
             let _ = msg.forward();
         }
         served
     }
 
-    /// Serve one coalescing group from `serving`: one serve request whose
+    /// Serve one coalescing group from `drain`: one serve request whose
     /// response bytes are broadcast to every waiter. Returns the number of
     /// waiters served beyond the primary.
-    fn coalesced_group_serve(&self, mut waiters: Vec<QueryRequest>, serving: &DrainServing) -> u64 {
+    fn coalesced_group_serve(&self, mut waiters: Vec<QueryRequest>, drain: &Drain) -> u64 {
+        let serving: &QueryServing = &drain.at.serving;
         // Stamp drain_started_at on every waiter (including the one that
         // becomes primary) so `coalesce_wait_seconds` fires per-waiter,
         // not just per-group.
@@ -133,8 +128,8 @@ impl CacheDispatch {
         for w in &mut waiters {
             w.timing.drain_started_at = Some(drain_started);
         }
-        waiters = waiters_on_reference(waiters, serving.reference.as_deref());
-        waiters = self.waiters_privileged(waiters, serving.read_facts.as_deref());
+        waiters = waiters_on_reference(waiters, drain.reference.as_deref());
+        waiters = self.waiters_privileged(waiters, &serving.read_facts.privilege_needs);
         if waiters.is_empty() {
             return 0;
         }
@@ -171,13 +166,13 @@ impl CacheDispatch {
         // (all waiters share the same fingerprint and dispatch moment).
         // The group already passed `limit_is_sufficient(max_limit, primary_needed)`
         // above; reuse `primary_needed` as the rows-needed witness.
-        let mv = self.mv_dispatch_decide(serving.fingerprint, primary_needed);
+        let mv = self.mv_dispatch_decide(drain.fingerprint, primary_needed);
         if let Err(e) = self.pool_serve_coalesced(
-            serving.fingerprint,
+            drain.fingerprint,
             primary,
             Arc::clone(&serving.bound),
             Arc::clone(&serving.serve_shape),
-            serving.generation,
+            drain.at.generation,
             mv,
             coalesced,
         ) {
@@ -195,8 +190,12 @@ impl CacheDispatch {
         let Some(groups) = self.waiting.drain(fingerprint) else {
             return;
         };
+        self.groups_forward(groups.into_values());
+    }
 
-        for (_key, waiters) in groups {
+    /// Forward every waiter of the drained `groups` to origin.
+    fn groups_forward(&self, groups: impl IntoIterator<Item = Vec<QueryRequest>>) {
+        for waiters in groups {
             let drain_started = Instant::now();
             for mut msg in waiters {
                 msg.timing.drain_started_at = Some(drain_started);

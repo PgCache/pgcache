@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use tracing::{debug, error};
 
-use super::core::{QueryServing, WriterCore};
+use super::core::WriterCore;
 use super::registration::{
     QueryResolution, RegistrationIdentity, WriterRegistration, cached_query_insert,
 };
@@ -17,7 +17,7 @@ use crate::cache::admission::{
     subsumption_references,
 };
 use crate::cache::messages::SubsumptionResult;
-use crate::cache::types::Cache;
+use crate::cache::types::{Cache, QueryServing, ServingAt};
 use crate::cache::{CacheError, CacheResult, MapIntoReport};
 use crate::query::Fingerprint;
 use crate::query::constraint_index::table_constraints_keyed;
@@ -103,6 +103,7 @@ impl WriterRegistration {
         let read_facts = Arc::clone(&resolution.read_facts);
         let serve_shape = Arc::clone(&resolution.serve_shape);
         let max_limit = resolution.max_limit;
+        let reference_only = resolution.reference_only;
 
         let (generation, relations_changed) = cached_query_insert(core, identity, resolution);
 
@@ -110,14 +111,17 @@ impl WriterRegistration {
             core.publication_relations_add().await?;
         }
 
-        let serving = QueryServing {
+        let at = ServingAt {
             generation,
-            bound,
-            read_facts,
-            serve_shape,
-            max_limit,
+            serving: Arc::new(QueryServing {
+                bound,
+                read_facts,
+                serve_shape,
+                max_limit,
+                reference_only,
+            }),
         };
-        Ok(subsumed_ready_mark(core, fingerprint, serving, cover).await)
+        Ok(subsumed_ready_mark(core, fingerprint, at, cover).await)
     }
 }
 
@@ -128,11 +132,12 @@ impl WriterRegistration {
 pub(super) async fn subsumed_ready_mark(
     core: &mut WriterCore,
     fingerprint: Fingerprint,
-    serving: QueryServing,
+    at: ServingAt,
     cover: SubsumptionCover,
 ) -> SubsumptionResult {
     let subsume_start = Instant::now();
-    let generation = serving.generation;
+    let generation = at.generation;
+    let serving = &at.serving;
     // Running the query under the new generation stamps the rows it reads,
     // which the subsumer already holds.
     let stamp_sql = serving.bound.sql();
@@ -174,7 +179,7 @@ pub(super) async fn subsumed_ready_mark(
 
     let bound = Arc::clone(&serving.bound);
     let serve_shape = Arc::clone(&serving.serve_shape);
-    core.state_ready_transition(fingerprint, serving);
+    core.state_ready_transition(fingerprint, at);
 
     // Clear registration_started_at to signal completion
     if let Some(mut q) = core.cache.cached_queries.get1_mut(fingerprint) {

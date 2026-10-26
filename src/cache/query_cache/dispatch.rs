@@ -34,6 +34,7 @@ use crate::pg::Lsn;
 use crate::proxy::ClientSocket;
 use crate::query::ast::LimitClause;
 use crate::query::keying_settings::KeyingSettings;
+use crate::query::resolve::PrivilegeNeeds;
 use crate::query::{Fingerprint, SessionKey};
 use crate::result::error_chain_format;
 use crate::settings::{CachePolicy, DynamicConfig, Settings};
@@ -144,7 +145,9 @@ impl CacheDispatch {
         if !matches!(view.state, CachedQueryState::Ready) {
             return None;
         }
-        view.read_facts.clone()
+        view.serving
+            .as_ref()
+            .map(|serving| Arc::clone(&serving.read_facts))
     }
 
     /// The fingerprint the alias map has for a session key; `None` is an
@@ -443,13 +446,8 @@ impl CacheDispatch {
     /// Whether `role` may be served a read needing `needs` (PGC-463). A
     /// missing verdict forwards the read and asks the writer to look it up;
     /// a denied one forwards it to origin's own error.
-    pub(super) fn privilege_gate(&self, role: &EcoString, facts: Option<&ReadFacts>) -> bool {
+    pub(super) fn privilege_gate(&self, role: &EcoString, needs: &PrivilegeNeeds) -> bool {
         let m = crate::metrics::handles();
-        let Some(needs) = facts.map(|facts| &facts.privilege_needs) else {
-            debug_assert!(false, "Ready entry without privilege needs");
-            m.query.privilege_forward_pending.increment(1);
-            return false;
-        };
         match self.state_view.privileges.check(role, needs) {
             PrivilegeCheck::Allowed => true,
             PrivilegeCheck::Denied => {
@@ -517,32 +515,26 @@ impl CacheDispatch {
         msg: QueryRequest,
     ) -> CacheResult<()> {
         let fingerprint = target.fingerprint;
-        let Some(CachedQueryView {
-            generation,
-            bound: Some(bound),
-            serve_shape: Some(serve_shape),
-            reference_only,
-            read_facts,
-            ..
-        }) = entry
+        let Some((generation, serving)) =
+            entry.and_then(|entry| Some((entry.generation, entry.serving.as_ref()?)))
         else {
-            // The writer publishes the bound query and its shape together
-            // with Ready; serve from origin rather than guess if not.
-            debug_assert!(false, "Ready entry without a serve shape {fingerprint}");
-            debug!("ready entry without a serve shape, forwarding {fingerprint}");
+            // The writer writes Ready with its serving; serve from origin
+            // rather than guess if not.
+            debug_assert!(false, "Ready entry without a serving {fingerprint}");
+            debug!("ready entry without a serving, forwarding {fingerprint}");
             return msg.forward();
         };
         // A literal the writer could not canonicalise means what the
         // reference settings make of it; a session on other settings would
         // read different rows from origin.
-        if *reference_only && msg.keying.literals != reference_settings::current().literals {
+        if serving.reference_only && msg.keying.literals != reference_settings::current().literals {
             crate::metrics::handles()
                 .cache
                 .reference_only_forward_total
                 .increment(1);
             return msg.forward();
         }
-        if !self.privilege_gate(&msg.effective_role, read_facts.as_deref()) {
+        if !self.privilege_gate(&msg.effective_role, &serving.read_facts.privilege_needs) {
             return msg.forward();
         }
         self.metrics_hit_record(fingerprint);
@@ -550,9 +542,9 @@ impl CacheDispatch {
         self.hit_serve(
             fingerprint,
             msg,
-            Arc::clone(bound),
-            Arc::clone(serve_shape),
-            *generation,
+            Arc::clone(&serving.bound),
+            Arc::clone(&serving.serve_shape),
+            generation,
             target.input.rows_needed,
         )
         .await
@@ -675,11 +667,7 @@ impl CacheDispatch {
                     slot.insert(CachedQueryView {
                         state: transition.new,
                         generation: Generation::ZERO,
-                        bound: None,
-                        read_facts: None,
-                        serve_shape: None,
-                        max_limit: None,
-                        reference_only: false,
+                        serving: None,
                         referenced: false,
                         // Writer fills this in after resolution/classification.
                         mv: MvMeta::new(ShapeGate::Skip, None),

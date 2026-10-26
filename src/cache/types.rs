@@ -80,7 +80,7 @@ pub struct CachedQuery {
     pub invalidated: bool,
     /// Pinned queries are protected from eviction and auto-readmitted after CDC invalidation.
     pub pinned: bool,
-    /// Mirrored into `CachedQueryView.reference_only`.
+    /// Mirrored into the view's `QueryServing::reference_only`.
     pub reference_only: bool,
 }
 
@@ -486,25 +486,48 @@ impl ReadFacts {
 
 pub(super) type SharedReadFacts = Arc<ReadFacts>;
 
+/// What a cached query serves: the facts its resolution produced, written
+/// to the view as one value when the writer marks Ready (and Loading, for a
+/// readmit or limit bump) and sent with the Ready notify, so a hit or a
+/// coalesce drain reads them as a unit.
+/// The query's generation travels beside it, not in it: CLOCK second chance
+/// re-stamps the generation without changing what is served.
+#[derive(Debug)]
+pub(crate) struct QueryServing {
+    pub(crate) bound: SharedResolvedQuery,
+    /// What a hit on `bound` must prove.
+    pub(crate) read_facts: SharedReadFacts,
+    /// Parameterized serve shape (mirrors `CachedQuery.serve_shape`, PGC-294).
+    pub(crate) serve_shape: SharedQueryShape,
+    /// Maximum rows cached for this fingerprint (None = all rows).
+    pub(crate) max_limit: Option<u64>,
+    /// A date-time literal was left as written at registration, so the
+    /// entry holds what the reference settings make of it; serve only to a
+    /// session on the same settings (PGC-287).
+    pub(crate) reference_only: bool,
+}
+
+pub(crate) type SharedQueryServing = Arc<QueryServing>;
+
+/// A serving at the query's generation: what a writer handoff carries. The
+/// generation stays out of the shared payload and travels beside it here.
+#[derive(Debug, Clone)]
+pub(crate) struct ServingAt {
+    pub(crate) generation: Generation,
+    pub(crate) serving: SharedQueryServing,
+}
+
 /// Lightweight view of a cached query for dispatch lookups.
 #[derive(Debug, Clone)]
 pub struct CachedQueryView {
     pub state: CachedQueryState,
-    /// Generation number (0 for Loading placeholder before writer assigns real value)
+    /// The query's current generation; 0 for a placeholder the dispatch
+    /// inserted before the writer assigned one.
     pub generation: Generation,
-    /// The bound query (None for Loading placeholder before writer resolves)
-    pub bound: Option<SharedResolvedQuery>,
-    /// What a hit on `bound` must prove; set with `bound`.
-    pub(crate) read_facts: Option<SharedReadFacts>,
-    /// Parameterized serve shape (mirrors `CachedQuery.serve_shape`, PGC-294).
-    /// None while Loading; Some once the view transitions to Ready.
-    pub serve_shape: Option<SharedQueryShape>,
-    /// Maximum rows cached for this fingerprint (None = all rows)
-    pub max_limit: Option<u64>,
-    /// A date-time literal was left as written at registration, so the
-    /// entry holds what the reference settings make of it; serve only to a
-    /// session on the same settings (PGC-287).
-    pub reference_only: bool,
+    /// What the entry serves; `None` until the writer first writes the
+    /// entry: Pending, and the Loading placeholder of a fresh admission
+    /// until it is Ready.
+    pub(crate) serving: Option<SharedQueryServing>,
     /// CLOCK reference bit — set by dispatch on cache hit, read/cleared by writer during eviction
     pub referenced: bool,
     /// MV shape classification, runtime state, and captured output column

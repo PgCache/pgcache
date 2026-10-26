@@ -68,7 +68,7 @@ impl From<&CachedQueryView> for EntrySnapshot {
     fn from(view: &CachedQueryView) -> Self {
         EntrySnapshot {
             state: view.state,
-            max_limit: view.max_limit,
+            max_limit: view.serving.as_ref().and_then(|serving| serving.max_limit),
         }
     }
 }

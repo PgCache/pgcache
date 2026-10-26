@@ -2,6 +2,8 @@
 //! cached query and hand an [`ExplainJob`] to the serve pool, which borrows a
 //! connection and runs the actual EXPLAIN off the connection's thread.
 
+use std::sync::Arc;
+
 use ecow::EcoString;
 use tracing::debug;
 
@@ -104,13 +106,10 @@ fn explain_kind_for_view(
     options: EcoString,
 ) -> ExplainKind {
     let CachedQueryView {
-        state,
-        serve_shape,
-        mv,
-        ..
+        state, serving, mv, ..
     } = view;
-    match (state, serve_shape) {
-        (CachedQueryState::Ready, Some(serve_shape)) => {
+    match (state, serving) {
+        (CachedQueryState::Ready, Some(serving)) => {
             // Read-only backend decision: reflect what would serve now without
             // the serve-path `mv_dispatch_decide` side effects (a diagnostic
             // must not schedule an MV build or move serve metrics). A Fresh MV
@@ -123,7 +122,7 @@ fn explain_kind_for_view(
             ExplainKind::Run {
                 fingerprint,
                 mv,
-                serve_shape,
+                serve_shape: Arc::clone(&serving.serve_shape),
                 options,
             }
         }

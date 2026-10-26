@@ -22,10 +22,7 @@ use crate::cache::{
     messages::{QueryCommand, WriterNotify},
     mv::{MvMeta, MvState},
     mv_shape::ShapeGate,
-    types::{
-        ActiveRelations, Cache, CacheStateView, CachedQueryState, CachedQueryView,
-        SharedQueryShape, SharedReadFacts, SharedResolvedQuery,
-    },
+    types::{ActiveRelations, Cache, CacheStateView, CachedQueryState, CachedQueryView, ServingAt},
 };
 use crate::catalog::CatalogTable;
 use crate::oid::Oid;
@@ -125,16 +122,6 @@ pub(crate) struct WriterShared {
     pub(crate) watermark_nudge: Arc<Notify>,
     /// Shared multi-thread runtime; MV build tasks are spawned here.
     pub(crate) runtime: Handle,
-}
-
-/// What a cached query serves at a generation: mirrored into the state view
-/// on every Loading / Ready transition and sent with the Ready notify.
-pub(super) struct QueryServing {
-    pub(super) generation: Generation,
-    pub(super) bound: SharedResolvedQuery,
-    pub(super) read_facts: SharedReadFacts,
-    pub(super) serve_shape: SharedQueryShape,
-    pub(super) max_limit: Option<u64>,
 }
 
 /// The cache volume, as read once at startup (PGC-251 Slice 2).
@@ -667,38 +654,20 @@ impl WriterCore {
     /// Preserves shape_gate and mv_state. Private — callers must go through
     /// the public `state_*_transition` wrappers so paired side effects (notify
     /// on Ready) aren't skipped.
-    fn state_view_write(
-        &self,
-        fingerprint: Fingerprint,
-        state: CachedQueryState,
-        serving: &QueryServing,
-    ) {
-        let reference_only = self
-            .cache
-            .cached_queries
-            .get1(&fingerprint)
-            .is_some_and(|q| q.reference_only);
+    fn state_view_write(&self, fingerprint: Fingerprint, state: CachedQueryState, at: &ServingAt) {
         self.state_view
             .cached_queries
             .entry(fingerprint)
             .and_modify(|v| {
                 v.state = state;
-                v.generation = serving.generation;
-                v.bound = Some(Arc::clone(&serving.bound));
-                v.read_facts = Some(Arc::clone(&serving.read_facts));
-                v.serve_shape = Some(Arc::clone(&serving.serve_shape));
-                v.max_limit = serving.max_limit;
-                v.reference_only = reference_only;
+                v.generation = at.generation;
+                v.serving = Some(Arc::clone(&at.serving));
                 v.referenced = false;
             })
             .or_insert_with(|| CachedQueryView {
                 state,
-                generation: serving.generation,
-                bound: Some(Arc::clone(&serving.bound)),
-                read_facts: Some(Arc::clone(&serving.read_facts)),
-                serve_shape: Some(Arc::clone(&serving.serve_shape)),
-                max_limit: serving.max_limit,
-                reference_only,
+                generation: at.generation,
+                serving: Some(Arc::clone(&at.serving)),
                 referenced: false,
                 mv: MvMeta::new(ShapeGate::Skip, None),
             });
@@ -706,32 +675,15 @@ impl WriterCore {
 
     /// Caller must follow up with population work (or another Ready/Failed
     /// transition); otherwise coalesced waiters stay stuck.
-    pub(super) fn state_loading_transition(
-        &self,
-        fingerprint: Fingerprint,
-        serving: &QueryServing,
-    ) {
-        self.state_view_write(fingerprint, CachedQueryState::Loading, serving);
+    pub(super) fn state_loading_transition(&self, fingerprint: Fingerprint, at: &ServingAt) {
+        self.state_view_write(fingerprint, CachedQueryState::Loading, at);
     }
 
     /// Mark Ready and notify the cache loop. Skipping the notify leaves
     /// coalesced waiters hung forever — always go through this wrapper.
-    pub(super) fn state_ready_transition(&self, fingerprint: Fingerprint, serving: QueryServing) {
-        self.state_view_write(fingerprint, CachedQueryState::Ready, &serving);
-        let QueryServing {
-            generation,
-            bound,
-            serve_shape,
-            max_limit,
-            ..
-        } = serving;
-        let _ = self.notify_tx.send(WriterNotify::Ready {
-            fingerprint,
-            generation,
-            bound,
-            serve_shape,
-            max_limit,
-        });
+    pub(super) fn state_ready_transition(&self, fingerprint: Fingerprint, at: ServingAt) {
+        self.state_view_write(fingerprint, CachedQueryState::Ready, &at);
+        let _ = self.notify_tx.send(WriterNotify::Ready { fingerprint, at });
     }
 
     /// Drain any coalesced waiters parked on `fingerprint` to origin (the
