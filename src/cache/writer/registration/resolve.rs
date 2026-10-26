@@ -1,6 +1,7 @@
-//! Registration phase 1: ensure the query's tables exist in the cache, resolve
-//! it, render its serve shape, classify its shape and limits, and register
-//! its per-table update queries.
+//! Registration phase 1: ensure the query's tables exist in the cache and
+//! bind it to them; then, for a query that gets an entry, render its serve
+//! shape, classify its shape and limits, and register its per-table update
+//! queries.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -16,7 +17,7 @@ use crate::cache::admission::{
 };
 use crate::cache::messages::RegisterRequest;
 use crate::cache::mv::{query_has_join, query_has_window};
-use crate::cache::types::{ReadFacts, SharedQueryShape};
+use crate::cache::types::{ReadFacts, SharedQueryShape, SharedResolvedQuery};
 use crate::cache::update_query::{UpdateQueries, UpdateQueryRegistration};
 use crate::cache::writer::core::WriterCore;
 use crate::cache::{CacheError, CacheResult, ReportExt};
@@ -66,22 +67,35 @@ async fn cache_tables_ensure(
     Ok(())
 }
 
-/// The fingerprint of a query under the session's keying settings: the hash
-/// of its serve SQL (schema-qualified tables, canonical literals). Ensures
-/// the cache tables exist and resolves exactly as registration does, so the
-/// two agree.
-pub(super) async fn query_fingerprint_resolve(
+/// Ensure the query's tables exist in the cache and bind it to them under
+/// the session's keying settings, with the user's LIMIT split off. The one
+/// path to a query's canonical form: the fingerprint dispatch resolves and
+/// the one registration asserts on both come from here.
+async fn query_bind_canonical(
     core: &mut WriterCore,
     query: &QueryTree,
     keying: &KeyingSettings,
-) -> CacheResult<Fingerprint> {
-    let (base_query, _) = base_query_prepare(query);
+) -> CacheResult<(CanonicalResolution, Option<u64>)> {
+    let (base_query, user_max_limit) = base_query_prepare(query);
     cache_tables_ensure(core, &base_query, &keying.search_path).await?;
     let path = search_path(keying);
     let resolution =
         query_resolve_canonical(base_query, &core.cache.tables, &path, &keying.literals)
             .map_err(|e| e.context_transform(CacheError::from))
-            .attach_loc("resolving query expression for its fingerprint")?;
+            .attach_loc("resolving query expression")?;
+    Ok((resolution, user_max_limit))
+}
+
+/// The fingerprint of a query under the session's keying settings: the hash
+/// of its serve SQL (schema-qualified tables, canonical literals).
+pub(super) async fn query_fingerprint_resolve(
+    core: &mut WriterCore,
+    query: &QueryTree,
+    keying: &KeyingSettings,
+) -> CacheResult<Fingerprint> {
+    let (resolution, _) = query_bind_canonical(core, query, keying)
+        .await
+        .attach_loc("resolving query expression for its fingerprint")?;
     Ok(resolution.bound.fingerprint())
 }
 
@@ -125,27 +139,24 @@ fn resolution_limits(
     (max_limit, mv_limit)
 }
 
+/// A query bound against the cache catalog: what the subsumption check reads.
+/// A check-only miss nothing covers stops here, so the rest of the
+/// resolution is never built for it.
+pub(super) struct BoundQuery {
+    pub(super) bound: SharedResolvedQuery,
+    user_max_limit: Option<u64>,
+    reference_only: bool,
+}
+
 impl WriterRegistration {
-    /// Resolve a query's tables and AST, register update queries, and extract constraints.
-    /// This is the first phase of registration, before subsumption or population.
-    pub(super) async fn query_resolve(
+    /// Ensure the query's tables exist in the cache and bind it to them.
+    pub(super) async fn query_bind(
         &self,
         core: &mut WriterCore,
         request: &RegisterRequest,
-    ) -> CacheResult<QueryResolution> {
-        let (base_query, user_max_limit) = base_query_prepare(request.cacheable_query.tree());
-
-        cache_tables_ensure(core, &base_query, &request.keying.search_path).await?;
-
-        let path = search_path(&request.keying);
-        let CanonicalResolution { bound, literals } = query_resolve_canonical(
-            base_query,
-            &core.cache.tables,
-            &path,
-            &request.keying.literals,
-        )
-        .map_err(|e| e.context_transform(CacheError::from))
-        .attach_loc("resolving query expression")?;
+    ) -> CacheResult<BoundQuery> {
+        let (CanonicalResolution { bound, literals }, user_max_limit) =
+            query_bind_canonical(core, request.cacheable_query.tree(), &request.keying).await?;
         // The identity dispatch resolved this pair to must be the one this
         // resolution produces.
         debug_assert_eq!(
@@ -159,6 +170,28 @@ impl WriterRegistration {
             .enum_order_dependence_check()
             .map_err(|e| e.context_transform(CacheError::from))
             .attach_loc("enum order-dependence gate")?;
+
+        Ok(BoundQuery {
+            bound,
+            user_max_limit,
+            reference_only: literals.residual,
+        })
+    }
+
+    /// Complete a bound query's resolution for its entry: render the serve
+    /// shape, classify shape and limits, register the update queries and
+    /// build the read facts.
+    pub(super) fn query_resolve(
+        &self,
+        core: &mut WriterCore,
+        fingerprint: Fingerprint,
+        query: BoundQuery,
+    ) -> CacheResult<QueryResolution> {
+        let BoundQuery {
+            bound,
+            user_max_limit,
+            reference_only,
+        } = query;
 
         let serve_shape = serve_shape_render(&bound);
 
@@ -178,7 +211,7 @@ impl WriterRegistration {
         let uq_start = Instant::now();
         let relation_oids = self.update_queries_register(
             core,
-            request.fingerprint,
+            fingerprint,
             &bound,
             decorrelated.as_ref(),
             max_limit.is_some(),
@@ -199,7 +232,7 @@ impl WriterRegistration {
             max_limit,
             mv_limit,
             shape_gate,
-            reference_only: literals.residual,
+            reference_only,
         })
     }
 

@@ -350,6 +350,11 @@ pub mod names {
         "pgcache.cache.writer.command_handle_seconds";
     /// Phase timings inside `query_register`. Suspected O(N) growth lives in
     /// `subsumption_check` and (transitively) in `resolve.update_queries_register`.
+    /// `bind` is recorded for every registration, including a check-only
+    /// miss that ends at the subsumption check; `resolve` only when the
+    /// resolution is completed for an entry.
+    pub const CACHE_WRITER_REGISTER_BIND_SECONDS: &str =
+        "pgcache.cache.writer.register.bind_seconds";
     pub const CACHE_WRITER_REGISTER_RESOLVE_SECONDS: &str =
         "pgcache.cache.writer.register.resolve_seconds";
     pub const CACHE_WRITER_REGISTER_SUBSUMPTION_CHECK_SECONDS: &str =
@@ -928,6 +933,7 @@ pub struct RegHandles {
     pub cmd_mv_build: Histogram,
     pub cmd_mv_build_complete: Histogram,
     pub cmd_privilege_resolve: Histogram,
+    pub register_bind: Histogram,
     pub register_resolve: Histogram,
     pub register_subsumption_check: Histogram,
     pub register_subsume: Histogram,
@@ -964,8 +970,8 @@ impl RegHandles {
             CACHE_POPULATION_SCALE_UP, CACHE_POPULATION_STREAM_SECONDS,
             CACHE_POPULATION_TASK_SECONDS, CACHE_POPULATION_WAIT_SECONDS, CACHE_POPULATION_WORKERS,
             CACHE_SUBSUMPTION_LATENCY_SECONDS, CACHE_SUBSUMPTIONS, CACHE_SUBSUMPTIONS_SPLIT,
-            CACHE_WRITER_COMMAND_HANDLE_SECONDS, CACHE_WRITER_REGISTER_INSERT_SECONDS,
-            CACHE_WRITER_REGISTER_POPULATE_DISPATCH_SECONDS,
+            CACHE_WRITER_COMMAND_HANDLE_SECONDS, CACHE_WRITER_REGISTER_BIND_SECONDS,
+            CACHE_WRITER_REGISTER_INSERT_SECONDS, CACHE_WRITER_REGISTER_POPULATE_DISPATCH_SECONDS,
             CACHE_WRITER_REGISTER_PUBLICATION_UPDATE_SECONDS,
             CACHE_WRITER_REGISTER_RESOLVE_SECONDS, CACHE_WRITER_REGISTER_SUBSUME_SECONDS,
             CACHE_WRITER_REGISTER_SUBSUMPTION_CHECK_SECONDS, CACHE_WRITER_RESOLVE_DEPARSE_SECONDS,
@@ -982,6 +988,7 @@ impl RegHandles {
             cmd_mv_build: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "mv_build"),
             cmd_privilege_resolve: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "privilege_resolve"),
             cmd_mv_build_complete: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "mv_build_complete"),
+            register_bind: metrics::histogram!(CACHE_WRITER_REGISTER_BIND_SECONDS),
             register_resolve: metrics::histogram!(CACHE_WRITER_REGISTER_RESOLVE_SECONDS),
             register_subsumption_check: metrics::histogram!(
                 CACHE_WRITER_REGISTER_SUBSUMPTION_CHECK_SECONDS

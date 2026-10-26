@@ -40,7 +40,7 @@ The subsumption check is per table reference, not across the full constraint set
 - `Admit` — proceed with normal registration and population
 - `CheckOnly` — only check subsumption, don't register (for pending queries below the admission threshold)
 
-**Writer** (`writer/query.rs`): During `query_register()`, after resolving the query and extracting constraints:
+**Writer** (`writer/registration/`): During `query_register()`, after binding the query and before the rest of its resolution is built (a `CheckOnly` miss nothing covers ends at the check, so no update queries, MV state or memo slot are created for it):
 1. `subsumption_check()` iterates each relation OID, looking up existing `UpdateQuery` entries that are Ready, non-limited, and complete for that table
 2. For each, calls `table_constraints_subsumed()` to check if the cached equality constraints are a subset of the new query's constraints
 3. If all tables are covered: `query_subsume()` assigns a generation, stamps rows in the cache DB (same `SET mem.query_generation` pattern as eviction bumps), registers metadata, marks `Ready`, and responds `SubsumptionResult::Subsumed`

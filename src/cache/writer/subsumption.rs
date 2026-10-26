@@ -19,7 +19,6 @@ use crate::cache::admission::{
 use crate::cache::messages::SubsumptionResult;
 use crate::cache::types::Cache;
 use crate::cache::{CacheError, CacheResult, MapIntoReport};
-use crate::oid::Oid;
 use crate::query::Fingerprint;
 use crate::query::constraint_index::table_constraints_keyed;
 use crate::query::constraints::TableRanges;
@@ -81,14 +80,10 @@ impl WriterRegistration {
     pub(super) fn subsumption_check(
         &self,
         core: &WriterCore,
-        relation_oids: &[Oid],
         bound: &ResolvedQuery,
     ) -> Option<SubsumptionCover> {
-        if relation_oids.is_empty() {
-            return None;
-        }
-
         // A set operation is covered when every arm is (PGC-495).
+        // A query without base references has none to cover and yields `None`.
         let references = subsumption_references(bound)?;
         subsumption_covered(&references, &WriterSubsumerSource { cache: &core.cache })
     }

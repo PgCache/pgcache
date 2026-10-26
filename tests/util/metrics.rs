@@ -53,6 +53,8 @@ pub(crate) struct MetricsSnapshot {
     pub cache_memo_evictions: u64,
     /// Gauge: memo version slots currently held.
     pub cache_memo_slots: u64,
+    /// Gauge: entries Pending below the admission threshold.
+    pub cache_queries_pending: u64,
     pub cache_cdc_local_eval_hits: u64,
     pub cache_cdc_pg_eval_hits: u64,
     pub protocol_describe_cache_hits: u64,
@@ -172,6 +174,7 @@ const SAMPLES: &[Sample] = samples! {
     "pgcache_cache_reference_only_forward_total" => cache_reference_only_forwards,
     "pgcache_cache_memo_evictions" => cache_memo_evictions,
     "pgcache_cache_memo_slots" => cache_memo_slots,
+    "pgcache_cache_queries_pending" => cache_queries_pending,
     "pgcache_cache_cdc_local_eval_hits" => cache_cdc_local_eval_hits,
     "pgcache_cache_cdc_pg_eval_hits" => cache_cdc_pg_eval_hits,
     "pgcache_protocol_describe_cache_hits" => protocol_describe_cache_hits,
@@ -238,8 +241,10 @@ pub(crate) fn metrics_delta(before: &MetricsSnapshot, after: &MetricsSnapshot) -
     for sample in SAMPLES {
         *(sample.field)(&mut delta) = *(sample.field)(&mut after) - *(sample.field)(&mut before);
     }
-    // Gauge, not a counter: carry the current value rather than a delta.
+    // Gauges, not counters: carry the current value rather than a delta.
     delta.cache_coalesce_waiting = after.cache_coalesce_waiting;
+    delta.cache_memo_slots = after.cache_memo_slots;
+    delta.cache_queries_pending = after.cache_queries_pending;
     // Rates are cumulative averages, not meaningful for deltas: left at zero.
     delta
 }

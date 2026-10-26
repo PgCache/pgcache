@@ -55,7 +55,7 @@ impl WriterRegistration {
             .cache
             .cached_queries
             .get1(&fingerprint)
-            .and_then(|cached| self.subsumption_check(core, &cached.relation_oids, &cached.bound));
+            .and_then(|cached| self.subsumption_check(core, &cached.bound));
 
         let new_generation = core.cache.generation_allocate();
 

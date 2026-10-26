@@ -28,9 +28,10 @@ struct SubsumptionFallback {
 }
 
 impl WriterRegistration {
-    /// Registers a query in the cache. Checks subsumption first — if the data
-    /// is already cached by a broader query, stamps rows and marks Ready immediately.
-    /// Otherwise, dispatches population (if `admit_action` is `Admit`).
+    /// Registers a query in the cache. Checks subsumption on the bound query
+    /// first — if the data is already cached by a broader query, stamps rows
+    /// and marks Ready immediately. Otherwise, dispatches population (if
+    /// `admit_action` is `Admit`); a `CheckOnly` miss ends at the check.
     ///
     /// If the query was previously invalidated (CLOCK policy), takes the fast
     /// readmission path that reuses existing metadata.
@@ -63,9 +64,31 @@ impl WriterRegistration {
             return Ok(());
         }
 
-        // Phase 1: Resolve
+        // Phase 1: Bind. The subsumption check reads only the bound query;
+        // the rest of the resolution is built once an entry will be created.
+        let bind_start = Instant::now();
+        let query = self.query_bind(core, &request).await?;
+        crate::metrics::handles()
+            .reg
+            .register_bind
+            .record(bind_start.elapsed().as_secs_f64());
+
+        // Phase 2: Subsumption check
+        let subsumption_start = Instant::now();
+        let cover = self.subsumption_check(core, &query.bound);
+        crate::metrics::handles()
+            .reg
+            .register_subsumption_check
+            .record(subsumption_start.elapsed().as_secs_f64());
+
+        if cover.is_none() && request.admit_action == AdmitAction::CheckOnly {
+            // Pending below threshold: no entry, nothing more to build.
+            let _ = request.subsumption_tx.send(SubsumptionResult::NotSubsumed);
+            return Ok(());
+        }
+
         let resolve_start = Instant::now();
-        let resolution = self.query_resolve(core, &request).await?;
+        let resolution = self.query_resolve(core, fingerprint, query)?;
         crate::metrics::handles()
             .reg
             .register_resolve
@@ -73,9 +96,7 @@ impl WriterRegistration {
 
         // The registering role's verdicts, before Ready: its first hit then
         // serves instead of forwarding while a lookup runs (PGC-463).
-        if let Some(role) = &request.effective_role
-            && request.admit_action != AdmitAction::CheckOnly
-        {
+        if let Some(role) = &request.effective_role {
             core.privilege_prefetch(role, &resolution.read_facts.privilege_needs)
                 .await;
         }
@@ -84,14 +105,6 @@ impl WriterRegistration {
         // preserve the result through state_view_write. Classification was
         // done in `query_resolve`; reuse here.
         core.mv_state_set(fingerprint, resolution.shape_gate, resolution.mv_limit);
-
-        // Phase 2: Subsumption check
-        let subsumption_start = Instant::now();
-        let cover = self.subsumption_check(core, &resolution.relation_oids, &resolution.bound);
-        crate::metrics::handles()
-            .reg
-            .register_subsumption_check
-            .record(subsumption_start.elapsed().as_secs_f64());
 
         if let Some(cover) = cover {
             // Phase 3a: Subsume — stamp rows, mark Ready
@@ -111,17 +124,8 @@ impl WriterRegistration {
             return Ok(());
         }
 
-        // Phase 3b: Not subsumed
+        // Phase 3b: Admit
         let _ = request.subsumption_tx.send(SubsumptionResult::NotSubsumed);
-
-        if request.admit_action == AdmitAction::CheckOnly {
-            // Pending below threshold — don't register, don't populate.
-            // Clean up the update_queries we registered in query_resolve.
-            core.cache
-                .update_queries_remove_fingerprint(fingerprint, &resolution.relation_oids);
-            return Ok(());
-        }
-
         self.query_admit(core, identity, resolution).await
     }
 

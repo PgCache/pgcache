@@ -1,6 +1,11 @@
 use std::io::Error;
+use std::time::{Duration, Instant};
 
-use crate::util::{TestContext, assert_cache_hit, assert_cache_miss, assert_row_at};
+use tokio::time::sleep;
+
+use crate::util::{
+    MetricsSnapshot, TestContext, assert_cache_hit, assert_cache_miss, assert_row_at,
+};
 
 mod util;
 
@@ -183,4 +188,66 @@ async fn test_clock_fast_readmission() -> Result<(), Error> {
     let _m = assert_cache_hit(&mut ctx, m).await?;
 
     Ok(())
+}
+
+/// A miss below the admission threshold ends at the subsumption check: no
+/// entry is created, so no memo slot is held for a query that may never be
+/// admitted (PGC-545). Both gauges are published on the writer's 1s tick;
+/// a second pending query makes the pending gauge prove a tick ran after the
+/// writer handled the first miss, so the memo gauge read with it is current.
+#[tokio::test]
+async fn test_pending_miss_holds_no_memo_slot() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_clock(2).await?;
+    let timeout = Duration::from_secs(5);
+
+    ctx.query(
+        "CREATE TABLE test_pending_memo (id INTEGER PRIMARY KEY, data TEXT)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO test_pending_memo (id, data) VALUES (1, 'foo')",
+        &[],
+    )
+    .await?;
+    let query_str = "SELECT id, data FROM test_pending_memo WHERE data = 'foo'";
+
+    // First miss: Pending(1), checked for subsumption only. A miss returns
+    // only after the writer replied, so the second query's Pending view is
+    // inserted after the writer handled the first; a tick that publishes
+    // pending == 2 ran after that, and its memo-slot count is current.
+    ctx.simple_query(query_str).await?;
+    ctx.simple_query("SELECT id, data FROM test_pending_memo WHERE data = 'bar'")
+        .await?;
+    let m = gauges_wait(&mut ctx, timeout, |m| m.cache_queries_pending == 2).await?;
+    assert_eq!(
+        m.cache_memo_slots, 0,
+        "a pending query below threshold must not hold a memo slot"
+    );
+
+    // Second miss admits; the entry holds its slot once registered.
+    ctx.simple_query(query_str).await?;
+    ctx.cache_settle().await?;
+    gauges_wait(&mut ctx, timeout, |m| m.cache_memo_slots == 1).await?;
+
+    Ok(())
+}
+
+/// Poll the metrics endpoint until `ready` holds, returning that snapshot.
+async fn gauges_wait(
+    ctx: &mut TestContext,
+    timeout: Duration,
+    ready: impl Fn(&MetricsSnapshot) -> bool,
+) -> Result<MetricsSnapshot, Error> {
+    let start = Instant::now();
+    loop {
+        let m = ctx.metrics().await?;
+        if ready(&m) {
+            return Ok(m);
+        }
+        if start.elapsed() > timeout {
+            return Err(Error::other(format!("gauges did not settle: {m:?}")));
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
 }
