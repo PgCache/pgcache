@@ -502,6 +502,7 @@ mod tests {
             num_workers: 1,
             population_workers_min: 2,
             population_workers_max: 16,
+            role_poll_interval: std::time::Duration::ZERO,
             tls_cert: None,
             tls_key: None,
             metrics: None,

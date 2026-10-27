@@ -38,6 +38,8 @@ pub(crate) struct MetricsSnapshot {
     /// not a delta).
     pub cache_coalesce_waiting: u64,
     pub cache_restarts_total: u64,
+    /// Role catalog changes seen by the writer's role poll (PGC-548).
+    pub cache_role_changes: u64,
     pub cache_pool_replenished: u64,
     pub cache_serve_desync_total: u64,
     pub cache_mv_hits: u64,
@@ -160,6 +162,8 @@ const SAMPLES: &[Sample] = samples! {
     "pgcache_cache_coalesce_deadline_forward_total" => cache_coalesce_deadline_forward,
     "pgcache_cache_coalesce_waiting" => cache_coalesce_waiting,
     "pgcache_cache_restarts_total" => cache_restarts_total,
+    "pgcache_cache_role_changes" => cache_role_changes,
+
     "pgcache_cache_pool_replenished" => cache_pool_replenished,
     "pgcache_cache_serve_desync_total" => cache_serve_desync_total,
     "pgcache_cache_mv_hits" => cache_mv_hits,

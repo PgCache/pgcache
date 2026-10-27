@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use lexopt::prelude::*;
 use rootcause::Report;
@@ -168,6 +169,7 @@ pub(super) struct CliArgs {
     pub(super) num_workers: Option<usize>,
     pub(super) population_workers_min: Option<usize>,
     pub(super) population_workers_max: Option<usize>,
+    pub(super) role_poll_interval: Option<u64>,
     pub(super) tls_cert: Option<PathBuf>,
     pub(super) tls_key: Option<PathBuf>,
     pub(super) metrics_socket: Option<SocketAddr>,
@@ -337,6 +339,18 @@ const CACHE_REQUIRED_FLAGS: PgRequiredFlags = PgRequiredFlags {
 
 const POPULATION_WORKERS_MIN_ENV: &str = "PGCACHE_POPULATION_WORKERS_MIN";
 const POPULATION_WORKERS_MAX_ENV: &str = "PGCACHE_POPULATION_WORKERS_MAX";
+const ROLE_POLL_INTERVAL_ENV: &str = "PGCACHE_ROLE_POLL_INTERVAL";
+
+/// Seconds between role catalog polls when nothing sets them.
+const ROLE_POLL_INTERVAL_DEFAULT_SECS: u64 = 5;
+
+/// The role poll interval, CLI over TOML over env var, as a duration.
+fn role_poll_interval_resolve(cli: Option<u64>, toml_value: Option<u64>) -> Duration {
+    Duration::from_secs(
+        env_override_resolve(cli, toml_value, ROLE_POLL_INTERVAL_ENV)
+            .unwrap_or(ROLE_POLL_INTERVAL_DEFAULT_SECS),
+    )
+}
 
 impl PgSettingsPartial {
     /// Set one field from the flag's value.
@@ -413,6 +427,9 @@ fn cli_args_parse() -> ConfigResult<(CliArgs, Option<SettingsToml>, Option<PathB
             }
             Long("population_workers_max") => {
                 args.population_workers_max = Some(arg_parse(&mut parser)?);
+            }
+            Long("role_poll_interval") => {
+                args.role_poll_interval = Some(arg_parse(&mut parser)?);
             }
             Long("tls_cert") => args.tls_cert = Some(PathBuf::from(arg_string(&mut parser)?)),
             Long("tls_key") => args.tls_key = Some(PathBuf::from(arg_string(&mut parser)?)),
@@ -693,6 +710,10 @@ pub(super) fn settings_build_with_config(
         num_workers,
         population_workers_min,
         population_workers_max,
+        role_poll_interval: role_poll_interval_resolve(
+            args.role_poll_interval,
+            config.role_poll_interval,
+        ),
         tls_cert: args.tls_cert.or_else(|| config.tls_cert.clone()),
         tls_key: args.tls_key.or_else(|| config.tls_key.clone()),
         metrics: args
@@ -750,6 +771,7 @@ pub(super) fn settings_build_cli_only(args: CliArgs) -> ConfigResult<Settings> {
         num_workers,
         population_workers_min,
         population_workers_max,
+        role_poll_interval: role_poll_interval_resolve(args.role_poll_interval, None),
         tls_cert: args.tls_cert,
         tls_key: args.tls_key,
         metrics: args.metrics_socket.map(|socket| MetricsSettings { socket }),
@@ -792,6 +814,7 @@ impl Settings {
             --num_workers NUMBER \n \
             [--population_workers_min NUMBER] (population worker floor; default max(num_workers, 2)) \n \
             [--population_workers_max NUMBER] (population worker ceiling; default num_workers * 8) \n \
+            [--role_poll_interval SECONDS] (default: 5; origin role catalog poll for membership and attribute changes; 0 disables) \n \
             [--cache_size BYTES] (deprecated and ignored; use --disk_limit) \n \
             [--cache_policy fifo|clock] (default: clock) \n \
             [--admission_threshold N] (default: 1, clock policy only) \n \

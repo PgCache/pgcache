@@ -14,6 +14,7 @@ use tracing::debug;
 use super::frame::{FRAME_BUF_CAPACITY, FrameRowEvent, FrameState, OverlayEntry};
 use super::merge_queue::MergeQueue;
 use super::mv_build::MvBuildPool;
+use super::privileges::roles_digest_read;
 use super::staging::{PopulationDeletedKeys, PopulationKey, StagingPool};
 use crate::cache::Generation;
 use crate::cache::reference_settings;
@@ -378,6 +379,10 @@ pub(super) struct WriterCore {
     /// giving the asynchronous disk reclaim time to land in the next `statvfs`
     /// read before deciding to drop again (avoids lag-driven over-dropping).
     pub(super) disk_drop_backoff: bool,
+    /// The role catalog digest the privilege verdicts are current to, read
+    /// before any verdict can be recorded (PGC-548); `None` when the role
+    /// poll is disabled.
+    pub(super) roles_digest: Option<EcoString>,
 }
 
 /// Whether a parked population (a queued merge or a gated ready entry) at
@@ -467,6 +472,16 @@ impl WriterCore {
         query_tx: UnboundedSender<QueryCommand>,
     ) -> CacheResult<Self> {
         let (cache_client, origin_client, disk) = writer_resources_open(settings).await?;
+        let roles_digest = if settings.role_poll_interval.is_zero() {
+            None
+        } else {
+            Some(
+                roles_digest_read(&origin_client)
+                    .await
+                    .attach_loc("reading the role catalog at writer start")?
+                    .digest,
+            )
+        };
         let WriterShared {
             state_view,
             active_relations,
@@ -534,6 +549,7 @@ impl WriterCore {
             pending_insert_carry: 0,
             disk_pressure_ticks: 0,
             disk_drop_backoff: false,
+            roles_digest,
         })
     }
 

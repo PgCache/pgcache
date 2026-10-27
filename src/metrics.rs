@@ -268,6 +268,9 @@ pub mod names {
         "pgcache.cache.coalesce_deadline_forward_total";
     /// Successful cache-subsystem restarts performed by the supervisor.
     pub const CACHE_RESTARTS_TOTAL: &str = "pgcache.cache.restarts_total";
+    /// Role catalog changes seen by the role poll (PGC-548), each forgetting
+    /// every stored privilege verdict; a poll that could not be read counts.
+    pub const CACHE_ROLE_CHANGES: &str = "pgcache.cache.role_changes";
     /// Cache-DB serve-pool connections reconnected after a poisoned discard.
     pub const CACHE_POOL_REPLENISHED: &str = "pgcache.cache.pool_replenished";
     /// Cache-DB serve-pool connections recycled under memory pressure to reclaim
@@ -700,6 +703,8 @@ pub struct CacheHandles {
     pub memo_slots: Gauge,
     /// Incremented each time the supervisor rebuilds the cache subsystem.
     pub restarts_total: Counter,
+    /// Role catalog changes observed by the writer's role poll (PGC-548).
+    pub role_changes: Counter,
     /// Incremented each time a discarded serve-pool connection is replaced.
     pub pool_replenished: Counter,
     /// Incremented each time a serve-pool connection is recycled for memory reclaim.
@@ -744,10 +749,10 @@ impl CacheHandles {
             CACHE_REFERENCE_ONLY_FORWARD_TOTAL, CACHE_REG_GATE_BTLBW, CACHE_REG_GATE_DRAIN_RATE,
             CACHE_REG_GATE_LOADING, CACHE_REG_GATE_QUEUE_MIN, CACHE_REG_GATE_RATE,
             CACHE_REGISTRATION_THROTTLED, CACHE_REGISTRATION_THROTTLED_TOTAL, CACHE_RESTARTS_TOTAL,
-            CACHE_RSS_BYTES, CACHE_SERVE_DESYNC_TOTAL, CACHE_SERVE_DIRTY_RETURN_TOTAL,
-            CACHE_SERVE_POOL_BACKSTOP_GROWS, CACHE_SERVE_POOL_SCALE_DOWN,
-            CACHE_SERVE_POOL_SCALE_UP, CACHE_SERVE_POOL_SIZE, CACHE_SERVE_SETTINGS_APPLIED,
-            CACHE_SERVE_STALL_TOTAL, CACHE_SERVES_IN_FLIGHT,
+            CACHE_ROLE_CHANGES, CACHE_RSS_BYTES, CACHE_SERVE_DESYNC_TOTAL,
+            CACHE_SERVE_DIRTY_RETURN_TOTAL, CACHE_SERVE_POOL_BACKSTOP_GROWS,
+            CACHE_SERVE_POOL_SCALE_DOWN, CACHE_SERVE_POOL_SCALE_UP, CACHE_SERVE_POOL_SIZE,
+            CACHE_SERVE_SETTINGS_APPLIED, CACHE_SERVE_STALL_TOTAL, CACHE_SERVES_IN_FLIGHT,
         };
         Self {
             lookup_latency: metrics::histogram!(CACHE_LOOKUP_LATENCY_SECONDS),
@@ -765,6 +770,8 @@ impl CacheHandles {
             memo_bytes: metrics::gauge!(CACHE_MEMO_BYTES),
             memo_slots: metrics::gauge!(CACHE_MEMO_SLOTS),
             restarts_total: metrics::counter!(CACHE_RESTARTS_TOTAL),
+            role_changes: metrics::counter!(CACHE_ROLE_CHANGES),
+
             pool_replenished: metrics::counter!(CACHE_POOL_REPLENISHED),
             pool_recycled: metrics::counter!(CACHE_POOL_RECYCLED),
             rss_bytes: metrics::gauge!(CACHE_RSS_BYTES),

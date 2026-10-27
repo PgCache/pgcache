@@ -3,7 +3,8 @@
 //! column, schema and function the query touches. Verdicts are cached per
 //! (role, object) with the catalog snapshot they were read under, and each
 //! DDL the stream applies drops exactly the verdicts whose read could not
-//! have seen it.
+//! have seen it. Role changes are not on the stream: the writer polls a
+//! digest of the role catalog, and a change drops every stored verdict.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -73,6 +74,19 @@ impl CatalogSnapshot {
         xid < self.xmin || (xid < self.xmax && !self.in_progress.contains(&xid))
     }
 
+    /// Whether every transaction `other` saw committed, this snapshot saw
+    /// too: nothing `other` could see is still ahead of or in progress at
+    /// this one. Compared on `xmax` and the in-progress list, not `xmin`,
+    /// which one long-running transaction pins for every later snapshot.
+    fn covers(&self, other: &Self) -> bool {
+        self.xmax >= other.xmax
+            && self
+                .in_progress
+                .iter()
+                .filter(|xid| **xid < other.xmax)
+                .all(|xid| other.in_progress.contains(xid))
+    }
+
     /// The 64-bit form of a 32-bit transaction id: the epoch of `xmax`,
     /// adjusted when the id sits on the other side of an epoch boundary.
     fn xid8(&self, xid: u32) -> u64 {
@@ -128,18 +142,20 @@ pub(crate) enum PrivilegeCheck {
 /// pending.
 type Stored<V> = (V, Option<Arc<CatalogSnapshot>>);
 
-/// The DDL transactions applied so far, by sequence number, as far back as
-/// a lookup in flight can need them.
+/// What has pruned the store so far: the DDL transactions applied, by
+/// sequence number, as far back as a lookup in flight can need them, and the
+/// snapshot the latest role change was observed under.
 #[derive(Debug, Default)]
-struct DdlLog {
+struct PruneLog {
     next_seq: u64,
     applied: VecDeque<(u64, u32)>,
+    role_change: Option<CatalogSnapshot>,
 }
 
 /// Lookups older than this many DDL are dropped rather than validated.
 const DDL_LOG_CAPACITY: usize = 256;
 
-impl DdlLog {
+impl PruneLog {
     fn push(&mut self, xid: u32) {
         self.applied.push_back((self.next_seq, xid));
         self.next_seq += 1;
@@ -163,19 +179,20 @@ impl DdlLog {
 }
 
 /// The verdict store: wait-free reads on the hit path, written by the
-/// writer's lookup command and pruned by its schema-change handler.
+/// writer's lookup command and pruned by its schema-change handler and its
+/// role poll.
 #[derive(Debug, Default)]
 pub struct PrivilegeVerdicts {
-    ddl: Mutex<DdlLog>,
+    prune: Mutex<PruneLog>,
     relations: DashMap<(EcoString, Oid), Stored<RelationVerdict>>,
     functions: DashMap<(EcoString, EcoString), Stored<FunctionVerdict>>,
 }
 
 impl PrivilegeVerdicts {
-    fn ddl_log(&self) -> std::sync::MutexGuard<'_, DdlLog> {
+    fn prune_log(&self) -> std::sync::MutexGuard<'_, PruneLog> {
         // The log is a bounded deque; a poisoned lock holds nothing worse
         // than a truncated history, which only forwards.
-        self.ddl
+        self.prune
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -189,7 +206,7 @@ impl PrivilegeVerdicts {
         }
         let mut lookup = PrivilegeLookup {
             role: role.clone(),
-            seq: self.ddl_log().next_seq,
+            seq: self.prune_log().next_seq,
             relations: Vec::new(),
             functions: Vec::new(),
         };
@@ -251,12 +268,19 @@ impl PrivilegeVerdicts {
     }
 
     /// Record origin's answers for `lookup`, unless a DDL applied since the
-    /// check was invisible to the snapshot they were read under (or the log
-    /// no longer says): the pending marks are then dropped and the next
-    /// read asks again.
+    /// check, or the latest role change, was invisible to the snapshot they
+    /// were read under (or the log no longer says): the pending marks are
+    /// then dropped and the next read asks again.
     pub(crate) fn apply(&self, lookup: &PrivilegeLookup, results: PrivilegeResults) {
-        let since = self.ddl_log().since(lookup.seq);
-        let valid = since.is_some_and(|xids| xids.iter().all(|xid| results.snapshot.sees(*xid)));
+        let valid = {
+            let log = self.prune_log();
+            log.since(lookup.seq)
+                .is_some_and(|xids| xids.iter().all(|xid| results.snapshot.sees(*xid)))
+                && log
+                    .role_change
+                    .as_ref()
+                    .is_none_or(|change| results.snapshot.covers(change))
+        };
         if !valid {
             self.pending_clear(lookup);
             return;
@@ -297,12 +321,28 @@ impl PrivilegeVerdicts {
     /// is forgotten. Pending marks stay; their results are validated on
     /// arrival.
     pub(crate) fn ddl_applied(&self, xid: u32) {
-        self.ddl_log().push(xid);
+        self.prune_log().push(xid);
         let unseen = |snapshot: &Option<Arc<CatalogSnapshot>>| {
             snapshot.as_ref().is_some_and(|s| !s.sees(xid))
         };
         self.relations.retain(|_, v| !unseen(&v.1));
         self.functions.retain(|_, v| !unseen(&v.1));
+    }
+
+    /// The role poll saw the role catalog change, under `snapshot` when the
+    /// poll could read one: membership, superuser or inheritance may have
+    /// changed for any role, so every stored verdict is forgotten. Pending
+    /// marks stay; their results are validated against the snapshot on
+    /// arrival. Without one, nothing in flight can be validated, and the
+    /// writer's sequential execution is what keeps a stale result out.
+    pub(crate) fn roles_changed(&self, snapshot: Option<CatalogSnapshot>) {
+        if let Some(snapshot) = snapshot {
+            self.prune_log().role_change = Some(snapshot);
+        }
+        self.relations
+            .retain(|_, v| v.0 == RelationVerdict::Pending);
+        self.functions
+            .retain(|_, v| v.0 == FunctionVerdict::Pending);
     }
 }
 
@@ -517,6 +557,92 @@ mod tests {
             store.check(&role, &need),
             PrivilegeCheck::Pending(_)
         ));
+    }
+
+    #[test]
+    fn test_snapshot_covers_everything_an_earlier_one_saw() {
+        let change = snapshot("50:60:55");
+        assert!(snapshot("50:60:55").covers(&change), "the same snapshot");
+        assert!(
+            snapshot("50:70:55").covers(&change),
+            "later, with the same long-running transaction still open"
+        );
+        assert!(
+            snapshot("50:70:55,65").covers(&change),
+            "a transaction opened after the change is not one it saw"
+        );
+        assert!(
+            !snapshot("50:58:").covers(&change),
+            "an earlier snapshot has not reached the change's xmax"
+        );
+        assert!(
+            !snapshot("50:70:58").covers(&change),
+            "58 was committed at the change and is in progress here, so this read is older"
+        );
+    }
+
+    #[test]
+    fn test_role_change_forgets_stored_verdicts_and_keeps_pending_marks() {
+        let store = PrivilegeVerdicts::default();
+        let role = EcoString::from("member");
+        let stored = pending(&store, &role, &needs(&[(10, &["id"])], &["f"]));
+        store.apply(
+            &stored,
+            PrivilegeResults {
+                snapshot: snapshot("50:50:"),
+                relations: vec![(Oid::from_raw(10), RelationVerdict::Full)],
+                functions: vec![(EcoString::from("f"), FunctionVerdict::Allowed)],
+            },
+        );
+        let in_flight = pending(&store, &role, &needs(&[(11, &["id"])], &[]));
+
+        store.roles_changed(Some(snapshot("60:60:")));
+        assert!(
+            matches!(
+                store.check(&role, &needs(&[(10, &["id"])], &["f"])),
+                PrivilegeCheck::Pending(_)
+            ),
+            "stored verdicts are forgotten"
+        );
+        assert!(
+            pending(&store, &role, &needs(&[(11, &["id"])], &[])).is_empty(),
+            "the in-flight mark stays"
+        );
+        // Its result predates the change and is dropped; a later one lands.
+        store.apply(
+            &in_flight,
+            results("55:55:", vec![(Oid::from_raw(11), RelationVerdict::Full)]),
+        );
+        let again = pending(&store, &role, &needs(&[(11, &["id"])], &[]));
+        assert_eq!(again.relations, vec![Oid::from_raw(11)], "asks again");
+        store.apply(
+            &again,
+            results("60:61:", vec![(Oid::from_raw(11), RelationVerdict::Full)]),
+        );
+        assert_eq!(
+            store.check(&role, &needs(&[(11, &["id"])], &[])),
+            PrivilegeCheck::Allowed
+        );
+    }
+
+    #[test]
+    fn test_role_change_without_a_snapshot_still_forgets_stored_verdicts() {
+        let store = PrivilegeVerdicts::default();
+        let role = EcoString::from("member");
+        let need = needs(&[(10, &["id"])], &[]);
+        let lookup = pending(&store, &role, &need);
+        store.apply(
+            &lookup,
+            results("50:50:", vec![(Oid::from_raw(10), RelationVerdict::Full)]),
+        );
+        store.roles_changed(None);
+        let again = pending(&store, &role, &need);
+        assert_eq!(again.relations, vec![Oid::from_raw(10)]);
+        store.apply(
+            &again,
+            results("50:50:", vec![(Oid::from_raw(10), RelationVerdict::Full)]),
+        );
+        assert_eq!(store.check(&role, &need), PrivilegeCheck::Allowed);
     }
 
     #[test]

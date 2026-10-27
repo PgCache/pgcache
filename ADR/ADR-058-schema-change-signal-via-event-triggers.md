@@ -40,7 +40,8 @@ Two event triggers on origin, on `ddl_command_end` and `sql_drop`, emit each com
 - Every DDL in the database, cached or not, now produces a row-less frame in the writer. DDL is rare and the frame is cheap, but a migration storm is visible as frames.
 - A DDL whose message arrives after a query has already registered on the post-DDL catalog is evicted needlessly. Correct, but one wasted repopulation per such race.
 - Creating event triggers needs a superuser or the managed-PG master role, so for most deployments the install is an admin step.
-- Role-level changes (`pg_authid`, `pg_auth_members`) are global objects that fire no event triggers and are not decoded; they remain unsignalled.
+- Role-level changes (`pg_authid`, `pg_auth_members`) are global objects that fire no event triggers and are not decoded; they remain unsignalled, and are observed by the writer's role poll instead (ADR-061).
+
 - Every partition in the database carries a `pgcache_truncate` trigger, visible in `\d`, whether or not its root is cached. Installing it inside the `ddl_command_end` trigger runs DDL as the user issuing the create or attach; a failure there is downgraded to a warning so user DDL never fails on pgcache's account.
 - `TRUNCATE` of a partitioned root yields pgoutput's truncate plus one message per partition; all but the first resolve to a table already forgotten.
 

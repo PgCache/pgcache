@@ -1,11 +1,15 @@
 //! The writer's half of the hit-path privilege check (PGC-463): one catalog
 //! read per lookup, asking origin what `role` may read of each relation and
-//! whether it may execute each function, recorded in the state view.
+//! whether it may execute each function, recorded in the state view. Also
+//! the role poll (PGC-548): role commands reach no event trigger and are
+//! not decoded, so a digest of the role catalog is read every interval and
+//! a change forgets every stored verdict.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use ecow::EcoString;
+use tokio_postgres::Client;
 use tracing::debug;
 
 use super::core::WriterCore;
@@ -41,7 +45,74 @@ const FUNCTIONS_SQL: &str = "SELECT n.name, \
 const SNAPSHOT_SQL: &str = "SELECT pg_current_snapshot()::text, \
             EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1::text)";
 
+/// A digest of everything about roles that a privilege verdict depends on
+/// and no DDL signal reports: each role's identity and the attributes that
+/// decide inheritance, superuser and RLS bypass, plus every membership row.
+/// Public views only, so pgcache's role needs no privilege to read them. The
+/// snapshot is the one the digest's reads ran under.
+const ROLES_DIGEST_SQL: &str = "SELECT md5(string_agg(entry, ',' ORDER BY entry)), \
+            pg_current_snapshot()::text \
+     FROM (SELECT 'r' || oid::text || ':' || rolname || ':' \
+                  || rolsuper::text || rolinherit::text || rolbypassrls::text \
+             FROM pg_roles \
+           UNION ALL \
+           SELECT 'm' || m::text FROM pg_auth_members m) AS entries(entry)";
+
+/// The role catalog's digest and the snapshot it was read under.
+pub(super) struct RolesDigest {
+    pub(super) digest: EcoString,
+    pub(super) snapshot: CatalogSnapshot,
+}
+
+/// Read the role catalog's digest on `client`.
+pub(super) async fn roles_digest_read(client: &Client) -> CacheResult<RolesDigest> {
+    let row = client
+        .query_one(ROLES_DIGEST_SQL, &[])
+        .await
+        .map_into_report::<CacheError>()
+        .attach_loc("reading the role catalog digest")?;
+    let digest: &str = row.try_get(0).map_into_report::<CacheError>()?;
+    let snapshot_text: &str = row.try_get(1).map_into_report::<CacheError>()?;
+    let snapshot = CatalogSnapshot::parse(snapshot_text).ok_or_else(|| {
+        Report::from(CacheError::PrivilegeSnapshot {
+            text: snapshot_text.to_owned(),
+        })
+    })?;
+    Ok(RolesDigest {
+        digest: EcoString::from(digest),
+        snapshot,
+    })
+}
+
 impl WriterCore {
+    /// One poll of the role catalog: a digest unlike the last one means a
+    /// role, an attribute or a membership changed, and every stored verdict
+    /// is forgotten. A poll that cannot be read is treated as a change, so
+    /// an unobservable interval never serves on verdicts it might have
+    /// stale; the digest kept is the last one read.
+    pub(super) async fn roles_poll(&mut self) {
+        let Some(last) = self.roles_digest.as_ref() else {
+            return;
+        };
+        let snapshot = match roles_digest_read(&self.db_origin).await {
+            Ok(read) if read.digest == *last => return,
+            Ok(read) => {
+                debug!("role catalog changed, privilege verdicts forgotten");
+                self.roles_digest = Some(read.digest);
+                Some(read.snapshot)
+            }
+            Err(e) => {
+                debug!(
+                    "role catalog poll failed, privilege verdicts forgotten: {}",
+                    crate::result::error_chain_format(e.current_context())
+                );
+                None
+            }
+        };
+        self.state_view.privileges.roles_changed(snapshot);
+        crate::metrics::handles().cache.role_changes.increment(1);
+    }
+
     /// Fetch the verdicts `role` lacks for `needs`, if any, before the
     /// query they belong to is published Ready.
     pub(super) async fn privilege_prefetch(&self, role: &EcoString, needs: &PrivilegeNeeds) {

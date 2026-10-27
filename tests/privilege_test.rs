@@ -348,3 +348,104 @@ async fn test_coalesced_waiter_of_denied_role_forwards() -> Result<(), Error> {
     );
     Ok(())
 }
+
+/// The writer's role poll has seen a role catalog change since `before`.
+async fn role_change_wait(ctx: &mut TestContext, before: &MetricsSnapshot) -> Result<(), Error> {
+    for _ in 0..100 {
+        if ctx.metrics().await?.cache_role_changes > before.cache_role_changes {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Err(Error::other("the role poll never saw the role change"))
+}
+
+/// A `readers` group holding `SELECT` on `secret`, and `member` in it.
+async fn membership_create(ctx: &mut TestContext) -> Result<(), Error> {
+    for sql in [
+        "CREATE ROLE readers",
+        "GRANT SELECT ON secret TO readers",
+        "CREATE ROLE member LOGIN",
+        "GRANT readers TO member",
+    ] {
+        ctx.origin_query(sql, &[]).await?;
+    }
+    ctx.cache_settle().await
+}
+
+/// A membership `REVOKE` fires no schema-change signal; the role poll sees
+/// it, forgets the verdicts, and the next read forwards to origin's error.
+/// A membership `GRANT` back serves again.
+#[tokio::test]
+async fn test_membership_change_is_observed_by_the_role_poll() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_with_args(&["--role_poll_interval", "1"]).await?;
+    roles_create(&mut ctx).await?;
+    membership_create(&mut ctx).await?;
+
+    let member = ctx.proxy_client_connect_as("member").await?;
+    register(&mut ctx, &member, READ_BOTH).await?;
+
+    let before = ctx.metrics().await?;
+    ctx.origin_query("REVOKE readers FROM member", &[]).await?;
+    role_change_wait(&mut ctx, &before).await?;
+    denied_wait(&mut ctx, &member, READ_BOTH, "member after REVOKE readers").await?;
+
+    let before = ctx.metrics().await?;
+    ctx.origin_query("GRANT readers TO member", &[]).await?;
+    role_change_wait(&mut ctx, &before).await?;
+    hit_wait(&mut ctx, &member, READ_BOTH).await?;
+    Ok(())
+}
+
+/// A role attribute change is observed the same way: a denied role made a
+/// superuser is served, and is denied again once the attribute is dropped.
+#[tokio::test]
+async fn test_superuser_attribute_change_is_observed_by_the_role_poll() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_with_args(&["--role_poll_interval", "1"]).await?;
+    roles_create(&mut ctx).await?;
+
+    let reader = ctx.proxy_client_connect_as("reader").await?;
+    register(&mut ctx, &reader, READ_BOTH).await?;
+    let outsider = ctx.proxy_client_connect_as("outsider").await?;
+    denied_wait(&mut ctx, &outsider, READ_BOTH, "outsider before SUPERUSER").await?;
+
+    let before = ctx.metrics().await?;
+    ctx.origin_query("ALTER ROLE outsider SUPERUSER", &[])
+        .await?;
+    role_change_wait(&mut ctx, &before).await?;
+    let rows = hit_wait(&mut ctx, &outsider, READ_BOTH).await?;
+    assert_eq!(
+        rows,
+        vec![vec![Some("1".to_owned()), Some("classified".to_owned())]]
+    );
+
+    let before = ctx.metrics().await?;
+    ctx.origin_query("ALTER ROLE outsider NOSUPERUSER", &[])
+        .await?;
+    role_change_wait(&mut ctx, &before).await?;
+    denied_wait(&mut ctx, &outsider, READ_BOTH, "outsider after NOSUPERUSER").await?;
+    Ok(())
+}
+
+/// The store is keyed by role name. A role dropped and recreated under its
+/// name, without the membership the old one had, must not inherit the old
+/// role's verdicts.
+#[tokio::test]
+async fn test_recreated_role_does_not_inherit_the_old_roles_verdicts() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_with_args(&["--role_poll_interval", "1"]).await?;
+    roles_create(&mut ctx).await?;
+    membership_create(&mut ctx).await?;
+
+    let member = ctx.proxy_client_connect_as("member").await?;
+    register(&mut ctx, &member, READ_BOTH).await?;
+    drop(member);
+
+    let before = ctx.metrics().await?;
+    for sql in ["DROP ROLE member", "CREATE ROLE member LOGIN"] {
+        ctx.origin_query(sql, &[]).await?;
+    }
+    role_change_wait(&mut ctx, &before).await?;
+    let member = ctx.proxy_client_connect_as("member").await?;
+    denied_wait(&mut ctx, &member, READ_BOTH, "the recreated member").await?;
+    Ok(())
+}

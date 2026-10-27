@@ -9,7 +9,8 @@ use std::time::Duration;
 use tokio::runtime::Builder;
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver};
 use tokio::task::LocalSet;
-use tokio::time::Interval;
+use tokio::time::{Instant, Interval};
+
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
@@ -110,6 +111,18 @@ struct WriterLoop {
     /// Emit on a 1s tick instead — well below typical Prometheus scrape
     /// intervals.
     gauges_interval: Interval,
+    /// The role catalog poll (PGC-548); `None` when disabled.
+    role_poll_interval: Option<Interval>,
+}
+
+/// The next tick of an optional interval; never, when there is none.
+async fn interval_tick(interval: &mut Option<Interval>) {
+    match interval {
+        Some(interval) => {
+            interval.tick().await;
+        }
+        None => std::future::pending().await,
+    }
 }
 
 impl WriterLoop {
@@ -134,6 +147,14 @@ impl WriterLoop {
 
         let mut gauges_interval = tokio::time::interval(Duration::from_secs(1));
         gauges_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The baseline digest was read in `WriterCore::new`; the first poll
+        // waits a full interval rather than firing at once.
+        let role_poll_interval = (!settings.role_poll_interval.is_zero()).then(|| {
+            let period = settings.role_poll_interval;
+            let mut interval = tokio::time::interval_at(Instant::now() + period, period);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval
+        });
 
         #[cfg(feature = "fault-injection")]
         fault::init();
@@ -154,6 +175,7 @@ impl WriterLoop {
             status_rx,
             cancel,
             gauges_interval,
+            role_poll_interval,
         })
     }
 
@@ -166,6 +188,10 @@ impl WriterLoop {
                 }
                 _ = self.gauges_interval.tick() => {
                     self.tick_handle().await;
+                    LoopStep::Continue
+                }
+                () = interval_tick(&mut self.role_poll_interval) => {
+                    self.core.roles_poll().await;
                     LoopStep::Continue
                 }
                 msg = self.query_rx.recv() => self.query_command_received(msg, QuerySource::Dispatch).await,

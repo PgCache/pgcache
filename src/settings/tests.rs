@@ -507,6 +507,7 @@ fn base_toml_config() -> SettingsToml {
     SettingsToml {
         population_workers_min: None,
         population_workers_max: None,
+        role_poll_interval: None,
         origin: PgSettings {
             host: "origin.example.com".to_owned(),
             port: 5432,

@@ -4,6 +4,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::Duration;
 
 use error_set::error_set;
 use rootcause::Report;
@@ -302,6 +303,11 @@ struct SettingsToml {
     /// `num_workers * 8`; never below `population_workers_min`.
     #[serde(default)]
     population_workers_max: Option<usize>,
+    /// Seconds between polls of the origin's role catalog for membership
+    /// and attribute changes, which the schema-change signal cannot report
+    /// (PGC-548). 0 disables the poll. Defaults to 5.
+    #[serde(default)]
+    role_poll_interval: Option<u64>,
 }
 
 /// The origin-side subset of [`Settings`] that `--check` needs. Cache-side
@@ -357,4 +363,11 @@ pub struct Settings {
     /// PGCACHE_POPULATION_WORKERS_MAX; defaults to `num_workers * 8`, and is
     /// clamped to at least `population_workers_min`.
     pub population_workers_max: usize,
+    /// How often the writer polls the origin's role catalog for membership
+    /// and attribute changes, which no schema-change signal reports
+    /// (PGC-548); a change forgets every cached privilege verdict. Zero
+    /// disables the poll. Set via CLI --role_poll_interval SECONDS, TOML
+    /// role_poll_interval, or env PGCACHE_ROLE_POLL_INTERVAL; defaults to
+    /// 5 seconds.
+    pub role_poll_interval: Duration,
 }
