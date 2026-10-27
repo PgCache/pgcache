@@ -17,8 +17,9 @@ use crate::query::ast::{BinaryOp, LiteralValue};
 use crate::query::constraints::{ColumnConstraintKind, TableConstraint};
 use crate::query::guc::Guc;
 use crate::query::write::{
-    DeleteStatement, INSERT_MAX_ROWS, InsertRow, InsertStatement, IsolationEffect, IsolationLevel,
-    RelationRef, SetAssignment, SettingsEffect, TransactionBoundary, UpdateStatement, WriteClass,
+    CustomSettingEffect, CustomSettingEffects, DeleteStatement, INSERT_MAX_ROWS, InsertRow,
+    InsertStatement, IsolationEffect, IsolationLevel, RelationRef, SetAssignment, SettingsEffect,
+    TransactionBoundary, UpdateStatement, WriteClass,
 };
 
 /// Classification of a non-SELECT root statement.
@@ -32,6 +33,8 @@ pub(super) enum NonSelectClass {
         transaction: Option<TransactionBoundary>,
         isolation: IsolationEffect,
         settings: SettingsEffect,
+        /// Custom settings a `SET` / `RESET` names (PGC-113).
+        custom_settings: CustomSettingEffects,
     },
 }
 
@@ -41,6 +44,58 @@ fn read_only(transaction: Option<TransactionBoundary>) -> NonSelectClass {
         transaction,
         isolation: IsolationEffect::None,
         settings: SettingsEffect::NONE,
+        custom_settings: CustomSettingEffects::new(),
+    }
+}
+
+/// The custom setting a `SET` / `RESET` of an untracked name changes, with
+/// the value when it is one literal the proxy can read as origin stores it.
+/// `RESET`, `TO DEFAULT`, `FROM CURRENT` and multi-part values leave it to
+/// a probe. A fixed setting is tracked by [`variable_set_settings_effect`];
+/// every other name is kept, so a policy reading it is never inlined under
+/// a value a `SET` has since changed.
+unsafe fn variable_set_custom_effect(s: *const pg::VariableSetStmt) -> CustomSettingEffects {
+    unsafe {
+        let kind = (*s).kind;
+        if kind == pg::VariableSetKind_VAR_RESET_ALL || kind == pg::VariableSetKind_VAR_SET_MULTI {
+            return CustomSettingEffects::new();
+        }
+        let name = cstr((*s).name);
+        if Guc::parse(name).is_some() {
+            return CustomSettingEffects::new();
+        }
+        let value = if kind == pg::VariableSetKind_VAR_SET_VALUE {
+            let mut args = list_nodes((*s).args);
+            match (args.next(), args.next()) {
+                (Some(arg), None) => set_value_text(arg),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let mut effects = CustomSettingEffects::new();
+        effects.push(CustomSettingEffect {
+            name: EcoString::from(name.to_ascii_lowercase()),
+            value,
+            local: (*s).is_local,
+        });
+        effects
+    }
+}
+
+/// A `SET` value as origin stores it: a string or an integer. A float's
+/// stored spelling is the statement's own, which the literal has lost, so
+/// it is left to a probe.
+unsafe fn set_value_text(arg: NodePtr) -> Option<EcoString> {
+    unsafe {
+        if node_tag(arg) != pg::NodeTag_T_A_Const {
+            return None;
+        }
+        match const_value_extract(cast::<pg::A_Const>(arg)).ok()? {
+            LiteralValue::String(value) => Some(value),
+            LiteralValue::Integer(value) => Some(EcoString::from(value.to_string())),
+            _ => None,
+        }
     }
 }
 
@@ -213,6 +268,7 @@ pub(super) unsafe fn non_select_classify(stmt: NodePtr) -> NonSelectClass {
                     transaction: None,
                     isolation: variable_set_isolation_effect(s),
                     settings: variable_set_settings_effect(s),
+                    custom_settings: variable_set_custom_effect(s),
                 }
             }
             pg::NodeTag_T_DiscardStmt => {
@@ -230,6 +286,7 @@ pub(super) unsafe fn non_select_classify(stmt: NodePtr) -> NonSelectClass {
                     } else {
                         SettingsEffect::NONE
                     },
+                    custom_settings: CustomSettingEffects::new(),
                 }
             }
             pg::NodeTag_T_ExplainStmt => explain_classify(cast::<pg::ExplainStmt>(stmt)),
@@ -324,6 +381,7 @@ unsafe fn transaction_classify(s: *const pg::TransactionStmt) -> NonSelectClass 
                     transaction: Some(TransactionBoundary::Begin),
                     isolation: begin_isolation_effect((*s).options),
                     settings: SettingsEffect::NONE,
+                    custom_settings: CustomSettingEffects::new(),
                 }
             }
             // AND CHAIN immediately re-enters a transaction.
@@ -339,6 +397,7 @@ unsafe fn transaction_classify(s: *const pg::TransactionStmt) -> NonSelectClass 
                 transaction: None,
                 isolation: IsolationEffect::None,
                 settings: SettingsEffect::BLOCK_REVERT,
+                custom_settings: CustomSettingEffects::new(),
             },
             // PREPARE TRANSACTION commits later, possibly from another
             // session — the entry must never be LSN-stamped.

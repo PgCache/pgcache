@@ -183,7 +183,7 @@ fn command_histogram(cmd: &QueryCommand) -> &'static Histogram {
 /// (ambiguous self-join columns, USING/NATURAL qualifiers, etc.) as a
 /// `ResolveError`; a correlated subquery that can't be decorrelated as a
 /// `DecorrelateError`; a table with row-level security enabled as
-/// `RowSecurityEnabled` (PGC-112). A forwarded query still returns the correct result; a
+/// an RLS refusal (PGC-113). A forwarded query still returns the correct result; a
 /// wrong cached result is caught by the result-diff path, and "should have
 /// cached" by routing assertions — neither relies on this error log.
 fn register_failure_log(key: impl std::fmt::Display, error: &CacheError) {
@@ -192,7 +192,14 @@ fn register_failure_log(key: impl std::fmt::Display, error: &CacheError) {
         CacheError::DecorrelateError(_)
             | CacheError::ResolveError(_)
             | CacheError::UnknownTable { .. }
-            | CacheError::RowSecurityEnabled { .. }
+            | CacheError::RlsNoContext
+            | CacheError::RlsRoleUnknown
+            | CacheError::RlsSettingUnknown { .. }
+            | CacheError::RlsDefaultDeny
+            | CacheError::RlsRowSecurityOff
+            | CacheError::RlsUninlinable { .. }
+            | CacheError::RlsUnsupported { .. }
+            | CacheError::RlsRoleCannotBypass
     ) {
         debug!(
             "query {key} forwarded (not cacheable): {}",
@@ -225,6 +232,7 @@ async fn resolve_command(core: &mut WriterCore, request: ResolveRequest) {
                 Alias {
                     fingerprint,
                     tick: core.alias_tick,
+                    rls: request.keying.rls.is_some(),
                 },
             );
             ResolveResult::Resolved(fingerprint)

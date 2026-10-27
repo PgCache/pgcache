@@ -13,17 +13,23 @@ use crate::{
     query::ast::rope::{Function, NodeKind, QueryTree, View},
     query::ast::{AstError, LiteralValue, RawStatement, statement_convert_raw},
     query::guc::Guc,
-    query::write::{IsolationEffect, SettingsEffect, StatementEffects, WriteClass},
+    query::write::{
+        CustomSettingEffect, CustomSettingEffects, IsolationEffect, SettingsEffect,
+        StatementEffects, WriteClass,
+    },
 };
 
 /// The settings effect of the `set_config` calls in a converted statement:
 /// each call with a literal name touches that setting (an untracked name is
-/// not an effect), scoped by a literal `is_local`; a call whose name is not a
-/// literal may change anything. The caller only asks when the text mentions
-/// `set_config`, so finding no call means it hides somewhere the converter
-/// does not model and the answer is likewise everything.
-fn set_config_calls_effect(tree: &QueryTree) -> SettingsEffect {
+/// a custom setting, with its value when that is a literal too), scoped by
+/// a literal `is_local`; a call
+/// whose name is not a literal may change anything. The caller only asks
+/// when the text mentions `set_config`, so finding no call means it hides
+/// somewhere the converter does not model and the answer is likewise
+/// everything.
+fn set_config_calls_effect(tree: &QueryTree) -> (SettingsEffect, CustomSettingEffects) {
     let mut effect = SettingsEffect::NONE;
+    let mut custom = CustomSettingEffects::new();
     let mut calls = 0usize;
     for position in tree.root().node_ref().subtree() {
         let NodeKind::Function { name, .. } = position.kind() else {
@@ -35,17 +41,27 @@ fn set_config_calls_effect(tree: &QueryTree) -> SettingsEffect {
         calls += 1;
         let mut args = Function::from_ref(position).args();
         let Some(LiteralValue::String(name)) = args.next().and_then(|arg| arg.literal()) else {
-            return SettingsEffect::all();
+            return (SettingsEffect::all(), CustomSettingEffects::new());
         };
-        let local = args.nth(1).and_then(|arg| arg.literal()) == Some(&LiteralValue::Boolean(true));
+        let value = args.next().and_then(|arg| arg.literal()).cloned();
+        let local = args.next().and_then(|arg| arg.literal()) == Some(&LiteralValue::Boolean(true));
         if let Some(guc) = Guc::parse(name.as_str()) {
             effect = effect.union(SettingsEffect::guc(guc, local));
+        } else {
+            custom.push(CustomSettingEffect {
+                name: name.to_ascii_lowercase(),
+                value: match value {
+                    Some(LiteralValue::String(value)) => Some(value),
+                    _ => None,
+                },
+                local,
+            });
         }
     }
     if calls == 0 {
-        return SettingsEffect::all();
+        return (SettingsEffect::all(), CustomSettingEffects::new());
     }
-    effect
+    (effect, custom)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -164,6 +180,7 @@ pub(super) fn analyze(
     } else {
         SettingsEffect::NONE
     };
+    let mut custom_settings = CustomSettingEffects::new();
 
     let mut action = match convert_result {
         Ok(RawStatement::Select {
@@ -171,7 +188,7 @@ pub(super) fn analyze(
             ..
         }) => {
             if mentions_set_config {
-                settings = set_config_calls_effect(&query);
+                (settings, custom_settings) = set_config_calls_effect(&query);
             }
             // `SELECT pgcache_explain(...)` is intercepted before cacheability
             // classification (it would otherwise be an uncacheable unknown
@@ -234,6 +251,7 @@ pub(super) fn analyze(
             transaction,
             isolation: statement_isolation,
             settings: statement_settings,
+            custom_settings: statement_custom_settings,
         }) => Action::Forward(
             ForwardReason::UnsupportedStatement,
             // Only a whitelisted utility carries a parsed effect; the
@@ -247,7 +265,8 @@ pub(super) fn analyze(
                 },
                 transaction,
             )
-            .with_settings(statement_settings),
+            .with_settings(statement_settings)
+            .with_custom_settings(statement_custom_settings),
         ),
         Err(ast_error) => {
             let reason = ast_error_forward_reason(&ast_error);
@@ -262,6 +281,7 @@ pub(super) fn analyze(
     };
     if let Action::Forward(_, effects) = &mut action {
         effects.settings = effects.settings.union(settings);
+        effects.custom_settings.extend(custom_settings);
     }
 
     // Don't memoize writes: DML text is almost always unique (fresh literals
@@ -486,6 +506,35 @@ mod tests {
             assert_eq!(settings_of(sql), expected, "{sql}");
         }
         assert!(StatementEffects::unknown().settings.all);
+    }
+
+    fn custom_settings_of(sql: &str) -> Vec<CustomSettingEffect> {
+        match analyze_fresh(sql, &HashMap::new()) {
+            Action::Forward(_, effects) => effects.custom_settings.into_vec(),
+            _ => panic!("expected a forward for {sql:?}"),
+        }
+    }
+
+    /// PGC-113: a literal `set_config` of a dotted name carries the custom
+    /// setting and its value when that is a literal; a `SET` of one likewise.
+    #[test]
+    fn test_analyze_custom_setting_effects() {
+        let effect = |name: &str, value: Option<&str>, local: bool| CustomSettingEffect {
+            name: name.into(),
+            value: value.map(Into::into),
+            local,
+        };
+        #[rustfmt::skip]
+        let cases = [
+            ("SELECT set_config('request.jwt.claims', '{}', true)", vec![effect("request.jwt.claims", Some("{}"), true)]),
+            ("SELECT set_config('app.tenant', $1, false)", vec![effect("app.tenant", None, false)]),
+            ("SELECT set_config('timezone', 'UTC', true)", vec![]),
+            ("SET app.tenant = '7'", vec![effect("app.tenant", Some("7"), false)]),
+            ("SELECT now()", vec![]),
+        ];
+        for (sql, expected) in cases {
+            assert_eq!(custom_settings_of(sql), expected, "{sql}");
+        }
     }
 
     #[test]

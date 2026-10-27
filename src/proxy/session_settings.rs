@@ -12,6 +12,7 @@
 //! the open block's. In between, the analyzer's [`SettingsEffect`] of each
 //! forwarded statement marks what it may have changed, in which scope.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use ecow::EcoString;
@@ -23,20 +24,32 @@ use crate::proxy::search_path::SearchPath;
 use crate::query::guc::Guc;
 use crate::query::keying_settings::KeyingSettings;
 use crate::query::literal_settings::LiteralSettings;
-use crate::query::write::{IsolationLevel, SettingsEffect};
+use crate::query::transform::{CustomSettingValue, SessionTermContext};
+use crate::query::write::{CustomSettingEffect, IsolationLevel, SettingsEffect};
 
 /// A setting's value as the proxy knows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SettingValue {
     Unknown,
     Known(EcoString),
+    /// A custom setting the session never set (PGC-113): origin errors on
+    /// its name, or reads NULL with `missing_ok`. Never a fixed setting's.
+    Unset,
 }
 
 impl SettingValue {
     fn known(&self) -> Option<&str> {
         match self {
             Self::Known(value) => Some(value),
-            Self::Unknown => None,
+            Self::Unknown | Self::Unset => None,
+        }
+    }
+
+    /// The value a probe column holds: NULL is an unset custom setting.
+    fn sampled(column: &Option<EcoString>) -> Self {
+        match column {
+            Some(value) => Self::Known(value.clone()),
+            None => Self::Unset,
         }
     }
 }
@@ -79,6 +92,39 @@ impl SettingState {
         }
     }
 
+    /// A custom setting first seen at mutation `seq`: unknown until a probe
+    /// samples it or a statement sets it to a literal.
+    fn for_custom(seq: u64) -> Self {
+        Self {
+            session: SettingValue::Unknown,
+            session_since: seq,
+            block: None,
+            block_since: seq,
+            touched_in_block: false,
+            reported: false,
+            block_sample_valid: true,
+        }
+    }
+
+    /// A statement set this setting to a value the proxy read off it. A
+    /// block-scoped value is the block's; a session-scoped one made inside
+    /// a block is also the block's, while the session value is left to a
+    /// probe after the block, since a rollback would undo it.
+    fn value_set(&mut self, value: EcoString, local: bool, in_block: bool, seq: u64) {
+        if local || in_block {
+            self.block = Some(SettingValue::Known(value.clone()));
+            self.block_since = seq;
+            self.touched_in_block = true;
+        }
+        if !local {
+            if in_block {
+                self.session_unknown_mark(seq);
+            } else {
+                self.session = SettingValue::Known(value);
+            }
+        }
+    }
+
     fn session_unknown_mark(&mut self, seq: u64) {
         self.session = SettingValue::Unknown;
         self.session_since = seq;
@@ -114,15 +160,15 @@ impl SettingState {
 
     /// Fill the session value from a sample taken at `seq`, if it was
     /// unknown since before then.
-    fn session_fill(&mut self, value: &EcoString, seq: u64) {
+    fn session_fill(&mut self, value: &SettingValue, seq: u64) {
         if self.session == SettingValue::Unknown && self.session_since <= seq {
-            self.session = SettingValue::Known(value.clone());
+            self.session = value.clone();
         }
     }
 
     /// A sample taken with no block open. A block mark made after the probe
     /// was injected belongs to a block the sample predates, so it stays.
-    fn idle_sample_apply(&mut self, value: &EcoString, seq: u64) {
+    fn idle_sample_apply(&mut self, value: &SettingValue, seq: u64) {
         if self.block_since <= seq {
             self.block = None;
         }
@@ -132,16 +178,25 @@ impl SettingState {
     /// A sample taken inside a block: it fills the block override when one
     /// is marked unknown, else the session value the block inherits. Nothing
     /// for a setting whose in-block sample is meaningless.
-    fn block_sample_apply(&mut self, value: &EcoString, seq: u64) {
+    fn block_sample_apply(&mut self, value: &SettingValue, seq: u64) {
         if !self.block_sample_valid {
             return;
         }
         match &self.block {
             Some(SettingValue::Unknown) if self.block_since <= seq => {
-                self.block = Some(SettingValue::Known(value.clone()));
+                self.block = Some(value.clone());
             }
             Some(_) => {}
             None => self.session_fill(value, seq),
+        }
+    }
+
+    /// Apply a probe sample under the status its `ReadyForQuery` carried.
+    fn sample_apply(&mut self, value: &SettingValue, in_block: bool, seq: u64) {
+        if in_block {
+            self.block_sample_apply(value, seq);
+        } else {
+            self.idle_sample_apply(value, seq);
         }
     }
 
@@ -297,6 +352,14 @@ pub(crate) struct SessionSettings {
     /// costs two `Arc` clones, not a settings parse and eleven string clones.
     idle: ScopeViews,
     block: ScopeViews,
+    /// The custom (dotted) settings this connection tracks (PGC-113): the
+    /// ones its statements set and the ones the policies of the relations it
+    /// reads depend on. Ordered, so the probe's columns and a read's context
+    /// come out the same for the same names.
+    custom: BTreeMap<EcoString, SettingState>,
+    /// The custom names the in-flight settings probe samples, in column order
+    /// after the fixed settings.
+    probe_custom_names: Vec<EcoString>,
 }
 
 /// What a read at one scope dispatches with, derived from the values in
@@ -316,6 +379,7 @@ impl ScopeViews {
         let label = Arc::new(KeyingSettings {
             search_path: Arc::from([]),
             literals: LiteralSettings::default(),
+            rls: None,
         });
         Self {
             keying: Err(SettingsForwardReason::SettingUnknown(Guc::SearchPath)),
@@ -337,6 +401,8 @@ impl SessionSettings {
             isolation: IsolationState::Unknown,
             idle: ScopeViews::unknown(),
             block: ScopeViews::unknown(),
+            custom: BTreeMap::new(),
+            probe_custom_names: Vec::new(),
         };
         settings.views_rederive();
         settings
@@ -423,11 +489,13 @@ impl SessionSettings {
                 Arc::new(KeyingSettings {
                     search_path,
                     literals: literals.clone(),
+                    rls: None,
                 })
             }),
             label: Arc::new(KeyingSettings {
                 search_path: self.search_path.resolve().unwrap_or_else(|| Arc::from([])),
                 literals,
+                rls: None,
             }),
             output: Arc::new(self.output_settings_build(in_block)),
             role: self
@@ -493,7 +561,93 @@ impl SessionSettings {
     pub(crate) fn probe_needed(&self, in_block: bool) -> bool {
         Guc::ALL.into_iter().any(|guc| {
             (!in_block || guc.block_sample_valid()) && self.state(guc).unknown_at(in_block)
-        })
+        }) || self.custom.values().any(|state| state.unknown_at(in_block))
+    }
+
+    /// The settings probe's text when the connection tracks custom settings:
+    /// the fixed columns, then one `current_setting(name, true)` per custom
+    /// name, whose order is kept for the reply. `None` means the fixed probe
+    /// serves as it is.
+    pub(crate) fn probe_sql(&mut self) -> Option<String> {
+        if self.custom.is_empty() {
+            self.probe_custom_names.clear();
+            return None;
+        }
+        let mut sql = String::with_capacity(SETTINGS_PROBE_SQL.len() + 48 * self.custom.len());
+        sql.push_str(SETTINGS_PROBE_SQL);
+        self.probe_custom_names.clear();
+        for name in self.custom.keys() {
+            sql.push_str(",current_setting('");
+            sql.push_str(&name.replace("'", "''"));
+            sql.push_str("',true)");
+            self.probe_custom_names.push(name.clone());
+        }
+        Some(sql)
+    }
+
+    /// Track `names` from now on (the settings the policies of a relation
+    /// being read depend on): one not yet tracked is unknown until probed.
+    pub(crate) fn custom_require(&mut self, names: &[EcoString]) {
+        let seq = self.mutation_seq;
+        for name in names {
+            self.custom
+                .entry(name.clone())
+                .or_insert_with(|| SettingState::for_custom(seq));
+        }
+    }
+
+    /// The session values the policies over `names` are inlined under at
+    /// this scope (PGC-113): the roles in force and each named setting as
+    /// known, unset, or not yet sampled.
+    pub(crate) fn rls_context(&self, names: &[EcoString], in_block: bool) -> SessionTermContext {
+        let custom = |name: &EcoString| match self.custom.get(name).map(|s| s.effective(in_block)) {
+            Some(SettingValue::Known(value)) => CustomSettingValue::Known(value.clone()),
+            Some(SettingValue::Unset) => CustomSettingValue::Unset,
+            Some(SettingValue::Unknown) | None => CustomSettingValue::Unknown,
+        };
+        SessionTermContext {
+            current_user: self.role_in_force(in_block).map(EcoString::from),
+            session_user: self
+                .effective(Guc::SessionAuthorization, in_block)
+                .known()
+                .or(self.startup_user.as_deref())
+                .map(EcoString::from),
+            settings: names
+                .iter()
+                .map(|name| (name.clone(), custom(name)))
+                .collect(),
+        }
+    }
+
+    /// `row_security` at this scope as on/off; `None` while unknown.
+    pub(crate) fn row_security(&self, in_block: bool) -> Option<bool> {
+        self.effective(Guc::RowSecurity, in_block)
+            .known()
+            .map(|value| value.trim().eq_ignore_ascii_case("on"))
+    }
+
+    /// Forwarded statements changed custom settings (`SET app.x`,
+    /// `set_config('app.x', …)`, `RESET app.x`). A literal value is known at
+    /// once; anything else is unknown until probed.
+    pub(crate) fn custom_effects_apply(&mut self, effects: &[CustomSettingEffect], in_block: bool) {
+        if effects.iter().all(|effect| effect.local && !in_block) {
+            return;
+        }
+        self.mutation_seq += 1;
+        let seq = self.mutation_seq;
+        for effect in effects {
+            if effect.local && !in_block {
+                continue;
+            }
+            let state = self
+                .custom
+                .entry(effect.name.clone())
+                .or_insert_with(|| SettingState::for_custom(seq));
+            match &effect.value {
+                Some(value) => state.value_set(value.clone(), effect.local, in_block, seq),
+                None => state.effect_mark(effect.local, in_block, seq),
+            }
+        }
     }
 
     /// The startup message's user: the `$user` fallback.
@@ -532,6 +686,11 @@ impl SessionSettings {
                     self.state_mut(guc).effect_mark(effect.local, in_block, seq);
                 }
             }
+            if effect.all {
+                for state in self.custom.values_mut() {
+                    state.effect_mark(effect.local, in_block, seq);
+                }
+            }
         }
         self.views_rederive();
     }
@@ -539,7 +698,7 @@ impl SessionSettings {
     /// A `ROLLBACK TO SAVEPOINT` may have reverted every block value a
     /// statement touched inside the block.
     fn block_touched_revert(&mut self, seq: u64) {
-        for state in &mut self.states {
+        for state in self.states.iter_mut().chain(self.custom.values_mut()) {
             if state.touched_in_block {
                 state.block_unknown_mark(seq);
             }
@@ -565,7 +724,7 @@ impl SessionSettings {
     /// The open block ended: block values are gone, and session values were
     /// already marked unknown by any session-scoped change made inside it.
     pub(crate) fn block_exit(&mut self) {
-        for state in &mut self.states {
+        for state in self.states.iter_mut().chain(self.custom.values_mut()) {
             state.block = None;
             state.touched_in_block = false;
         }
@@ -589,14 +748,17 @@ impl SessionSettings {
         }
         let in_block = status == TransactionStatus::InTransaction;
         for (guc, column) in Guc::ALL.into_iter().zip(columns) {
+            // A fixed setting is never NULL; an unreadable column stays unknown.
             let Some(value) = column else {
                 continue;
             };
-            let state = self.state_mut(guc);
-            if in_block {
-                state.block_sample_apply(value, seq);
-            } else {
-                state.idle_sample_apply(value, seq);
+            self.state_mut(guc)
+                .sample_apply(&SettingValue::Known(value.clone()), in_block, seq);
+        }
+        let custom_columns = columns.get(Guc::ALL.len()..).unwrap_or_default();
+        for (name, column) in self.probe_custom_names.iter().zip(custom_columns) {
+            if let Some(state) = self.custom.get_mut(name) {
+                state.sample_apply(&SettingValue::sampled(column), in_block, seq);
             }
         }
         self.views_rederive();
@@ -644,7 +806,7 @@ impl SessionSettings {
                 let write = user_certain.then(|| state.resolve()).flatten();
                 (state, write)
             }
-            SettingValue::Unknown => (SearchPathState::Unknown, None),
+            SettingValue::Unknown | SettingValue::Unset => (SearchPathState::Unknown, None),
         };
         if search_path != self.search_path {
             self.search_path = search_path;
@@ -761,6 +923,103 @@ mod tests {
             .map(|guc| format!("current_setting('{}',true)", guc.name()))
             .collect();
         assert_eq!(SETTINGS_PROBE_SQL, format!("SELECT {}", columns.join(",")));
+    }
+
+    /// A tracked custom setting (PGC-113): required by a read, it is unknown
+    /// until the probe samples it, whose NULL is "unset"; a literal `SET`
+    /// makes it known without a probe; `SET LOCAL` scopes it to the block.
+    #[test]
+    fn test_custom_settings_are_probed_set_and_scoped() {
+        let tenant = EcoString::from("app.tenant");
+        let mut settings = all_known(TransactionStatus::Idle);
+        assert!(!settings.probe_needed(false));
+        settings.custom_require(std::slice::from_ref(&tenant));
+        assert!(
+            settings.probe_needed(false),
+            "a required setting is unknown"
+        );
+        assert_eq!(
+            settings
+                .rls_context(std::slice::from_ref(&tenant), false)
+                .settings,
+            vec![(tenant.clone(), CustomSettingValue::Unknown)]
+        );
+        let sql = settings.probe_sql().expect("custom columns");
+        assert!(sql.starts_with(SETTINGS_PROBE_SQL), "{sql}");
+        assert!(
+            sql.ends_with(",current_setting('app.tenant',true)"),
+            "{sql}"
+        );
+
+        let mut columns = sample("public");
+        columns.push(None);
+        settings.probe_apply(&columns, TransactionStatus::Idle, settings.probe_seq());
+        assert!(!settings.probe_needed(false));
+        assert_eq!(
+            settings
+                .rls_context(std::slice::from_ref(&tenant), false)
+                .settings,
+            vec![(tenant.clone(), CustomSettingValue::Unset)]
+        );
+
+        let set = |value: &str, local: bool| CustomSettingEffect {
+            name: tenant.clone(),
+            value: Some(value.into()),
+            local,
+        };
+        settings.custom_effects_apply(&[set("7", false)], false);
+        assert!(
+            !settings.probe_needed(false),
+            "a literal SET needs no probe"
+        );
+        let context = settings.rls_context(std::slice::from_ref(&tenant), false);
+        assert_eq!(
+            context.settings,
+            vec![(tenant.clone(), CustomSettingValue::Known("7".into()))]
+        );
+        assert_eq!(context.current_user.as_deref(), Some("alice"));
+
+        settings.custom_effects_apply(&[set("8", true)], true);
+        assert_eq!(
+            settings
+                .rls_context(std::slice::from_ref(&tenant), true)
+                .settings,
+            vec![(tenant.clone(), CustomSettingValue::Known("8".into()))],
+            "the block's value"
+        );
+        assert_eq!(
+            settings
+                .rls_context(std::slice::from_ref(&tenant), false)
+                .settings,
+            vec![(tenant.clone(), CustomSettingValue::Known("7".into()))],
+            "the session's value outside the block"
+        );
+        settings.block_exit();
+        assert_eq!(
+            settings
+                .rls_context(std::slice::from_ref(&tenant), true)
+                .settings,
+            vec![(tenant.clone(), CustomSettingValue::Known("7".into()))]
+        );
+
+        // RESET leaves the value to a probe; RESET ALL every custom setting.
+        settings.custom_effects_apply(
+            &[CustomSettingEffect {
+                name: tenant.clone(),
+                value: None,
+                local: false,
+            }],
+            false,
+        );
+        assert!(settings.probe_needed(false));
+        settings.probe_apply(&columns, TransactionStatus::Idle, settings.probe_seq());
+        settings.custom_effects_apply(&[set("9", false)], false);
+        settings.effect_apply(SettingsEffect::all(), false);
+        assert!(settings.probe_needed(false));
+        assert_eq!(
+            settings.rls_context(&[tenant], false).settings[0].1,
+            CustomSettingValue::Unknown
+        );
     }
 
     #[test]

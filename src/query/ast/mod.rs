@@ -63,7 +63,7 @@ error_set! {
 }
 
 // Re-export everything public from submodules
-#[cfg(test)]
+#[cfg(any(test, feature = "proxy"))]
 pub(crate) use convert_tree::query_tree_parse;
 pub use convert_tree::{RawStatement, query_tree_convert_raw, statement_convert_raw};
 pub(crate) use deparse::separated_deparse;

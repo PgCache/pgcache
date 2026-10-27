@@ -106,7 +106,8 @@ pub(crate) fn bind_value_write(buf: &mut BytesMut, literal: &LiteralValue) -> Ca
         | LiteralValue::Array(..)
         | LiteralValue::Null
         | LiteralValue::NullWithCast(_)
-        | LiteralValue::Parameter(_) => {
+        | LiteralValue::Parameter(_)
+        | LiteralValue::SessionTerm(_) => {
             debug_assert!(false, "non-parameterizable literal in shape binds");
             bind_text_write(buf, b"")
         }

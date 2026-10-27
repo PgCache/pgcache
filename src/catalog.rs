@@ -119,6 +119,10 @@ pub struct TableMetadata {
     /// bypassed (the tuple itself is authoritative) and PK changes are
     /// detected by comparing PK columns rather than key-tuple presence.
     pub replica_identity_full: bool,
+    /// Whether origin applies row-level security to the relation
+    /// (`pg_class.relrowsecurity`): a query over it is registered only with
+    /// the applicable policies inlined (PGC-113).
+    pub row_security: bool,
     /// Every partition under this table, leaves and intermediate levels
     /// alike (`pg_inherits` descendants). Under `publish_via_partition_root`
     /// a partition's rows stream as this table's, so a schema change signalled
@@ -195,6 +199,7 @@ impl TableMetadata {
             schema: "public".into(),
             primary_key_columns,
             columns,
+            row_security: false,
             indexes: Vec::new(),
             replica_identity_full: false,
             partitions: Vec::new(),

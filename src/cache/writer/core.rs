@@ -15,6 +15,7 @@ use super::frame::{FRAME_BUF_CAPACITY, FrameRowEvent, FrameState, OverlayEntry};
 use super::merge_queue::MergeQueue;
 use super::mv_build::MvBuildPool;
 use super::privileges::roles_digest_read;
+use super::rls::RlsCatalog;
 use super::staging::{PopulationDeletedKeys, PopulationKey, StagingPool};
 use crate::cache::Generation;
 use crate::cache::reference_settings;
@@ -25,7 +26,7 @@ use crate::cache::{
     mv_shape::ShapeGate,
     types::{ActiveRelations, Cache, CacheStateView, CachedQueryState, CachedQueryView, ServingAt},
 };
-use crate::catalog::CatalogTable;
+use crate::catalog::{CatalogTable, FunctionVolatility, function_volatility_map_load};
 use crate::oid::Oid;
 use crate::pg;
 use crate::pg::Lsn;
@@ -383,6 +384,14 @@ pub(super) struct WriterCore {
     /// before any verdict can be recorded (PGC-548); `None` when the role
     /// poll is disabled.
     pub(super) roles_digest: Option<EcoString>,
+    /// The secured relations and their policies (PGC-113).
+    pub(super) rls: RlsCatalog,
+    /// Function volatility by name, for the cacheability check of an inlined
+    /// policy predicate.
+    pub(super) function_volatility: HashMap<EcoString, FunctionVolatility>,
+    /// The writer connection's resolved search_path: what `pg_get_expr`
+    /// deparses a policy's table names under.
+    pub(super) origin_search_path: Arc<[EcoString]>,
 }
 
 /// Whether a parked population (a queued merge or a gated ready entry) at
@@ -451,6 +460,17 @@ async fn writer_origin_connect(origin: &PgSettings) -> CacheResult<Client> {
     Ok(origin_client)
 }
 
+/// The schemas the writer connection resolves a bare name along.
+async fn origin_search_path_read(client: &Client) -> CacheResult<Arc<[EcoString]>> {
+    let row = client
+        .query_one("SELECT current_schemas(true)", &[])
+        .await
+        .map_into_report::<CacheError>()
+        .attach_loc("reading the writer connection's search_path")?;
+    let schemas: Vec<String> = row.try_get(0).map_into_report::<CacheError>()?;
+    Ok(schemas.into_iter().map(EcoString::from).collect())
+}
+
 /// The writer's cache and origin sessions (the cache one pinned to the
 /// reference settings) and the cache volume's initial stats.
 async fn writer_resources_open(
@@ -482,6 +502,11 @@ impl WriterCore {
                     .digest,
             )
         };
+        let function_volatility = function_volatility_map_load(&origin_client)
+            .await
+            .map_into_report::<CacheError>()
+            .attach_loc("loading function volatility for policy inlining")?;
+        let origin_search_path = origin_search_path_read(&origin_client).await?;
         let WriterShared {
             state_view,
             active_relations,
@@ -490,7 +515,7 @@ impl WriterCore {
             runtime,
         } = shared;
 
-        Ok(Self {
+        let mut core = Self {
             cache: Cache::new(settings),
             db_cache: cache_client,
             db_origin: Rc::new(origin_client),
@@ -550,7 +575,14 @@ impl WriterCore {
             disk_pressure_ticks: 0,
             disk_drop_backoff: false,
             roles_digest,
-        })
+            rls: RlsCatalog::default(),
+            function_volatility,
+            origin_search_path,
+        };
+        core.rls_startup_load()
+            .await
+            .attach_loc("loading row-level security policies at writer start")?;
+        Ok(core)
     }
 
     /// Borrow a cleared candidate `FingerprintSet` from the scratch pool

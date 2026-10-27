@@ -289,7 +289,8 @@ impl Pass<'_> {
             | LiteralValue::Boolean(_)
             | LiteralValue::Null
             | LiteralValue::NullWithCast(_)
-            | LiteralValue::Parameter(_) => {}
+            | LiteralValue::Parameter(_)
+            | LiteralValue::SessionTerm(_) => {}
         }
     }
 

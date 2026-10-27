@@ -12,6 +12,8 @@ use crate::settings::{CdcSettings, PgSettings};
 pub(super) struct RoleInfo {
     pub name: String,
     pub superuser: bool,
+    /// `BYPASSRLS`: population sees every row of a secured table (PGC-113).
+    pub bypassrls: bool,
     pub replication: bool,
     pub create_on_database: bool,
     pub rds_replication: bool,
@@ -24,7 +26,8 @@ pub(super) async fn role_info_load(client: &Client) -> Result<RoleInfo, Error> {
                     has_database_privilege(current_database(), 'CREATE'), \
                     CASE WHEN EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'rds_replication') \
                          THEN pg_has_role(current_user, 'rds_replication', 'MEMBER') \
-                         ELSE false END \
+                         ELSE false END, \
+                    r.rolbypassrls \
              FROM pg_roles r WHERE r.rolname = current_user",
             &[],
         )
@@ -35,6 +38,7 @@ pub(super) async fn role_info_load(client: &Client) -> Result<RoleInfo, Error> {
         replication: row.try_get(2)?,
         create_on_database: row.try_get(3)?,
         rds_replication: row.try_get(4)?,
+        bypassrls: row.try_get(5)?,
     })
 }
 
@@ -253,6 +257,7 @@ mod tests {
         let role = RoleInfo {
             name: "app".to_owned(),
             superuser: false,
+            bypassrls: false,
             replication: false,
             create_on_database: false,
             rds_replication: false,

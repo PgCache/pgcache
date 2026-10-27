@@ -37,6 +37,7 @@ impl CacheDispatch {
         let keying = Arc::new(KeyingSettings {
             search_path: pinned_search_path(),
             literals: reference_settings::current().literals.clone(),
+            rls: None,
         });
         for pq in pinned {
             let session_key = keying.session_key(pq.cacheable_query.tree());

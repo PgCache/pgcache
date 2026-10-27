@@ -3,6 +3,7 @@
 //! object the trigger saw is listed; only tables matter to the cache today,
 //! the rest is reported for the policy, grant and view consumers to come.
 
+use ecow::EcoString;
 use serde::Deserialize;
 use tracing::trace;
 
@@ -23,6 +24,9 @@ struct DdlObject {
     #[serde(rename = "type")]
     object_type: String,
     oid: Option<u32>,
+    /// `pg_identify_object().identity`: for a policy, `<name> on <schema>.<table>`.
+    #[serde(default)]
+    identity: Option<String>,
     /// The direct parent when the object is a partition (`pg_inherits`, still
     /// visible at `ddl_command_end`).
     #[serde(default)]
@@ -34,6 +38,64 @@ struct DroppedObject {
     #[serde(rename = "type")]
     object_type: String,
     oid: Option<u32>,
+    #[serde(default)]
+    identity: Option<String>,
+}
+
+/// A row-level security policy: created, altered or dropped (PGC-113).
+const POLICY: &str = "policy";
+
+/// The `(schema, table)` a policy's identity names: `<policy> on
+/// <schema>.<table>`, each part possibly quoted. `None` for anything else.
+fn policy_table_parse(identity: &str) -> Option<(EcoString, EcoString)> {
+    let table = unquoted_on_split(identity)?;
+    let (schema, name) = qualified_name_split(table)?;
+    Some((identifier_unquote(schema), identifier_unquote(name)))
+}
+
+/// What follows the first ` on ` outside double quotes: the policy name
+/// before it and the table after it may both contain the words when quoted.
+fn unquoted_on_split(identity: &str) -> Option<&str> {
+    let mut quoted = false;
+    for (index, ch) in identity.char_indices() {
+        if ch == '"' {
+            quoted = !quoted;
+        } else if !quoted
+            && identity
+                .get(index..)
+                .is_some_and(|rest| rest.starts_with(" on "))
+        {
+            return identity.get(index + " on ".len()..);
+        }
+    }
+    None
+}
+
+/// `schema.name` with either part possibly double-quoted (quotes doubled
+/// inside): the split at the dot outside quotes.
+fn qualified_name_split(text: &str) -> Option<(&str, &str)> {
+    let mut quoted = false;
+    for (index, ch) in text.char_indices() {
+        match ch {
+            '"' => quoted = !quoted,
+            '.' if !quoted => {
+                let (schema, rest) = text.split_at(index);
+                return Some((schema, rest.strip_prefix('.').unwrap_or(rest)));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn identifier_unquote(text: &str) -> EcoString {
+    match text
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    {
+        Some(inner) => EcoString::from(inner.replace("\"\"", "\"")),
+        None => EcoString::from(text),
+    }
 }
 
 #[derive(Deserialize)]
@@ -77,6 +139,13 @@ pub(super) fn schema_change_parse(content: &[u8]) -> Result<SchemaChange, serde_
                     change.views_changed = true;
                     continue;
                 }
+                if object_type == POLICY {
+                    match object.identity.as_deref().and_then(policy_table_parse) {
+                        Some(table) => change.policies_changed.push(table),
+                        None => trace!(tag, "policy object without a table identity"),
+                    }
+                    continue;
+                }
                 match (tag, object.oid, object.parent) {
                     (ALTER_TABLE, Some(oid), _) if is_table(object_type) => {
                         change.altered_tables.push(Oid::from_raw(oid));
@@ -98,6 +167,10 @@ pub(super) fn schema_change_parse(content: &[u8]) -> Result<SchemaChange, serde_
             for object in objects {
                 if object.object_type == VIEW {
                     change.views_changed = true;
+                } else if object.object_type == POLICY {
+                    if let Some(table) = object.identity.as_deref().and_then(policy_table_parse) {
+                        change.policies_changed.push(table);
+                    }
                 } else if let Some(oid) = object.oid
                     && is_table(&object.object_type)
                 {
@@ -211,5 +284,61 @@ mod tests {
     fn test_schema_change_parse_rejects_unknown_kind() {
         assert!(schema_change_parse(br#"{"kind":"rename","objects":[]}"#).is_err());
         assert!(schema_change_parse(b"not json").is_err());
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    /// A policy object names its table in its identity, quoted parts
+    /// included; the table's queries are evicted and its policies reloaded.
+    #[test]
+    fn test_schema_change_parse_collects_policy_tables_from_identities() {
+        let payload = br#"{"kind":"ddl","objects":[
+            {"tag":"CREATE POLICY","type":"policy","oid":16400,"identity":"tenant_policy on public.docs","parent":null},
+            {"tag":"ALTER POLICY","type":"policy","oid":16401,"identity":"\"my pol\" on \"My Schema\".\"T.x\"","parent":null}]}"#;
+        let change = schema_change_parse(payload).expect("parse ddl payload");
+        assert_eq!(
+            change.policies_changed,
+            vec![
+                ("public".into(), "docs".into()),
+                ("My Schema".into(), "T.x".into()),
+            ]
+        );
+        assert!(change.altered_tables.is_empty());
+        assert!(!change.is_empty());
+
+        let dropped = br#"{"kind":"drop","objects":[
+            {"type":"policy","oid":16400,"identity":"tenant_policy on public.docs","original":true}]}"#;
+        let change = schema_change_parse(dropped).expect("parse drop payload");
+        assert_eq!(
+            change.policies_changed,
+            vec![("public".into(), "docs".into())]
+        );
+        assert!(change.dropped_tables.is_empty());
+    }
+
+    #[test]
+    fn test_policy_table_parse_splits_at_the_first_unquoted_on() {
+        assert_eq!(
+            policy_table_parse(r#"p on public."docs on hold""#),
+            Some(("public".into(), "docs on hold".into()))
+        );
+        assert_eq!(
+            policy_table_parse(r#""hold on" on "s on s".t"#),
+            Some(("s on s".into(), "t".into()))
+        );
+    }
+
+    #[test]
+    fn test_policy_table_parse_rejects_identities_without_a_table() {
+        assert_eq!(policy_table_parse("tenant_policy"), None);
+        assert_eq!(policy_table_parse("p on docs"), None, "no schema");
+        assert_eq!(
+            policy_table_parse("p on s.t.u"),
+            Some(("s".into(), "t.u".into())),
+            "the first unquoted dot splits"
+        );
     }
 }

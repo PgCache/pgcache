@@ -224,6 +224,7 @@ impl<'a> ResolutionScope<'a> {
 
         let table = Arc::new(TableMetadata {
             replica_identity_full: false,
+            row_security: false,
             partitions: Vec::new(),
             ancestors: Vec::new(),
             write_aliases: Vec::new(),

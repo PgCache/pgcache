@@ -59,6 +59,7 @@ fn literal_keyed(kind: ValueKind, value: &LiteralValue) -> LiteralValue {
         LiteralValue::Null
         | LiteralValue::NullWithCast(_)
         | LiteralValue::Parameter(_)
+        | LiteralValue::SessionTerm(_)
         | LiteralValue::Array(..) => value.clone(),
         LiteralValue::String(_)
         | LiteralValue::StringWithCast(..)

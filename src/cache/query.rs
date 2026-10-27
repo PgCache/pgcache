@@ -39,6 +39,12 @@ error_set! {
         NonImmutableFunction {
             function: EcoString,
         },
+        /// A value the session supplies, left unsubstituted: `current_user`
+        /// or `current_setting(…)` in the client's own query (PGC-113).
+        #[display("Session term: {term}")]
+        SessionTerm {
+            term: EcoString,
+        },
         #[display("Schema-qualified function: {function}")]
         SchemaQualifiedFunction {
             function: EcoString,

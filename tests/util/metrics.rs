@@ -25,6 +25,10 @@ pub(crate) struct MetricsSnapshot {
     pub queries_rls_skipped: u64,
     pub queries_privilege_forward_pending: u64,
     pub queries_privilege_forward_denied: u64,
+    /// Reads over an RLS table forwarded instead of inlined (PGC-113), by reason.
+    pub queries_rls_forward_setting_unknown: u64,
+    pub queries_rls_forward_default_deny: u64,
+    pub queries_rls_forward_row_security_off: u64,
     pub cache_subsumptions: u64,
     /// Subsumptions that needed an in-set column split to cover (PGC-494).
     pub cache_subsumptions_split: u64,
@@ -133,6 +137,9 @@ const SAMPLES: &[Sample] = samples! {
     "pgcache_queries_rls_skipped" => queries_rls_skipped,
     "pgcache_queries_privilege_forwards{reason=\"pending\"}" => queries_privilege_forward_pending,
     "pgcache_queries_privilege_forwards{reason=\"denied\"}" => queries_privilege_forward_denied,
+    "pgcache_queries_rls_forwards{reason=\"setting_unknown\"}" => queries_rls_forward_setting_unknown,
+    "pgcache_queries_rls_forwards{reason=\"default_deny\"}" => queries_rls_forward_default_deny,
+    "pgcache_queries_rls_forwards{reason=\"row_security_off\"}" => queries_rls_forward_row_security_off,
     "pgcache_raw_writes_recorded" => raw_writes_recorded,
     "pgcache_raw_probes" => raw_probes,
     "pgcache_raw_forwards{scope=\"table\"}" => raw_forwards_table,

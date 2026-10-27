@@ -298,7 +298,10 @@ pub fn literal_locally_comparable(ty: &Type, literal: &LiteralValue, op: BinaryO
     match literal {
         // NULL and parameters never match a non-null row; the evaluator
         // decides them without parsing.
-        LiteralValue::Null | LiteralValue::NullWithCast(_) | LiteralValue::Parameter(_) => true,
+        LiteralValue::Null
+        | LiteralValue::NullWithCast(_)
+        | LiteralValue::Parameter(_)
+        | LiteralValue::SessionTerm(_) => true,
         LiteralValue::Array(..) => false,
         LiteralValue::String(_)
         | LiteralValue::StringWithCast(..)
@@ -341,9 +344,10 @@ impl TypedLiteral {
     pub fn new(ty: &Type, literal: &LiteralValue) -> Self {
         let kind = ValueKind::of_type(ty);
         let parsed = match literal {
-            LiteralValue::Null | LiteralValue::NullWithCast(_) | LiteralValue::Parameter(_) => {
-                LiteralParse::Never
-            }
+            LiteralValue::Null
+            | LiteralValue::NullWithCast(_)
+            | LiteralValue::Parameter(_)
+            | LiteralValue::SessionTerm(_) => LiteralParse::Never,
             LiteralValue::Array(..) => LiteralParse::Undecidable,
             LiteralValue::String(_)
             | LiteralValue::StringWithCast(..)
@@ -641,6 +645,7 @@ fn literal_parse(kind: ValueKind, literal: &LiteralValue) -> Option<TypedValue> 
         LiteralValue::Null
         | LiteralValue::NullWithCast(_)
         | LiteralValue::Parameter(_)
+        | LiteralValue::SessionTerm(_)
         | LiteralValue::Array(..) => None,
     }
 }

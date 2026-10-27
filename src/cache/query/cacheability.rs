@@ -9,7 +9,7 @@ use crate::query::ast::rope::{
     Body, Case, Function, Join, JoinQual, NodeKind, Query, QueryTree, Scalar, ScalarKind, Select,
     SelectItem, Source, Where, WhereKind,
 };
-use crate::query::ast::{BinaryOp, JoinType, UnaryOp};
+use crate::query::ast::{BinaryOp, Deparse, JoinType, LiteralValue, UnaryOp};
 
 /// Reject queries that reference a PostgreSQL system catalog: a `pg_`
 /// prefix on the schema or the table name, anywhere in the tree.
@@ -232,7 +232,17 @@ fn scalar_cacheable(
     fv: &FunctionVolatilityMap,
 ) -> Result<(), CacheabilityError> {
     match expr.kind() {
-        ScalarKind::Column(_) | ScalarKind::Literal(_) => Ok(()),
+        ScalarKind::Column(_) => Ok(()),
+        // A session term is a placeholder for a value origin would read from
+        // the session; until something substitutes it, the query forwards.
+        ScalarKind::Literal(literal) => {
+            if let LiteralValue::SessionTerm(term) = literal.value() {
+                let mut text = String::new();
+                term.deparse(&mut text);
+                return Err(CacheabilityError::SessionTerm { term: text.into() });
+            }
+            Ok(())
+        }
         ScalarKind::Function(function) => function_cacheable(function, ctx, fv),
         ScalarKind::Case(case) => case_cacheable(case, ctx, fv),
         ScalarKind::Arithmetic(arithmetic) => {
@@ -377,6 +387,14 @@ mod tests {
         assert_eq!(
             display("SELECT relname FROM pg_catalog.pg_class"),
             "System catalog reference: pg_catalog.pg_class"
+        );
+        assert_eq!(
+            display("SELECT id FROM a WHERE owner = current_user"),
+            "Session term: CURRENT_USER"
+        );
+        assert_eq!(
+            display("SELECT id FROM a WHERE tenant = current_setting('app.tenant', true)::int"),
+            "Session term: current_setting('app.tenant', true)"
         );
         assert_eq!(
             display("SELECT * FROM (SELECT 1)"),

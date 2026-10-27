@@ -110,6 +110,9 @@ impl WriterCore {
             }
         };
         self.state_view.privileges.roles_changed(snapshot);
+        // A membership or attribute change can change which policies apply
+        // to a role, and so which inlined form its reads resolve to.
+        self.rls_aliases_clear();
         crate::metrics::handles().cache.role_changes.increment(1);
     }
 

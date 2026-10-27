@@ -126,14 +126,7 @@ impl WriterCore {
             Some(schema) => schema,
             None => first.get("table_schema"),
         };
-        if first.get::<_, bool>("row_security") {
-            crate::metrics::handles().query.rls_skipped.increment(1);
-            return Err(CacheError::RowSecurityEnabled {
-                schema: schema.to_owned(),
-                name: table.to_owned(),
-            }
-            .into());
-        }
+        let row_security: bool = first.get("row_security");
 
         let mut columns: Vec<ColumnMetadata> = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -160,6 +153,7 @@ impl WriterCore {
 
         Ok(TableMetadata {
             replica_identity_full: identity == ReplicaIdentity::Full,
+            row_security,
             name: table.into(),
             schema: schema.into(),
             relation_oid,

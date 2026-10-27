@@ -13,7 +13,7 @@ use crate::query::ast::raw::{
     string_node_value,
 };
 use crate::query::ast::rope::{NodeKind, TreeBuilder};
-use crate::query::ast::{ArithmeticOp, AstError, Deparse, LiteralValue};
+use crate::query::ast::{ArithmeticOp, AstError, Deparse, LiteralValue, SessionTerm};
 use crate::query::cast::cast_target_from_canonical;
 use crate::query::transform::literal_arithmetic_fold;
 
@@ -43,6 +43,11 @@ pub(super) unsafe fn scalar_emit(
                 scalar_subquery_emit(builder, cast::<pg::SubLink>(node), scope)
             }
             pg::NodeTag_T_FuncCall => func_call_emit(builder, cast::<pg::FuncCall>(node), scope),
+            pg::NodeTag_T_SQLValueFunction => {
+                let term = sql_value_function_term(cast::<pg::SQLValueFunction>(node))?;
+                builder.leaf(NodeKind::Literal(LiteralValue::SessionTerm(term)));
+                Ok(())
+            }
             pg::NodeTag_T_CoalesceExpr => {
                 let args = (*cast::<pg::CoalesceExpr>(node)).args;
                 function_bare_emit(builder, "coalesce", args, scope)
@@ -209,6 +214,10 @@ unsafe fn func_call_emit(
                 });
             }
         };
+        if let Some(term) = current_setting_term(func_call, schema.as_deref(), &name)? {
+            builder.leaf(NodeKind::Literal(LiteralValue::SessionTerm(term)));
+            return Ok(());
+        }
         let agg_star = (*func_call).agg_star;
         let agg_filter = (*func_call).agg_filter as NodePtr;
         let over = (*func_call).over;
@@ -240,6 +249,79 @@ unsafe fn func_call_emit(
         }
         builder.close(open);
         Ok(())
+    }
+}
+
+/// `current_user`, `current_role`, `user` and `session_user` are session
+/// terms; the date-time value functions are not supported.
+unsafe fn sql_value_function_term(
+    svf: *const pg::SQLValueFunction,
+) -> Result<SessionTerm, AstError> {
+    unsafe {
+        match (*svf).op {
+            pg::SQLValueFunctionOp_SVFOP_CURRENT_USER
+            | pg::SQLValueFunctionOp_SVFOP_CURRENT_ROLE
+            | pg::SQLValueFunctionOp_SVFOP_USER => Ok(SessionTerm::CurrentUser),
+            pg::SQLValueFunctionOp_SVFOP_SESSION_USER => Ok(SessionTerm::SessionUser),
+            _ => Err(AstError::UnsupportedFeature {
+                feature: "CURRENT_DATE-style value function".to_owned(),
+            }),
+        }
+    }
+}
+
+/// `current_setting(<literal name>[, <literal missing_ok>])` as a session
+/// term. Any other call of the name stays a function, which the
+/// cacheability check rejects as non-immutable.
+unsafe fn current_setting_term(
+    func_call: *const pg::FuncCall,
+    schema: Option<&str>,
+    name: &str,
+) -> Result<Option<SessionTerm>, AstError> {
+    unsafe {
+        if !name.eq_ignore_ascii_case("current_setting")
+            || schema.is_some_and(|schema| schema != "pg_catalog")
+            || (*func_call).agg_star
+            || !(*func_call).over.is_null()
+            || !(*func_call).agg_filter.is_null()
+            || !list_is_empty((*func_call).agg_order)
+        {
+            return Ok(None);
+        }
+        let mut args = list_nodes((*func_call).args);
+        let (Some(first), second, None) = (args.next(), args.next(), args.next()) else {
+            return Ok(None);
+        };
+        let Some(LiteralValue::String(setting)) = const_literal_peeled(first)? else {
+            return Ok(None);
+        };
+        let missing_ok = match second {
+            None => false,
+            Some(arg) => match const_literal_peeled(arg)? {
+                Some(LiteralValue::Boolean(missing_ok)) => missing_ok,
+                _ => return Ok(None),
+            },
+        };
+        Ok(Some(SessionTerm::CurrentSetting {
+            name: setting,
+            missing_ok,
+        }))
+    }
+}
+
+/// A constant argument, through the cast `pg_get_expr` wraps it in
+/// (`'app.tenant'::text`); `None` for anything else.
+unsafe fn const_literal_peeled(node: NodePtr) -> Result<Option<LiteralValue>, AstError> {
+    unsafe {
+        let node = if node_tag(node) == pg::NodeTag_T_TypeCast {
+            (*cast::<pg::TypeCast>(node)).arg as NodePtr
+        } else {
+            node
+        };
+        if node.is_null() || node_tag(node) != pg::NodeTag_T_A_Const {
+            return Ok(None);
+        }
+        Ok(Some(const_value_extract(cast::<pg::A_Const>(node))?))
     }
 }
 

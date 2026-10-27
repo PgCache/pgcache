@@ -133,7 +133,7 @@ pub(super) unsafe fn where_expr_emit(
                 ))));
                 Ok(())
             }
-            pg::NodeTag_T_FuncCall | pg::NodeTag_T_TypeCast => {
+            pg::NodeTag_T_FuncCall | pg::NodeTag_T_TypeCast | pg::NodeTag_T_SQLValueFunction => {
                 scalar_emit(builder, node, scope).map_err(WhereParseError::from)
             }
             _ => Err(WhereParseError::UnsupportedPattern),

@@ -10,8 +10,8 @@ use crate::query::guc::Guc;
 use crate::query::write::IsolationEffect::{SessionDefault, SessionUnknown, Transaction};
 use crate::query::write::IsolationLevel::{ReadCommitted, RepeatableRead, Serializable};
 use crate::query::write::{
-    DeleteStatement, INSERT_MAX_ROWS, InsertStatement, IsolationEffect, RelationRef,
-    SettingsEffect, TransactionBoundary, UpdateStatement, WriteClass,
+    CustomSettingEffect, DeleteStatement, INSERT_MAX_ROWS, InsertStatement, IsolationEffect,
+    RelationRef, SettingsEffect, TransactionBoundary, UpdateStatement, WriteClass,
 };
 
 fn comparison(column: &str, op: BinaryOp, value: LiteralValue) -> TableConstraint {
@@ -682,5 +682,47 @@ fn test_unconvertible_select_with_select_ctes_is_not_a_write() {
             cte_write: None,
         }) => {}
         other => panic!("expected non-write failed Select, got {other:?}"),
+    }
+}
+
+// ---------- Custom settings (PGC-113) ----------
+
+fn custom_settings_of(sql: &str) -> Vec<CustomSettingEffect> {
+    match classify(sql) {
+        Ok(RawStatement::ReadOnlyUtility {
+            custom_settings, ..
+        }) => custom_settings.into_vec(),
+        other => panic!("expected ReadOnlyUtility for {sql:?}, got {other:?}"),
+    }
+}
+
+/// A `SET` of a dotted name carries the literal it sets, scoped; `RESET`,
+/// `TO DEFAULT` and values the proxy cannot read as origin stores them
+/// leave the value to a probe. Fixed settings are not custom.
+#[test]
+fn test_custom_setting_effects_of_set_and_reset() {
+    let effect = |name: &str, value: Option<&str>, local: bool| CustomSettingEffect {
+        name: name.into(),
+        value: value.map(Into::into),
+        local,
+    };
+    #[rustfmt::skip]
+    let cases = [
+        ("SET app.tenant = '7'", vec![effect("app.tenant", Some("7"), false)]),
+        ("SET LOCAL app.tenant TO 8", vec![effect("app.tenant", Some("8"), true)]),
+        ("SET App.Tenant = on", vec![effect("app.tenant", Some("on"), false)]),
+        ("SET app.ratio = 1.50", vec![effect("app.ratio", None, false)]),
+        ("SET app.list = a, b", vec![effect("app.list", None, false)]),
+        ("RESET app.tenant", vec![effect("app.tenant", None, false)]),
+        ("SET app.tenant TO DEFAULT", vec![effect("app.tenant", None, false)]),
+        ("SET timezone = 'UTC'", vec![]),
+        // An untracked built-in name is kept like a custom one: a policy may
+        // read it, and its tracked value must not survive the SET.
+        ("SET application_name = 'x'", vec![effect("application_name", Some("x"), false)]),
+        ("RESET ALL", vec![]),
+        ("DISCARD ALL", vec![]),
+    ];
+    for (sql, expected) in cases {
+        assert_eq!(custom_settings_of(sql), expected, "{sql}");
     }
 }

@@ -110,7 +110,9 @@ async fn test_check_reports_every_defect_on_unprepared_origin() -> Result<(), Er
     assert!(report.contains("public.logs"), "{report}");
     assert!(report.contains("  WARN  views"), "{report}");
     assert!(report.contains("public.recent_logs"), "{report}");
-    assert!(report.contains("  WARN  row-level security"), "{report}");
+    // The superuser bypasses row-level security, so the secured table is
+    // cached with its policies inlined (PGC-113): reported, not a warning.
+    assert!(report.contains("  PASS  row-level security"), "{report}");
     assert!(report.contains("public.tenants"), "{report}");
     assert!(
         report.contains("Origin is not ready for pgcache."),

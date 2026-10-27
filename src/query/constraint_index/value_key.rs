@@ -94,6 +94,7 @@ impl ValueKey {
             LiteralValue::Null
             | LiteralValue::NullWithCast(_)
             | LiteralValue::Parameter(_)
+            | LiteralValue::SessionTerm(_)
             | LiteralValue::Array(..) => None,
         }
     }

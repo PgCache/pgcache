@@ -341,7 +341,8 @@ fn array_literal_values(rhs: Scalar<'_>) -> Option<Vec<LiteralValue>> {
             | LiteralValue::Boolean(_)
             | LiteralValue::Null
             | LiteralValue::NullWithCast(_)
-            | LiteralValue::Parameter(_) => None,
+            | LiteralValue::Parameter(_)
+            | LiteralValue::SessionTerm(_) => None,
         },
         ScalarKind::Array(array) => {
             let mut out = Vec::with_capacity(array.elements().len());

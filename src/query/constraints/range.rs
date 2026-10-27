@@ -47,7 +47,10 @@ pub(crate) enum ColumnRange {
 pub(crate) fn literal_value_is_incomparable(v: &LiteralValue) -> bool {
     matches!(
         v,
-        LiteralValue::Parameter(_) | LiteralValue::Null | LiteralValue::NullWithCast(_)
+        LiteralValue::Parameter(_)
+            | LiteralValue::SessionTerm(_)
+            | LiteralValue::Null
+            | LiteralValue::NullWithCast(_)
     )
 }
 

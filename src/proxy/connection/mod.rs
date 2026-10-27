@@ -28,6 +28,7 @@ mod extended_buffer;
 mod origin_intercept;
 mod probe;
 mod relay;
+mod rls;
 mod telemetry;
 mod transaction_isolation;
 mod write_log;

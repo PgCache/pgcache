@@ -281,6 +281,7 @@ impl ConnectionState {
             isolation: stmt.effects.isolation,
             transaction: stmt.effects.transaction,
             settings: stmt.effects.settings,
+            custom_settings: stmt.effects.custom_settings.clone(),
         }
     }
 

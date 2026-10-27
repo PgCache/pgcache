@@ -26,7 +26,9 @@ use super::raw::{
 };
 use super::rope::{QueryTree, TreeBuilder};
 use super::{AstError, CteMaterialization, NullOrder, OrderDirection, SubLinkType};
-use crate::query::write::{IsolationEffect, SettingsEffect, TransactionBoundary, WriteClass};
+use crate::query::write::{
+    CustomSettingEffects, IsolationEffect, SettingsEffect, TransactionBoundary, WriteClass,
+};
 
 mod from;
 mod scalar;
@@ -79,6 +81,8 @@ pub enum RawStatement {
         isolation: IsolationEffect,
         /// Tracked session settings the statement may change (PGC-287).
         settings: SettingsEffect,
+        /// Custom settings a `SET` / `RESET` names (PGC-113).
+        custom_settings: CustomSettingEffects,
     },
 }
 
@@ -116,10 +120,12 @@ pub unsafe fn statement_convert_raw(
                     transaction,
                     isolation,
                     settings,
+                    custom_settings,
                 } => RawStatement::ReadOnlyUtility {
                     transaction,
                     isolation,
                     settings,
+                    custom_settings,
                 },
             },
         })
@@ -312,9 +318,10 @@ pub(super) fn sublink_type_map(t: pg::SubLinkType) -> Result<SubLinkType, AstErr
     }
 }
 
-/// Parse `sql` straight to the rope through the raw path: the one test entry
-/// for every fixture that starts from SQL.
-#[cfg(test)]
+/// Parse `sql` straight to the rope through the raw path: the one entry for
+/// every test fixture that starts from SQL, and for the writer's parse of a
+/// policy expression (PGC-113).
+#[cfg(any(test, feature = "proxy"))]
 pub(crate) fn query_tree_parse(sql: &str) -> Result<QueryTree, AstError> {
     pg_query::parse_raw_scoped(sql, |tree| unsafe {
         query_tree_convert_raw(tree, sql.len())

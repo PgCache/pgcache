@@ -52,6 +52,7 @@ pub(crate) fn literal_is_parameterizable(literal: &LiteralValue) -> bool {
         | LiteralValue::Array(_, _)
         | LiteralValue::Null
         | LiteralValue::NullWithCast(_)
-        | LiteralValue::Parameter(_) => false,
+        | LiteralValue::Parameter(_)
+        | LiteralValue::SessionTerm(_) => false,
     }
 }

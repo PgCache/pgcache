@@ -27,7 +27,8 @@ use crate::cache::reg_bucket::RegRateBucket;
 use crate::cache::reply::ReplySender;
 use crate::cache::serve_decision::{DecisionInput, EntrySnapshot, ServeDecision, serve_decide};
 use crate::cache::types::{
-    CacheStateView, CachedQueryState, CachedQueryView, QueryMetrics, ReadFacts, WriteTargetMap,
+    CacheStateView, CachedQueryState, CachedQueryView, QueryMetrics, ReadFacts, RlsRelations,
+    WriteTargetMap,
 };
 use crate::cache::{CacheError, CacheResult, fast_path};
 use crate::pg::Lsn;
@@ -131,6 +132,12 @@ impl CacheDispatch {
     /// write to a name lands rows in (ADR-048, PGC-542).
     pub fn write_targets(&self) -> Arc<WriteTargetMap> {
         self.state_view.write_targets.load_full()
+    }
+
+    /// The row-level-secured relations and the settings their policies read
+    /// (PGC-113), for the proxy's keying of a read naming one.
+    pub fn rls_relations(&self) -> Arc<RlsRelations> {
+        self.state_view.rls_relations.load_full()
     }
 
     /// The resolved form of a registered (Ready) query, if present. Used by the

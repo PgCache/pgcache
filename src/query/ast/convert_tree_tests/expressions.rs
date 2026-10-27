@@ -3,6 +3,7 @@
 #![allow(clippy::wildcard_enum_match_arm, clippy::type_complexity)]
 
 use super::*;
+use crate::query::ast::SessionTerm;
 
 // ============================================================================
 // Functions, CASE, casts and arithmetic
@@ -484,4 +485,61 @@ fn test_having_aggregate_decorations_cases() {
         parse("SELECT name FROM users GROUP BY name HAVING COUNT(*) FILTER (WHERE id > 0) > 5")
             .sql();
     assert_eq!(parse(&first).sql(), first);
+}
+
+// ============================================================================
+// Session terms (PGC-113)
+// ============================================================================
+
+/// `current_user`-style value functions and `current_setting` with a
+/// literal name convert to session-term literals, in the WHERE clause and
+/// the select list alike, through the cast `pg_get_expr` wraps the name in.
+#[test]
+fn test_session_terms_convert_to_literals() {
+    let setting = |name: &str, missing_ok: bool| {
+        LiteralValue::SessionTerm(SessionTerm::CurrentSetting {
+            name: name.into(),
+            missing_ok,
+        })
+    };
+    #[rustfmt::skip]
+    let cases = [
+        ("SELECT current_user FROM t", LiteralValue::SessionTerm(SessionTerm::CurrentUser)),
+        ("SELECT current_role FROM t", LiteralValue::SessionTerm(SessionTerm::CurrentUser)),
+        ("SELECT user FROM t", LiteralValue::SessionTerm(SessionTerm::CurrentUser)),
+        ("SELECT session_user FROM t", LiteralValue::SessionTerm(SessionTerm::SessionUser)),
+        ("SELECT current_setting('app.tenant') FROM t", setting("app.tenant", false)),
+        ("SELECT current_setting('app.tenant', true) FROM t", setting("app.tenant", true)),
+        ("SELECT pg_catalog.current_setting('app.tenant'::text, false) FROM t", setting("app.tenant", false)),
+    ];
+    for (sql, expected) in cases {
+        let tree = parse(sql);
+        match expr_of(items(select_of(&tree))[0]).kind() {
+            ScalarKind::Literal(literal) => assert_eq!(literal.value(), &expected, "{sql}"),
+            _ => panic!("{sql}: expected a literal"),
+        }
+    }
+
+    // A non-literal name stays a function call.
+    let tree = parse("SELECT current_setting(name) FROM t");
+    assert!(matches!(
+        expr_of(items(select_of(&tree))[0]).kind(),
+        ScalarKind::Function(_)
+    ));
+    // The date-time value functions are not session terms.
+    assert!(query_tree_parse("SELECT current_date FROM t").is_err());
+}
+
+#[test]
+fn test_session_terms_render() {
+    #[rustfmt::skip]
+    let cases = [
+        ("SELECT id FROM t WHERE owner = current_user", "SELECT id FROM t WHERE owner = CURRENT_USER"),
+        ("SELECT id FROM t WHERE owner = session_user", "SELECT id FROM t WHERE owner = SESSION_USER"),
+        ("SELECT id FROM t WHERE tenant = current_setting('app.tenant')::int", "SELECT id FROM t WHERE tenant = (current_setting('app.tenant'))::int4"),
+        ("SELECT id FROM t WHERE tenant = current_setting('app.tenant', true)", "SELECT id FROM t WHERE tenant = current_setting('app.tenant', true)"),
+    ];
+    for (sql, expected) in cases {
+        assert_eq!(parse(sql).sql(), expected, "{sql}");
+    }
 }

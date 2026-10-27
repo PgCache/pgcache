@@ -1,5 +1,7 @@
 //! Commands for CDC mutations and relation tracking, sent to the writer thread.
 
+use ecow::EcoString;
+
 use crate::catalog::TableMetadata;
 use crate::oid::Oid;
 use crate::pg::Lsn;
@@ -67,6 +69,10 @@ pub(crate) struct SchemaChange {
     /// A view was created, replaced, altered or dropped: the write-alias
     /// lists of the cached tables are reloaded (ADR-048).
     pub(crate) views_changed: bool,
+    /// `CREATE`, `ALTER` or `DROP POLICY`, as `(schema, table)` of the
+    /// policy's table (PGC-113): its queries are evicted and its policies
+    /// reloaded.
+    pub(crate) policies_changed: Vec<(EcoString, EcoString)>,
     /// Any DDL or drop at all, a `GRANT` or an owner change included: who
     /// may read what may have changed, so the privilege verdicts are
     /// flushed (PGC-463). A truncate cannot change privileges.
@@ -87,6 +93,7 @@ impl SchemaChange {
             && self.truncated_tables.is_empty()
             && self.partitions_created.is_empty()
             && !self.views_changed
+            && self.policies_changed.is_empty()
             && !self.privileges_changed
     }
 }

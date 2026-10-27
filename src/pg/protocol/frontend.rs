@@ -1,12 +1,14 @@
+use std::borrow::Cow;
+
 use phf::phf_map;
 use tokio_util::{
     bytes::{Buf, BytesMut},
     codec::Decoder,
 };
 
-use super::{PgConnectionState, PgMessage, PgMessageType, ProtocolError};
 #[cfg(test)]
-use super::{ProtocolResult, message_length};
+use super::ProtocolResult;
+use super::{PgConnectionState, PgMessage, PgMessageType, ProtocolError, message_length};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum PgFrontendMessageType {
@@ -91,7 +93,7 @@ pub(crate) fn startup_message_parameter<'a>(data: &'a [u8], key: &str) -> Option
 /// A constant query pgcache injects into an origin session. Its length is
 /// checked at compile time, so building its message cannot fail.
 pub(crate) struct ProbeQuery {
-    sql: &'static str,
+    sql: Cow<'static, str>,
     message_len: i32,
 }
 
@@ -102,7 +104,20 @@ impl ProbeQuery {
         assert!(sql.len() <= Self::MAX_LEN, "probe query too long");
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)] // bounded above
         let message_len = (4 + sql.len() + 1) as i32;
-        Self { sql, message_len }
+        Self {
+            sql: Cow::Borrowed(sql),
+            message_len,
+        }
+    }
+
+    /// A probe built at runtime (the settings probe with the connection's
+    /// custom setting columns, PGC-113); `None` for a text too long to frame.
+    pub(crate) fn dynamic(sql: String) -> Option<Self> {
+        let message_len = message_length(4 + sql.len() + 1).ok()?;
+        Some(Self {
+            sql: Cow::Owned(sql),
+            message_len,
+        })
     }
 
     pub(crate) fn message(&self) -> BytesMut {

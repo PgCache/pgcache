@@ -144,9 +144,13 @@ pub async fn preflight_run(settings: &PreflightSettings) -> PreflightReport {
         .push(server::replication_slots_check(&client, &settings.cdc.slot_name, environment).await);
 
     let role = privileges::role_info_load(&client).await;
-    let (superuser, role_name) = match &role {
-        Ok(role) => (role.superuser, role.name.clone()),
-        Err(_) => (false, origin.user.clone()),
+    let (superuser, bypasses_rls, role_name) = match &role {
+        Ok(role) => (
+            role.superuser,
+            role.superuser || role.bypassrls,
+            role.name.clone(),
+        ),
+        Err(_) => (false, false, origin.user.clone()),
     };
     report.results.push(match &role {
         Ok(role) => privileges::role_privileges_evaluate(role, origin, environment),
@@ -172,9 +176,11 @@ pub async fn preflight_run(settings: &PreflightSettings) -> PreflightReport {
                 .results
                 .push(relations::primary_keys_evaluate(&relations));
             report.results.push(relations::views_evaluate(&relations));
-            report
-                .results
-                .push(relations::row_level_security_evaluate(&relations));
+            report.results.push(relations::row_level_security_evaluate(
+                &relations,
+                bypasses_rls,
+                &role_name,
+            ));
         }
         Err(e) => report.results.push(CheckResult::skipped("tables", e)),
     }

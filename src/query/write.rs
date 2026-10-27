@@ -162,6 +162,23 @@ impl SettingsEffect {
     }
 }
 
+/// A custom (dotted) setting a forwarded statement changes (PGC-113):
+/// `SET app.tenant = '7'`, `set_config('app.tenant', '7', true)`, `RESET
+/// app.tenant`. Named settings have no fixed set, so each carries its name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomSettingEffect {
+    pub name: EcoString,
+    /// The value the statement sets, when it is a literal the proxy can
+    /// read; `None` (`RESET`, `TO DEFAULT`, a computed value) leaves the
+    /// setting unknown until a probe samples it.
+    pub value: Option<EcoString>,
+    /// Transaction-scoped: the change reverts when the block ends.
+    pub local: bool,
+}
+
+/// The custom settings one statement changes; almost always none or one.
+pub type CustomSettingEffects = SmallVec<[CustomSettingEffect; 1]>;
+
 /// Everything a forwarded statement does to the proxy's per-connection state,
 /// bundled so every forward path (simple query, extended Sync, extended Flush,
 /// forward-without-cache-decision) applies it the same way.
@@ -176,6 +193,8 @@ pub struct StatementEffects {
     pub transaction: Option<TransactionBoundary>,
     /// Tracked session settings the statement may change (PGC-287).
     pub settings: SettingsEffect,
+    /// Custom settings the statement changes (PGC-113).
+    pub custom_settings: CustomSettingEffects,
 }
 
 impl StatementEffects {
@@ -185,6 +204,7 @@ impl StatementEffects {
             isolation,
             transaction,
             settings: SettingsEffect::NONE,
+            custom_settings: SmallVec::new(),
         }
     }
 
@@ -194,11 +214,17 @@ impl StatementEffects {
             isolation,
             transaction: None,
             settings: SettingsEffect::NONE,
+            custom_settings: SmallVec::new(),
         }
     }
 
     pub fn with_settings(mut self, settings: SettingsEffect) -> Self {
         self.settings = self.settings.union(settings);
+        self
+    }
+
+    pub fn with_custom_settings(mut self, custom_settings: CustomSettingEffects) -> Self {
+        self.custom_settings.extend(custom_settings);
         self
     }
 
@@ -211,6 +237,7 @@ impl StatementEffects {
             isolation: IsolationEffect::SessionUnknown,
             transaction: None,
             settings: SettingsEffect::all(),
+            custom_settings: SmallVec::new(),
         }
     }
 }

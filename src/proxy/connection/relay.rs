@@ -248,6 +248,12 @@ async fn handle_connection(
                     }
                 };
                 crate::metrics::handles().query.cacheable.increment(1);
+                // A read over a row-level-secured relation is keyed on the
+                // session values its policies read as well (PGC-113).
+                let keying = match msg.cacheable_query() {
+                    Some(cq) => state.rls_keying_apply(keying, cq.tree(), in_block),
+                    None => keying,
+                };
                 // Hashed once here for the gate, the timing id and dispatch. A
                 // parameterized read is keyed on its placeholders and values,
                 // never on a substituted tree.
@@ -654,6 +660,10 @@ impl ConnectionState {
         let in_block = self.forwarding_into_block();
         let settings = effects.settings;
         self.session_settings_update(|state| state.effect_apply(settings, in_block));
+        if !effects.custom_settings.is_empty() {
+            self.session_settings
+                .custom_effects_apply(&effects.custom_settings, in_block);
+        }
         self.isolation_effects_apply(effects);
     }
 

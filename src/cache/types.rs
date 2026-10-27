@@ -37,6 +37,43 @@ use crate::{
 pub struct Alias {
     pub fingerprint: Fingerprint,
     pub tick: u64,
+    /// The key carries an RLS context (PGC-113): the fingerprint depends on
+    /// the role's policies, so a role or policy change drops the alias.
+    pub rls: bool,
+}
+
+/// The relations origin applies row-level security to, by bare name (any
+/// schema), each with the custom settings its policies read (PGC-113). The
+/// proxy keys a read naming one of them on the session's values of those
+/// settings and its role; the writer resolves the name exactly and inlines.
+#[derive(Debug, Default)]
+pub struct RlsRelations {
+    by_name: HashMap<EcoString, Vec<EcoString>>,
+}
+
+impl RlsRelations {
+    /// From `(table name, settings its policies read)` entries; two
+    /// relations of one name in different schemas pool their settings.
+    pub fn new(entries: impl IntoIterator<Item = (EcoString, Vec<EcoString>)>) -> Self {
+        let mut by_name: HashMap<EcoString, Vec<EcoString>> = HashMap::new();
+        for (name, settings) in entries {
+            let pooled = by_name.entry(name).or_default();
+            pooled.extend(settings);
+            pooled.sort();
+            pooled.dedup();
+        }
+        Self { by_name }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_name.is_empty()
+    }
+
+    /// The settings the policies of any relation named `name` read, or
+    /// `None` when no such relation has row-level security.
+    pub fn settings_of(&self, name: &str) -> Option<&[EcoString]> {
+        self.by_name.get(name).map(Vec::as_slice)
+    }
 }
 
 /// The canonical plain tree with its bindings (ADR-057), shared so a cache
@@ -401,6 +438,10 @@ pub struct CacheStateView {
     /// whole by the writer on every change to the cached tables or their alias
     /// lists; a connection loads it wait-free when it records a write.
     pub write_targets: ArcSwap<WriteTargetMap>,
+    /// The relations with row-level security and the custom settings their
+    /// policies read (PGC-113), published whole by the writer; a connection
+    /// loads it to decide what a read over such a relation is keyed under.
+    pub rls_relations: ArcSwap<RlsRelations>,
     /// Empty cache-hit latency histogram cloned into each query's metrics, so
     /// the one fallible construction happens at startup. Auto-resizing (starts
     /// at a few hundred bytes, grows on record) rather than fixed-range — a
@@ -445,6 +486,7 @@ impl CacheStateView {
             settled_lsn: Arc::new(AtomicU64::new(0)),
             received_lsn: Arc::new(AtomicU64::new(0)),
             write_targets: ArcSwap::from_pointee(WriteTargetMap::default()),
+            rls_relations: ArcSwap::from_pointee(RlsRelations::default()),
             memo: ResultMemo::new(dynamic),
             privileges: PrivilegeVerdicts::default(),
             latency_template,

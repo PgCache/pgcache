@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::sync::watch;
 
 use super::CacheDispatch;
-use crate::cache::types::{ReadFacts, WriteTargetMap};
+use crate::cache::types::{ReadFacts, RlsRelations, WriteTargetMap};
 use crate::pg::Lsn;
 use crate::query::SessionKey;
 
@@ -43,6 +43,12 @@ impl CacheDispatchHandle {
     /// under its own name alone cannot be served stale against).
     pub fn write_targets(&self) -> Option<Arc<WriteTargetMap>> {
         self.rx.borrow().as_ref().map(CacheDispatch::write_targets)
+    }
+
+    /// The current generation's row-level-secured relations (PGC-113), or
+    /// `None` if the cache is down/restarting.
+    pub fn rls_relations(&self) -> Option<Arc<RlsRelations>> {
+        self.rx.borrow().as_ref().map(CacheDispatch::rls_relations)
     }
 
     /// The read facts of a Ready registered query in the current generation,

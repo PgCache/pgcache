@@ -123,6 +123,25 @@ impl TestContext {
         test_db_connect(&self.dbs.origin).await
     }
 
+    /// A direct connection to origin as `user`, for the rows a role sees
+    /// without pgcache in between.
+    pub(crate) async fn origin_connect_as(&self, user: &str) -> Result<Client, Error> {
+        let (client, connection) = Config::new()
+            .host("127.0.0.1")
+            .port(self.dbs.origin.db_port())
+            .user(user)
+            .dbname(self.dbs.origin.db_name())
+            .connect(NoTls)
+            .await
+            .map_err(Error::other)?;
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                eprintln!("origin connection error: {e}");
+            }
+        });
+        Ok(client)
+    }
+
     /// Set up a test context with extra pgcache CLI args (e.g.
     /// `--mv_compute_min_rows 0` to force MV materialization of `Gated` shapes
     /// regardless of size).

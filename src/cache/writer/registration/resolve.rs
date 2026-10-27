@@ -79,10 +79,20 @@ async fn query_bind_canonical(
     let (base_query, user_max_limit) = base_query_prepare(query);
     cache_tables_ensure(core, &base_query, &keying.search_path).await?;
     let path = search_path(keying);
-    let resolution =
+    let mut resolution =
         query_resolve_canonical(base_query, &core.cache.tables, &path, &keying.literals)
             .map_err(|e| e.context_transform(CacheError::from))
             .attach_loc("resolving query expression")?;
+    // A secured relation's references take the policies that apply to the
+    // read's role (PGC-113); the inlined form is the one the query is
+    // registered and keyed under, and it may name tables of its own.
+    if let Some(inlined) = core.rls_inline(&resolution.bound, keying).await? {
+        cache_tables_ensure(core, &inlined, &keying.search_path).await?;
+        let path = search_path(keying);
+        resolution = query_resolve_canonical(inlined, &core.cache.tables, &path, &keying.literals)
+            .map_err(|e| e.context_transform(CacheError::from))
+            .attach_loc("resolving the query with its policies inlined")?;
+    }
     Ok((resolution, user_max_limit))
 }
 

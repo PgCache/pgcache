@@ -69,6 +69,8 @@ pub(super) fn parse_relation_to_table_metadata(relation_body: &RelationBody) -> 
 
     TableMetadata {
         replica_identity_full: matches!(relation_body.replica_identity(), ReplicaIdentity::Full),
+        // A catalog fact the stream does not carry; the writer refills it.
+        row_security: false,
         name: table_name,
         schema: schema_name,
         relation_oid,

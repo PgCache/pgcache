@@ -43,7 +43,16 @@ impl ConnectionState {
         if self.settings_probe_wanted() {
             debug!("session settings unknown, probing");
             let seq = self.session_settings.probe_seq();
-            self.probe_send(ProbeKind::SessionSettings { seq }, &SETTINGS_PROBE);
+            // The fixed probe unless the connection tracks custom settings,
+            // whose columns follow the fixed ones (PGC-113).
+            match self
+                .session_settings
+                .probe_sql()
+                .and_then(ProbeQuery::dynamic)
+            {
+                Some(probe) => self.probe_send(ProbeKind::SessionSettings { seq }, &probe),
+                None => self.probe_send(ProbeKind::SessionSettings { seq }, &SETTINGS_PROBE),
+            }
             crate::metrics::handles().conn.settings_probes.increment(1);
         }
         self.commit_lsn_probe_inject();

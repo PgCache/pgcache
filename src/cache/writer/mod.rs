@@ -11,6 +11,7 @@ mod population;
 mod privileges;
 mod publication;
 mod registration;
+mod rls;
 mod staging;
 mod status;
 mod subsumption;

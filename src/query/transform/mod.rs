@@ -2,6 +2,7 @@ mod constant_fold;
 mod literal_canon;
 mod parameters;
 pub(crate) mod predicate_pushdown;
+mod session_terms;
 mod substitute;
 mod values;
 
@@ -37,6 +38,10 @@ pub(crate) use parameters::{
 };
 pub(crate) use parameters::{literal_is_parameterizable, literal_value_parameters_replace};
 pub use predicate_pushdown::query_predicate_pushdown;
+pub use session_terms::{
+    CustomSettingValue, SessionTermContext, SessionTermError, query_tree_has_session_term,
+    query_tree_session_terms_replace, query_tree_setting_names,
+};
 pub use substitute::query_tree_parameters_replace;
 pub use values::{
     BATCH_IDX_COLUMN, PgEvalTemplate, TableOccurrence, membership_batch_into,

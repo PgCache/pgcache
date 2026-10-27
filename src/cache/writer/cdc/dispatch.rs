@@ -300,22 +300,31 @@ impl WriterCdc {
             .attach_loc("resolving a Relation message's primary key")?;
         core.frame_relation_oids.insert(table_metadata.relation_oid);
         let relation_oid = table_metadata.relation_oid;
-        // Row-level security enabled since registration (PGC-112): without
-        // the schema-change signal this re-sent Relation is the only notice.
-        if core
+        // Row-level security switched since registration (PGC-112, PGC-113):
+        // without the schema-change signal this re-sent Relation is the only
+        // notice, and the queries' inlined form no longer matches origin's.
+        let secured = core
             .query_row_security_get(relation_oid)
             .await
-            .attach_loc("reading a Relation message's row security")?
+            .attach_loc("reading a Relation message's row security")?;
+        table_metadata.row_security = secured;
+        if core
+            .cache
+            .tables
+            .get1(&relation_oid)
+            .is_some_and(|current| current.row_security != secured)
         {
-            if core.cache.tables.contains_key1(&relation_oid) {
-                info!(
-                    relation_oid = %relation_oid,
-                    "origin enabled row-level security on a cached table: evicting its queries"
-                );
-                self.cached_relation_forget(core, relation_oid)
-                    .await
-                    .attach_loc("row-level security enabled on a cached table")?;
-            }
+            info!(
+                relation_oid = %relation_oid,
+                secured,
+                "origin switched row-level security on a cached table: evicting its queries"
+            );
+            self.cached_relation_forget(core, relation_oid)
+                .await
+                .attach_loc("row-level security switched on a cached table")?;
+            core.rls_table_reload(relation_oid)
+                .await
+                .attach_loc("reloading a relation's policies after its Relation message")?;
             return Ok(());
         }
         // A mid-frame Relation message whose metadata CHANGED (intra-txn
@@ -471,6 +480,40 @@ impl WriterCdc {
             core.write_aliases_reload(&cached)
                 .await
                 .attach_loc("a view changed on origin")?;
+        }
+        // A policy change reshapes the inlined form of every read over its
+        // table (PGC-113): evict them and reload the policies. An altered
+        // table's row-security flags, owner or policies may have changed too.
+        let mut rls_reload: Vec<Oid> = Vec::new();
+        for (schema, name) in &change.policies_changed {
+            let cached = core
+                .cache
+                .tables
+                .get2(&(schema.as_str(), name.as_str()))
+                .map(|table| table.relation_oid);
+            let relation_oid = match cached {
+                Some(oid) => oid,
+                None => match core.rls_table_oid_lookup(schema, name).await? {
+                    Some(oid) => oid,
+                    None => continue,
+                },
+            };
+            if cached.is_some() {
+                self.cached_relation_forget(core, relation_oid)
+                    .await
+                    .attach_loc("a policy changed on a cached table")?;
+            }
+            rls_reload.push(relation_oid);
+        }
+        // Any ALTER TABLE may have enabled, disabled or forced row-level
+        // security, or changed the owner the exemption is judged against.
+        rls_reload.extend(change.altered_tables.iter().copied());
+        rls_reload.sort_unstable();
+        rls_reload.dedup();
+        for relation_oid in rls_reload {
+            core.rls_table_reload(relation_oid)
+                .await
+                .attach_loc("reloading a secured relation's policies")?;
         }
         Ok(())
     }

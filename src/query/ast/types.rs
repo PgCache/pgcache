@@ -24,12 +24,48 @@ pub enum LiteralValue {
     Null,
     NullWithCast(EcoString),
     Parameter(EcoString), // For $1, $2, etc.
+    /// A value the session supplies (`current_user`, `current_setting`):
+    /// a placeholder like a parameter, substituted from the session before
+    /// the query is keyed (PGC-113).
+    SessionTerm(SessionTerm),
     /// A 1-D array literal: `(elements, cast)`. Produced by binary array
     /// parameter substitution (PGC-103) so the constraint analyzer can
     /// extract `WHERE col = ANY($1)` as an `InSet` constraint and let
     /// ANY-clause queries subsume each other (PGC-106). The cast string
     /// is the array type name, e.g. `"int4[]"`.
     Array(Vec<LiteralValue>, EcoString),
+}
+
+/// A value a query reads from the session rather than the data: who is
+/// running it, or a setting. Policies read these (PGC-113); pgcache
+/// substitutes the session's values before the query is keyed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SessionTerm {
+    /// `current_user`, `current_role` and `user`: the effective role.
+    CurrentUser,
+    /// `session_user`: the authenticated role.
+    SessionUser,
+    /// `current_setting(name[, missing_ok])` with a literal name. Without
+    /// `missing_ok` an unset name is an error at origin; with it, NULL.
+    CurrentSetting { name: EcoString, missing_ok: bool },
+}
+
+impl Deparse for SessionTerm {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        match self {
+            SessionTerm::CurrentUser => buf.push_str("CURRENT_USER"),
+            SessionTerm::SessionUser => buf.push_str("SESSION_USER"),
+            SessionTerm::CurrentSetting { name, missing_ok } => {
+                buf.push_str("current_setting(");
+                emit_escaped_string_literal(name, buf);
+                if *missing_ok {
+                    buf.push_str(", true");
+                }
+                buf.push(')');
+            }
+        }
+        buf
+    }
 }
 
 impl LiteralValue {
@@ -67,6 +103,7 @@ impl LiteralValue {
             (Some(_), LiteralValue::Null) => false,
             (Some(_), LiteralValue::NullWithCast(_)) => false,
             (Some(_), LiteralValue::Parameter(_)) => false, // Parameters shouldn't appear in constraints
+            (Some(_), LiteralValue::SessionTerm(_)) => false,
             // Array constraints flow through `ColumnConstraintKind::AnyOf` not
             // `Comparison`, so a row-vs-array equality test is never the
             // right question; reject defensively.
@@ -104,6 +141,9 @@ impl Deparse for LiteralValue {
             }
             LiteralValue::Parameter(p) => {
                 buf.push_str(p);
+            }
+            LiteralValue::SessionTerm(term) => {
+                term.deparse(buf);
             }
             LiteralValue::Array(elements, cast) => {
                 // Bytes must match the previous `StringWithCast(text, cast)`
@@ -188,7 +228,9 @@ fn array_element_text_render(elem: &LiteralValue, out: &mut String) {
         // shouldn't reach this branch. `?` marks them visibly without
         // panicking (the resulting SQL would be invalid, fail loudly at
         // origin) — easier to debug than a silent wrong answer.
-        LiteralValue::Array(_, _) | LiteralValue::Parameter(_) => out.push('?'),
+        LiteralValue::Array(_, _) | LiteralValue::Parameter(_) | LiteralValue::SessionTerm(_) => {
+            out.push('?')
+        }
     }
 }
 

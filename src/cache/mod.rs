@@ -1,5 +1,6 @@
 use std::io;
 
+use ecow::EcoString;
 use error_set::error_set;
 use rootcause::Report;
 #[cfg(feature = "proxy")]
@@ -94,13 +95,13 @@ pub use status::{
     CacheStatusData, CdcStatusData, LatencyStats, QueryStatusData, StatusRequest, StatusResponse,
 };
 #[cfg(feature = "proxy")]
-pub use types::{Cache, CachedQuery, CachedQueryView, PinnedQuery, WriteTargetMap};
+pub use types::{Cache, CachedQuery, CachedQueryView, PinnedQuery, RlsRelations, WriteTargetMap};
 pub use update_query::{
     SubqueryKind, UpdateEvalStrategy, UpdateQueries, UpdateQuery, UpdateQueryKey, UpdateQuerySource,
 };
 
 error_set! {
-    CacheError := WriteError || ReadError || DbError || ParseError || TableError || SendError || QueryResolutionError || SetupError || PrivilegeError
+    CacheError := WriteError || ReadError || DbError || ParseError || TableError || SendError || QueryResolutionError || SetupError || PrivilegeError || RlsError
 
     ReadError := {
         IoError(io::Error),
@@ -181,14 +182,36 @@ error_set! {
         },
         UnknownSchema,
         NoPrimaryKey,
-        /// The table has row-level security enabled: pgcache populates as
-        /// its own role and cannot apply the policies (PGC-112), so a query
-        /// over it forwards.
-        #[display("Table '{schema}.{name}' has row-level security enabled")]
-        RowSecurityEnabled {
-            schema: String,
-            name: String,
+    }
+
+    /// Why a read over a row-level-secured relation cannot be registered
+    /// with its policies inlined (PGC-113); each forwards the read.
+    RlsError := {
+        #[display("row-level security: the read carries no session context")]
+        RlsNoContext,
+        #[display("row-level security: the role in force is unknown")]
+        RlsRoleUnknown,
+        #[display("row-level security: setting {name} is not known or not set")]
+        RlsSettingUnknown {
+            name: EcoString,
         },
+        #[display("row-level security: no permissive policy applies to the role")]
+        RlsDefaultDeny,
+        #[display("row-level security: row_security is off and a policy applies")]
+        RlsRowSecurityOff,
+        #[display("row-level security: policy {policy} cannot be inlined: {reason}")]
+        RlsUninlinable {
+            policy: EcoString,
+            reason: EcoString,
+        },
+        #[display("row-level security: {reason}")]
+        RlsUnsupported {
+            reason: &'static str,
+        },
+        /// pgcache's own role is subject to the policies, so a population
+        /// would be filtered by them on top of the inlined ones.
+        #[display("row-level security: pgcache's role cannot bypass it, so secured relations are not cached")]
+        RlsRoleCannotBypass,
     }
 
     PrivilegeError := {

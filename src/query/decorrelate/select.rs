@@ -774,6 +774,7 @@ impl<'t> Planner<'t> {
         });
         let derived = self.derived_push(TableMetadata {
             replica_identity_full: false,
+            row_security: false,
             partitions: Vec::new(),
             ancestors: Vec::new(),
             write_aliases: Vec::new(),
