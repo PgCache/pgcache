@@ -29,10 +29,7 @@ pub(super) type OriginWriteHalf<'a> = TlsWriteHalf<'a, rustls::ClientConnection>
 /// Decomposes the TlsStream to allow borrowed splits with `.writable()`.
 fn origin_stream_from_tls(tls_stream: tokio_rustls::client::TlsStream<TcpStream>) -> OriginStream {
     let (tcp, client_connection) = tls_stream.into_inner();
-    TlsStream::Tls {
-        tcp,
-        tls_state: Arc::new(std::sync::Mutex::new(client_connection)),
-    }
+    TlsStream::tls(tcp, Arc::new(std::sync::Mutex::new(client_connection)))
 }
 
 /// Connect to the origin database server.
