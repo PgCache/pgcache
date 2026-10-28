@@ -1639,3 +1639,224 @@ async fn test_soft_delete_join_preserved_parent_subsumes() -> Result<(), Error> 
     let _m = assert_cache_hit(&mut ctx, m).await?;
     Ok(())
 }
+
+// =============================================================================
+// Range and other predicates in a join's ON clause (PGC-534)
+// =============================================================================
+
+/// Orders of two tenants, one low priority, with refunds on both sides of
+/// an amount threshold.
+async fn setup_orders_refund_amounts(ctx: &mut TestContext) -> Result<(), Error> {
+    ctx.query(
+        "CREATE TABLE ra_orders (id INTEGER PRIMARY KEY, tenant_id INTEGER, priority INTEGER)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "CREATE TABLE ra_refunds (id INTEGER PRIMARY KEY, order_id INTEGER, amount INTEGER)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO ra_orders VALUES (1, 1, 2), (2, 1, 0), (3, 2, 2)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO ra_refunds VALUES (10, 1, 3), (11, 1, 8), (12, 2, 9), (13, 3, 4)",
+        &[],
+    )
+    .await?;
+    ctx.cdc_decode_settle().await
+}
+
+const RANGE_ON_QUERY: &str = "SELECT o.id, r.id AS refund, r.amount \
+    FROM ra_orders o LEFT JOIN ra_refunds r \
+    ON r.order_id = o.id AND r.amount > 5 \
+    WHERE o.tenant_id = 1 ORDER BY o.id, r.id";
+
+/// A range on the nullable side of a LEFT JOIN's ON filters that side and
+/// leaves it terminal: refunds inserted on either side of the threshold,
+/// amounts crossing it both ways and an order delete all apply in place.
+#[tokio::test]
+async fn test_left_join_on_range_nullable_side_applied_in_place() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_orders_refund_amounts(&mut ctx).await?;
+
+    query_warm(&mut ctx, RANGE_ON_QUERY).await?;
+    let (_, origin) = ctx.proxy_and_origin_rows(RANGE_ON_QUERY).await?;
+    assert_eq!(origin.len(), 2, "one refund above the threshold per order");
+    let m = ctx.metrics().await?;
+
+    let changes = [
+        "INSERT INTO ra_refunds VALUES (14, 2, 2)",
+        "INSERT INTO ra_refunds VALUES (15, 2, 7)",
+        "UPDATE ra_refunds SET amount = 6 WHERE id = 10",
+        "UPDATE ra_refunds SET amount = 1 WHERE id = 11",
+        "DELETE FROM ra_refunds WHERE id = 15",
+        "DELETE FROM ra_orders WHERE id = 1",
+    ];
+    let mut m = m;
+    for change in changes {
+        m = origin_change_applied_in_place(&mut ctx, m, change, RANGE_ON_QUERY).await?;
+    }
+    let (_, origin) = ctx.proxy_and_origin_rows(RANGE_ON_QUERY).await?;
+    assert_eq!(
+        origin.len(),
+        1,
+        "order 2 with refund 12 alone, order 1 gone"
+    );
+    Ok(())
+}
+
+/// A LIKE in a LEFT JOIN's ON is maintained like the range: a note edited
+/// into and out of the pattern attaches and detaches its refund in place.
+#[tokio::test]
+async fn test_left_join_on_like_applied_in_place() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    ctx.query(
+        "CREATE TABLE rl_orders (id INTEGER PRIMARY KEY, tenant_id INTEGER)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "CREATE TABLE rl_refunds (id INTEGER PRIMARY KEY, order_id INTEGER, note TEXT)",
+        &[],
+    )
+    .await?;
+    ctx.query("INSERT INTO rl_orders VALUES (1, 1), (2, 1)", &[])
+        .await?;
+    ctx.query(
+        "INSERT INTO rl_refunds VALUES (10, 1, 'damaged box'), (11, 2, 'late')",
+        &[],
+    )
+    .await?;
+    ctx.cdc_decode_settle().await?;
+
+    let query = "SELECT o.id, r.id AS refund FROM rl_orders o LEFT JOIN rl_refunds r \
+                 ON r.order_id = o.id AND r.note LIKE 'damaged%' \
+                 WHERE o.tenant_id = 1 ORDER BY o.id, r.id";
+    let m = query_warm(&mut ctx, query).await?;
+    let m = origin_change_applied_in_place(
+        &mut ctx,
+        m,
+        "UPDATE rl_refunds SET note = 'damaged lid' WHERE id = 11",
+        query,
+    )
+    .await?;
+    origin_change_applied_in_place(
+        &mut ctx,
+        m,
+        "UPDATE rl_refunds SET note = 'fine' WHERE id = 10",
+        query,
+    )
+    .await?;
+    Ok(())
+}
+
+/// A range on the preserved side of a LEFT JOIN's ON filters no order: a
+/// low-priority order is returned NULL-padded, an inserted one included.
+/// Its column decides which refunds attach, so a priority change, like the
+/// insert, can attach refunds the cache never loaded and invalidates.
+#[tokio::test]
+async fn test_left_join_on_range_preserved_side() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_orders_refund_amounts(&mut ctx).await?;
+
+    let query = "SELECT o.id, r.id AS refund FROM ra_orders o LEFT JOIN ra_refunds r \
+                 ON r.order_id = o.id AND o.priority > 1 \
+                 WHERE o.tenant_id = 1 ORDER BY o.id, r.id";
+    query_warm(&mut ctx, query).await?;
+    let (_, origin) = ctx.proxy_and_origin_rows(query).await?;
+    assert_eq!(
+        origin.len(),
+        3,
+        "order 1 with two refunds, order 2 NULL-padded"
+    );
+    let m = ctx.metrics().await?;
+
+    origin_change_invalidates(&mut ctx, m, "INSERT INTO ra_orders VALUES (4, 1, 0)", query).await?;
+    let (proxied, origin) = ctx.proxy_and_origin_rows(query).await?;
+    assert_eq!(origin.len(), 4, "origin returns every tenant-1 order");
+    assert_eq!(proxied, origin, "result after preserved-side insert");
+    let m = ctx.metrics().await?;
+
+    origin_change_invalidates(
+        &mut ctx,
+        m,
+        "UPDATE ra_orders SET priority = 3 WHERE id = 2",
+        query,
+    )
+    .await?;
+    let (proxied, origin) = ctx.proxy_and_origin_rows(query).await?;
+    assert_eq!(origin.len(), 4, "order 2 now attaches its refund");
+    assert_eq!(proxied, origin, "result after preserved-side update");
+    Ok(())
+}
+
+/// In an inner join the ON range filters as a WHERE would: a refund inserted
+/// below the threshold can never join and applies in place, while one above
+/// it can grow the result and invalidates.
+#[tokio::test]
+async fn test_inner_join_on_range_filters_like_where() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_orders_refund_amounts(&mut ctx).await?;
+
+    let query = "SELECT o.id, r.id AS refund, r.amount FROM ra_orders o JOIN ra_refunds r \
+                 ON r.order_id = o.id AND r.amount > 5 \
+                 WHERE o.tenant_id = 1 ORDER BY o.id, r.id";
+    let m = query_warm(&mut ctx, query).await?;
+    let m = origin_change_applied_in_place(
+        &mut ctx,
+        m,
+        "INSERT INTO ra_refunds VALUES (14, 2, 2)",
+        query,
+    )
+    .await?;
+    let (_, origin) = ctx.proxy_and_origin_rows(query).await?;
+    assert_eq!(origin.len(), 2, "only refunds above the threshold join");
+    let m = assert_cache_hit(&mut ctx, m).await?;
+
+    origin_change_invalidates(
+        &mut ctx,
+        m,
+        "INSERT INTO ra_refunds VALUES (15, 2, 7)",
+        query,
+    )
+    .await?;
+    let (proxied, origin) = ctx.proxy_and_origin_rows(query).await?;
+    assert_eq!(origin.len(), 3, "the refund above the threshold joins");
+    assert_eq!(proxied, origin, "result after insert above the threshold");
+    Ok(())
+}
+
+/// An OR in a LEFT JOIN's ON is kept opaque, so the nullable side has no
+/// filter but stays terminal: a refund moved across either bound attaches
+/// or detaches in place, and the result matches origin throughout.
+#[tokio::test]
+async fn test_left_join_on_or_predicate_applied_in_place() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_orders_refund_amounts(&mut ctx).await?;
+
+    let query = "SELECT o.id, r.id AS refund, r.amount FROM ra_orders o LEFT JOIN ra_refunds r \
+                 ON r.order_id = o.id AND (r.amount > 5 OR r.amount < 2) \
+                 WHERE o.tenant_id = 1 ORDER BY o.id, r.id";
+    let m = query_warm(&mut ctx, query).await?;
+    let changes = [
+        "INSERT INTO ra_refunds VALUES (14, 2, 1)",
+        "UPDATE ra_refunds SET amount = 4 WHERE id = 11",
+        "UPDATE ra_refunds SET amount = 0 WHERE id = 10",
+        "DELETE FROM ra_refunds WHERE id = 14",
+    ];
+    let mut m = m;
+    for change in changes {
+        m = origin_change_applied_in_place(&mut ctx, m, change, query).await?;
+    }
+    let (_, origin) = ctx.proxy_and_origin_rows(query).await?;
+    assert_eq!(
+        origin.len(),
+        2,
+        "order 1 with refund 10, order 2 with refund 12"
+    );
+    Ok(())
+}

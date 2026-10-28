@@ -9,7 +9,7 @@ use crate::query::ast::rope::{
     Body, Case, Function, Join, JoinQual, NodeKind, Query, QueryTree, Scalar, ScalarKind, Select,
     SelectItem, Source, Where, WhereKind,
 };
-use crate::query::ast::{BinaryOp, Deparse, JoinType, LiteralValue, UnaryOp};
+use crate::query::ast::{Deparse, JoinType, LiteralValue};
 
 /// Reject queries that reference a PostgreSQL system catalog: a `pg_`
 /// prefix on the schema or the table name, anywhere in the tree.
@@ -42,10 +42,13 @@ fn pg_prefixed(s: &str) -> bool {
 ///
 /// Functions in the SELECT list are safe (re-evaluated against cached rows);
 /// immutable functions are safe in any context; non-immutable functions in
-/// a WHERE (or a FILTER) are rejected.
+/// a WHERE, a join's ON or a FILTER are rejected. A join's ON also rejects
+/// subqueries: decorrelation reads only WHERE, so a correlated one there
+/// would register in its correlated form.
 #[derive(Clone, Copy)]
 enum ExprContext {
     WhereClause,
+    JoinOn,
     SelectList,
 }
 
@@ -141,54 +144,13 @@ fn join_supported(join: Join<'_>, fv: &FunctionVolatilityMap) -> Result<(), Cach
             construct: "FULL JOIN",
         });
     }
-    // ON must be equality / AND of equalities. USING/NATURAL resolve to
-    // the same equi-join shape; CROSS (no predicate) is fine.
-    let condition_valid = match join.qual() {
-        JoinQual::On(condition) => join_condition_valid(condition),
-        JoinQual::Using(_) | JoinQual::Natural | JoinQual::Cross => true,
-    };
-    if !condition_valid {
-        return Err(CacheabilityError::UnsupportedFrom {
-            construct: "non-equi join condition",
-        });
+    // Any predicate WHERE accepts is accepted in ON: the per-reference
+    // predicate model (ADR-059) keeps what it cannot read as opaque.
+    if let JoinQual::On(condition) = join.qual() {
+        where_cacheable(condition, ExprContext::JoinOn, fv)?;
     }
     source_supported(join.left(), fv)?;
     source_supported(join.right(), fv)
-}
-
-/// Whether a join condition is an equality, a null test on a column (the
-/// soft-delete idiom, PGC-510), or an AND of those.
-fn join_condition_valid(expr: Where<'_>) -> bool {
-    match expr.kind() {
-        WhereKind::Binary(binary) => match binary.op() {
-            BinaryOp::Equal => true,
-            BinaryOp::And => {
-                join_condition_valid(binary.lexpr()) && join_condition_valid(binary.rexpr())
-            }
-            BinaryOp::Or
-            | BinaryOp::NotEqual
-            | BinaryOp::LessThan
-            | BinaryOp::LessThanOrEqual
-            | BinaryOp::GreaterThan
-            | BinaryOp::GreaterThanOrEqual
-            | BinaryOp::Like
-            | BinaryOp::ILike
-            | BinaryOp::NotLike
-            | BinaryOp::NotILike => false,
-        },
-        WhereKind::Unary(unary) => match unary.op() {
-            UnaryOp::IsNull | UnaryOp::IsNotNull => matches!(
-                unary.expr().kind(),
-                WhereKind::Scalar(scalar) if matches!(scalar.kind(), ScalarKind::Column(_))
-            ),
-            UnaryOp::Not
-            | UnaryOp::IsTrue
-            | UnaryOp::IsNotTrue
-            | UnaryOp::IsFalse
-            | UnaryOp::IsNotFalse => false,
-        },
-        WhereKind::Scalar(_) | WhereKind::Multi(_) | WhereKind::Subquery(_) => false,
-    }
 }
 
 /// A predicate: comparisons, AND/OR, LIKE, multi-operand forms, unary
@@ -209,7 +171,7 @@ fn where_cacheable(
             .try_for_each(|operand| where_cacheable(operand, ctx, fv)),
         WhereKind::Unary(unary) => where_cacheable(unary.expr(), ctx, fv),
         WhereKind::Subquery(subquery) => {
-            subquery_inner_cacheable(subquery.query(), fv)?;
+            subquery_inner_cacheable(subquery.query(), ctx, fv)?;
             if let Some(test) = subquery.test_expr() {
                 scalar_cacheable(test, ctx, fv)?;
             }
@@ -221,8 +183,14 @@ fn where_cacheable(
 /// A subquery's inner query; LIMIT is allowed, as in a derived table.
 fn subquery_inner_cacheable(
     query: Query<'_>,
+    ctx: ExprContext,
     fv: &FunctionVolatilityMap,
 ) -> Result<(), CacheabilityError> {
+    if matches!(ctx, ExprContext::JoinOn) {
+        return Err(CacheabilityError::UnsupportedFrom {
+            construct: "subquery in join condition",
+        });
+    }
     body_cacheable(query.body(), fv)
 }
 
@@ -249,7 +217,7 @@ fn scalar_cacheable(
             scalar_cacheable(arithmetic.left(), ctx, fv)?;
             scalar_cacheable(arithmetic.right(), ctx, fv)
         }
-        ScalarKind::Subquery(subquery) => subquery_inner_cacheable(subquery.query(), fv),
+        ScalarKind::Subquery(subquery) => subquery_inner_cacheable(subquery.query(), ctx, fv),
         ScalarKind::Array(array) => array
             .elements()
             .try_for_each(|element| scalar_cacheable(element, ctx, fv)),
@@ -496,29 +464,43 @@ mod tests {
         );
     }
 
+    /// Any predicate WHERE accepts is accepted in a join's ON, in inner,
+    /// LEFT and RIGHT joins alike (PGC-534); FULL stays out.
     #[test]
-    fn test_join_with_non_equality_condition_not_cacheable() {
-        let sql = "SELECT * FROM a JOIN b ON a.id > b.id WHERE a.id = 1";
-        let result = check_cacheable(sql);
+    fn test_join_condition_predicates_cacheable() {
+        let cacheable = [
+            "SELECT * FROM a JOIN b ON a.id > b.id WHERE a.id = 1",
+            "SELECT * FROM a JOIN b ON a.id > b.id JOIN c ON b.id = c.id WHERE a.id = 1",
+            "SELECT * FROM a JOIN b ON a.id = b.a_id AND b.amount > 5",
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id AND b.amount BETWEEN 1 AND 5",
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id AND b.name LIKE 'x%'",
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id AND b.status IN ('a', 'b')",
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id AND a.status <> 'closed'",
+            "SELECT * FROM a RIGHT JOIN b ON a.id = b.a_id AND a.amount >= b.amount WHERE b.id = 1",
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id AND (b.amount > 5 OR b.flag)",
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id OR b.deleted_at IS NULL",
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id AND NOT b.deleted_at IS NULL",
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id AND b.active IS TRUE",
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id AND lower(b.name) IS NULL",
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id AND b.deleted_at + 1 IS NULL",
+            "SELECT * FROM a LEFT JOIN b ON lower(a.name) = lower(b.name)",
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id AND b.kind = ANY(ARRAY['x', 'y'])",
+        ];
+        for sql in cacheable {
+            assert!(check_cacheable(sql).is_ok(), "{sql}");
+        }
+        let full = "SELECT * FROM a FULL JOIN b ON a.id = b.a_id AND b.amount > 5";
         assert!(
-            matches!(result, Err(CacheabilityError::UnsupportedFrom { .. })),
-            "Non-equality join condition should not be cacheable"
-        );
-    }
-
-    #[test]
-    fn test_nested_join_with_non_equality_not_cacheable() {
-        let sql = "SELECT * FROM a JOIN b ON a.id > b.id JOIN c ON b.id = c.id WHERE a.id = 1";
-        let result = check_cacheable(sql);
-        assert!(
-            matches!(result, Err(CacheabilityError::UnsupportedFrom { .. })),
-            "Nested join with non-equality condition should not be cacheable"
+            matches!(
+                check_cacheable(full),
+                Err(CacheabilityError::UnsupportedFrom { .. })
+            ),
+            "{full}"
         );
     }
 
     /// A null test on a column beside the join's equalities is cacheable in
-    /// an inner, LEFT or RIGHT join; FULL stays out, as does a null test on
-    /// anything but a column, or any other unary test.
+    /// an inner, LEFT or RIGHT join; FULL stays out.
     #[test]
     fn test_join_null_test_condition_cacheability() {
         let cacheable = [
@@ -532,19 +514,48 @@ mod tests {
         for sql in cacheable {
             assert!(check_cacheable(sql).is_ok(), "{sql}");
         }
-        let rejected = [
-            "SELECT * FROM a FULL JOIN b ON a.id = b.a_id AND b.deleted_at IS NULL",
-            "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id AND lower(b.name) IS NULL",
-            "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id AND b.deleted_at + 1 IS NULL",
-            "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id AND b.active IS TRUE",
-            "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id AND NOT b.deleted_at IS NULL",
-            "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id OR b.deleted_at IS NULL",
+        let full = "SELECT * FROM a FULL JOIN b ON a.id = b.a_id AND b.deleted_at IS NULL";
+        assert!(
+            matches!(
+                check_cacheable(full),
+                Err(CacheabilityError::UnsupportedFrom { .. })
+            ),
+            "{full}"
+        );
+    }
+
+    /// A join's ON follows the WHERE rules for functions and session terms:
+    /// a non-immutable function there is rejected, which the equality-only
+    /// gate let through. Subqueries in ON are rejected until decorrelation
+    /// reads them.
+    #[test]
+    fn test_join_condition_rejections() {
+        let non_immutable = [
+            "SELECT * FROM a JOIN b ON random() = a.id",
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id AND b.created_at > now()",
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id AND b.seq = nextval('s')",
         ];
-        for sql in rejected {
+        for sql in non_immutable {
             assert!(
                 matches!(
                     check_cacheable(sql),
-                    Err(CacheabilityError::UnsupportedFrom { .. })
+                    Err(CacheabilityError::NonImmutableFunction { .. })
+                ),
+                "{sql}"
+            );
+        }
+        let subqueries = [
+            "SELECT * FROM a JOIN b ON a.id = b.a_id AND b.x IN (SELECT x FROM c)",
+            "SELECT * FROM a JOIN b ON a.id = b.a_id AND EXISTS (SELECT 1 FROM c WHERE c.b_id = b.id)",
+            "SELECT * FROM a JOIN b ON a.id = (SELECT max(id) FROM c)",
+        ];
+        for sql in subqueries {
+            assert!(
+                matches!(
+                    check_cacheable(sql),
+                    Err(CacheabilityError::UnsupportedFrom {
+                        construct: "subquery in join condition"
+                    })
                 ),
                 "{sql}"
             );

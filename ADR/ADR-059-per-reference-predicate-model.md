@@ -84,6 +84,7 @@ Every SELECT branch is described by a `QueryBranchPredicates` (`query/predicates
   * `query/update.rs` (sources from roles);
   * `cache/writer/core.rs` (read-after-write ranges, derived once at Ready publish).
 * `constraints/` holds the constraint vocabulary (`Constraint<C>` with its `ColumnConstraintKind`, keyed by binding in the model and by name for consumers) and the range algebra.
+* A join's ON admits any predicate WHERE admits (PGC-534): the model reads it over the join's reach, so a range on the nullable side filters it, one on the preserved side is a link column, and a cross-reference comparison is opaque with both columns linked. Subqueries in ON stay rejected, since decorrelation reads only WHERE.
 * A recognizer declares whether its constraint rejects NULL; reduction consults that, not recognition. `IS [NOT] NULL` over a bare column is recognized (PGC-533), and `IS NULL` is the one constraint NULL satisfies: it never reduces a join, and in the range algebra it is `ColumnRange::Null`, while `IS NOT NULL` is the unbounded `Range`.
 
 Supersedes ADR-003; amends ADR-024 and ADR-037.

@@ -822,6 +822,56 @@ mod tests {
         }
     }
 
+    /// Any predicate in a join's ON is read like a WHERE conjunct over the
+    /// join's reach (PGC-534): a range on the nullable side filters it and
+    /// leaves it terminal, on the preserved side it is a link column, and a
+    /// cross-reference comparison is opaque with both columns linked.
+    #[test]
+    fn test_join_on_predicates_per_reference() {
+        #[rustfmt::skip]
+        let cases: &[(&str, &[&str])] = &[
+            ("SELECT * FROM a JOIN b ON b.id = a.id AND b.x > 5",
+             &["a exact=false role=Kept filters=[] links=[id]",
+               "b exact=false role=Kept filters=[x GreaterThan Integer(5)] links=[id]"]),
+            ("SELECT * FROM a LEFT JOIN b ON b.id = a.id AND b.x > 5",
+             &["a exact=true role=Kept filters=[] links=[id]",
+               "b exact=false role=Terminal filters=[x GreaterThan Integer(5)] links=[]"]),
+            ("SELECT * FROM a LEFT JOIN b ON b.id = a.id AND b.x BETWEEN 1 AND 5",
+             &["a exact=true role=Kept filters=[] links=[id]",
+               "b exact=false role=Terminal filters=[x GreaterThanOrEqual Integer(1), x LessThanOrEqual Integer(5)] links=[]"]),
+            ("SELECT * FROM a LEFT JOIN b ON b.id = a.id AND b.x IN (1, 2)",
+             &["a exact=true role=Kept filters=[] links=[id]",
+               "b exact=false role=Terminal filters=[x AnyOf [Integer(1), Integer(2)]] links=[]"]),
+            ("SELECT * FROM a LEFT JOIN b ON b.id = a.id AND a.x > 5",
+             &["a exact=true role=Kept filters=[] links=[id, x]",
+               "b exact=false role=Terminal filters=[] links=[]"]),
+            ("SELECT * FROM a LEFT JOIN b ON b.id = a.id AND a.x > b.y",
+             &["a exact=true role=Kept filters=[] links=[id, x]",
+               "b exact=false role=Terminal filters=[] links=[]"]),
+            ("SELECT * FROM a JOIN b ON b.id = a.id AND a.x > b.y",
+             &["a exact=false role=Kept filters=[] links=[id, x]",
+               "b exact=false role=Kept filters=[] links=[id, y]"]),
+            ("SELECT * FROM a LEFT JOIN b ON b.id = a.id AND (b.x > 5 OR b.y < 2)",
+             &["a exact=true role=Kept filters=[] links=[id]",
+               "b exact=false role=Terminal filters=[] links=[]"]),
+        ];
+        for (sql, expected) in cases {
+            assert_eq!(reference_lines(sql), *expected, "{sql}");
+        }
+
+        let bound = resolve("SELECT * FROM a JOIN b ON b.id = a.id AND a.x > b.y");
+        let branch = root_predicates(&bound);
+        for name in ["a", "b"] {
+            let relation = branch
+                .relation_predicates(bound.bindings(), slot_of(&bound, &branch, name))
+                .expect("relation predicates");
+            assert!(
+                relation.unrecognized,
+                "{name} is mentioned by the opaque comparison"
+            );
+        }
+    }
+
     /// A subquery that reads the outer rows links them, at any depth; one
     /// correlated only within itself doesn't.
     #[test]
