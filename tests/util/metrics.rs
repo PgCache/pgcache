@@ -52,11 +52,17 @@ pub(crate) struct MetricsSnapshot {
     pub cache_mv_rebuilds: u64,
     pub cache_mv_skipped_rebuilds: u64,
     pub cache_mv_dirty_truncates: u64,
+    /// MV dirty marks skipped because the UPDATE changed no column the MV's
+    /// query reads (PGC-404).
+    pub cache_mv_dirty_skipped: u64,
     pub cache_memo_hits: u64,
     pub cache_memo_captures: u64,
     pub cache_serve_settings_applied: u64,
     pub cache_reference_only_forwards: u64,
     pub cache_memo_evictions: u64,
+    /// Memo evictions skipped because the UPDATE changed no column the
+    /// query reads (PGC-247).
+    pub cache_memo_evictions_skipped: u64,
     /// Gauge: memo version slots currently held.
     pub cache_memo_slots: u64,
     /// Gauge: entries Pending below the admission threshold.
@@ -179,11 +185,13 @@ const SAMPLES: &[Sample] = samples! {
     "pgcache_cache_mv_rebuilds" => cache_mv_rebuilds,
     "pgcache_cache_mv_skipped_rebuilds" => cache_mv_skipped_rebuilds,
     "pgcache_cache_mv_dirty_truncates" => cache_mv_dirty_truncates,
+    "pgcache_cache_mv_dirty_skipped" => cache_mv_dirty_skipped,
     "pgcache_cache_memo_hits" => cache_memo_hits,
     "pgcache_cache_memo_captures" => cache_memo_captures,
     "pgcache_cache_serve_settings_applied" => cache_serve_settings_applied,
     "pgcache_cache_reference_only_forward_total" => cache_reference_only_forwards,
     "pgcache_cache_memo_evictions" => cache_memo_evictions,
+    "pgcache_cache_memo_evictions_skipped" => cache_memo_evictions_skipped,
     "pgcache_cache_memo_slots" => cache_memo_slots,
     "pgcache_cache_queries_pending" => cache_queries_pending,
     "pgcache_cache_cdc_local_eval_hits" => cache_cdc_local_eval_hits,

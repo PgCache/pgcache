@@ -13,7 +13,7 @@ use crate::cache::Generation;
 use crate::cache::messages::QueryCommand;
 use crate::cache::types::CachedQueryState;
 use crate::cache::update_query::{
-    RowChanges, SubqueryKind, UpdateQueries, UpdateQuery, UpdateQuerySource,
+    ChangeRelevance, RowChanges, SubqueryKind, UpdateQueries, UpdateQuery, UpdateQuerySource,
 };
 use crate::cache::writer::core::WriterCore;
 use crate::catalog::TableMetadata;
@@ -80,22 +80,40 @@ pub(super) fn eval_candidates_into(
 /// Filtered by eligibility, not by whether an entry exists now: a capture can
 /// store F's first entry after this row is replayed and before the frame
 /// commits, and only a bump of `Memo(F)` reaches it (PGC-350).
+///
+/// `relevance` then drops the candidates an in-place UPDATE cannot have
+/// touched (PGC-247): a memo over a query reading none of the changed
+/// columns is byte-identical and stays.
 pub(super) fn memo_frame_accumulate(
     core: &mut WriterCore,
+    relation_oid: Oid,
     memo_candidates: impl IntoIterator<Item = Fingerprint>,
+    relevance: ChangeRelevance<'_>,
 ) {
     // Not gated on memoization being enabled: a runtime enable mid-batch lets
     // a capture land after rows replayed while it was off.
     if core.memo_eligible.is_empty() {
         return;
     }
+    let update_queries = core.cache.update_queries.get(&relation_oid);
     // Takes an iterator so callers can chain the new- and old-image candidate
     // sets without materializing their union (PGC-340). `frame_memo_evictions`
     // is a set, so a fingerprint present in both images inserts idempotently.
     core.frame_memo_evictions.extend(
         memo_candidates
             .into_iter()
-            .filter(|fingerprint| core.memo_eligible.contains(fingerprint)),
+            .filter(|fingerprint| core.memo_eligible.contains(fingerprint))
+            .filter(|fingerprint| {
+                let touched =
+                    update_queries.is_none_or(|queries| relevance.touches(queries, *fingerprint));
+                if !touched {
+                    crate::metrics::handles()
+                        .cdc
+                        .memo_evictions_skipped
+                        .increment(1);
+                }
+                touched
+            }),
     );
 }
 

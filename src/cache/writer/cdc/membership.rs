@@ -4,7 +4,7 @@ use super::WriterCdc;
 use super::row_match::update_query_matches_locally;
 use super::segment_eval::BatchEvalView;
 use crate::cache::CacheResult;
-use crate::cache::update_query::{UpdateEvalStrategy, UpdateQueries, UpdateQuery};
+use crate::cache::update_query::{ChangeRelevance, UpdateEvalStrategy, UpdateQueries, UpdateQuery};
 use crate::cache::writer::core::WriterCore;
 use crate::oid::Oid;
 use crate::pg::protocol::ByteString;
@@ -21,6 +21,9 @@ pub(super) struct MembershipRow<'a> {
     pub(super) candidates: &'a FingerprintSet,
     /// Precomputed segment matrix (PGC-241), when the batch covers this row.
     pub(super) batch: Option<BatchEvalView<'a>>,
+    /// Which candidates' MVs a match may dirty: an in-place UPDATE that kept
+    /// every column a query reads leaves its MV current (PGC-404).
+    pub(super) relevance: ChangeRelevance<'a>,
 }
 
 /// LocalEval: Rust evaluation over the candidates. Cheap, so always evaluated
@@ -41,7 +44,12 @@ fn local_eval_match(
             "update_queries local-eval matched fingerprint {}",
             update_query.fingerprint
         );
-        core.mv_dirty_mark(update_query.fingerprint);
+        if row
+            .relevance
+            .touches(update_queries, update_query.fingerprint)
+        {
+            core.mv_dirty_mark(update_query.fingerprint);
+        }
         matched = true;
     }
     if matched {
@@ -71,10 +79,11 @@ fn maintained_candidates<'a>(
 /// per-row evaluation.
 fn pg_eval_batched_match<'a>(
     core: &WriterCore,
+    update_queries: &UpdateQueries,
     pg_eval: Vec<&'a UpdateQuery>,
-    batch: Option<&BatchEvalView<'_>>,
+    row: &MembershipRow<'_>,
 ) -> (bool, Vec<&'a UpdateQuery>) {
-    let Some(view) = batch else {
+    let Some(view) = row.batch.as_ref() else {
         return (false, pg_eval);
     };
     let (batched, fallback): (Vec<&UpdateQuery>, Vec<&UpdateQuery>) =
@@ -85,7 +94,12 @@ fn pg_eval_batched_match<'a>(
             "update_queries batched pg-eval matched fingerprint {}",
             update_query.fingerprint
         );
-        core.mv_dirty_mark(update_query.fingerprint);
+        if row
+            .relevance
+            .touches(update_queries, update_query.fingerprint)
+        {
+            core.mv_dirty_mark(update_query.fingerprint);
+        }
         matched = true;
     }
     (matched, fallback)
@@ -126,11 +140,11 @@ impl WriterCdc {
         Ok(matched)
     }
 
-    /// Phase A of `update_queries_execute_batch`. Fresh-MV queries must be
-    /// fully evaluated so every match is dirty-marked (else a Fresh MV silently
-    /// goes stale). Non-Fresh queries only decide whether the row belongs in
-    /// the shared cache table — one match triggers the single upsert, so they
-    /// short-circuit.
+    /// Phase A of `update_queries_execute_batch`. Fresh-MV queries the change
+    /// can touch must be fully evaluated so every match is dirty-marked (else
+    /// a Fresh MV silently goes stale). The rest only decide whether the row
+    /// belongs in the shared cache table — one match triggers the single
+    /// upsert, so they short-circuit.
     async fn row_membership_evaluate(
         &mut self,
         core: &WriterCore,
@@ -162,13 +176,16 @@ impl WriterCdc {
             return Ok(matched);
         }
 
-        let (batched_hit, fallback) = pg_eval_batched_match(core, pg_eval, row.batch.as_ref());
+        let (batched_hit, fallback) = pg_eval_batched_match(core, update_queries, pg_eval, row);
         matched |= batched_hit;
 
-        // Per-row fallback for non-batchable shapes / uncovered rows.
-        let (fresh_pg, rest_pg): (Vec<&UpdateQuery>, Vec<&UpdateQuery>) = fallback
-            .into_iter()
-            .partition(|q| core.mv_dirty_eval_required(q.fingerprint));
+        // Per-row fallback for non-batchable shapes / uncovered rows. A
+        // dirtyable MV the change cannot touch needs no full evaluation.
+        let (fresh_pg, rest_pg): (Vec<&UpdateQuery>, Vec<&UpdateQuery>) =
+            fallback.into_iter().partition(|q| {
+                core.mv_dirty_eval_required(q.fingerprint)
+                    && row.relevance.touches(update_queries, q.fingerprint)
+            });
 
         let fresh_hits = self
             .pg_eval_matches(&fresh_pg, table_metadata, row.row_data)

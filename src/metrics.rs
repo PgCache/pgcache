@@ -186,6 +186,9 @@ pub mod names {
     pub const CACHE_MV_SKIPPED_REBUILDS: &str = "pgcache.cache.mv_skipped_rebuilds";
     /// Dirty MV tables truncated by the eviction pre-sweep.
     pub const CACHE_MV_DIRTY_TRUNCATES: &str = "pgcache.cache.mv_dirty_truncates";
+    /// Dirty marks skipped on a Fresh or Building MV because the UPDATE
+    /// changed no column its query reads (PGC-404), per row and MV.
+    pub const CACHE_MV_DIRTY_SKIPPED: &str = "pgcache.cache.mv_dirty_skipped";
     /// Histogram of MV build durations (seconds). Labeled by `kind={first_pop,rebuild}`
     /// so operators can correlate with replication slot lag to decide whether
     /// off-thread builds (Option B) are needed.
@@ -209,6 +212,9 @@ pub mod names {
     pub const CACHE_SERVE_SETTINGS_APPLIED: &str = "pgcache.cache.serve_settings_applied";
     /// Memo entries dropped (CDC-evicted via stale seqlock, or budget-reclaimed).
     pub const CACHE_MEMO_EVICTIONS: &str = "pgcache.cache.memo_evictions";
+    /// Memo-eligible candidates not evicted because the UPDATE changed no
+    /// column their query reads (PGC-247), per row and candidate.
+    pub const CACHE_MEMO_EVICTIONS_SKIPPED: &str = "pgcache.cache.memo_evictions_skipped";
     /// Current number of live memo entries.
     pub const CACHE_MEMO_ENTRIES: &str = "pgcache.cache.memo_entries";
     /// Current total bytes held by the memo.
@@ -838,6 +844,8 @@ pub struct CdcHandles {
     pub toast_repairs: Counter,
     pub toast_fallbacks: Counter,
     pub toast_stale_aborts: Counter,
+    /// Memo-eligible candidates an in-place UPDATE left untouched (PGC-247).
+    pub memo_evictions_skipped: Counter,
     pub handle_inserts: Counter,
     pub handle_updates: Counter,
     pub handle_deletes: Counter,
@@ -864,10 +872,11 @@ impl CdcHandles {
             CACHE_CDC_PREPARED_MISSES, CACHE_CDC_TOAST_FALLBACKS, CACHE_CDC_TOAST_REPAIRS,
             CACHE_CDC_TOAST_STALE_ABORTS, CACHE_HANDLE_DELETE_SECONDS, CACHE_HANDLE_DELETES,
             CACHE_HANDLE_INSERT_SECONDS, CACHE_HANDLE_INSERTS, CACHE_HANDLE_UPDATE_SECONDS,
-            CACHE_HANDLE_UPDATES, CACHE_INVALIDATIONS, CACHE_WRITER_COMMAND_HANDLE_SECONDS,
-            CDC_APPLIED_LSN, CDC_DELETES, CDC_EVENTS_PROCESSED, CDC_FLUSH_STALENESS_SECONDS,
-            CDC_FLUSHED_LSN, CDC_INSERTS, CDC_KEEPALIVE_MARKS_COALESCED, CDC_LAG_BYTES,
-            CDC_LAG_SECONDS, CDC_MESSAGES, CDC_RECEIVED_LSN, CDC_UPDATES,
+            CACHE_HANDLE_UPDATES, CACHE_INVALIDATIONS, CACHE_MEMO_EVICTIONS_SKIPPED,
+            CACHE_WRITER_COMMAND_HANDLE_SECONDS, CDC_APPLIED_LSN, CDC_DELETES,
+            CDC_EVENTS_PROCESSED, CDC_FLUSH_STALENESS_SECONDS, CDC_FLUSHED_LSN, CDC_INSERTS,
+            CDC_KEEPALIVE_MARKS_COALESCED, CDC_LAG_BYTES, CDC_LAG_SECONDS, CDC_MESSAGES,
+            CDC_RECEIVED_LSN, CDC_UPDATES,
         };
         Self {
             events_processed: metrics::counter!(CDC_EVENTS_PROCESSED),
@@ -887,6 +896,7 @@ impl CdcHandles {
             toast_repairs: metrics::counter!(CACHE_CDC_TOAST_REPAIRS),
             toast_fallbacks: metrics::counter!(CACHE_CDC_TOAST_FALLBACKS),
             toast_stale_aborts: metrics::counter!(CACHE_CDC_TOAST_STALE_ABORTS),
+            memo_evictions_skipped: metrics::counter!(CACHE_MEMO_EVICTIONS_SKIPPED),
             prepared_hits: metrics::counter!(CACHE_CDC_PREPARED_HITS),
             prepared_misses: metrics::counter!(CACHE_CDC_PREPARED_MISSES),
             handle_inserts: metrics::counter!(CACHE_HANDLE_INSERTS),
@@ -913,6 +923,8 @@ pub struct MvHandles {
     pub rebuilds: Counter,
     pub skipped_rebuilds: Counter,
     pub dirty_truncates: Counter,
+    /// Dirty marks an in-place UPDATE left unapplied on a dirtyable MV (PGC-404).
+    pub dirty_skipped: Counter,
     pub build_queue: Gauge,
     // Build-duration histogram, one cached handle per `kind` label.
     pub build_first_pop: Histogram,
@@ -925,13 +937,14 @@ pub struct MvHandles {
 impl MvHandles {
     fn build() -> Self {
         use names::{
-            CACHE_MV_BUILD_DURATION_SECONDS, CACHE_MV_BUILD_QUEUE, CACHE_MV_DIRTY_TRUNCATES,
-            CACHE_MV_GATE, CACHE_MV_REBUILDS, CACHE_MV_SKIPPED_REBUILDS,
+            CACHE_MV_BUILD_DURATION_SECONDS, CACHE_MV_BUILD_QUEUE, CACHE_MV_DIRTY_SKIPPED,
+            CACHE_MV_DIRTY_TRUNCATES, CACHE_MV_GATE, CACHE_MV_REBUILDS, CACHE_MV_SKIPPED_REBUILDS,
         };
         Self {
             rebuilds: metrics::counter!(CACHE_MV_REBUILDS),
             skipped_rebuilds: metrics::counter!(CACHE_MV_SKIPPED_REBUILDS),
             dirty_truncates: metrics::counter!(CACHE_MV_DIRTY_TRUNCATES),
+            dirty_skipped: metrics::counter!(CACHE_MV_DIRTY_SKIPPED),
             build_queue: metrics::gauge!(CACHE_MV_BUILD_QUEUE),
             build_first_pop: metrics::histogram!(CACHE_MV_BUILD_DURATION_SECONDS, "kind" => "first_pop"),
             build_rebuild: metrics::histogram!(CACHE_MV_BUILD_DURATION_SECONDS, "kind" => "rebuild"),

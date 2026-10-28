@@ -8,6 +8,7 @@ use std::time::Instant;
 use ecow::EcoString;
 use tracing::{error, instrument, trace};
 
+use super::relevance::update_unchanged_columns;
 use super::row_match::DeleteImage;
 use super::segment_eval::BatchEvalView;
 use super::{
@@ -15,7 +16,7 @@ use super::{
     eval_candidates_into, memo_frame_accumulate, toast_fallback_structural_invalidate,
     update_queries_check_invalidate, update_query_matches_locally,
 };
-use crate::cache::update_query::{RowChanges, UpdateEvalStrategy, UpdateQuery};
+use crate::cache::update_query::{ChangeRelevance, RowChanges, UpdateEvalStrategy, UpdateQuery};
 use crate::cache::writer::core::WriterCore;
 use crate::cache::writer::staging::pk_body_render;
 use crate::cache::{CacheError, CacheResult, ReportExt};
@@ -117,6 +118,16 @@ fn relation_needs_change_eval(core: &WriterCore, relation_oid: Oid) -> bool {
         .update_queries
         .get(&relation_oid)
         .is_some_and(|q| q.needs_change_eval())
+}
+
+/// Whether the row-change booleans have any consumer on the relation: the
+/// invalidation check, or the memo/MV relevance test of any query
+/// (PGC-247/404).
+fn relation_wants_row_changes(core: &WriterCore, relation_oid: Oid) -> bool {
+    core.cache
+        .update_queries
+        .get(&relation_oid)
+        .is_some_and(|q| q.wants_row_changes())
 }
 
 /// Whether the batch deleted this row's PK after the pre-batch snapshot that
@@ -428,6 +439,7 @@ impl WriterCdc {
             row_data,
             candidates: &local_candidates,
             batch,
+            relevance: ChangeRelevance::All,
         };
         let matched = self
             .update_queries_execute_batch(core, relation_oid, membership_row)
@@ -435,7 +447,12 @@ impl WriterCdc {
 
         // Rung 3b: evict memos this insert grows into. An INSERT only adds the
         // row, so the new-row candidates are the full memo-eviction set (ADR-045).
-        memo_frame_accumulate(core, local_candidates.iter().copied());
+        memo_frame_accumulate(
+            core,
+            relation_oid,
+            local_candidates.iter().copied(),
+            ChangeRelevance::All,
+        );
         core.candidate_set_return(local_candidates);
 
         // The inserted row is alive at origin: cancel any tracked deletion of
@@ -493,16 +510,28 @@ impl WriterCdc {
         );
         let (local_candidates, old_candidates) = update_candidates_probe(core, update, probe);
 
-        if relation_needs_change_eval(core, relation_oid) {
+        let row_changes = if relation_wants_row_changes(core, relation_oid) {
             let batched = batch.as_ref().and_then(|view| view.row_change);
-            let row_changes = self
-                .update_row_changes_resolve(core, update, batched)
-                .await?;
+            self.update_row_changes_resolve(core, update, batched)
+                .await?
+        } else {
+            UpdateRowChanges::Batched(None)
+        };
+        if relation_needs_change_eval(core, relation_oid) {
             let fp_list =
                 update_invalidations_collect(core, update, row_changes.get(), &local_candidates);
             // Deferred to frame_invalidations_flush (see handle_insert).
             core.frame_invalidations.extend(fp_list);
         }
+
+        // The columns this UPDATE provably kept: a candidate reading none of
+        // the changed ones keeps its memo and its MV (PGC-247/404).
+        let unchanged = core.cache.tables.get1(&relation_oid).and_then(|table| {
+            update_unchanged_columns(table, update, pk_changed, row_changes.get())
+        });
+        let relevance = unchanged
+            .as_ref()
+            .map_or(ChangeRelevance::All, ChangeRelevance::Unchanged);
 
         // Rung 3b: memo eviction over the symmetric candidate set. Independent of
         // the PGC-227 invalidation skip — an in-place value change leaves the
@@ -510,16 +539,19 @@ impl WriterCdc {
         // Symmetric new ∪ old candidates, chained to avoid allocating the union.
         memo_frame_accumulate(
             core,
+            relation_oid,
             local_candidates
                 .iter()
                 .copied()
                 .chain(old_candidates.iter().copied()),
+            relevance,
         );
 
         let membership_row = MembershipRow {
             row_data: update.new_row_data,
             candidates: &local_candidates,
             batch,
+            relevance,
         };
         let matched = self
             .update_queries_execute_batch(core, relation_oid, membership_row)
@@ -534,7 +566,7 @@ impl WriterCdc {
         // precisely — PGC-255 tracks precision). Reuse the old-image candidates
         // already probed above for the memo pass; `mv_dirty_mark` self-gates
         // (Fresh and Building only).
-        core.mv_dirty_mark_candidates(&old_candidates);
+        core.mv_dirty_mark_candidates(relation_oid, &old_candidates, relevance);
 
         core.candidate_set_return(local_candidates);
         core.candidate_set_return(old_candidates);
@@ -685,7 +717,7 @@ impl WriterCdc {
             true,
             &mut removed_candidates,
         );
-        core.mv_dirty_mark_candidates(&removed_candidates);
+        core.mv_dirty_mark_candidates(relation_oid, &removed_candidates, ChangeRelevance::All);
         core.candidate_set_return(removed_candidates);
 
         // The new-PK row is alive at origin: under recording its eviction must
@@ -795,7 +827,12 @@ impl WriterCdc {
             .and_then(|view| view.old_image)
             .unwrap_or(row_data);
         eval_candidates_into(core, relation_oid, old_image, &mut del_candidates);
-        memo_frame_accumulate(core, del_candidates.iter().copied());
+        memo_frame_accumulate(
+            core,
+            relation_oid,
+            del_candidates.iter().copied(),
+            ChangeRelevance::All,
+        );
 
         // A deleted row leaves stale rows in any Fresh MV that materialized it;
         // CDC removals never went through the upsert path's dirty-mark, so the
@@ -803,7 +840,7 @@ impl WriterCdc {
         // set (the genuine old image; exact under REPLICA IDENTITY FULL, PK-only
         // via `Unknown` wildcard under DEFAULT) is identical to `del_candidates`
         // above — reuse it instead of re-probing (PGC-292/ADR-045).
-        core.mv_dirty_mark_candidates(&del_candidates);
+        core.mv_dirty_mark_candidates(relation_oid, &del_candidates, ChangeRelevance::All);
         core.candidate_set_return(del_candidates);
 
         // Removing a row can grow the result through an Exclusion or Scalar

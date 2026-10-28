@@ -13,6 +13,7 @@ use std::sync::Arc;
 use ecow::EcoString;
 use iddqd::{BiHashItem, BiHashMap, bi_upcast};
 use postgres_types::{Kind, Type};
+use smallvec::{SmallVec, smallvec};
 #[cfg(feature = "proxy")]
 use tokio_postgres::{Client, Error};
 
@@ -94,6 +95,72 @@ impl PartialEq for ColumnStore {
 }
 
 impl Eq for ColumnStore {}
+
+/// A set of a table's columns, by the 0-based index of each column's
+/// position (`ColumnMetadata::index`), which is how CDC row images are
+/// indexed. Word-wise, so a subset test over a wide table is a few ANDs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ColumnMask {
+    words: SmallVec<[u64; 2]>,
+}
+
+impl ColumnMask {
+    const WORD_BITS: usize = u64::BITS as usize;
+
+    /// The empty set, sized for `columns` columns.
+    pub fn with_len(columns: usize) -> Self {
+        Self {
+            words: smallvec![0; columns.div_ceil(Self::WORD_BITS)],
+        }
+    }
+
+    /// Every column of `table`.
+    pub fn all(table: &TableMetadata) -> Self {
+        let mut mask = Self::with_len(table.columns.len());
+        for column in &table.columns {
+            mask.set(column.index());
+        }
+        mask
+    }
+
+    /// The columns of `table` that `names` name; `None` when a name is not
+    /// a column of the table, so the caller falls back to reading every
+    /// column.
+    pub fn columns_named<'a>(
+        table: &TableMetadata,
+        names: impl IntoIterator<Item = &'a str>,
+    ) -> Option<Self> {
+        let mut mask = Self::with_len(table.columns.len());
+        for name in names {
+            mask.set(table.columns.get(name)?.index());
+        }
+        Some(mask)
+    }
+
+    pub fn set(&mut self, index: usize) {
+        let word = index / Self::WORD_BITS;
+        if word >= self.words.len() {
+            self.words.resize(word + 1, 0);
+        }
+        if let Some(bits) = self.words.get_mut(word) {
+            *bits |= 1 << (index % Self::WORD_BITS);
+        }
+    }
+
+    pub fn contains(&self, index: usize) -> bool {
+        self.words
+            .get(index / Self::WORD_BITS)
+            .is_some_and(|word| word & (1 << (index % Self::WORD_BITS)) != 0)
+    }
+
+    /// Whether every column in `self` is also in `other`.
+    pub fn is_subset_of(&self, other: &Self) -> bool {
+        self.words.iter().enumerate().all(|(i, word)| {
+            let in_other = other.words.get(i).copied().unwrap_or(0);
+            word & !in_other == 0
+        })
+    }
+}
 
 /// Metadata about a database table.
 ///
@@ -527,5 +594,48 @@ mod tests {
         }
         let past_max = usize::try_from(i16::MAX).expect("i16::MAX as usize");
         assert_eq!(ColumnPosition::from_index(past_max), None);
+    }
+
+    /// A mask names columns by index; a name the table lacks yields no
+    /// mask; a set is a subset of another when it adds no column, and a
+    /// column past the inline words still fits.
+    #[test]
+    fn test_column_mask_subset_and_naming() {
+        let table = TableMetadata::for_test(
+            "t",
+            7,
+            [
+                column_fixture("id", 1, true),
+                column_fixture("a", 2, false),
+                column_fixture("b", 3, false),
+            ],
+        );
+        let all = ColumnMask::all(&table);
+        let ab = ColumnMask::columns_named(&table, ["a", "b"]).expect("named");
+        let a = ColumnMask::columns_named(&table, ["a"]).expect("named");
+        assert!(ColumnMask::columns_named(&table, ["a", "zz"]).is_none());
+        assert!(a.is_subset_of(&ab));
+        assert!(!ab.is_subset_of(&a));
+        assert!(ab.is_subset_of(&all));
+        assert!(ColumnMask::with_len(3).is_subset_of(&a), "empty set");
+        assert!(a.contains(1) && !a.contains(0) && !a.contains(2));
+
+        let mut wide = ColumnMask::with_len(3);
+        wide.set(130);
+        assert!(wide.contains(130));
+        assert!(!wide.is_subset_of(&all));
+        assert!(all.is_subset_of(&ColumnMask::all(&table)));
+    }
+
+    fn column_fixture(name: &str, position: i16, is_primary_key: bool) -> ColumnMetadata {
+        ColumnMetadata {
+            name: name.into(),
+            position: ColumnPosition::from_raw(position),
+            type_oid: TypeOid::from_raw(Type::TEXT.oid()),
+            data_type: Type::TEXT,
+            type_name: "text".into(),
+            cache_type_name: "text".into(),
+            is_primary_key,
+        }
     }
 }

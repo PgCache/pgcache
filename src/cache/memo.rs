@@ -17,9 +17,12 @@
 //!
 //! The store is **rung-agnostic** — only two policies differ per precision rung:
 //! which slots a memo stamps (capture) and which slots a CDC change bumps (evict).
-//! Rung 1 (this version) uses [`SlotKey::Relation`] only: any change to relation
-//! R bumps R, busting every memo over R. The finer [`SlotKey`] variants are
-//! reserved for rung 2 (column-aware eviction).
+//! A memo stamps its own [`SlotKey::Memo`]; the CDC frame bumps it for every
+//! memo-eligible query the eval-index candidate probe returns for a changed
+//! row, new and old image alike (ADR-045), minus the candidates an in-place
+//! UPDATE provably left untouched because it changed no column the query reads
+//! (PGC-247). [`SlotKey::Relation`] is bumped for every touched relation as
+//! the capture-window guard only.
 //!
 //! ## Correctness: the slot version is a seqlock
 //!
@@ -98,8 +101,7 @@ pub(crate) const MEMO_CAPTURE_MIN_HITS: u64 = 1;
 /// still bumps it for every touched relation (begin/end), and a capture re-checks
 /// it at finish, so a frame committing mid-capture drops the snapshot even when
 /// the change leaves the fingerprint's own slot alone. It is NOT stored in
-/// `MemoEntry`, so it never busts a stored entry. The
-/// `RelationMembership`/`RelationColumn` variants remain reserved (unused).
+/// `MemoEntry`, so it never busts a stored entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SlotKey {
     /// Per-fingerprint eviction slot (rung 3). The only slot a memo stamps.
@@ -107,11 +109,6 @@ pub enum SlotKey {
     /// Capture-window guard: bumped for every touched relation each frame and
     /// re-checked at capture finish, but not stored in the entry (rung 3).
     Relation(Oid),
-    /// A membership change (INSERT/DELETE) on this relation. Reserved (unused).
-    RelationMembership(Oid),
-    /// A specific column of this relation changed (`(relation_oid, attnum)`).
-    /// Reserved (unused).
-    RelationColumn(Oid, u32),
 }
 
 /// The result-shape component of a memo key. Cross-shape slicing is unsafe
@@ -290,13 +287,11 @@ impl ResultMemo {
     }
 
     /// Version of a slot with no entry: the floor for a `Memo` slot, 0 for the
-    /// never-removed relation slots.
+    /// never-removed relation slot.
     fn slot_base(&self, slot: SlotKey) -> u64 {
         match slot {
             SlotKey::Memo(_) => self.floor(),
-            SlotKey::Relation(_) | SlotKey::RelationMembership(_) | SlotKey::RelationColumn(..) => {
-                0
-            }
+            SlotKey::Relation(_) => 0,
         }
     }
 
@@ -316,9 +311,7 @@ impl ResultMemo {
             .map(|&slot| {
                 let version = match slot {
                     SlotKey::Memo(_) => *self.slot_epochs.get(&slot)?,
-                    SlotKey::Relation(_)
-                    | SlotKey::RelationMembership(_)
-                    | SlotKey::RelationColumn(..) => self.slot_version(slot),
+                    SlotKey::Relation(_) => self.slot_version(slot),
                 };
                 version.is_multiple_of(2).then_some((slot, version))
             })
@@ -1092,11 +1085,6 @@ mod tests {
             m.slot_version(SlotKey::Relation(Oid::from_raw(20))),
             0,
             "missing relation slot reads 0"
-        );
-        assert_eq!(
-            m.slot_version(SlotKey::RelationColumn(Oid::from_raw(20), 1)),
-            0,
-            "missing reserved slot reads 0"
         );
     }
 

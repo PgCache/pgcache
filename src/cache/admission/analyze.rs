@@ -1,7 +1,8 @@
 //! The per-table admission derivation, extracted verbatim from the writer's
 //! registration path (PGC-391) so pgcache-fit runs the identical analysis.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::ptr;
 use std::sync::Arc;
 
 use ecow::EcoString;
@@ -17,7 +18,7 @@ use crate::cache::mv_shape::{ShapeGate, shape_classify};
 use crate::cache::query::{limit_clause_of, limit_rows_needed};
 use crate::cache::update_query::{OrderByKey, UpdateEvalStrategy, UpdateQuery, UpdateQuerySource};
 use crate::cache::{CacheError, CacheResult};
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, ColumnMask};
 use crate::oid::Oid;
 use crate::query::Fingerprint;
 use crate::query::ast::rope::{Body, NodeKind, QueryTree, TreeBuilder, View};
@@ -193,12 +194,15 @@ pub fn query_admission_analyze(
 ) -> CacheResult<AdmissionAnalysis> {
     let update_source = query.decorrelated.unwrap_or(query.bound);
     let update_queries = query_table_update_queries(update_source);
+    let read_columns =
+        (depth == AdmissionDepth::Full).then(|| read_columns_collect(query.bound, update_source));
     let context = AdmissionContext {
         query: &query,
         update_source,
         aggregate_functions,
         tables,
         depth,
+        read_columns,
     };
     let admissions = update_queries
         .into_iter()
@@ -210,6 +214,21 @@ pub fn query_admission_analyze(
     })
 }
 
+/// The columns each relation is read through, in the registered form and,
+/// when it differs, the decorrelated form the update queries come from.
+fn read_columns_collect(
+    bound: &ResolvedQuery,
+    update_source: &ResolvedQuery,
+) -> HashMap<Oid, HashSet<EcoString>> {
+    let mut columns = bound.privilege_needs().relations;
+    if !ptr::eq(bound, update_source) {
+        for (relation_oid, names) in update_source.privilege_needs().relations {
+            columns.entry(relation_oid).or_default().extend(names);
+        }
+    }
+    columns
+}
+
 /// What every table's admission is derived against.
 struct AdmissionContext<'a> {
     query: &'a AdmissionQuery<'a>,
@@ -219,11 +238,22 @@ struct AdmissionContext<'a> {
     aggregate_functions: &'a HashSet<EcoString>,
     tables: &'a Catalog,
     depth: AdmissionDepth,
+    /// The read columns per relation (`UpdateQuery::read_columns`); only a
+    /// full admission derives them.
+    read_columns: Option<HashMap<Oid, HashSet<EcoString>>>,
 }
 
 impl AdmissionContext<'_> {
     fn full(&self) -> bool {
         self.depth == AdmissionDepth::Full
+    }
+
+    /// The relation's read columns as a mask over its table, `None` when
+    /// not derived or when a name is not a column of the table.
+    fn read_columns(&self, relation_oid: Oid) -> Option<ColumnMask> {
+        let names = self.read_columns.as_ref()?.get(&relation_oid)?;
+        let table = self.tables.get1(&relation_oid)?;
+        ColumnMask::columns_named(table, names.iter().map(EcoString::as_str))
     }
 
     fn table_admission_build(&self, bound_update: TableUpdateQuery<'_>) -> TableAdmission {
@@ -250,6 +280,7 @@ impl AdmissionContext<'_> {
             change_dependent: false,
             pg_batchable: self.pg_batchable(branch, eval_strategy),
             predicate_columns: predicate_columns_collect(branch, table_name),
+            read_columns: self.read_columns(relation_oid),
             is_single_table,
             compiled_where: self.compiled_where(branch, table_name, eval_strategy),
             pg_eval_template: self.pg_eval_template(branch, relation_oid, eval_strategy),

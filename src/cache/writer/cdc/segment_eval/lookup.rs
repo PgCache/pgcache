@@ -79,7 +79,7 @@ fn row_change_select_into(
 ) {
     buf.push_str("SELECT v.");
     buf.push_str(BATCH_IDX_COLUMN);
-    if spec.needs_changes {
+    if spec.wants_changes {
         let projection = RowChangeProjection {
             old_qualifier: "o.",
             order_columns,

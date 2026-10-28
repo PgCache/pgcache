@@ -15,6 +15,7 @@ mod dispatch;
 mod frame;
 mod invalidation;
 mod membership;
+mod relevance;
 mod row_changes;
 mod row_match;
 mod segment_eval;

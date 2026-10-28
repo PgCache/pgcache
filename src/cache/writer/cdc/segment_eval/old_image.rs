@@ -17,13 +17,13 @@ use crate::oid::Oid;
 use crate::pg::protocol::ByteString;
 
 /// Per-relation lookup shape for one segment, computed once per relation:
-/// whether update events consume changed-column booleans, and the eval-index
+/// whether update events want changed-column booleans, and the eval-index
 /// columns (positions for overlay recording and old-image expansion;
 /// `fetch_columns` for the rung-2 SQL projection). REPLICA IDENTITY FULL
 /// relations skip the ladder entirely — the 'O' tuple is authoritative
 /// (rung 0 in the dispatch handlers).
 pub(super) struct RelationFetchSpec {
-    pub(super) needs_changes: bool,
+    pub(super) wants_changes: bool,
     replica_identity_full: bool,
     /// `UpdateQueries::epoch` at spec build — stamped into the overlay via
     /// `old_image_overlay_epoch_reconcile` before any overlay activity, and
@@ -49,7 +49,7 @@ impl RelationFetchSpec {
             .map(|uq| uq.eval_index_columns().cloned().collect())
             .unwrap_or_default();
         let mut spec = Self {
-            needs_changes: update_queries.is_some_and(|uq| uq.needs_change_eval()),
+            wants_changes: update_queries.is_some_and(|uq| uq.wants_row_changes()),
             replica_identity_full: false,
             epoch: update_queries.map_or(0, |uq| uq.epoch()),
             reserved_columns: false,
@@ -316,12 +316,13 @@ impl<'a, 'c> OldImagePrepass<'a, 'c> {
         key_data: &'a [Option<ByteString>],
         new_row_data: &'a [Option<ByteString>],
     ) {
-        // PGC-227: booleans only for relations where some query's UPDATE
-        // invalidation depends on changed columns. Reserved-prefix relations
-        // never enter the batch (their column aliases would collide with the
-        // projection namespace) — the per-row fallback carries their booleans.
+        // Booleans for every relation with queries: the invalidation check
+        // (PGC-227) and the memo/MV relevance test (PGC-247/404) read them.
+        // Reserved-prefix relations never enter the batch (their column
+        // aliases would collide with the projection namespace) — the per-row
+        // fallback carries their booleans.
         let spec = relation_fetch_spec(self.core, &mut self.specs, relation_oid);
-        let wants_changes = spec.needs_changes && !spec.reserved_columns;
+        let wants_changes = spec.wants_changes && !spec.reserved_columns;
         let wants_old_image =
             self.update_old_image(event_idx, relation_oid, key_data, new_row_data);
         if wants_changes || wants_old_image {

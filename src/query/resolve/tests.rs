@@ -1064,6 +1064,15 @@ fn test_privilege_needs_lists_referenced_columns_per_relation_and_functions() {
     );
     assert_eq!(count.functions, ["count"]);
 
+    // A column read only by ORDER BY still decides the result's order.
+    let ordered = bound("SELECT id FROM orders ORDER BY total", &tables).privilege_needs();
+    let mut ordered_columns: Vec<&str> = ordered.relations[&Oid::from_raw(1001)]
+        .iter()
+        .map(EcoString::as_str)
+        .collect();
+    ordered_columns.sort_unstable();
+    assert_eq!(ordered_columns, ["id", "total"]);
+
     // A CTE or FROM subquery is no relation at origin: only the base
     // columns its body reads count.
     let cte = bound(

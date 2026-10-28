@@ -21,6 +21,7 @@ use tracing::{debug, error, trace};
 
 use super::core::WriterCore;
 use super::mv_build::{MvBuildContext, mv_build_spawn};
+use crate::cache::update_query::ChangeRelevance;
 use crate::cache::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
     messages::{MvBuildOutcome, QueryCommand},
@@ -418,10 +419,21 @@ impl WriterCore {
     /// Lets a caller that already ran the old-image probe for the memo pass
     /// reuse it for MV instead of probing the `eval_index` twice (ADR-045).
     /// O(candidates): `mv_dirty_mark` self-gates, so non-dirtiable entries are
-    /// cheap no-ops.
-    pub(super) fn mv_dirty_mark_candidates(&self, candidates: &FingerprintSet) {
-        for fingerprint in candidates {
-            self.mv_dirty_mark(*fingerprint);
+    /// cheap no-ops. `relevance` keeps an MV the change cannot touch current
+    /// (PGC-404); a dirtyable one so kept is counted as a skipped dirty.
+    pub(super) fn mv_dirty_mark_candidates(
+        &self,
+        relation_oid: Oid,
+        candidates: &FingerprintSet,
+        relevance: ChangeRelevance<'_>,
+    ) {
+        let update_queries = self.cache.update_queries.get(&relation_oid);
+        for &fingerprint in candidates {
+            if update_queries.is_none_or(|queries| relevance.touches(queries, fingerprint)) {
+                self.mv_dirty_mark(fingerprint);
+            } else if self.mv_dirty_eval_required(fingerprint) {
+                crate::metrics::handles().mv.dirty_skipped.increment(1);
+            }
         }
     }
 

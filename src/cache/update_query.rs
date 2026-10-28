@@ -7,6 +7,7 @@ use iddqd::{IdHashItem, id_upcast};
 use rootcause::Report;
 
 use crate::cache::{CacheError, CacheResult};
+use crate::catalog::ColumnMask;
 #[cfg(feature = "proxy")]
 use crate::catalog::TableMetadata;
 use crate::id_hash::{BuildIdHasher, impl_id_hashable};
@@ -190,6 +191,12 @@ pub struct UpdateQuery {
     /// makes every eval verdict for this query untrustworthy, forcing
     /// invalidation (PGC-264).
     pub predicate_columns: HashSet<EcoString>,
+    /// This relation's columns the query reads anywhere: select list,
+    /// predicates, ON, GROUP BY, ORDER BY, subqueries, stars expanded. An
+    /// UPDATE that keeps its PK and changes none of them leaves the query's
+    /// result byte-identical, so its memo and MV stand (PGC-247/404). `None`
+    /// when unknown, read as every column.
+    pub read_columns: Option<ColumnMask>,
     /// `QueryBranch::is_single_table` of the branch, kept because the CDC
     /// invalidation checks consult it per row per query and it walks the tree.
     pub is_single_table: bool,
@@ -259,6 +266,31 @@ pub struct SubsumerRegion {
     pub ranges: TableRanges,
     /// In their key forms, for the candidate index (PGC-478).
     pub keyed_ranges: TableRanges,
+}
+
+/// Whether a CDC row change can alter a candidate query's result
+/// (PGC-247/404). An UPDATE that keeps its PK and changes no column a query
+/// reads leaves membership, output and order as they were, so its memo and
+/// MV need no eviction; everything else, and any row the cache cannot
+/// compare, touches every candidate.
+#[cfg(feature = "proxy")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ChangeRelevance<'a> {
+    /// INSERT, DELETE, a PK change, or nothing provable about the row.
+    All,
+    /// An in-place UPDATE whose row provably kept these columns.
+    Unchanged(&'a ColumnMask),
+}
+
+#[cfg(feature = "proxy")]
+impl ChangeRelevance<'_> {
+    /// Whether the change can alter `fingerprint`'s result on this relation.
+    pub(crate) fn touches(self, update_queries: &UpdateQueries, fingerprint: Fingerprint) -> bool {
+        match self {
+            Self::All => true,
+            Self::Unchanged(unchanged) => update_queries.update_touches(fingerprint, unchanged),
+        }
+    }
 }
 
 /// An update query to register, with what the relation's indexes take.
@@ -523,6 +555,30 @@ impl UpdateQueries {
         self.change_dependent_count > 0
     }
 
+    /// Whether the row-change booleans of a CDC UPDATE have a consumer on
+    /// this relation. The invalidation check needs them only when
+    /// [`Self::needs_change_eval`]; the memo and MV relevance test
+    /// ([`Self::update_touches`]) needs them for any query, as every Ready
+    /// query is memo-eligible or an MV candidate (PGC-247/404).
+    pub fn wants_row_changes(&self) -> bool {
+        !self.queries.is_empty()
+    }
+
+    /// Whether an in-place UPDATE that left `unchanged` as it was can alter
+    /// `fingerprint`'s result: one of its update queries here reads a
+    /// changed column or has no known read set. A fingerprint with no update
+    /// query on this relation proves nothing and counts as touched.
+    pub fn update_touches(&self, fingerprint: Fingerprint, unchanged: &ColumnMask) -> bool {
+        self.queries.get(&fingerprint).is_none_or(|entries| {
+            entries.iter().any(|query| {
+                query
+                    .read_columns
+                    .as_ref()
+                    .is_none_or(|read| !read.is_subset_of(unchanged))
+            })
+        })
+    }
+
     /// Register `fingerprint`'s update queries on this relation, replacing
     /// any it had: one entry per table reference, each exact one a
     /// subsumption parent of its own.
@@ -739,6 +795,39 @@ mod tests {
             .iter()
             .any(|key| key.fingerprint == FINGERPRINT)
             || subsumer_for(queries, "x")
+    }
+
+    /// A fingerprint is touched by an in-place UPDATE when a column its
+    /// query reads changed: the read set spans the select list and the
+    /// predicates, a star reads every column, an aggregate over no column
+    /// reads none, and an unknown fingerprint proves nothing.
+    #[test]
+    fn test_update_touches_follows_read_columns() {
+        let mask = |indexes: &[usize]| {
+            let mut mask = ColumnMask::with_len(2);
+            for &index in indexes {
+                mask.set(index);
+            }
+            mask
+        };
+        let id_kind = mask(&[0, 1]);
+        let id_only = mask(&[0]);
+        let nothing = mask(&[]);
+
+        let queries = registered("SELECT id FROM items WHERE kind = 'x'", false);
+        assert!(!queries.update_touches(FINGERPRINT, &id_kind));
+        assert!(
+            queries.update_touches(FINGERPRINT, &id_only),
+            "kind changed"
+        );
+        assert!(queries.update_touches(Fingerprint::from_raw(99), &id_kind));
+
+        let star = registered("SELECT * FROM items", false);
+        assert!(star.update_touches(FINGERPRINT, &id_only));
+        assert!(!star.update_touches(FINGERPRINT, &id_kind));
+
+        let count = registered("SELECT count(*) FROM items", false);
+        assert!(!count.update_touches(FINGERPRINT, &nothing));
     }
 
     const UNION: &str = "SELECT id FROM items WHERE kind = 'x' \
