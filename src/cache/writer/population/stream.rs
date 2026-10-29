@@ -610,9 +610,8 @@ mod tests {
     #[test]
     fn test_population_select_null_filled_reads_widened() {
         const ANTI: &str = "FROM public.users u LEFT JOIN public.orders o ON o.user_id = u.id";
-        // A nested join renders without parentheses: the inner ON binds first.
-        const NESTED: &str = "FROM public.users u LEFT JOIN public.orders o LEFT JOIN public.items i \
-                              ON i.order_id = o.id";
+        const NESTED: &str = "FROM public.users u LEFT JOIN (public.orders o LEFT JOIN public.items i \
+                              ON i.order_id = o.id)";
         #[rustfmt::skip]
         let cases: [(&str, &str, &[&str]); 9] = [
             ("anti-join", "SELECT u.id FROM users u LEFT JOIN orders o ON o.user_id = u.id WHERE o.total IS NULL", &[

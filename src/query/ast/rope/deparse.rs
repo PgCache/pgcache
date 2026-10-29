@@ -494,7 +494,17 @@ fn join_deparse_with<C: DeparseContext>(join: Join<'_>, cx: &mut C, buf: &mut St
             buf.push_str(join.join_type().join_keyword());
         }
     }
-    source_deparse_with(join.right(), cx, buf);
+    // A join on the right binds its own qualification before the outer
+    // one does; the grammar allows it bare, the parentheses make it read.
+    if let Source::Join(inner) = join.right() {
+        let mut nested = String::new();
+        join_deparse_with(inner, cx, &mut nested);
+        buf.push_str(" (");
+        buf.push_str(nested.trim_start());
+        buf.push(')');
+    } else {
+        source_deparse_with(join.right(), cx, buf);
+    }
     match qual {
         JoinQualText::On(condition) => {
             cx.clause_enter(Clause::JoinOn);
