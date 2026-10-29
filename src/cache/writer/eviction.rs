@@ -578,6 +578,7 @@ impl WriterCore {
         // Drain coalesced waiters parked on the now-removed query (eviction can
         // remove a Loading query whose waiters would otherwise never be drained).
         self.waiters_fail(fingerprint);
+        self.waiters_release_request(fingerprint);
 
         self.cache
             .update_queries_remove_fingerprint(fingerprint, &query.relation_oids);

@@ -5,8 +5,9 @@
 
 use ecow::EcoString;
 
-use super::{SubsumerCandidate, SubsumerSource};
+use super::{CandidateState, SubsumerCandidate, SubsumerSource};
 use crate::oid::Oid;
+use crate::query::Fingerprint;
 use crate::query::ast::{BinaryOp, LiteralValue};
 use crate::query::constraints::{
     ColumnConstraintKind, TableConstraint, TableRanges, literal_value_canonical_order,
@@ -86,15 +87,45 @@ pub fn subsumption_covered(
     join: Option<&JoinRegion>,
     source: &impl SubsumerSource,
 ) -> Option<SubsumptionCover> {
+    cover_decide(references, join, source, None)
+}
+
+/// The one parent still populating whose Ready would cover the new query
+/// as [`subsumption_covered`] requires (PGC-496): the same cover, allowed
+/// to lean on a single populating candidate beside Ready ones. `None` when
+/// Ready parents already cover it, when it would take a second populating
+/// parent, or when only a split would cover a reference.
+pub fn subsumption_pending_parent(
+    references: &[SubsumptionReference],
+    join: Option<&JoinRegion>,
+    source: &impl SubsumerSource,
+) -> Option<Fingerprint> {
+    let mut pending = None;
+    cover_decide(references, join, source, Some(&mut pending))?;
+    pending
+}
+
+/// The cover, by a parent of the join's shape ([`join_covered`]) or
+/// reference by reference; `pending` lets one populating parent hold.
+fn cover_decide(
+    references: &[SubsumptionReference],
+    join: Option<&JoinRegion>,
+    source: &impl SubsumerSource,
+    mut pending: Option<&mut Option<Fingerprint>>,
+) -> Option<SubsumptionCover> {
     if references.is_empty() {
         return None;
     }
-    if join.is_some_and(|join| join_covered(join, source)) {
+    if join.is_some_and(|join| join_covered(join, source, pending.as_deref_mut())) {
         return Some(SubsumptionCover::Join);
     }
     let mut cover = SubsumptionCover::Whole;
     for reference in references {
-        if reference_covered(reference, source) {
+        if candidate_holds(
+            source.candidates(reference),
+            &reference.ranges,
+            pending.as_deref_mut(),
+        ) {
             continue;
         }
         if !reference_covered_split(reference, source) {
@@ -105,9 +136,10 @@ pub fn subsumption_covered(
     Some(cover)
 }
 
-/// Whether one candidate on the reference's relation holds its whole region.
+/// Whether one Ready candidate on the reference's relation holds its whole
+/// region.
 fn reference_covered(reference: &SubsumptionReference, source: &impl SubsumerSource) -> bool {
-    candidate_holds(source.candidates(reference), &reference.ranges)
+    candidate_holds(source.candidates(reference), &reference.ranges, None)
 }
 
 /// Whether one parent of the join's shape holds every FROM row its WHERE
@@ -116,22 +148,47 @@ fn reference_covered(reference: &SubsumptionReference, source: &impl SubsumerSou
 /// column, each column keyed by its slot, so a NULL-padded row answers like
 /// any other. A row the cache assembles from the parent's rows is a FROM
 /// row origin has, so serving the new query over them returns its result.
-fn join_covered(join: &JoinRegion, source: &impl SubsumerSource) -> bool {
-    candidate_holds(source.join_candidates(join), &join.ranges)
+fn join_covered(
+    join: &JoinRegion,
+    source: &impl SubsumerSource,
+    pending: Option<&mut Option<Fingerprint>>,
+) -> bool {
+    candidate_holds(source.join_candidates(join), &join.ranges, pending)
 }
 
+/// Whether a LIMIT-free candidate holds `ranges`: a Ready one, or, when
+/// `pending` is given, a populating one, which `pending` records as the
+/// parent the cover waits on. A cover leans on one such parent at most, so
+/// a second populating candidate holds only when it is that parent.
 fn candidate_holds<'a>(
-    mut candidates: impl Iterator<Item = SubsumerCandidate<'a>>,
+    candidates: impl Iterator<Item = SubsumerCandidate<'a>>,
     ranges: &TableRanges,
+    pending: Option<&mut Option<Fingerprint>>,
 ) -> bool {
-    candidates.any(|candidate| {
-        let SubsumerCandidate {
-            region,
-            has_limit,
-            ready,
-        } = candidate;
-        !has_limit && ready && table_ranges_subsumed(ranges, region)
-    })
+    let mut populating: Vec<Fingerprint> = Vec::new();
+    for candidate in candidates {
+        if candidate.has_limit || !table_ranges_subsumed(ranges, candidate.region) {
+            continue;
+        }
+        match candidate.state {
+            CandidateState::Ready => return true,
+            CandidateState::Populating => populating.push(candidate.fingerprint),
+            CandidateState::Unavailable => {}
+        }
+    }
+    let Some(pending) = pending else {
+        return false;
+    };
+    match pending {
+        Some(parent) => populating.contains(parent),
+        None => match populating.first() {
+            Some(first) => {
+                *pending = Some(*first);
+                true
+            }
+            None => false,
+        },
+    }
 }
 
 /// One in-set column a split fixes, with its values in a stable order.

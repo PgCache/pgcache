@@ -441,6 +441,7 @@ fn query_invalidated_mark(core: &mut WriterCore, fingerprint: Fingerprint, gener
         entry.mv.dirty_apply(Instant::now());
     }
     core.waiters_fail(fingerprint);
+    core.waiters_release_request(fingerprint);
 }
 
 impl WriterCore {
@@ -481,6 +482,7 @@ impl WriterCore {
             debug!("pinned query invalidated, deferring readmit {fingerprint}");
             let _ = self.query_tx.send(QueryCommand::Readmit { fingerprint });
             self.waiters_fail(fingerprint);
+            self.waiters_release_request(fingerprint);
             return Ok(true);
         }
 

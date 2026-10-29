@@ -1,4 +1,5 @@
 use std::io::Error;
+use std::time::Duration;
 
 use crate::util::{
     MetricsSnapshot, TestContext, assert_cache_hit, assert_cache_miss, assert_not_subsumed,
@@ -1407,5 +1408,174 @@ async fn test_subsumption_point_parents_cover_in_set_child() -> Result<(), Error
     assert_eq!(proxied, origin, "after update");
     assert_eq!(proxied[1], [Some("2".to_owned()), Some("21".to_owned())]);
     assert_cache_hit(&mut ctx, m).await?;
+    Ok(())
+}
+
+// =============================================================================
+// Waiting on a populating parent (PGC-496)
+// =============================================================================
+
+/// `sw_users` 1..8 and `sw_orders` 10 (user 1), 11 (user 6).
+async fn setup_wait_tables(ctx: &mut TestContext) -> Result<(), Error> {
+    ctx.query(
+        "CREATE TABLE sw_users (id INTEGER PRIMARY KEY, name TEXT)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "CREATE TABLE sw_orders (id INTEGER PRIMARY KEY, user_id INTEGER)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO sw_users VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), \
+         (5, 'e'), (6, 'f'), (7, 'g'), (8, 'h')",
+        &[],
+    )
+    .await?;
+    ctx.query("INSERT INTO sw_orders VALUES (10, 1), (11, 6)", &[])
+        .await?;
+    ctx.cdc_decode_settle().await
+}
+
+const SW_USERS_WIDE: &str = "SELECT id, name FROM sw_users WHERE id > 0 ORDER BY id";
+const SW_USERS_NARROW: &str = "SELECT id, name FROM sw_users WHERE id > 5 ORDER BY id";
+const SW_LEFT_JOIN_WIDE: &str = "SELECT u.id, o.id FROM sw_users u \
+    LEFT JOIN sw_orders o ON o.user_id = u.id WHERE u.id > 0 ORDER BY u.id, o.id";
+const SW_JOIN_WIDE: &str = "SELECT u.id, o.id FROM sw_users u \
+    JOIN sw_orders o ON o.user_id = u.id WHERE u.id > 0 ORDER BY u.id, o.id";
+const SW_JOIN_NARROW: &str = "SELECT u.id, o.id FROM sw_users u \
+    JOIN sw_orders o ON o.user_id = u.id WHERE u.id > 5 ORDER BY u.id, o.id";
+
+/// A query registered while the parent that covers it is still populating
+/// waits for that parent and is stamped from its rows: one population serves
+/// both.
+#[tokio::test]
+async fn test_subsumption_child_waits_on_populating_parent() -> Result<(), Error> {
+    let mut ctx =
+        TestContext::setup_fault(&[("PGCACHE_FAULT_POPULATION_DELAY_ONCE_MS", "1500")]).await?;
+    setup_wait_tables(&mut ctx).await?;
+
+    let m = ctx.metrics().await?;
+    ctx.simple_query(SW_USERS_WIDE).await?;
+    ctx.simple_query(SW_USERS_NARROW).await?;
+    ctx.cache_settle_with_timeout(Duration::from_secs(10))
+        .await?;
+
+    let (proxied, origin) = ctx.proxy_and_origin_rows(SW_USERS_NARROW).await?;
+    assert_eq!(proxied, origin, "the child serves origin's rows");
+    let delta = metrics_delta(&m, &ctx.metrics_after_outcomes(&m, 3).await?);
+    assert_eq!(delta.queries_cache_miss, 2, "both registrations miss");
+    assert_eq!(delta.queries_cache_hit, 1, "the child's read is a hit");
+    assert_eq!(delta.cache_subsumption_waits, 1, "the child waited");
+    assert_eq!(delta.cache_subsumptions, 1, "the child was stamped");
+    assert_eq!(delta.cache_subsumption_wait_fallbacks, 0);
+    Ok(())
+}
+
+/// The parent is invalidated while the child waits on it: the child is
+/// released to its own population. A users insert invalidates the LEFT JOIN
+/// parent but applies in place to the single-table child.
+#[tokio::test]
+async fn test_subsumption_wait_parent_invalidated_falls_back() -> Result<(), Error> {
+    let mut ctx =
+        TestContext::setup_fault(&[("PGCACHE_FAULT_POPULATION_DELAY_ONCE_MS", "1500")]).await?;
+    setup_wait_tables(&mut ctx).await?;
+
+    let m = ctx.metrics().await?;
+    ctx.simple_query(SW_LEFT_JOIN_WIDE).await?;
+    ctx.simple_query(SW_USERS_NARROW).await?;
+    ctx.origin_query("INSERT INTO sw_users VALUES (9, 'i')", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+    ctx.cache_settle_with_timeout(Duration::from_secs(10))
+        .await?;
+
+    let (proxied, origin) = ctx.proxy_and_origin_rows(SW_USERS_NARROW).await?;
+    assert_eq!(proxied, origin, "the child serves origin's rows");
+    assert_eq!(origin.len(), 4, "users 6, 7, 8 and 9");
+    let delta = metrics_delta(&m, &ctx.metrics_after_outcomes(&m, 3).await?);
+    assert_eq!(delta.queries_cache_hit, 1, "the child's read is a hit");
+    assert_eq!(delta.cache_subsumption_waits, 1, "the child waited");
+    assert_eq!(
+        delta.cache_subsumption_wait_fallbacks, 1,
+        "the child populated itself"
+    );
+    assert_eq!(delta.cache_subsumptions, 0);
+    Ok(())
+}
+
+/// A readmitted query waits on its parent's readmission too: after both
+/// joins are invalidated, the child read behind the parent's repopulation is
+/// stamped from it once it lands.
+#[tokio::test]
+async fn test_subsumption_wait_through_parent_readmission() -> Result<(), Error> {
+    let mut ctx =
+        TestContext::setup_fault_clock_admitting(&[("PGCACHE_FAULT_POPULATION_DELAY_MS", "1500")])
+            .await?;
+    setup_wait_tables(&mut ctx).await?;
+
+    ctx.simple_query(SW_JOIN_WIDE).await?;
+    ctx.cache_settle_with_timeout(Duration::from_secs(10))
+        .await?;
+    let m = ctx.metrics().await?;
+    ctx.simple_query(SW_JOIN_NARROW).await?;
+    let m = assert_subsume_hit(&mut ctx, m).await?;
+
+    ctx.origin_query("INSERT INTO sw_orders VALUES (12, 7)", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+    ctx.simple_query(SW_JOIN_WIDE).await?;
+    ctx.simple_query(SW_JOIN_NARROW).await?;
+    ctx.cache_settle_with_timeout(Duration::from_secs(10))
+        .await?;
+
+    let (proxied, origin) = ctx.proxy_and_origin_rows(SW_JOIN_NARROW).await?;
+    assert_eq!(proxied, origin, "the child serves origin's rows");
+    assert_eq!(origin.len(), 2, "orders 11 and 12");
+    let delta = metrics_delta(&m, &ctx.metrics_after_outcomes(&m, 3).await?);
+    assert_eq!(delta.queries_cache_hit, 1, "the child's read is a hit");
+    assert_eq!(delta.cache_readmissions, 2, "both readmitted");
+    assert_eq!(delta.cache_subsumption_waits, 1, "the child waited");
+    assert_eq!(delta.cache_subsumptions, 1, "the child was stamped");
+    assert_eq!(delta.cache_subsumption_wait_fallbacks, 0);
+    Ok(())
+}
+
+/// A child invalidated while it waits is left alone at the release; its
+/// next read readmits it, and by then both parents are Ready.
+#[tokio::test]
+async fn test_subsumption_waiting_child_invalidated_readmits() -> Result<(), Error> {
+    let mut ctx =
+        TestContext::setup_fault_clock_admitting(&[("PGCACHE_FAULT_POPULATION_DELAY_MS", "1500")])
+            .await?;
+    setup_wait_tables(&mut ctx).await?;
+
+    ctx.simple_query("SELECT id, user_id FROM sw_orders")
+        .await?;
+    ctx.cache_settle_with_timeout(Duration::from_secs(10))
+        .await?;
+
+    let m = ctx.metrics().await?;
+    ctx.simple_query(SW_USERS_WIDE).await?;
+    ctx.simple_query(SW_JOIN_NARROW).await?;
+    ctx.origin_query("INSERT INTO sw_orders VALUES (13, 8)", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+    ctx.cache_settle_with_timeout(Duration::from_secs(10))
+        .await?;
+
+    let (proxied, origin) = ctx.proxy_and_origin_rows(SW_JOIN_NARROW).await?;
+    assert_eq!(proxied, origin, "the child serves origin's rows");
+    assert_eq!(origin.len(), 2, "orders 11 and 13");
+    let delta = metrics_delta(&m, &ctx.metrics_after_outcomes(&m, 3).await?);
+    assert_eq!(delta.queries_cache_hit, 1, "the child's read is a hit");
+    assert_eq!(delta.cache_subsumption_waits, 1, "the child waited");
+    assert_eq!(delta.cache_subsumption_wait_fallbacks, 0);
+    assert_eq!(delta.cache_readmissions, 1, "the child readmitted");
+    assert_eq!(
+        delta.cache_readmission_subsumptions, 1,
+        "the readmission was stamped"
+    );
     Ok(())
 }

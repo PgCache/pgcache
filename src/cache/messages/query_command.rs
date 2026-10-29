@@ -164,6 +164,11 @@ pub enum QueryCommand {
     /// Deferred via the writer's internal channel to avoid inline population during CDC processing.
     Readmit { fingerprint: Fingerprint },
 
+    /// The query became Ready, or never will: release the queries waiting on
+    /// it as their subsumption parent (PGC-496), each to a stamp from a
+    /// cover it now has, or to its own population.
+    WaitersRelease { fingerprint: Fingerprint },
+
     /// Population staged its origin snapshot into `pgcache_stage`. The writer
     /// merges it into the shared cache table(s) — filtering rows CDC removed
     /// during the population — when no CDC frame is open, then marks the query
@@ -223,6 +228,10 @@ impl std::fmt::Debug for QueryCommand {
                 .finish_non_exhaustive(),
             Self::Readmit { fingerprint } => f
                 .debug_struct("Readmit")
+                .field("fingerprint", fingerprint)
+                .finish(),
+            Self::WaitersRelease { fingerprint } => f
+                .debug_struct("WaitersRelease")
                 .field("fingerprint", fingerprint)
                 .finish(),
             Self::MvBuild { fingerprint } => f

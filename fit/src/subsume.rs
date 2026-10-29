@@ -2,15 +2,16 @@
 //! are the proxy's own (`pgcache_lib::cache::admission`); this module only
 //! stores admitted candidates per relation, one per exact reference as the
 //! writer does, and per join shape (PGC-417) — indexed through the same
-//! `ConstraintIndex` (ADR-037) — and answers lookups with `ready` always
-//! true (infinite cache, nothing ever invalidates).
+//! `ConstraintIndex` (ADR-037) — and answers lookups with every parent
+//! Ready (infinite cache, nothing ever invalidates).
 
 use std::collections::HashMap;
 use std::hash::Hash;
 
 use pgcache_lib::cache::UpdateQueryKey;
 use pgcache_lib::cache::admission::{
-    SubsumerCandidate, SubsumerSource, SubsumptionCover, SubsumptionReference, subsumption_covered,
+    CandidateState, SubsumerCandidate, SubsumerSource, SubsumptionCover, SubsumptionReference,
+    subsumption_covered,
 };
 use pgcache_lib::id_hash::IdHashable;
 use pgcache_lib::oid::Oid;
@@ -36,6 +37,7 @@ struct Subsumers<K> {
 }
 
 struct AdmittedSubsumer {
+    fingerprint: Fingerprint,
     region: TableRanges,
     has_limit: bool,
 }
@@ -50,11 +52,12 @@ impl<K: IdHashable + Copy> Default for Subsumers<K> {
 }
 
 impl<K: IdHashable + Copy + Hash + Eq> Subsumers<K> {
-    fn insert(&mut self, key: K, region: &TableRanges, has_limit: bool) {
+    fn insert(&mut self, key: K, fingerprint: Fingerprint, region: &TableRanges, has_limit: bool) {
         self.index.insert(key, region);
         self.admitted.insert(
             key,
             AdmittedSubsumer {
+                fingerprint,
                 region: region.clone(),
                 has_limit,
             },
@@ -68,9 +71,10 @@ impl<K: IdHashable + Copy + Hash + Eq> Subsumers<K> {
             .into_iter()
             .filter_map(move |key| {
                 self.admitted.get(&key).map(|subsumer| SubsumerCandidate {
+                    fingerprint: subsumer.fingerprint,
                     region: &subsumer.region,
                     has_limit: subsumer.has_limit,
-                    ready: true,
+                    state: CandidateState::Ready,
                 })
             })
     }
@@ -91,6 +95,7 @@ impl SubsumerRegistry {
         if let Some(region) = analysis.join_region.as_ref().filter(|region| region.exact) {
             self.by_shape.entry(region.shape).or_default().insert(
                 analysis.fingerprint,
+                analysis.fingerprint,
                 &region.ranges,
                 analysis.has_limit,
             );
@@ -110,7 +115,7 @@ impl SubsumerRegistry {
             self.by_relation
                 .entry(admission.relation_oid)
                 .or_default()
-                .insert(key, region, analysis.has_limit);
+                .insert(key, analysis.fingerprint, region, analysis.has_limit);
         }
     }
 

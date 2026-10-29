@@ -9,6 +9,7 @@ use ecow::EcoString;
 
 use super::update_query::UpdateQuery;
 use crate::oid::Oid;
+use crate::query::Fingerprint;
 use crate::query::constraints::TableRanges;
 use crate::query::join_region::JoinRegion;
 
@@ -23,7 +24,8 @@ pub use analyze::{
     query_admission_analyze, query_decorrelate_checked, query_pushdown, query_resolve_canonical,
 };
 pub use subsume::{
-    SubsumptionCover, SubsumptionReference, subsumption_covered, subsumption_references,
+    SubsumptionCover, SubsumptionReference, subsumption_covered, subsumption_pending_parent,
+    subsumption_references,
 };
 
 /// Everything the writer stores (and pgcache-fit simulates) for one table of
@@ -57,14 +59,26 @@ pub struct AdmissionAnalysis {
     pub join_region: Option<JoinRegion>,
 }
 
+/// Whether a candidate parent's rows can be stamped from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateState {
+    /// Populated, not invalidated. Always the state in pgcache-fit's
+    /// infinite-cache model.
+    Ready,
+    /// Registered with its population in flight, not invalidated: a query
+    /// it covers can wait for its Ready instead of populating (PGC-496).
+    Populating,
+    /// Invalidated, or gone.
+    Unavailable,
+}
+
 /// One registered subsumption candidate as seen at lookup time.
 pub struct SubsumerCandidate<'a> {
+    pub fingerprint: Fingerprint,
     /// The parent's region: it holds every row these ranges describe.
     pub region: &'a TableRanges,
     pub has_limit: bool,
-    /// The parent is Ready: populated, not invalidated. Always true for
-    /// pgcache-fit's infinite-cache model.
-    pub ready: bool,
+    pub state: CandidateState,
 }
 
 /// Source of subsumption candidates: per relation, and per join shape. The

@@ -403,15 +403,19 @@ pub(super) async fn connect_pgcache_fault_policy(
     cache_policy: &str,
     env: &[(&str, &str)],
 ) -> Result<(PgCacheProcess, u16, u16, Client), Error> {
+    connect_pgcache_fault_args(dbs, &["--cache_policy", cache_policy], env).await
+}
+
+/// Connect to pgcache with the CLI args given, which name the policy, and
+/// fault-injection environment variables set.
+pub(super) async fn connect_pgcache_fault_args(
+    dbs: &TempDBs,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> Result<(PgCacheProcess, u16, u16, Client), Error> {
     let listen_port = find_available_port()?;
     let metrics_port = find_available_port()?;
-    let mut pgcache = pgcache_spawn_env(
-        dbs,
-        listen_port,
-        metrics_port,
-        &["--cache_policy", cache_policy],
-        env,
-    );
+    let mut pgcache = pgcache_spawn_env(dbs, listen_port, metrics_port, args, env);
     proxy_wait_for_ready(&mut pgcache).map_err(Error::other)?;
     let client = pgcache_client_connect(listen_port).await?;
     Ok((pgcache, listen_port, metrics_port, client))

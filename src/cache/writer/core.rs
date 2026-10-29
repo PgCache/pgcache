@@ -732,6 +732,19 @@ impl WriterCore {
     pub(super) fn state_ready_transition(&self, fingerprint: Fingerprint, at: ServingAt) {
         self.state_view_write(fingerprint, CachedQueryState::Ready, &at);
         let _ = self.notify_tx.send(WriterNotify::Ready { fingerprint, at });
+        self.waiters_release_request(fingerprint);
+    }
+
+    /// Queue the release of the queries waiting on `fingerprint` as their
+    /// subsumption parent (PGC-496), if any. Called wherever the parent
+    /// becomes Ready or stops being able to: the release re-checks each
+    /// waiter's cover, so a stale request costs one lookup.
+    pub(super) fn waiters_release_request(&self, fingerprint: Fingerprint) {
+        if self.cache.waiting_children.contains_key(&fingerprint) {
+            let _ = self
+                .query_tx
+                .send(QueryCommand::WaitersRelease { fingerprint });
+        }
     }
 
     /// Drain any coalesced waiters parked on `fingerprint` to origin (the

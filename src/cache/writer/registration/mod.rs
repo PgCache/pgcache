@@ -41,6 +41,7 @@ mod merge;
 mod pool;
 mod register;
 mod resolve;
+mod waiting;
 
 /// Work item for population worker pool.
 pub(crate) struct PopulationWork {
@@ -135,6 +136,7 @@ pub(super) fn cached_query_insert(
         invalidated: false,
         pinned: identity.pinned,
         reference_only: resolution.reference_only,
+        waiting_on: None,
     });
     (generation, changed)
 }
@@ -169,6 +171,7 @@ fn command_histogram(cmd: &QueryCommand) -> &'static Histogram {
         QueryCommand::Failed { .. } => &reg.cmd_failed,
         QueryCommand::LimitBump { .. } => &reg.cmd_limit_bump,
         QueryCommand::Readmit { .. } => &reg.cmd_readmit,
+        QueryCommand::WaitersRelease { .. } => &reg.cmd_waiters_release,
         QueryCommand::PrivilegeResolve(_) => &reg.cmd_privilege_resolve,
         QueryCommand::MvBuild { .. } => &reg.cmd_mv_build,
         QueryCommand::MvBuildComplete { .. } => &reg.cmd_mv_build_complete,
@@ -345,6 +348,9 @@ impl WriterRegistration {
                 max_limit,
             } => self.limit_bump_command(core, fingerprint, max_limit).await,
             QueryCommand::Readmit { fingerprint } => self.readmit_command(core, fingerprint).await,
+            QueryCommand::WaitersRelease { fingerprint } => {
+                self.waiters_release_command(core, fingerprint).await;
+            }
             QueryCommand::MvBuild { fingerprint } => mv_build_command(core, fingerprint).await,
             QueryCommand::MvBuildComplete {
                 fingerprint,
@@ -454,6 +460,7 @@ impl WriterRegistration {
         core.state_view.cached_queries.remove(&fingerprint);
         core.memo_eligible_remove(fingerprint);
         core.waiters_fail(fingerprint);
+        core.waiters_release_request(fingerprint);
     }
 }
 

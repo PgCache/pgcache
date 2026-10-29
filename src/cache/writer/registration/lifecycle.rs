@@ -57,14 +57,19 @@ impl WriterRegistration {
 
         // Checked while the entry is still flagged invalidated, so the parent
         // readiness gate never picks the query as its own parent.
-        let cover = core
+        let (cover, pending_parent) = core
             .cache
             .cached_queries
             .get1(&fingerprint)
-            .and_then(|cached| {
+            .map(|cached| {
                 let join = query_join_region(&cached.bound);
-                self.subsumption_check(core, &cached.bound, join.as_ref())
-            });
+                let cover = self.subsumption_check(core, fingerprint, &cached.bound, join.as_ref());
+                let pending = cover.is_none().then(|| {
+                    self.subsumption_pending_parent(core, fingerprint, &cached.bound, join.as_ref())
+                });
+                (cover, pending.flatten())
+            })
+            .unwrap_or((None, None));
 
         let new_generation = core.cache.generation_allocate();
 
@@ -88,6 +93,7 @@ impl WriterRegistration {
         cached.invalidated = false;
         cached.cached_bytes = 0;
         cached.registration_started_at = Some(started_at);
+        cached.waiting_on = None;
         let population = Arc::clone(&cached.population);
         // Refcount unchanged — readmit reuses the existing relation_oids set.
         core.cache.cached_queries.insert_overwrite(cached);
@@ -107,6 +113,10 @@ impl WriterRegistration {
             }
         }
 
+        if let Some(parent) = pending_parent {
+            core.query_park(fingerprint, parent);
+            return Ok(SubsumptionResult::NotSubsumed);
+        }
         self.population_start(
             core,
             PopulationTarget {

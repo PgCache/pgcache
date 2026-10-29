@@ -75,7 +75,8 @@ impl WriterRegistration {
 
         // Phase 2: Subsumption check
         let subsumption_start = Instant::now();
-        let cover = self.subsumption_check(core, &query.bound, query.join_region.as_ref());
+        let cover =
+            self.subsumption_check(core, fingerprint, &query.bound, query.join_region.as_ref());
         crate::metrics::handles()
             .reg
             .register_subsumption_check
@@ -86,6 +87,16 @@ impl WriterRegistration {
             let _ = request.subsumption_tx.send(SubsumptionResult::NotSubsumed);
             return Ok(());
         }
+        // Uncovered, but a parent still populating would cover it: the entry
+        // waits for that parent's Ready instead of populating (PGC-496).
+        let pending_parent = cover.is_none().then(|| {
+            self.subsumption_pending_parent(
+                core,
+                fingerprint,
+                &query.bound,
+                query.join_region.as_ref(),
+            )
+        });
 
         let resolve_start = Instant::now();
         let resolution = self.query_resolve(core, fingerprint, query)?;
@@ -126,7 +137,8 @@ impl WriterRegistration {
 
         // Phase 3b: Admit
         let _ = request.subsumption_tx.send(SubsumptionResult::NotSubsumed);
-        self.query_admit(core, identity, resolution).await
+        self.query_admit(core, identity, resolution, pending_parent.flatten())
+            .await
     }
 
     /// Stamp the subsumed rows and mark Ready, as the reply for the dispatch.
@@ -179,12 +191,14 @@ impl WriterRegistration {
     }
 
     /// Admit a non-subsumed query: insert the entry, publish any relation that
-    /// became active, and dispatch its population.
+    /// became active, and dispatch its population, or park it on
+    /// `pending_parent` until that parent is Ready.
     async fn query_admit(
         &mut self,
         core: &mut WriterCore,
         identity: RegistrationIdentity,
         resolution: QueryResolution,
+        pending_parent: Option<Fingerprint>,
     ) -> CacheResult<()> {
         let fingerprint = identity.fingerprint;
         let population = Arc::clone(&resolution.population);
@@ -209,6 +223,11 @@ impl WriterRegistration {
                 .reg
                 .register_publication_update
                 .record(pub_start.elapsed().as_secs_f64());
+        }
+
+        if let Some(parent) = pending_parent {
+            core.query_park(fingerprint, parent);
+            return Ok(());
         }
 
         let dispatch_start = Instant::now();

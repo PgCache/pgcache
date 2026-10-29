@@ -13,8 +13,8 @@ use super::registration::{
     QueryResolution, RegistrationIdentity, WriterRegistration, cached_query_insert,
 };
 use crate::cache::admission::{
-    SubsumerCandidate, SubsumerSource, SubsumptionCover, SubsumptionReference, subsumption_covered,
-    subsumption_references,
+    CandidateState, SubsumerCandidate, SubsumerSource, SubsumptionCover, SubsumptionReference,
+    subsumption_covered, subsumption_pending_parent, subsumption_references,
 };
 use crate::cache::messages::SubsumptionResult;
 use crate::cache::types::{Cache, QueryServing, ServingAt};
@@ -31,15 +31,24 @@ use crate::timing::duration_to_ns_u64;
 /// subsumption indexes plus parent readiness state.
 struct WriterSubsumerSource<'a> {
     cache: &'a Cache,
+    /// The query being checked: never its own parent. Its index entries
+    /// exist once it is resolved, and it is Populating while it waits.
+    query: Fingerprint,
 }
 
 impl WriterSubsumerSource<'_> {
-    /// The parent is Ready: populated, not invalidated.
-    fn parent_ready(&self, fingerprint: Fingerprint) -> bool {
-        self.cache
-            .cached_queries
-            .get1(&fingerprint)
-            .is_some_and(|q| !q.invalidated && q.registration_started_at.is_none())
+    /// Ready once populated and not invalidated; populating while its
+    /// registration (a fresh one, a readmit or a limit bump) is in flight.
+    fn parent_state(&self, fingerprint: Fingerprint) -> CandidateState {
+        if fingerprint == self.query {
+            return CandidateState::Unavailable;
+        }
+        match self.cache.cached_queries.get1(&fingerprint) {
+            Some(q) if q.invalidated => CandidateState::Unavailable,
+            Some(q) if q.registration_started_at.is_some() => CandidateState::Populating,
+            Some(_) => CandidateState::Ready,
+            None => CandidateState::Unavailable,
+        }
     }
 }
 
@@ -70,12 +79,13 @@ impl SubsumerSource for WriterSubsumerSource<'_> {
                         let region = update_queries.subsumer_region(key)?;
                         let fingerprint = key.fingerprint;
                         Some(SubsumerCandidate {
+                            fingerprint,
                             region: &region.ranges,
                             has_limit: update_queries
                                 .queries_of(fingerprint)
                                 .iter()
                                 .any(|update_query| update_query.has_limit),
-                            ready: self.parent_ready(fingerprint),
+                            state: self.parent_state(fingerprint),
                         })
                     })
             })
@@ -87,20 +97,23 @@ impl SubsumerSource for WriterSubsumerSource<'_> {
             .join_subsumers
             .candidates(join.shape, &keyed)
             .map(|(fingerprint, candidate)| SubsumerCandidate {
+                fingerprint,
                 region: candidate.region,
                 has_limit: candidate.has_limit,
-                ready: self.parent_ready(fingerprint),
+                state: self.parent_state(fingerprint),
             })
     }
 }
 
 impl WriterRegistration {
-    /// Whether `bound` is covered by a Ready, LIMIT-free cached join of its
-    /// shape, or every table reference of it by the regions of such queries
-    /// on its relation, and how. `join` is `bound`'s join region.
+    /// Whether `bound`, the query `fingerprint`, is covered by a Ready,
+    /// LIMIT-free cached join of its shape, or every table reference of it
+    /// by the regions of such queries on its relation, and how. `join` is
+    /// `bound`'s join region.
     pub(super) fn subsumption_check(
         &self,
         core: &WriterCore,
+        fingerprint: Fingerprint,
         bound: &ResolvedQuery,
         join: Option<&JoinRegion>,
     ) -> Option<SubsumptionCover> {
@@ -110,7 +123,30 @@ impl WriterRegistration {
         subsumption_covered(
             &references,
             join,
-            &WriterSubsumerSource { cache: &core.cache },
+            &WriterSubsumerSource {
+                cache: &core.cache,
+                query: fingerprint,
+            },
+        )
+    }
+
+    /// The populating parent whose Ready would cover `bound`, the query
+    /// `fingerprint`, when no Ready cover exists (PGC-496).
+    pub(super) fn subsumption_pending_parent(
+        &self,
+        core: &WriterCore,
+        fingerprint: Fingerprint,
+        bound: &ResolvedQuery,
+        join: Option<&JoinRegion>,
+    ) -> Option<Fingerprint> {
+        let references = subsumption_references(bound)?;
+        subsumption_pending_parent(
+            &references,
+            join,
+            &WriterSubsumerSource {
+                cache: &core.cache,
+                query: fingerprint,
+            },
         )
     }
 

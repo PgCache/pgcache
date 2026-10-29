@@ -120,6 +120,9 @@ pub struct CachedQuery {
     pub pinned: bool,
     /// Mirrored into the view's `QueryServing::reference_only`.
     pub reference_only: bool,
+    /// The populating parent whose Ready this entry waits for instead of
+    /// populating (PGC-496); cleared when released.
+    pub waiting_on: Option<Fingerprint>,
 }
 
 impl BiHashItem for CachedQuery {
@@ -156,6 +159,9 @@ pub struct Cache {
     /// (PGC-417).
     pub join_subsumers: JoinSubsumers,
     pub cached_queries: BiHashMap<CachedQuery>,
+    /// The entries waiting on each populating parent (PGC-496). An entry
+    /// whose `waiting_on` no longer names the parent is skipped at release.
+    pub waiting_children: HashMap<Fingerprint, Vec<Fingerprint>>,
     /// Monotonically increasing generation counter (starts at 1)
     pub generation_counter: Generation,
     /// Generations of active cached queries (for efficient min-tracking)
@@ -171,6 +177,7 @@ impl Cache {
             update_queries: IdHashMap::new(),
             join_subsumers: JoinSubsumers::default(),
             cached_queries: BiHashMap::new(),
+            waiting_children: HashMap::new(),
             generation_counter: Generation::ZERO,
             generations: BTreeSet::new(),
             dynamic: settings.dynamic.clone(),

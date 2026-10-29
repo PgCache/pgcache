@@ -385,8 +385,8 @@ mod tests {
 
     use super::*;
     use crate::cache::admission::{
-        SubsumerCandidate, SubsumerSource, SubsumptionReference, subsumption_covered,
-        subsumption_references,
+        CandidateState, SubsumerCandidate, SubsumerSource, SubsumptionReference,
+        subsumption_covered, subsumption_pending_parent, subsumption_references,
     };
     use crate::catalog::{ColumnMetadata, ColumnPosition, TableMetadata};
     use crate::oid::TypeOid;
@@ -670,8 +670,17 @@ mod tests {
         }
     }
 
+    /// One cached parent's region on a relation, in a state.
+    struct Parent {
+        fingerprint: Fingerprint,
+        relation_oid: Oid,
+        region: TableRanges,
+        has_limit: bool,
+        state: CandidateState,
+    }
+
     /// Every subsumer-shaped reference of the cached queries, as a source.
-    struct Parents(Vec<(Oid, TableRanges)>);
+    struct Parents(Vec<Parent>);
 
     impl SubsumerSource for Parents {
         fn candidates(
@@ -680,11 +689,12 @@ mod tests {
         ) -> impl Iterator<Item = SubsumerCandidate<'_>> {
             self.0
                 .iter()
-                .filter(move |(relation_oid, _)| *relation_oid == reference.relation_oid)
-                .map(|(_, region)| SubsumerCandidate {
-                    region,
-                    has_limit: false,
-                    ready: true,
+                .filter(move |parent| parent.relation_oid == reference.relation_oid)
+                .map(|parent| SubsumerCandidate {
+                    fingerprint: parent.fingerprint,
+                    region: &parent.region,
+                    has_limit: parent.has_limit,
+                    state: parent.state,
                 })
         }
 
@@ -696,26 +706,91 @@ mod tests {
         }
     }
 
+    /// The exact references of each `(fingerprint, cached query, LIMIT,
+    /// state)` as parents.
+    fn parents(cached: &[CachedParent<'_>]) -> Parents {
+        Parents(
+            cached
+                .iter()
+                .flat_map(|&(fingerprint, sql, has_limit, state)| {
+                    admission_analysis(sql)
+                        .tables
+                        .into_iter()
+                        .filter(|admission| admission.subsumer_shape)
+                        .map(move |admission| Parent {
+                            fingerprint: Fingerprint::from_raw(fingerprint),
+                            relation_oid: admission.relation_oid,
+                            region: admission.update_query.predicates.ranges,
+                            has_limit,
+                            state,
+                        })
+                })
+                .collect(),
+        )
+    }
+
+    /// A cached parent as `(fingerprint, query, LIMIT, state)`.
+    type CachedParent<'a> = (u64, &'a str, bool, CandidateState);
+
+    fn new_references(new: &str) -> Vec<SubsumptionReference> {
+        let tables = catalog();
+        let bound = ResolvedQuery::parse_resolve(new, &tables, &["public"]).expect("resolve");
+        subsumption_references(&bound).expect("references")
+    }
+
     /// Whether the exact references of `cached` cover every reference of
     /// `new`.
     fn parents_cover(cached: &str, new: &str) -> bool {
-        let parents = Parents(
-            admission_analysis(cached)
-                .tables
-                .into_iter()
-                .filter(|admission| admission.subsumer_shape)
-                .map(|admission| {
-                    (
-                        admission.relation_oid,
-                        admission.update_query.predicates.ranges,
-                    )
-                })
-                .collect(),
-        );
-        let tables = catalog();
-        let bound = ResolvedQuery::parse_resolve(new, &tables, &["public"]).expect("resolve");
-        let references = subsumption_references(&bound).expect("references");
-        subsumption_covered(&references, None, &parents).is_some()
+        let parents = parents(&[(1, cached, false, CandidateState::Ready)]);
+        subsumption_covered(&new_references(new), None, &parents).is_some()
+    }
+
+    /// A query no Ready parent covers waits on the one populating parent
+    /// that would: not on two, not on a limited one, and not when only a
+    /// split of Ready parents would cover it (PGC-496).
+    #[test]
+    fn test_subsumption_pending_parent() {
+        use CandidateState::{Populating, Ready};
+        #[rustfmt::skip]
+        let cases: &[(&[CachedParent<'_>], &str, Option<u64>, bool)] = &[
+            (&[(7, "SELECT * FROM a WHERE x > 0", false, Populating)],
+             "SELECT * FROM a WHERE x > 5", Some(7), false),
+            (&[(7, "SELECT * FROM a WHERE x > 0", false, Ready)],
+             "SELECT * FROM a WHERE x > 5", None, true),
+            (&[(7, "SELECT * FROM a WHERE x > 0", false, Populating),
+               (8, "SELECT * FROM a WHERE x > 0", false, Ready)],
+             "SELECT * FROM a WHERE x > 5", None, true),
+            (&[(7, "SELECT * FROM a WHERE x > 0", true, Populating)],
+             "SELECT * FROM a WHERE x > 5", None, false),
+            (&[(7, "SELECT * FROM a", false, Ready),
+               (8, "SELECT * FROM b", false, Populating)],
+             "SELECT * FROM a JOIN b ON b.id = a.id WHERE a.x = 1", Some(8), false),
+            (&[(7, "SELECT * FROM a", false, Populating),
+               (8, "SELECT * FROM b", false, Populating)],
+             "SELECT * FROM a JOIN b ON b.id = a.id WHERE a.x = 1", None, false),
+            (&[(7, "SELECT * FROM a", false, Populating)],
+             "SELECT * FROM a JOIN b ON b.id = a.id WHERE a.x = 1", None, false),
+            (&[(7, "SELECT * FROM a WHERE x = 1", false, Populating),
+               (8, "SELECT * FROM a WHERE x = 2", false, Populating)],
+             "SELECT * FROM a WHERE x IN (1, 2)", None, false),
+            (&[(7, "SELECT * FROM a WHERE x = 1", false, Ready),
+               (8, "SELECT * FROM a WHERE x = 2", false, Ready)],
+             "SELECT * FROM a WHERE x IN (1, 2)", None, true),
+        ];
+        for (cached, new, pending, covered) in cases {
+            let parents = parents(cached);
+            let references = new_references(new);
+            assert_eq!(
+                subsumption_covered(&references, None, &parents).is_some(),
+                *covered,
+                "covered: {new}"
+            );
+            assert_eq!(
+                subsumption_pending_parent(&references, None, &parents),
+                pending.map(Fingerprint::from_raw),
+                "pending: {new}"
+            );
+        }
     }
 
     /// Only one SELECT over several base tables whose WHERE the model

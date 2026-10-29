@@ -34,6 +34,10 @@ pub(crate) struct MetricsSnapshot {
     pub cache_subsumptions_split: u64,
     /// Subsumptions served by a cached join of the same shape (PGC-417).
     pub cache_subsumptions_join: u64,
+    /// Registrations parked on a populating parent (PGC-496).
+    pub cache_subsumption_waits: u64,
+    /// Parked registrations released to their own population (PGC-496).
+    pub cache_subsumption_wait_fallbacks: u64,
     pub cache_invalidations: u64,
     pub cache_readmissions: u64,
     pub cache_readmission_subsumptions: u64,
@@ -171,6 +175,8 @@ const SAMPLES: &[Sample] = samples! {
     "pgcache_cache_subsumptions" => cache_subsumptions,
     "pgcache_cache_subsumptions_split" => cache_subsumptions_split,
     "pgcache_cache_subsumptions_join" => cache_subsumptions_join,
+    "pgcache_cache_subsumption_waits" => cache_subsumption_waits,
+    "pgcache_cache_subsumption_wait_fallbacks" => cache_subsumption_wait_fallbacks,
     "pgcache_cache_invalidations" => cache_invalidations,
     "pgcache_cache_readmissions" => cache_readmissions,
     "pgcache_cache_readmission_subsumptions" => cache_readmission_subsumptions,

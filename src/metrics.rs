@@ -171,6 +171,11 @@ pub mod names {
     /// Subsumptions served by a cached join of the same shape under a wider
     /// WHERE (PGC-417).
     pub const CACHE_SUBSUMPTIONS_JOIN: &str = "pgcache.cache.subsumptions_join";
+    /// Registrations parked on a populating parent that covers them instead
+    /// of populating (PGC-496).
+    pub const CACHE_SUBSUMPTION_WAITS: &str = "pgcache.cache.subsumption_waits";
+    /// Parked registrations released to their own population after all.
+    pub const CACHE_SUBSUMPTION_WAIT_FALLBACKS: &str = "pgcache.cache.subsumption_wait_fallbacks";
     pub const CACHE_SUBSUMPTION_LATENCY_SECONDS: &str = "pgcache.cache.subsumption_latency_seconds";
 
     // Materialized result metrics
@@ -965,6 +970,7 @@ pub struct RegHandles {
     pub cmd_failed: Histogram,
     pub cmd_limit_bump: Histogram,
     pub cmd_readmit: Histogram,
+    pub cmd_waiters_release: Histogram,
     pub cmd_mv_build: Histogram,
     pub cmd_mv_build_complete: Histogram,
     pub cmd_privilege_resolve: Histogram,
@@ -980,6 +986,8 @@ pub struct RegHandles {
     pub subsumptions: Counter,
     pub subsumptions_split: Counter,
     pub subsumptions_join: Counter,
+    pub subsumption_waits: Counter,
+    pub subsumption_wait_fallbacks: Counter,
     pub subsumption_latency: Histogram,
     pub registration_latency: Histogram,
     pub population_task: Histogram,
@@ -1005,7 +1013,8 @@ impl RegHandles {
             CACHE_POPULATION_BACKSTOP_GROWS, CACHE_POPULATION_SCALE_DOWN,
             CACHE_POPULATION_SCALE_UP, CACHE_POPULATION_STREAM_SECONDS,
             CACHE_POPULATION_TASK_SECONDS, CACHE_POPULATION_WAIT_SECONDS, CACHE_POPULATION_WORKERS,
-            CACHE_SUBSUMPTION_LATENCY_SECONDS, CACHE_SUBSUMPTIONS, CACHE_SUBSUMPTIONS_JOIN,
+            CACHE_SUBSUMPTION_LATENCY_SECONDS, CACHE_SUBSUMPTION_WAIT_FALLBACKS,
+            CACHE_SUBSUMPTION_WAITS, CACHE_SUBSUMPTIONS, CACHE_SUBSUMPTIONS_JOIN,
             CACHE_SUBSUMPTIONS_SPLIT, CACHE_WRITER_COMMAND_HANDLE_SECONDS,
             CACHE_WRITER_REGISTER_BIND_SECONDS, CACHE_WRITER_REGISTER_INSERT_SECONDS,
             CACHE_WRITER_REGISTER_POPULATE_DISPATCH_SECONDS,
@@ -1022,6 +1031,7 @@ impl RegHandles {
             cmd_failed: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "failed"),
             cmd_limit_bump: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "limit_bump"),
             cmd_readmit: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "readmit"),
+            cmd_waiters_release: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "waiters_release"),
             cmd_mv_build: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "mv_build"),
             cmd_privilege_resolve: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "privilege_resolve"),
             cmd_mv_build_complete: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "mv_build_complete"),
@@ -1045,6 +1055,8 @@ impl RegHandles {
             subsumptions: metrics::counter!(CACHE_SUBSUMPTIONS),
             subsumptions_split: metrics::counter!(CACHE_SUBSUMPTIONS_SPLIT),
             subsumptions_join: metrics::counter!(CACHE_SUBSUMPTIONS_JOIN),
+            subsumption_waits: metrics::counter!(CACHE_SUBSUMPTION_WAITS),
+            subsumption_wait_fallbacks: metrics::counter!(CACHE_SUBSUMPTION_WAIT_FALLBACKS),
             subsumption_latency: metrics::histogram!(CACHE_SUBSUMPTION_LATENCY_SECONDS),
             registration_latency: metrics::histogram!(QUERY_REGISTRATION_LATENCY_SECONDS),
             population_task: metrics::histogram!(CACHE_POPULATION_TASK_SECONDS),
