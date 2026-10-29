@@ -5,6 +5,7 @@ use tokio_util::sync::CancellationToken;
 use crate::cache::CacheResult;
 
 mod cdc_driver;
+mod cpu_monitor;
 mod memory_monitor;
 mod pool_controller;
 mod population_pool;

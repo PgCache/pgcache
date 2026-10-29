@@ -14,6 +14,7 @@ use rootcause::Report;
 use super::generation::Generation;
 use super::join_subsumers::JoinSubsumers;
 use super::population_pool::PopulationPool;
+use super::pressure::CpuPressureCell;
 use super::privileges::PrivilegeVerdicts;
 use super::reg_gate::RegGate;
 use super::serve_pool_state::ServePool;
@@ -430,6 +431,10 @@ pub struct CacheStateView {
     /// `registration_throttled` (memory) so the two pressures are independent;
     /// dispatch ORs them.
     pub disk_throttle: Arc<AtomicBool>,
+    /// Box CPU pressure (PSI), published once a second by the cpu monitor and
+    /// read by the pool controllers and the registration gate, none of which
+    /// can see the box from their own queues (PGC-554).
+    pub cpu_pressure: Arc<CpuPressureCell>,
     /// Authoritative registered (Ready) query count, published by the writer so
     /// the memory monitor can size the count cap from a real measurement (PGC-251).
     pub registered_count: Arc<AtomicUsize>,
@@ -509,6 +514,7 @@ impl CacheStateView {
             pending_inserts_since_gc: AtomicU32::new(0),
             registration_throttled: Arc::new(AtomicBool::new(false)),
             disk_throttle: Arc::new(AtomicBool::new(false)),
+            cpu_pressure: Arc::new(CpuPressureCell::default()),
             registered_count: Arc::new(AtomicUsize::new(0)),
             query_count_cap: Arc::new(AtomicUsize::new(usize::MAX)),
             recycle_wanted: Arc::new(AtomicBool::new(false)),

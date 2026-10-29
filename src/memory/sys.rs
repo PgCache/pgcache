@@ -1,4 +1,4 @@
-//! Platform memory/disk introspection.
+//! Platform memory, disk and CPU-pressure introspection.
 //!
 //! Linux is the production/Docker target: RSS from `/proc/self/status`, the
 //! budget from `min(host MemTotal, cgroup memory limit)` so a constrained
@@ -46,6 +46,27 @@ pub fn system_private_bytes() -> Option<u64> {
     imp::system_private_bytes()
 }
 
+use crate::cache::pressure::CpuPressure;
+
+/// Box CPU pressure from PSI (PGC-554): the larger of the system-wide
+/// `/proc/pressure/cpu` and the process's own cgroup v2 `cpu.pressure`. The
+/// system file sees the whole box, including the cache PostgreSQL in its own
+/// service cgroup (on the bench box pgcache's cgroup alone read 13 % while
+/// the box read 98 %); the cgroup file sees stalls a CPU-limited container is
+/// throttled into that the host does not show. `None` where PSI is
+/// unavailable (kernel without `CONFIG_PSI`, non-Linux).
+pub fn cpu_pressure() -> Option<CpuPressure> {
+    imp::cpu_pressure()
+}
+
+/// Run-queue wait time accrued across all CPUs so far, in nanoseconds, from
+/// `/proc/schedstat` (PGC-554). Two readings a known interval apart give the
+/// average number of tasks that were waiting for a CPU. `None` where the file
+/// is unavailable (non-Linux).
+pub fn cpu_runqueue_wait_ns() -> Option<u64> {
+    imp::cpu_runqueue_wait_ns()
+}
+
 /// Total and available bytes of the filesystem hosting `path` (the cache PG data
 /// directory), via `statvfs`. `None` if the path can't be stat'd — not visible to
 /// this process, or non-unix — in which case the caller takes no auto disk limit.
@@ -88,7 +109,26 @@ mod imp {
     use std::fs;
 
     use super::{budget_from, field_kb};
-    use crate::memory::cgroup::cgroup_memory_snapshot;
+    use crate::cache::pressure::{CpuPressure, psi_cpu_parse, schedstat_wait_ns_parse};
+    use crate::memory::cgroup::{cgroup_memory_snapshot, self_path_v2};
+
+    pub fn cpu_runqueue_wait_ns() -> Option<u64> {
+        schedstat_wait_ns_parse(&fs::read_to_string("/proc/schedstat").ok()?)
+    }
+
+    pub fn cpu_pressure() -> Option<CpuPressure> {
+        let system = fs::read_to_string("/proc/pressure/cpu")
+            .ok()
+            .and_then(|text| psi_cpu_parse(&text));
+        let own = fs::read_to_string("/proc/self/cgroup")
+            .ok()
+            .and_then(|c| {
+                let rel = self_path_v2(&c)?.trim_matches('/').to_owned();
+                fs::read_to_string(format!("/sys/fs/cgroup/{rel}/cpu.pressure")).ok()
+            })
+            .and_then(|text| psi_cpu_parse(&text));
+        CpuPressure::max_of(system, own)
+    }
 
     pub fn process_rss_bytes() -> Option<u64> {
         // VmRSS in /proc/self/status is the resident size in kB (what `top`
@@ -159,6 +199,14 @@ mod imp {
     pub(super) fn system_private_bytes() -> Option<u64> {
         None
     }
+    /// macOS has no PSI; dev builds read no box pressure (a fault file can
+    /// pin one for tests).
+    pub(super) fn cpu_pressure() -> Option<crate::cache::pressure::CpuPressure> {
+        None
+    }
+    pub(super) fn cpu_runqueue_wait_ns() -> Option<u64> {
+        None
+    }
 }
 
 #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
@@ -173,6 +221,12 @@ mod imp {
         None
     }
     pub fn system_private_bytes() -> Option<u64> {
+        None
+    }
+    pub fn cpu_pressure() -> Option<crate::cache::pressure::CpuPressure> {
+        None
+    }
+    pub fn cpu_runqueue_wait_ns() -> Option<u64> {
         None
     }
 }

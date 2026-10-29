@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument};
 
 use super::cdc_driver::cdc_run;
+use super::cpu_monitor::cpu_monitor;
 use super::memory_monitor::{CountCapEstimator, memory_monitor, shared_buffers_bytes_query};
 use super::population_pool::population_pool_controller;
 use super::reg_gate::reg_gate_controller;
@@ -230,6 +231,7 @@ pub(super) fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
         CountCapEstimator::new(shared_buffers, serve_pool_max),
         cache_cancel.clone(),
     ));
+    handle.spawn(cpu_monitor(Arc::clone(&state_view), cache_cancel.clone()));
     handle.spawn(serve_pool_controller(
         Arc::clone(&state_view),
         settings.num_workers,

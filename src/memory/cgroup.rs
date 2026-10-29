@@ -51,7 +51,7 @@ pub(super) fn sane_limit(v: u64) -> Option<u64> {
 
 /// The unified-hierarchy (v2) entry of `/proc/self/cgroup`: the `0::<path>` line.
 #[cfg(any(target_os = "linux", test))]
-fn self_path_v2(proc_self_cgroup: &str) -> Option<&str> {
+pub(super) fn self_path_v2(proc_self_cgroup: &str) -> Option<&str> {
     proc_self_cgroup.lines().find_map(|l| l.strip_prefix("0::"))
 }
 

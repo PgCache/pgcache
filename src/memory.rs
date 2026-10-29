@@ -8,8 +8,8 @@ mod cgroup;
 mod sys;
 
 pub use sys::{
-    disk_stats_bytes, process_rss_bytes, system_private_bytes, system_used_bytes,
-    total_budget_bytes,
+    cpu_pressure, cpu_runqueue_wait_ns, disk_stats_bytes, process_rss_bytes, system_private_bytes,
+    system_used_bytes, total_budget_bytes,
 };
 
 /// Outcome of one memory-monitor sample.

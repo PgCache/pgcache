@@ -44,6 +44,8 @@ pub(crate) mod output_settings;
 #[cfg(feature = "proxy")]
 mod population_pool;
 #[cfg(feature = "proxy")]
+pub(crate) mod pressure;
+#[cfg(feature = "proxy")]
 pub(crate) mod privileges;
 pub mod query;
 #[cfg(feature = "proxy")]
