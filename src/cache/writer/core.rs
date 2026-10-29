@@ -727,6 +727,16 @@ impl WriterCore {
         self.state_view_write(fingerprint, CachedQueryState::Loading, at);
     }
 
+    /// Put the view back to Invalidated after a deferred readmission: dispatch
+    /// flipped it to Loading when it claimed the readmit, and requests that
+    /// coalesced on that Loading go to origin.
+    pub(super) fn state_invalidated_restore(&self, fingerprint: Fingerprint) {
+        if let Some(mut entry) = self.state_view.cached_queries.get_mut(&fingerprint) {
+            entry.state = CachedQueryState::Invalidated;
+        }
+        self.waiters_fail(fingerprint);
+    }
+
     /// Mark Ready and notify the cache loop. Skipping the notify leaves
     /// coalesced waiters hung forever — always go through this wrapper.
     pub(super) fn state_ready_transition(&self, fingerprint: Fingerprint, at: ServingAt) {

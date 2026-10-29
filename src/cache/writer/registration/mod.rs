@@ -134,6 +134,7 @@ pub(super) fn cached_query_insert(
         cached_bytes: 0,
         registration_started_at: Some(identity.started_at),
         invalidated: false,
+        last_lifetime: None,
         pinned: identity.pinned,
         reference_only: resolution.reference_only,
         waiting_on: None,

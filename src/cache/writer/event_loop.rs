@@ -229,6 +229,10 @@ impl WriterLoop {
             .reg
             .merge_pending_depth
             .set(core.merges.pending.len() as f64);
+        crate::metrics::handles()
+            .reg
+            .merge_head_age
+            .set(core.merges.head_age().as_secs_f64());
         core.disk_stats_refresh();
         core.stale_entries_cleanup();
         core.state_gauges_update();

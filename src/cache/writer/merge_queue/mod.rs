@@ -297,6 +297,18 @@ impl MergeQueue {
         }
     }
 
+    /// How long the staged population at the top of the heap has waited for
+    /// the merge slot; zero when nothing is pending. The least wait a merge
+    /// enqueued now will see, so a readmission whose result is not expected
+    /// to outlive it is deferred (PGC-553).
+    pub(super) fn head_age(&self) -> Duration {
+        self.pending
+            .peek()
+            .map_or(Duration::ZERO, |Reverse(PendingMerge(top))| {
+                top.enqueued_at.elapsed()
+            })
+    }
+
     pub(super) fn batch_flushed(&mut self) {
         self.batch_flush_seq = self.batch_flush_seq.wrapping_add(1);
     }

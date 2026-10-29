@@ -49,6 +49,7 @@ fn merge_heap_advance(core: &mut WriterCore, applied_lsn: Lsn) -> (HeapStop, boo
             // Its staging (a complete population) is emptied in chunks, not
             // with one DELETE on the writer.
             core.population_discard_enqueue(fingerprint, generation);
+            crate::metrics::handles().reg.merges_superseded.increment(1);
             continue;
         }
 
@@ -188,6 +189,7 @@ impl WriterRegistration {
             core.population_deleted_keys
                 .deactivate(head.fingerprint, head.generation);
             core.population_merge_discard_remaining();
+            crate::metrics::handles().reg.merges_superseded.increment(1);
             return Ok(());
         }
         match core.population_merge_step().await {

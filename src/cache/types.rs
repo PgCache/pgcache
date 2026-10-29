@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
@@ -131,6 +131,10 @@ pub struct CachedQuery {
     pub registration_started_at: Option<Instant>,
     /// True when in Invalidated state (kept in cached_queries for metadata reuse on readmission)
     pub invalidated: bool,
+    /// How long the last Ready period lasted (Ready → invalidated). A
+    /// readmission whose merge would wait longer than this is deferred
+    /// (PGC-553); `None` until the query has been invalidated once.
+    pub last_lifetime: Option<Duration>,
     /// Pinned queries are protected from eviction and auto-readmitted after CDC invalidation.
     pub pinned: bool,
     /// Mirrored into the view's `QueryServing::reference_only`.
@@ -412,9 +416,10 @@ pub struct CacheStateView {
     /// flushed by the writer on every schema-change signal.
     pub privileges: PrivilegeVerdicts,
     /// Set by the memory monitor when used memory crosses the registration
-    /// budget high-water mark. While set, dispatch forwards brand-new (and
-    /// in-flight Loading) queries to origin instead of registering them, and
-    /// population workers skip the in-flight backlog — bounding memory growth.
+    /// budget high-water mark. While set, dispatch forwards brand-new,
+    /// in-flight Loading and invalidated queries to origin instead of
+    /// registering or readmitting them, and population workers skip the
+    /// in-flight backlog — bounding memory growth.
     /// Already-cached queries are unaffected. `Arc` so population workers can
     /// share it; wait-free read on the hot path.
     pub registration_throttled: Arc<AtomicBool>,
@@ -521,9 +526,10 @@ impl CacheStateView {
         })
     }
 
-    /// Whether dispatch should forward new queries to origin instead of
-    /// registering them — under memory pressure (`registration_throttled`) or
-    /// disk pressure (`disk_throttle`). Wait-free; on the hot path.
+    /// Whether dispatch should forward new and invalidated queries to origin
+    /// instead of registering or readmitting them — under memory pressure
+    /// (`registration_throttled`) or disk pressure (`disk_throttle`).
+    /// Wait-free; on the hot path.
     pub fn throttled(&self) -> bool {
         self.registration_throttled.load(Ordering::Relaxed)
             || self.disk_throttle.load(Ordering::Relaxed)

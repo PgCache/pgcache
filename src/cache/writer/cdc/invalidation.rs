@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ecow::EcoString;
 use tracing::debug;
@@ -423,13 +423,20 @@ pub(super) fn update_queries_check_invalidate(
 /// metadata reuse on readmission, and drain waiters parked on its now-dead
 /// population.
 fn query_invalidated_mark(core: &mut WriterCore, fingerprint: Fingerprint, generation: Generation) {
+    let mut lifetime = None;
     if let Some(mut m) = core.state_view.metrics.get_mut(&fingerprint) {
         m.invalidation_count += 1;
-        m.cached_since_ns = None;
+        lifetime = m.cached_since_ns.take().map(|since| {
+            core.state_view
+                .started_at
+                .elapsed()
+                .saturating_sub(Duration::from_nanos(since.get()))
+        });
     }
     core.cache.generations.remove(&generation);
     if let Some(mut query) = core.cache.cached_queries.get1_mut(fingerprint) {
         query.invalidated = true;
+        query.last_lifetime = lifetime;
     }
     // Fold the MV dirty transition into the same get_mut block so dispatches
     // observe both transitions atomically — a reader that sees

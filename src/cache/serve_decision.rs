@@ -211,6 +211,11 @@ pub fn serve_decide(
                 action,
             }
         }
+        // Readmission under memory or disk pressure forwards like a cold
+        // query would: a population now only adds to the pressure (PGC-553).
+        CachedQueryState::Invalidated if input.throttled => {
+            ServeDecision::Forward(ForwardReason::Throttled)
+        }
         // Fast readmission: skip the admission gate.
         CachedQueryState::Invalidated => ServeDecision::Register {
             transition: Transition {
@@ -407,6 +412,18 @@ mod tests {
                 },
                 action: AdmitAction::Admit,
             }
+        );
+    }
+
+    #[test]
+    fn test_invalidated_forwards_when_throttled() {
+        let throttled = DecisionInput {
+            throttled: true,
+            ..input()
+        };
+        assert_eq!(
+            decide(Some(&state(CachedQueryState::Invalidated)), &throttled),
+            ServeDecision::Forward(ForwardReason::Throttled)
         );
     }
 

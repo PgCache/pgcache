@@ -164,6 +164,9 @@ pub mod names {
     pub const CACHE_READMISSIONS: &str = "pgcache.cache.readmissions";
     /// Readmissions served by a Ready parent instead of a population (PGC-532).
     pub const CACHE_READMISSION_SUBSUMPTIONS: &str = "pgcache.cache.readmission_subsumptions";
+    /// Readmissions deferred because the pending-merge head had waited longer
+    /// than the query's last Ready period lasted (PGC-553).
+    pub const CACHE_READMISSIONS_DEFERRED: &str = "pgcache.cache.readmissions_deferred";
     pub const CACHE_SUBSUMPTIONS: &str = "pgcache.cache.subsumptions";
     /// Subsumptions that covered a reference value by value, split on its
     /// in-set columns (PGC-494).
@@ -404,6 +407,13 @@ pub mod names {
     /// Time a staged population waits from merge-enqueue to merge-apply (the merge
     /// stage); complements population.wait (queue) + population.task (fetch+stage).
     pub const CACHE_MERGE_WAIT_SECONDS: &str = "pgcache.cache.merge.wait_seconds";
+    /// Age of the staged population at the top of the pending-merges heap: the
+    /// least wait a merge enqueued now will see (PGC-553).
+    pub const CACHE_MERGE_HEAD_AGE_SECONDS: &str = "pgcache.cache.merge.head_age_seconds";
+    /// Staged populations dropped before or during their merge because the
+    /// query was superseded, invalidated or evicted while they waited — the
+    /// wasted-population signal readmission deferral drives down (PGC-553).
+    pub const CACHE_MERGES_SUPERSEDED: &str = "pgcache.cache.merge.superseded_total";
     /// Population merges applied (drain throughput) — compare against the
     /// invalidation rate to see if the pipeline keeps up.
     pub const CACHE_MERGES_APPLIED: &str = "pgcache.cache.merge.applied_total";
@@ -998,8 +1008,10 @@ pub struct RegHandles {
     pub population_scale_down: Counter,
     pub population_backstop_grows: Counter,
     pub merge_pending_depth: Gauge,
+    pub merge_head_age: Gauge,
     pub merge_wait: Histogram,
     pub merges_applied: Counter,
+    pub merges_superseded: Counter,
     pub merge_chunks: Counter,
     pub merge_chunk: Histogram,
     pub merge_discard_chunks: Counter,
@@ -1009,10 +1021,11 @@ impl RegHandles {
     fn build() -> Self {
         use names::{
             CACHE_MERGE_CHUNK_SECONDS, CACHE_MERGE_CHUNKS, CACHE_MERGE_DISCARD_CHUNKS,
-            CACHE_MERGE_PENDING_DEPTH, CACHE_MERGE_WAIT_SECONDS, CACHE_MERGES_APPLIED,
-            CACHE_POPULATION_BACKSTOP_GROWS, CACHE_POPULATION_SCALE_DOWN,
-            CACHE_POPULATION_SCALE_UP, CACHE_POPULATION_STREAM_SECONDS,
-            CACHE_POPULATION_TASK_SECONDS, CACHE_POPULATION_WAIT_SECONDS, CACHE_POPULATION_WORKERS,
+            CACHE_MERGE_HEAD_AGE_SECONDS, CACHE_MERGE_PENDING_DEPTH, CACHE_MERGE_WAIT_SECONDS,
+            CACHE_MERGES_APPLIED, CACHE_MERGES_SUPERSEDED, CACHE_POPULATION_BACKSTOP_GROWS,
+            CACHE_POPULATION_SCALE_DOWN, CACHE_POPULATION_SCALE_UP,
+            CACHE_POPULATION_STREAM_SECONDS, CACHE_POPULATION_TASK_SECONDS,
+            CACHE_POPULATION_WAIT_SECONDS, CACHE_POPULATION_WORKERS,
             CACHE_SUBSUMPTION_LATENCY_SECONDS, CACHE_SUBSUMPTION_WAIT_FALLBACKS,
             CACHE_SUBSUMPTION_WAITS, CACHE_SUBSUMPTIONS, CACHE_SUBSUMPTIONS_JOIN,
             CACHE_SUBSUMPTIONS_SPLIT, CACHE_WRITER_COMMAND_HANDLE_SECONDS,
@@ -1067,8 +1080,10 @@ impl RegHandles {
             population_scale_down: metrics::counter!(CACHE_POPULATION_SCALE_DOWN),
             population_backstop_grows: metrics::counter!(CACHE_POPULATION_BACKSTOP_GROWS),
             merge_pending_depth: metrics::gauge!(CACHE_MERGE_PENDING_DEPTH),
+            merge_head_age: metrics::gauge!(CACHE_MERGE_HEAD_AGE_SECONDS),
             merge_wait: metrics::histogram!(CACHE_MERGE_WAIT_SECONDS),
             merges_applied: metrics::counter!(CACHE_MERGES_APPLIED),
+            merges_superseded: metrics::counter!(CACHE_MERGES_SUPERSEDED),
             merge_chunks: metrics::counter!(CACHE_MERGE_CHUNKS),
             merge_chunk: metrics::histogram!(CACHE_MERGE_CHUNK_SECONDS),
             merge_discard_chunks: metrics::counter!(CACHE_MERGE_DISCARD_CHUNKS),
@@ -1094,6 +1109,7 @@ pub struct StateHandles {
     pub evictions_bump: Counter,
     pub readmissions: Counter,
     pub readmission_subsumptions: Counter,
+    pub readmissions_deferred: Counter,
     pub queue_writer_query: Gauge,
     pub queue_writer_cdc: Gauge,
     pub queue_writer_internal: Gauge,
@@ -1106,10 +1122,10 @@ impl StateHandles {
             CACHE_DISK_AVAILABLE_BYTES, CACHE_DISK_LIMIT_BYTES, CACHE_DISK_TOTAL_BYTES,
             CACHE_DISK_USED_BYTES, CACHE_EVICTIONS, CACHE_GENERATION, CACHE_QUERIES_INVALIDATED,
             CACHE_QUERIES_LOADING, CACHE_QUERIES_PENDING, CACHE_QUERIES_REGISTERED,
-            CACHE_READMISSION_SUBSUMPTIONS, CACHE_READMISSIONS, CACHE_TABLES_TRACKED,
-            CACHE_WORKER_QUEUE, CACHE_WRITER_CDC_QUEUE, CACHE_WRITER_INTERNAL_QUEUE,
-            CACHE_WRITER_QUERY_QUEUE, CACHE_WRITER_UPDATE_QUERIES_MAX_PER_RELATION,
-            CACHE_WRITER_UPDATE_QUERIES_TOTAL,
+            CACHE_READMISSION_SUBSUMPTIONS, CACHE_READMISSIONS, CACHE_READMISSIONS_DEFERRED,
+            CACHE_TABLES_TRACKED, CACHE_WORKER_QUEUE, CACHE_WRITER_CDC_QUEUE,
+            CACHE_WRITER_INTERNAL_QUEUE, CACHE_WRITER_QUERY_QUEUE,
+            CACHE_WRITER_UPDATE_QUERIES_MAX_PER_RELATION, CACHE_WRITER_UPDATE_QUERIES_TOTAL,
         };
         Self {
             queries_registered: metrics::gauge!(CACHE_QUERIES_REGISTERED),
@@ -1131,6 +1147,7 @@ impl StateHandles {
             evictions_bump: metrics::counter!(CACHE_EVICTIONS, "result" => "bump"),
             readmissions: metrics::counter!(CACHE_READMISSIONS),
             readmission_subsumptions: metrics::counter!(CACHE_READMISSION_SUBSUMPTIONS),
+            readmissions_deferred: metrics::counter!(CACHE_READMISSIONS_DEFERRED),
             queue_writer_query: metrics::gauge!(CACHE_WRITER_QUERY_QUEUE),
             queue_writer_cdc: metrics::gauge!(CACHE_WRITER_CDC_QUEUE),
             queue_writer_internal: metrics::gauge!(CACHE_WRITER_INTERNAL_QUEUE),

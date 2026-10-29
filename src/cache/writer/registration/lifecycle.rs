@@ -3,7 +3,7 @@
 
 use std::num::NonZeroU64;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tracing::{debug, instrument, trace};
 
@@ -17,6 +17,15 @@ use crate::cache::writer::subsumption::subsumed_ready_mark;
 use crate::oid::Oid;
 use crate::query::Fingerprint;
 use crate::timing::{duration_to_ns_u64, duration_to_us_u64};
+
+/// Whether a readmission is deferred (PGC-553): the merge queue's head has
+/// already waited longer than the query's last Ready period lasted, so a
+/// population started now is expected to be invalidated again before its
+/// merge lands and would only hold staging. A query never invalidated has no
+/// horizon and admits.
+pub(super) fn readmission_deferred(head_age: Duration, last_lifetime: Option<Duration>) -> bool {
+    last_lifetime.is_some_and(|lifetime| head_age > lifetime)
+}
 
 /// Set the `has_limit` bit on the query's update queries and its join
 /// parent entry, re-deriving what depends on it there. Limited queries are
@@ -48,7 +57,27 @@ impl WriterRegistration {
         fingerprint: Fingerprint,
         started_at: Instant,
     ) -> CacheResult<SubsumptionResult> {
-        debug!("readmitting query {fingerprint}");
+        let last_lifetime = core
+            .cache
+            .cached_queries
+            .get1(&fingerprint)
+            .and_then(|cached| cached.last_lifetime);
+        let head_age = core.merges.head_age();
+        if readmission_deferred(head_age, last_lifetime) {
+            debug!(
+                "readmission deferred: merge head {head_age:?} outwaits last lifetime \
+                 {last_lifetime:?} {fingerprint}"
+            );
+            crate::metrics::handles()
+                .state
+                .readmissions_deferred
+                .increment(1);
+            core.state_invalidated_restore(fingerprint);
+            return Ok(SubsumptionResult::NotSubsumed);
+        }
+        debug!(
+            "readmitting query (merge head {head_age:?}, last lifetime {last_lifetime:?}) {fingerprint}"
+        );
         crate::metrics::handles().state.readmissions.increment(1);
         if let Some(mut m) = core.state_view.metrics.get_mut(&fingerprint) {
             m.readmission_count += 1;
@@ -276,5 +305,34 @@ impl WriterRegistration {
         )?;
         trace!("limit bump population queued for query {fingerprint}");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SECOND: Duration = Duration::from_secs(1);
+
+    /// The head has outwaited the query's last Ready period: its population
+    /// would be invalidated before its merge lands.
+    #[test]
+    fn test_readmission_deferred_when_head_outwaits_last_lifetime() {
+        assert!(readmission_deferred(3 * SECOND, Some(SECOND)));
+    }
+
+    /// Within the horizon the readmission goes ahead; equal is not over.
+    #[test]
+    fn test_readmission_admitted_within_last_lifetime() {
+        assert!(!readmission_deferred(SECOND, Some(3 * SECOND)));
+        assert!(!readmission_deferred(SECOND, Some(SECOND)));
+        assert!(!readmission_deferred(Duration::ZERO, Some(Duration::ZERO)));
+    }
+
+    /// Never invalidated before: no horizon, and an empty queue defers nothing.
+    #[test]
+    fn test_readmission_admitted_without_history_or_queue() {
+        assert!(!readmission_deferred(3 * SECOND, None));
+        assert!(!readmission_deferred(Duration::ZERO, Some(SECOND)));
     }
 }

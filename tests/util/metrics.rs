@@ -41,6 +41,8 @@ pub(crate) struct MetricsSnapshot {
     pub cache_invalidations: u64,
     pub cache_readmissions: u64,
     pub cache_readmission_subsumptions: u64,
+    /// Readmissions deferred behind a congested merge queue (PGC-553).
+    pub cache_readmissions_deferred: u64,
     pub cache_coalesce_served: u64,
     /// Coalesced waiters forwarded to origin on the population deadline (PGC-335).
     pub cache_coalesce_deadline_forward: u64,
@@ -184,6 +186,7 @@ const SAMPLES: &[Sample] = samples! {
     "pgcache_cache_invalidations" => cache_invalidations,
     "pgcache_cache_readmissions" => cache_readmissions,
     "pgcache_cache_readmission_subsumptions" => cache_readmission_subsumptions,
+    "pgcache_cache_readmissions_deferred" => cache_readmissions_deferred,
     "pgcache_cache_coalesce_served" => cache_coalesce_served,
     "pgcache_cache_coalesce_deadline_forward_total" => cache_coalesce_deadline_forward,
     "pgcache_cache_coalesce_waiting" => cache_coalesce_waiting,
