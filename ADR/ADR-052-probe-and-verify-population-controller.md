@@ -93,3 +93,4 @@ Replace the model with two feedback loops; no service-time baseline at all.
 - `population_task_floor_seconds` was removed with its only consumer;
   `population_backstop_grows` added.
 - Amends ADR-050 (controller core only; pool mechanics stand).
+- Box CPU pressure (ADR-063): the controller sheds members under sustained PSI pressure, probes nowhere while the 10 s window is at the level, and refutes a probe whose gain came with a rise in pressure.

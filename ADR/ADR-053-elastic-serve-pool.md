@@ -86,3 +86,4 @@ conclusion that produced ADR-052 for the population pool.
   ceiling is an occasional unpark/repark with zero connection churn.
 - Amends ADR-052 (controller shared, config-parameterized). Bench validation
   under PGC-442.
+- Box CPU pressure (ADR-063): the serve pool sheds last, at a higher PSI level than the population pool, since its shed costs latency rather than a forward.

@@ -1,0 +1,38 @@
+# ADR-063: Box-level CPU pressure feedback
+
+## Status
+Accepted
+
+## Context
+Three controllers size pgcache's demand on the box it shares with its cache PostgreSQL: the probe-and-verify pool controllers for population workers (ADR-052) and serve connections (ADR-053), and the registration admission gate (ADR-041). Each judges itself by its own queue. On a 2-vCPU bench box under a 25 % write mix all three ran to their ceilings and stayed there: a probe "confirms" when the pool's own throughput rises, and on a shared CPU a new backend wins its throughput by taking cycles from the writer, the fold bgworker, autovacuum and the other pool. The gate backed off to its 20/s floor on the writer queue and the Loading count, both congested, and 20 populations a second on two cores kept the box there. Load sat at 34; the writer's merge slot ran at a fifth of its pace, population wait went from 6 s to 177 s, and hit rate halved. Nothing in the loop had the box as an input, and readmissions, most of the population demand under a write mix, bypassed the gate entirely.
+
+Operators who act on pressure elsewhere (systemd-oomd, Android's lmkd, Kubernetes' PSI node conditions) publish no CPU threshold; what they share is the shape of the rule: a level, sustained over a longer window and still present in a shorter one, with a kill or a taint as the action. CPU is the compressible resource, so for us the action must be graduated.
+
+## Decision
+- **Two readings, one signal.** Linux PSI `/proc/pressure/cpu` `some` (the larger of the system-wide file and the process's own cgroup `cpu.pressure`): the fraction of wall time at least one runnable task waited for a CPU, over the kernel's 10 s and 60 s windows. It says *whether* the box is short of CPU and saturates near 1 once it is: the bench box read 0.95 at load 9 and at load 34. Beside it, the scheduler's run-queue wait time from `/proc/schedstat`, turned into the average number of tasks waiting for a CPU and smoothed over a few seconds: the *magnitude*, which keeps moving where PSI saturates. Published once a second on the shared state view, with gauges. Zero where the files are unavailable, which leaves every controller exactly as it was.
+- **Two-window rule.** A controller treats the box as congested when both `avg60` and `avg10` are at or above its level, and clear when `avg60` falls below. The 10 s window alone at the level blocks growth without triggering a shed.
+- **Pool controllers shed under PSI and judge every step on the run queue.** Under congestion (both PSI windows at the pool's level) a pool releases one member per cadence, whatever its own queue wait says, and judges the release the way ADR-052 judges a probe: if the waiting-task count fell by half a task within the cadence the pool was part of the pressure and the next shed follows; if not, the member bought nothing — the box is busy with something else — so it is restored and the pool holds on an escalating ladder before trying again. A busy box does not block an upward probe; the probe's verdict refutes it when the waiting-task count rose by half a task even though own throughput rose, because the gain came out of the rest of the box. Half a task is one member's expected mark on the run queue with the same slack as `verify_beta`. Levels are per pool: population 0.5, serve 0.8, so forwarding to origin is shed before serve latency.
+- **The gate gets a third congestion signal.** Box pressure standing on both PSI windows with the waiting-task count grown by a member's worth since the last window backs the admit rate off like a standing writer or population backlog; a saturated box whose run queue is not growing does not block the additive probe. Readmissions take a token from the same bucket; a denied readmission forwards and the entry stays Invalidated for the next read. Pinned queries readmit inside the writer and are unaffected.
+- **Levels are internal constants**, in the ADR-050 tradition, to be set against bench evidence, not settings.
+
+## Rationale
+- PSI is congestion by definition: it measures waiting, not utilisation, is smoothed by the kernel, costs one file read, and is cgroup-aware in containers. The alternatives were the instantaneous host-wide `/proc/stat` run queue and pgcache-internal victim timings (writer loop latency, bgworker schedstat), the latter the service-time class ADR-052 already rejected.
+- The two-window rule is what oomd's `pressure_rising_beyond` and Kubernetes' PSI node conditions converged on independently; it gives hysteresis from the kernel's own smoothing instead of a tick counter.
+- The differential refute and the shed verify need no level at all and do the work the level cannot: on the bench box PSI sat at 0.95 with every pool at its floor, because the pressure was the serve load itself — useful work — and a fixed level shed the population pool into it, starving cache maintenance for no relief. The level only says the box is busy; the verify says whether this pool is why. PSI could not carry the verify: it saturates, so the run queue's waiting-task count — which fell from 34 to 9 when the pools went from 32 backends to 6 — is the magnitude both verifies read. Any rule that blocks growth on PSI alone (an earlier draft refused to probe while `avg10` was at the level) pins the pools to their floors on a box saturated by its own serving.
+- Shedding order follows what each shed costs: a shed population is a forward to origin, the sanctioned relief valve (ADR-041); a shed serve connection is latency.
+- A hard CPU throttle OR'd into `throttled()` was rejected for now: it forwards everything and fails in-flight populations at one level, the memory monitor's semantics, where a graduated shed is wanted.
+
+## Consequences
+
+### Positive
+- The three controllers share one view of the box and back off before the writer and the fold bgworker starve; the merge slot and CDC apply keep their pace under a write mix.
+- Under pressure pgcache's footprint on a shared box is bounded by the box's own signal, not by `num_workers`-derived caps.
+- Readmission demand is paced for the first time; the memory, disk and heap-head shed paths now have a CPU counterpart.
+
+### Negative
+- Under pressure more reads forward to origin and the serve pool is smaller, so pages/s may fall at the top of the box's range; the bet is that hit rate and merge flow recover more than that costs.
+- PSI `some` reads high on a box with a few busy cores even when throughput is fine, which is why the levels are deliberately high and the serve level highest; tuning is bench-driven.
+- No signal on macOS (dev builds read 0) and none for a remote cache PostgreSQL's box; a cache-side signal is future work.
+
+## Implementation Notes
+Shedding the population pool only moves the congestion into the population queue unless admission follows: the readmission horizon (ADR-035) therefore includes the pool's expected queue wait, and staging is checked out by the worker that picks an item up, not at dispatch, so a long queue holds names rather than tables. `cache::pressure` holds the reading, the PSI parser and the published cell; `runtime::cpu_monitor` samples it (a fault-injection file stands in for the kernel in tests). `PoolControllerConfig` gained the per-pool `shed_pressure` and `shed_ticks`; the gate's AIMD step is a pure `GateAimd` with the pressure signal. Amends ADR-041, ADR-052 and ADR-053.
