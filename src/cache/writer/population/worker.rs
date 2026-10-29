@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use ecow::EcoString;
 use metrics::Histogram;
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -16,13 +15,15 @@ use tokio_postgres::Client;
 use tracing::{debug, error, trace};
 
 use super::stream::population_task;
-use super::{PopulationConnections, PopulationOutcome, PopulationSpawnContext, PopulationWork};
+use super::{
+    PopulationConnections, PopulationOutcome, PopulationSpawnContext, PopulationWork, WorkItem,
+};
 use crate::cache::messages::{PopulationMerge, QueryCommand};
 use crate::cache::population_pool::{POPULATION_PARK_EXPIRY, PopulationPool};
 use crate::cache::reference_settings;
 use crate::cache::writer::deadlock::{SQLSTATE_DEADLOCK, cache_error_sqlstate};
+use crate::cache::writer::merge_queue::StagingDiscard;
 use crate::cache::{CacheError, CacheResult, MapIntoReport};
-use crate::oid::Oid;
 use crate::pg;
 use crate::result::error_chain_format;
 use crate::settings::PgSettings;
@@ -54,19 +55,42 @@ fn population_failed_send(
     })
 }
 
-/// Dispatcher between the shared population work queue and the idle workers.
-/// Owns the single work receiver; each idle worker registers a one-shot slot
-/// and the dispatcher pairs the next work item with the next idle slot, so no
-/// item is ever bound to a busy worker (no head-of-line blocking) and worker
-/// count can change without re-routing.
+/// Take the next work item: a staging discard when one is queued, else a
+/// population. Discards go first because each is one cheap `DELETE` that
+/// returns a staging table (and its disk) to the pool, and they are never on
+/// a client's path to a result; a population behind a burst of them waits a
+/// few seconds at most. `None` once both queues are closed.
+async fn work_item_next(
+    work_rx: &mut UnboundedReceiver<PopulationWork>,
+    discard_rx: &mut UnboundedReceiver<StagingDiscard>,
+) -> Option<WorkItem> {
+    tokio::select! {
+        biased;
+        discard = discard_rx.recv() => match discard {
+            Some(discard) => Some(WorkItem::Discard(discard)),
+            // The discard side is gone (shutdown); keep serving populations
+            // until their queue closes too.
+            None => work_rx.recv().await.map(WorkItem::Populate),
+        },
+        work = work_rx.recv() => work.map(WorkItem::Populate),
+    }
+}
+
+/// Dispatcher between the shared population work queues and the idle workers.
+/// Owns the work receivers; each idle worker registers a one-shot slot and the
+/// dispatcher pairs the next work item with the next idle slot, so no item is
+/// ever bound to a busy worker (no head-of-line blocking) and worker count can
+/// change without re-routing. Discards are not population work: they do not
+/// count toward the queue gauge the pool controller scales on.
 pub(crate) async fn population_dispatcher(
     mut work_rx: UnboundedReceiver<PopulationWork>,
-    mut idle_rx: UnboundedReceiver<oneshot::Sender<PopulationWork>>,
+    mut discard_rx: UnboundedReceiver<StagingDiscard>,
+    mut idle_rx: UnboundedReceiver<oneshot::Sender<WorkItem>>,
     query_tx: UnboundedSender<QueryCommand>,
     pool: Arc<PopulationPool>,
 ) {
     let queue_handle = crate::metrics::population_queue_handle();
-    while let Some(mut work) = work_rx.recv().await {
+    while let Some(mut item) = work_item_next(&mut work_rx, &mut discard_rx).await {
         // Queue gauge + controller backlog hint (PGC-452); length never
         // approaches 2^53.
         pool.queue_depth_set(work_rx.len());
@@ -77,20 +101,24 @@ pub(crate) async fn population_dispatcher(
                 // The idle channel closes only when the registration (which
                 // holds a sender in its spawn context) is dropped — shutdown.
                 // With zero live workers this recv simply blocks until the
-                // reconcile tick respawns one. Best-effort fail the in-hand
-                // work so the writer's `Failed` handler releases its staging
-                // tables and deleted-key tracking.
-                debug!(
-                    "population dispatcher shutting down with query {} in hand",
-                    work.fingerprint
-                );
-                let _ = population_failed_send(&query_tx, &work);
+                // reconcile tick respawns one. Best-effort fail in-hand
+                // population work so the writer's `Failed` handler releases
+                // its staging tables and deleted-key tracking; an in-hand
+                // discard has nothing to release (its tables stay checked
+                // out until the cache reset that follows a shutdown).
+                if let WorkItem::Populate(work) = &item {
+                    debug!(
+                        "population dispatcher shutting down with query {} in hand",
+                        work.fingerprint
+                    );
+                    let _ = population_failed_send(&query_tx, work);
+                }
                 return;
             };
             // A slot whose worker died hands the work back; try the next one.
-            match slot.send(work) {
+            match slot.send(item) {
                 Ok(()) => break,
-                Err(returned) => work = returned,
+                Err(returned) => item = returned,
             }
         }
     }
@@ -142,7 +170,7 @@ pub(crate) async fn population_worker_run(
 
 /// What the worker does after one pass at the loop top.
 enum WorkerNext {
-    Work(PopulationWork),
+    Work(WorkItem),
     /// The idle wait timed out; re-check retirement.
     Recheck,
     /// Retired by a pool shrink; the id is already returned.
@@ -153,7 +181,7 @@ enum WorkerNext {
 
 struct PopulationWorker {
     id: usize,
-    idle_tx: UnboundedSender<oneshot::Sender<PopulationWork>>,
+    idle_tx: UnboundedSender<oneshot::Sender<WorkItem>>,
     origin_settings: PgSettings,
     cache_settings: PgSettings,
     query_tx: UnboundedSender<QueryCommand>,
@@ -193,7 +221,8 @@ impl PopulationWorker {
         debug!("population worker {} started", self.id);
         loop {
             match self.work_next().await {
-                WorkerNext::Work(work) => self.work_handle(work).await,
+                WorkerNext::Work(WorkItem::Populate(work)) => self.work_handle(work).await,
+                WorkerNext::Work(WorkItem::Discard(discard)) => self.discard_handle(discard).await,
                 WorkerNext::Recheck => {}
                 WorkerNext::Retired => return,
                 WorkerNext::Shutdown => break,
@@ -217,7 +246,7 @@ impl PopulationWorker {
         // to the dispatcher — which already skips dead slots — and the loop
         // top re-checks retirement before registering a fresh one.
         match tokio::time::timeout(IDLE_RETIRE_RECHECK, slot_rx).await {
-            Ok(Ok(work)) => WorkerNext::Work(work),
+            Ok(Ok(item)) => WorkerNext::Work(item),
             // The dispatcher dropped the unused slot: shutdown.
             Ok(Err(_)) => WorkerNext::Shutdown,
             Err(_) => WorkerNext::Recheck,
@@ -281,6 +310,37 @@ impl PopulationWorker {
 
         self.idle_start = Instant::now();
         self.outcome_send(&work, result, fetch_stage);
+    }
+
+    /// Empty the staging tables of a population that will never merge
+    /// (PGC-553) and tell the writer, which returns them to the pool. Runs
+    /// under memory throttling too — it releases resources — and needs only
+    /// the cache connection. Not population work: it records no wait or task
+    /// time, which drive the pool controller.
+    async fn discard_handle(&mut self, discard: StagingDiscard) {
+        self.idle_handle
+            .record(self.idle_start.elapsed().as_secs_f64());
+        let emptied = self.cache_heal().await
+            && staging_tables_clear(
+                &self.connections.cache,
+                discard.staged.iter().map(|(_, table)| table.as_str()),
+            )
+            .await;
+        if !emptied {
+            error!(
+                "population worker {}: staging discard failed for {}; the writer empties it",
+                self.id, discard.fingerprint
+            );
+        }
+        self.idle_start = Instant::now();
+        let ack = QueryCommand::Discarded {
+            fingerprint: discard.fingerprint,
+            generation: discard.generation,
+            emptied,
+        };
+        if self.query_tx.send(ack).is_err() {
+            error!("population worker {}: failed to send Discarded", self.id);
+        }
     }
 
     /// Reopen a closed origin or cache connection before reading. A dropped
@@ -357,7 +417,11 @@ impl PopulationWorker {
                 "population worker {}: query {} deadlocked, retry {attempt}/{POPULATION_DEADLOCK_MAX_RETRIES} after {backoff:?}",
                 self.id, work.fingerprint,
             );
-            staging_clear(&self.connections.cache, &work.staging).await;
+            staging_tables_clear(
+                &self.connections.cache,
+                work.staging.iter().map(|(_, table, _)| table.as_str()),
+            )
+            .await;
             sleep(backoff).await;
         }
     }
@@ -411,14 +475,22 @@ impl PopulationWorker {
     }
 }
 
-/// Empty any partial load before a deadlock retry re-streams: the pool slot
-/// isn't recreated between attempts (PGC-293), so clear it explicitly.
-async fn staging_clear(db_cache: &Client, staging: &[(Oid, EcoString, bool)]) {
-    for (_, table, _) in staging {
-        let _ = db_cache
+/// Empty staging tables on the worker's connection: a partial load before a
+/// deadlock retry re-streams (the pool slot isn't recreated between attempts,
+/// PGC-293), or the staging of a discarded population. False if any `DELETE`
+/// failed.
+async fn staging_tables_clear(db_cache: &Client, tables: impl Iterator<Item = &str>) -> bool {
+    let mut cleared = true;
+    for table in tables {
+        if let Err(e) = db_cache
             .batch_execute(&format!("DELETE FROM pgcache_stage.{table}"))
-            .await;
+            .await
+        {
+            error!("staging clear: emptying {table}: {e}");
+            cleared = false;
+        }
     }
+    cleared
 }
 
 /// Park a retired worker instead of exiting: hold the connection pair until

@@ -178,6 +178,16 @@ pub enum QueryCommand {
     /// Ready (PGC-250).
     Merge(PopulationMerge),
 
+    /// A population worker emptied the staging tables of a population that
+    /// will never merge (`StagingDiscard`); the writer returns them to the
+    /// pool. `emptied` is false when the worker's `DELETE` failed, so the
+    /// writer must empty them itself before reuse.
+    Discarded {
+        fingerprint: Fingerprint,
+        generation: Generation,
+        emptied: bool,
+    },
+
     /// Build (or rebuild) the materialized result for a cached query. Sent by
     /// the dispatch when it observes `mv_state == Pending { .. }` on a cache
     /// hit and transitions to `Scheduled { .. }`. The writer's handler snapshots
@@ -251,6 +261,16 @@ impl std::fmt::Debug for QueryCommand {
                 .field("generation", &m.generation)
                 .field("relations", &m.staged.len())
                 .finish_non_exhaustive(),
+            Self::Discarded {
+                fingerprint,
+                generation,
+                emptied,
+            } => f
+                .debug_struct("Discarded")
+                .field("fingerprint", fingerprint)
+                .field("generation", generation)
+                .field("emptied", emptied)
+                .finish(),
         }
     }
 }

@@ -1,6 +1,6 @@
 //! The writer's merge pipeline (PGC-272 / PGC-418): staged populations
-//! awaiting the drain gate, staging discards awaiting the slot, the one drain
-//! in progress, and the gate's bookkeeping.
+//! awaiting the drain gate, the one merge in progress, and the gate's
+//! bookkeeping.
 //!
 //! A population's staging→cache merge is withheld until the writer is
 //! quiescent (no CDC frame open) and the apply watermark has reached the
@@ -8,18 +8,18 @@
 //! — heap-page windows of the staging table — one chunk per writer-loop
 //! iteration, so CDC apply interleaves with the merge instead of waiting
 //! behind one statement over the whole table. Staging that will never be
-//! merged is emptied the same way (`DrainTarget::Discard`) rather than with
-//! one `DELETE` per table on the writer.
+//! merged never touches the writer's connection or the merge slot: it is
+//! handed to a population worker to empty (`StagingDiscard`, PGC-553).
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, VecDeque};
+use std::collections::{BinaryHeap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ecow::EcoString;
 use tokio::sync::Notify;
 
-use super::staging::PopulationDeletedKeys;
+use super::staging::{PopulationDeletedKeys, PopulationKey};
 use crate::cache::Generation;
 use crate::cache::messages::PopulationMerge;
 use crate::oid::Oid;
@@ -66,18 +66,6 @@ pub(super) enum HeapStop {
     SlotBusy,
 }
 
-/// What a drain does with each staging window.
-pub(super) enum DrainTarget {
-    /// Upsert into the cache table: the population merge, carrying the
-    /// population for Ready finalization.
-    Apply(PopulationMerge),
-    /// Delete only: the population was superseded, invalidated, evicted,
-    /// aborted, or failed, and its staging must be emptied for pool reuse —
-    /// in the same bounded chunks, so the check-in's one-statement `DELETE`
-    /// over up to millions of rows does not stall CDC apply (PGC-418).
-    Discard,
-}
-
 /// Where a drain is within its staged relations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DrainCursor {
@@ -97,7 +85,9 @@ enum DrainCursor {
     Done,
 }
 
-/// A population's staging tables awaiting a chunked discard.
+/// A population's staging tables to be emptied on a population worker: the
+/// population was superseded, invalidated, evicted, aborted, or failed. The
+/// pool ledger keeps them checked out until the worker's `Discarded` ack.
 pub(super) struct StagingDiscard {
     pub(super) fingerprint: Fingerprint,
     pub(super) generation: Generation,
@@ -180,17 +170,17 @@ pub(super) struct InputQueues {
     pub(super) internal_empty: bool,
 }
 
-/// A staging drain in progress — a population merge, or a discard — advanced
-/// one chunk at a time (PGC-418). At most one is in progress; the writer loop
-/// advances it by one chunk per iteration while no CDC frame is open, so CDC
-/// apply interleaves with it instead of waiting behind a single statement
-/// over the whole staging table.
+/// A population merge in progress, advanced one chunk at a time (PGC-418).
+/// At most one is in progress; the writer loop advances it by one chunk per
+/// iteration while no CDC frame is open, so CDC apply interleaves with it
+/// instead of waiting behind a single statement over the whole staging table.
 pub(super) struct MergeInProgress {
     pub(super) fingerprint: Fingerprint,
     pub(super) generation: Generation,
     /// `(relation_oid, staging table name in pgcache_stage)` per relation.
     staged: Vec<(Oid, EcoString)>,
-    pub(super) target: DrainTarget,
+    /// The population, carried for Ready finalization.
+    pub(super) merge: PopulationMerge,
     cursor: DrainCursor,
     chunk_blocks: u32,
     boundary: ChunkBoundary,
@@ -200,12 +190,6 @@ pub(super) struct MergeInProgress {
     pub(super) drained_rows: u64,
     pub(super) chunks: u64,
     pub(super) started_at: Instant,
-}
-
-impl MergeInProgress {
-    pub(super) fn is_applying(&self) -> bool {
-        matches!(self.target, DrainTarget::Apply(_))
-    }
 }
 
 /// A queued population merge, ordered by its watermark deadline (PGC-272).
@@ -243,7 +227,7 @@ impl PartialEq for PendingMerge {
 
 impl Eq for PendingMerge {}
 
-/// The writer's merge pipeline: two inputs feeding one slot.
+/// The writer's merge pipeline: the gated heap feeding one slot.
 pub(super) struct MergeQueue {
     /// Population merges awaiting both a quiescent (frame-Idle) writer and the
     /// CDC apply watermark reaching their snapshot LSN (PGC-272): a min-heap
@@ -253,11 +237,15 @@ pub(super) struct MergeQueue {
     /// until CDC has applied past the snapshot, so already-Ready bystander
     /// queries can never serve a torn mix of two origin points in time.
     pub(super) pending: BinaryHeap<Reverse<PendingMerge>>,
-    /// Superseded populations whose staging awaits a chunked discard, started
-    /// when the slot is free and no releasable merge is waiting.
-    pub(super) discards: VecDeque<StagingDiscard>,
-    /// The drain being advanced chunk by chunk, popped from `pending` once its
-    /// gate released, or started from `discards`.
+    /// The populations in `pending`. The one authority on who may release a
+    /// staged population's staging: `staged_take` succeeds once per
+    /// population, so an eager drop at invalidation and the tombstone's later
+    /// pop at the heap head can never both send its tables for discard.
+    staged: HashSet<PopulationKey>,
+    /// Discards handed to population workers and not yet acked.
+    pub(super) discards_pending: u64,
+    /// The merge being advanced chunk by chunk, popped from `pending` once
+    /// its gate released.
     pub(super) active: Option<MergeInProgress>,
     /// Count of CDC batch flushes (each returns the frame to Idle); see
     /// `ChunkBoundary`.
@@ -287,7 +275,8 @@ impl MergeQueue {
     pub(super) fn new(watermark_nudge: Arc<Notify>) -> Self {
         Self {
             pending: BinaryHeap::new(),
-            discards: VecDeque::new(),
+            staged: HashSet::new(),
+            discards_pending: 0,
             active: None,
             batch_flush_seq: 0,
             commands_handled: 0,
@@ -307,6 +296,26 @@ impl MergeQueue {
             .map_or(Duration::ZERO, |Reverse(PendingMerge(top))| {
                 top.enqueued_at.elapsed()
             })
+    }
+
+    /// Queue a staged population for its gated merge.
+    pub(super) fn pending_push(&mut self, merge: PopulationMerge) {
+        self.staged.insert((merge.fingerprint, merge.generation));
+        self.pending.push(Reverse(PendingMerge(merge)));
+    }
+
+    /// Pop the heap head. Its staging is then owned by whoever popped it (the
+    /// merge slot), or was already released by an earlier `staged_take`.
+    pub(super) fn pending_pop(&mut self) -> Option<PopulationMerge> {
+        let Reverse(PendingMerge(merge)) = self.pending.pop()?;
+        self.staged.remove(&(merge.fingerprint, merge.generation));
+        Some(merge)
+    }
+
+    /// Claim a staged population's staging for release: true exactly once per
+    /// population while its entry is in the heap, false once claimed or popped.
+    pub(super) fn staged_take(&mut self, population: PopulationKey) -> bool {
+        self.staged.remove(&population)
     }
 
     pub(super) fn batch_flushed(&mut self) {
@@ -365,6 +374,27 @@ impl MergeQueue {
     }
 }
 
+/// A population merge with the given staging, for tests of the pipeline.
+#[cfg(test)]
+pub(super) fn merge_fixture(
+    fingerprint: Fingerprint,
+    generation: Generation,
+    staged: Vec<(Oid, EcoString)>,
+) -> PopulationMerge {
+    use crate::pg::OriginSnapshot;
+    PopulationMerge {
+        fingerprint,
+        generation,
+        staged,
+        cached_bytes: 0,
+        row_count: 0,
+        snapshot: Arc::new(OriginSnapshot::new(0, 0, vec![])),
+        snapshot_lsn: Lsn::from_raw(0),
+        enqueued_at: Instant::now(),
+        fetch_stage_ms: 0.0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -378,14 +408,39 @@ mod tests {
 
     fn merges_with_active_drain() -> MergeQueue {
         let mut merges = MergeQueue::new(Arc::new(Notify::new()));
-        merges.active = Some(MergeInProgress::new(
-            Fingerprint::from_raw(1),
-            Generation::from_raw(1),
-            vec![],
-            DrainTarget::Discard,
-            merges.boundary(0),
-        ));
+        let merge = merge_fixture(Fingerprint::from_raw(1), Generation::from_raw(1), vec![]);
+        merges.active = Some(MergeInProgress::new(merge, merges.boundary(0)));
         merges
+    }
+
+    #[test]
+    fn test_staged_take_claims_a_population_once() {
+        let mut merges = MergeQueue::new(Arc::new(Notify::new()));
+        let population = (Fingerprint::from_raw(1), Generation::from_raw(1));
+        assert!(!merges.staged_take(population), "nothing staged");
+        merges.pending_push(merge_fixture(population.0, population.1, vec![]));
+        assert!(merges.staged_take(population), "claimed by the eager drop");
+        assert!(
+            !merges.staged_take(population),
+            "the tombstone pop finds it claimed"
+        );
+        assert!(
+            merges.pending_pop().is_some(),
+            "the entry itself stays until popped"
+        );
+    }
+
+    #[test]
+    fn test_pending_pop_takes_the_staging_with_the_entry() {
+        let mut merges = MergeQueue::new(Arc::new(Notify::new()));
+        let population = (Fingerprint::from_raw(1), Generation::from_raw(1));
+        merges.pending_push(merge_fixture(population.0, population.1, vec![]));
+        assert!(merges.pending_pop().is_some());
+        assert!(
+            !merges.staged_take(population),
+            "popped: the slot owns the staging"
+        );
+        assert!(merges.pending_pop().is_none());
     }
 
     #[test]

@@ -12,6 +12,7 @@ use tokio::sync::oneshot;
 use tokio_postgres::Client;
 
 use super::PopulationWork;
+use super::merge_queue::StagingDiscard;
 use crate::cache::messages::QueryCommand;
 use crate::cache::population_pool::PopulationPool;
 use crate::oid::Oid;
@@ -28,11 +29,18 @@ pub(super) use worker::{population_dispatcher, population_worker_connect, popula
 /// attempts every reconcile tick.
 pub(super) const POPULATION_SPAWN_COOLDOWN: Duration = Duration::from_secs(5);
 
+/// What the dispatcher hands an idle worker: a population to load, or the
+/// staging of a population that will never merge to empty (PGC-553).
+pub(super) enum WorkItem {
+    Populate(PopulationWork),
+    Discard(StagingDiscard),
+}
+
 /// Everything needed to spawn one population worker outside `new()` (elastic
 /// scale-up, PGC-437).
 #[derive(Clone)]
 pub(super) struct PopulationSpawnContext {
-    pub(super) idle_tx: UnboundedSender<oneshot::Sender<PopulationWork>>,
+    pub(super) idle_tx: UnboundedSender<oneshot::Sender<WorkItem>>,
     pub(super) cache_settings: PgSettings,
     pub(super) origin_settings: PgSettings,
     pub(super) query_tx: UnboundedSender<QueryCommand>,

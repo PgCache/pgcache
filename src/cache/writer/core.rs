@@ -12,7 +12,7 @@ use tokio_postgres::Client;
 use tracing::debug;
 
 use super::frame::{FRAME_BUF_CAPACITY, FrameRowEvent, FrameState, OverlayEntry};
-use super::merge_queue::MergeQueue;
+use super::merge_queue::{MergeQueue, StagingDiscard};
 use super::mv_build::MvBuildPool;
 use super::privileges::roles_digest_read;
 use super::rls::RlsCatalog;
@@ -164,6 +164,9 @@ pub(super) struct WriterCore {
     /// invalidation to defer pinned readmits, by MV to schedule builds, and
     /// cloned to population workers so they can report Ready/Failed.
     pub(super) query_tx: UnboundedSender<QueryCommand>,
+    /// Staging tables of populations that will never merge, for a population
+    /// worker to empty off the writer (PGC-553).
+    pub(super) discard_tx: UnboundedSender<StagingDiscard>,
     /// Shared multi-thread runtime handle; MV build tasks are spawned here so
     /// their SQL never blocks the writer's event loop.
     pub(super) runtime: Handle,
@@ -490,6 +493,7 @@ impl WriterCore {
         settings: &Settings,
         shared: WriterShared,
         query_tx: UnboundedSender<QueryCommand>,
+        discard_tx: UnboundedSender<StagingDiscard>,
     ) -> CacheResult<Self> {
         let (cache_client, origin_client, disk) = writer_resources_open(settings).await?;
         let roles_digest = if settings.role_poll_interval.is_zero() {
@@ -527,6 +531,7 @@ impl WriterCore {
             relations_dirty: false,
             forgotten_tables: Vec::new(),
             query_tx,
+            discard_tx,
             runtime,
             mv_build_pool: Arc::new(MvBuildPool::new(settings.cache.clone())),
             mv_builds_inflight: HashSet::default(),
@@ -648,8 +653,7 @@ impl WriterCore {
     /// Whether the population merge drain has work and the writer is
     /// quiescent (no CDC frame open).
     pub(super) fn merges_drain_wanted(&self) -> bool {
-        self.frame_state == FrameState::Idle
-            && (!self.merges.pending.is_empty() || !self.merges.discards.is_empty())
+        self.frame_state == FrameState::Idle && !self.merges.pending.is_empty()
     }
 
     /// Set the shape-gate classification and derive the initial MvState for a

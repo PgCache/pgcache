@@ -1,6 +1,6 @@
 //! Population merge drain (PGC-250, PGC-272, PGC-418): release queued merges
-//! in watermark-deadline order, advance the active merge or discard chunk by
-//! chunk, and finalize the query on a terminal outcome.
+//! in watermark-deadline order, advance the active merge chunk by chunk, and
+//! finalize the query on a terminal outcome.
 
 use std::cmp::Reverse;
 use std::time::Instant;
@@ -10,9 +10,7 @@ use tracing::{debug, error};
 use super::WriterRegistration;
 use crate::cache::Generation;
 use crate::cache::writer::core::WriterCore;
-use crate::cache::writer::merge_queue::{
-    DrainTarget, HeapStop, MERGE_FLUSH_FORCE_AFTER, MergeStep, PendingMerge,
-};
+use crate::cache::writer::merge_queue::{HeapStop, MERGE_FLUSH_FORCE_AFTER, MergeStep};
 use crate::cache::{CacheError, CacheResult, Report, ReportExt};
 use crate::pg::Lsn;
 use crate::query::Fingerprint;
@@ -36,20 +34,16 @@ fn merge_heap_advance(core: &mut WriterCore, applied_lsn: Lsn) -> (HeapStop, boo
         };
         // Tombstone check before the deadline check: a superseded /
         // invalidated / evicted entry is droppable regardless of the
-        // watermark — release its tracking and staging now rather than
-        // holding them until a deadline that no longer matters. (Stale
-        // entries buried below a live top are reaped lazily when they
-        // surface.) The successor population has its own entry.
+        // watermark. Its tracking and staging normally left with the
+        // invalidation or eviction that made it stale (`population_staged_drop`
+        // there); the drop here only catches a population that went stale some
+        // other way, and the pop clears the tombstone. The successor population
+        // has its own entry.
         if !core.population_is_current(fingerprint, generation) {
-            if core.merges.pending.pop().is_none() {
+            core.population_staged_drop(fingerprint, generation);
+            if core.merges.pending_pop().is_none() {
                 break HeapStop::Exhausted;
             }
-            core.population_deleted_keys
-                .deactivate(fingerprint, generation);
-            // Its staging (a complete population) is emptied in chunks, not
-            // with one DELETE on the writer.
-            core.population_discard_enqueue(fingerprint, generation);
-            crate::metrics::handles().reg.merges_superseded.increment(1);
             continue;
         }
 
@@ -65,7 +59,7 @@ fn merge_heap_advance(core: &mut WriterCore, applied_lsn: Lsn) -> (HeapStop, boo
         if core.merges.active.is_some() {
             break HeapStop::SlotBusy;
         }
-        let Some(Reverse(PendingMerge(merge))) = core.merges.pending.pop() else {
+        let Some(merge) = core.merges.pending_pop() else {
             break HeapStop::Exhausted;
         };
         started_any = true;
@@ -106,11 +100,10 @@ async fn merge_stall_handle(core: &mut WriterCore, stop: HeapStop) -> CacheResul
 /// overflow, bulk invalidation, a toast fallback on a staged or matching row):
 /// invalidate the query as that event would have had it been Ready, so its
 /// waiters go to origin and the next read readmits it without re-registering,
-/// then drain the remaining staging. The abort lands only when the merge comes
-/// up, which also delays the retry (PGC-484).
+/// and send the remaining staging for discard. The abort lands only when the
+/// merge comes up, which also delays the retry (PGC-484).
 async fn merge_abort_invalidate(core: &mut WriterCore, head: MergeHead) -> CacheResult<()> {
-    core.population_deleted_keys
-        .deactivate(head.fingerprint, head.generation);
+    core.population_merge_abandon();
     if core
         .cache_query_cdc_invalidate(head.fingerprint)
         .await
@@ -118,24 +111,21 @@ async fn merge_abort_invalidate(core: &mut WriterCore, head: MergeHead) -> Cache
     {
         crate::metrics::handles().cdc.invalidations.increment(1);
     }
-    core.population_merge_discard_remaining();
     Ok(())
 }
 
-/// The active drain's identity, copied out before stepping it.
+/// The active merge's identity, copied out before stepping it.
 #[derive(Clone, Copy)]
 struct MergeHead {
     fingerprint: Fingerprint,
     generation: Generation,
-    /// Applying a population (vs. discarding staging).
-    applying: bool,
 }
 
 impl WriterRegistration {
     /// Drain queued population merges in watermark-deadline order (PGC-250,
     /// PGC-272). Called from the writer loop only when no CDC frame is open,
     /// so a merge never races the CDC frame txn on the shared cache table —
-    /// on every such iteration, including while a drain is active: tombstones
+    /// on every such iteration, including while a merge is active: tombstones
     /// are reaped and a gated head is nudged regardless of the slot, only the
     /// start of the next releasable merge waits for it.
     ///
@@ -155,13 +145,6 @@ impl WriterRegistration {
         applied_lsn: Lsn,
     ) -> CacheResult<()> {
         let (stop, started_any) = merge_heap_advance(core, applied_lsn);
-        // Real merges take the slot first; a queued discard runs when none is
-        // releasable, so pool tables come back without ever stalling apply.
-        if core.merges.active.is_none()
-            && let Some(discard) = core.merges.discards.pop_front()
-        {
-            core.population_discard_start(discard);
-        }
         // A released merge means the watermark is advancing on its own; restart
         // the stall clock so the grace window times the *current* gated head.
         if started_any {
@@ -170,25 +153,21 @@ impl WriterRegistration {
         merge_stall_handle(core, stop).await
     }
 
-    /// Run one chunk of the in-progress population merge or discard and
-    /// finalize on a terminal outcome (PGC-418). Query-side finalization
-    /// happens the moment applying stops — `Done` marks the query Ready,
-    /// `Aborted` / error fail it, a superseded / invalidated / evicted query
-    /// is left to its successor — but the staging tables are only checked
-    /// back in once their rows have been drained in chunks
-    /// (`DrainTarget::Discard`), never with one DELETE over the remainder.
+    /// Run one chunk of the in-progress population merge and finalize on a
+    /// terminal outcome (PGC-418): `Done` marks the query Ready, `Aborted` /
+    /// error fail it, a superseded / invalidated / evicted query is left to
+    /// its successor. Whenever applying stops short, the slot is freed at once
+    /// and the remaining staging is emptied on a population worker, never
+    /// with a DELETE on the writer.
     pub(crate) async fn merge_in_progress_step(&self, core: &mut WriterCore) -> CacheResult<()> {
         let Some(head) = core.merges.active.as_ref().map(|m| MergeHead {
             fingerprint: m.fingerprint,
             generation: m.generation,
-            applying: m.is_applying(),
         }) else {
             return Ok(());
         };
-        if head.applying && !core.population_is_current(head.fingerprint, head.generation) {
-            core.population_deleted_keys
-                .deactivate(head.fingerprint, head.generation);
-            core.population_merge_discard_remaining();
+        if !core.population_is_current(head.fingerprint, head.generation) {
+            core.population_merge_abandon();
             crate::metrics::handles().reg.merges_superseded.increment(1);
             return Ok(());
         }
@@ -207,35 +186,25 @@ impl WriterRegistration {
         Ok(())
     }
 
-    /// The drain finished: check the staging tables back in (PGC-293), then
-    /// mark the query Ready if this was an applying merge.
+    /// The merge finished: check the staging tables back in (PGC-293) and mark
+    /// the query Ready.
     async fn merge_done(&self, core: &mut WriterCore, head: MergeHead) {
         let Some(finished) = core.merges.active.take() else {
             return;
         };
         core.staging_checkin(head.fingerprint, head.generation)
             .await;
-        match finished.target {
-            DrainTarget::Apply(applied) => {
-                debug!(
-                    "population merge applied in {} chunks / {} rows over {:?} {}",
-                    finished.chunks,
-                    finished.drained_rows,
-                    finished.started_at.elapsed(),
-                    head.fingerprint
-                );
-                core.population_deleted_keys
-                    .deactivate(head.fingerprint, head.generation);
-                crate::metrics::handles().reg.merges_applied.increment(1);
-                self.query_ready_finalize(core, &applied);
-            }
-            DrainTarget::Discard => {
-                debug!(
-                    "population staging discarded in {} chunks / {} rows {}",
-                    finished.chunks, finished.drained_rows, head.fingerprint
-                );
-            }
-        }
+        debug!(
+            "population merge applied in {} chunks / {} rows over {:?} {}",
+            finished.chunks,
+            finished.drained_rows,
+            finished.started_at.elapsed(),
+            head.fingerprint
+        );
+        core.population_deleted_keys
+            .deactivate(head.fingerprint, head.generation);
+        crate::metrics::handles().reg.merges_applied.increment(1);
+        self.query_ready_finalize(core, &finished.merge);
     }
 
     async fn merge_step_failed(
@@ -249,23 +218,13 @@ impl WriterRegistration {
             head.fingerprint,
             error_chain_format(e.current_context()),
         );
-        if head.applying {
-            self.merge_apply_abandon(core, head);
-        } else {
-            // The discard itself failed: fall back to the one-statement
-            // check-in rather than retry forever.
-            core.merges.active = None;
-            core.staging_checkin(head.fingerprint, head.generation)
-                .await;
-        }
+        self.merge_apply_abandon(core, head);
     }
 
-    /// Fail the query of an applying merge that can't finish, and drain its
-    /// remaining staging in chunks.
+    /// Fail the query of a merge that can't finish and send its remaining
+    /// staging for discard.
     fn merge_apply_abandon(&self, core: &mut WriterCore, head: MergeHead) {
-        core.population_deleted_keys
-            .deactivate(head.fingerprint, head.generation);
+        core.population_merge_abandon();
         self.query_failed_cleanup(core, head.fingerprint);
-        core.population_merge_discard_remaining();
     }
 }

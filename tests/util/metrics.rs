@@ -43,6 +43,17 @@ pub(crate) struct MetricsSnapshot {
     pub cache_readmission_subsumptions: u64,
     /// Readmissions deferred behind a congested merge queue (PGC-553).
     pub cache_readmissions_deferred: u64,
+    pub cache_merge_applied: u64,
+    /// Staged populations dropped before or during their merge (PGC-553).
+    pub cache_merge_superseded: u64,
+    /// Populations whose staging a worker was asked to empty (PGC-553).
+    pub cache_merge_discards: u64,
+    /// Gauge: discards handed to workers and not yet acked.
+    pub cache_merge_discards_pending: u64,
+    /// Gauge: staged populations waiting for the merge gate.
+    pub cache_merge_pending_depth: u64,
+    /// Gauge: populations holding staging tables.
+    pub cache_staging_held: u64,
     pub cache_coalesce_served: u64,
     /// Coalesced waiters forwarded to origin on the population deadline (PGC-335).
     pub cache_coalesce_deadline_forward: u64,
@@ -187,6 +198,12 @@ const SAMPLES: &[Sample] = samples! {
     "pgcache_cache_readmissions" => cache_readmissions,
     "pgcache_cache_readmission_subsumptions" => cache_readmission_subsumptions,
     "pgcache_cache_readmissions_deferred" => cache_readmissions_deferred,
+    "pgcache_cache_merge_applied_total" => cache_merge_applied,
+    "pgcache_cache_merge_superseded_total" => cache_merge_superseded,
+    "pgcache_cache_merge_discards_total" => cache_merge_discards,
+    "pgcache_cache_merge_discards_pending" => cache_merge_discards_pending,
+    "pgcache_cache_merge_pending_depth" => cache_merge_pending_depth,
+    "pgcache_cache_staging_held" => cache_staging_held,
     "pgcache_cache_coalesce_served" => cache_coalesce_served,
     "pgcache_cache_coalesce_deadline_forward_total" => cache_coalesce_deadline_forward,
     "pgcache_cache_coalesce_waiting" => cache_coalesce_waiting,

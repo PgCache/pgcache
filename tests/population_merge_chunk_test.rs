@@ -21,19 +21,6 @@ use tokio_postgres::SimpleQueryMessage;
 
 use crate::util::{TestContext, http_get};
 
-/// Discard chunks applied (staging of an abandoned/superseded population).
-async fn discard_chunks_total(metrics_port: u16) -> Result<f64, Error> {
-    let (status, body) = http_get(metrics_port, "/metrics").await?;
-    if status != 200 {
-        return Err(Error::other(format!("/metrics returned {status}")));
-    }
-    Ok(body
-        .lines()
-        .find_map(|l| l.strip_prefix("pgcache_cache_merge_discard_chunks_total "))
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .unwrap_or(0.0))
-}
-
 mod util;
 
 /// Heap blocks per chunk under test. The 12-byte rows below pack ~200 per
@@ -218,10 +205,11 @@ async fn test_delete_between_chunks_is_not_resurrected() -> Result<(), Error> {
 }
 
 /// A merge abandoned part-way (here: its query evicted under a count cap)
-/// must empty its remaining staging in chunks, not with one DELETE on the
-/// writer — a Ready bystander keeps seeing CDC while the discard runs.
+/// hands its remaining staging to a population worker — never a DELETE on the
+/// writer — so a Ready bystander keeps seeing CDC while the staging is
+/// emptied, and the tables come back to the pool once the worker is done.
 #[tokio::test]
-async fn test_abandoned_merge_discards_staging_in_chunks() -> Result<(), Error> {
+async fn test_abandoned_merge_discards_staging_off_the_writer() -> Result<(), Error> {
     // The bystander is pinned so the count-cap eviction takes the populating
     // query (the oldest unpinned generation) and not the observer.
     let q1 = "select id, v from chunked where grp = 1 order by id";
@@ -250,6 +238,7 @@ async fn test_abandoned_merge_discards_staging_in_chunks() -> Result<(), Error> 
     ctx.cache_settle_with_timeout(Duration::from_secs(15))
         .await?;
     let baseline = merge_chunks_total(ctx.metrics_port).await?;
+    let before = ctx.metrics().await?;
 
     // Populating query: its merge spans several seconds.
     let q2 = "select count(*) from chunked where grp = 2";
@@ -257,24 +246,24 @@ async fn test_abandoned_merge_discards_staging_in_chunks() -> Result<(), Error> 
     merge_in_progress_wait(&ctx, baseline).await?;
 
     // A third registration puts the count over the cap of one; the eviction
-    // tick evicts q2 mid-merge, which abandons the merge and discards its
-    // remaining staging in chunks.
+    // tick evicts q2 mid-merge, which abandons the merge and sends its
+    // remaining staging to a worker.
     ctx.simple_query("select id from trigger_t where id = 1")
         .await?;
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        if discard_chunks_total(ctx.metrics_port).await? >= 1.0 {
+        if ctx.metrics().await?.cache_merge_discards > before.cache_merge_discards {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "the abandoned merge never started discarding"
+            "the abandoned merge never sent its staging for discard"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    // An origin write to the bystander's group while the discard is in
-    // progress must reach it long before the discard ends.
+    // An origin write to the bystander's group right after the abandon must
+    // reach it promptly: the writer is not emptying the staging.
     let written_at = Instant::now();
     ctx.origin
         .batch_execute("insert into chunked (id, grp, v) values (2, 1, 2)")
@@ -305,21 +294,30 @@ async fn test_abandoned_merge_discards_staging_in_chunks() -> Result<(), Error> 
         }
         assert!(
             Instant::now() < deadline,
-            "insert never reached the bystander during the discard"
+            "insert never reached the bystander after the abandon"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // The discard drains the whole remainder in chunks (many, given the pinned
-    // chunk size), never as one statement.
+    // The worker acks and the tables return to the pool: nothing holds
+    // staging any more (the bystander and the trigger query are Ready).
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        if discard_chunks_total(ctx.metrics_port).await? >= 5.0 {
+        let m = ctx.metrics().await?;
+        if m.cache_merge_discards_pending == 0 && m.cache_staging_held == 0 {
+            // At least the abandoned population's; under a count cap of one the
+            // trigger query's own population can be evicted and discarded too.
+            assert!(
+                m.cache_merge_discards > before.cache_merge_discards,
+                "the abandoned population was discarded"
+            );
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "discard did not proceed in chunks"
+            "staging never returned to the pool: pending={} held={}",
+            m.cache_merge_discards_pending,
+            m.cache_staging_held
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

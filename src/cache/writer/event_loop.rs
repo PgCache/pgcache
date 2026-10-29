@@ -134,11 +134,14 @@ impl WriterLoop {
         // Loopback channel: population workers (and the writer itself) send
         // query commands back through it.
         let (query_tx, internal_rx) = tokio::sync::mpsc::unbounded_channel();
-        let core = WriterCore::new(settings, shared, query_tx.clone()).await?;
+        // Staging the population workers empty for the writer (PGC-553).
+        let (discard_tx, discard_rx) = tokio::sync::mpsc::unbounded_channel();
+        let core = WriterCore::new(settings, shared, query_tx.clone(), discard_tx).await?;
         let registration = WriterRegistration::new(
             settings,
             &core.db_origin,
             query_tx,
+            discard_rx,
             Arc::clone(&core.state_view.registration_throttled),
             Arc::clone(&core.state_view.population_pool),
         )
@@ -233,6 +236,16 @@ impl WriterLoop {
             .reg
             .merge_head_age
             .set(core.merges.head_age().as_secs_f64());
+        #[allow(clippy::cast_precision_loss)]
+        crate::metrics::handles()
+            .reg
+            .merge_discards_pending
+            .set(core.merges.discards_pending as f64);
+        #[allow(clippy::cast_precision_loss)]
+        crate::metrics::handles()
+            .reg
+            .staging_held
+            .set(core.staging_pool.held_count() as f64);
         core.disk_stats_refresh();
         core.stale_entries_cleanup();
         core.state_gauges_update();

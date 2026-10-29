@@ -593,6 +593,11 @@ impl StagingPool {
             .unwrap_or_default()
     }
 
+    /// Populations currently holding staging tables.
+    pub(super) fn held_count(&self) -> usize {
+        self.checked_out.len()
+    }
+
     /// The tables a population currently holds, without releasing them.
     pub(super) fn held(
         &self,
@@ -714,13 +719,45 @@ impl WriterCore {
     /// autovacuum, which for near-empty staging tables fires only after ~50 dead
     /// tuples accumulate — i.e. batched across many reuses — so it can't run a
     /// per-population vacuum (a per-population VACUUM, like VACUUM FULL, re-emits
-    /// the very invalidation this scheme avoids). Called on every terminal path
-    /// (merge / abort / failure / abandoned). Best-effort — a leak is recovered
-    /// by the next cache reset.
+    /// the very invalidation this scheme avoids). Called when a merge completes
+    /// (the tables are already empty) and as the fallback when a worker-side
+    /// discard failed. Best-effort — a leak is recovered by the next cache reset.
     pub(super) async fn staging_checkin(
         &mut self,
         fingerprint: Fingerprint,
         generation: Generation,
+    ) {
+        self.staging_return(fingerprint, generation, true).await;
+    }
+
+    /// Return a population's staging tables a worker has already emptied
+    /// (`Discarded`): release to the free-list without touching them.
+    async fn staging_release(&mut self, fingerprint: Fingerprint, generation: Generation) {
+        self.staging_return(fingerprint, generation, false).await;
+    }
+
+    /// A population worker finished emptying a discarded population's staging
+    /// (PGC-553): return the tables to the pool, emptying them here only if the
+    /// worker could not.
+    pub(super) async fn population_discarded(
+        &mut self,
+        fingerprint: Fingerprint,
+        generation: Generation,
+        emptied: bool,
+    ) {
+        self.merges.discards_pending = self.merges.discards_pending.saturating_sub(1);
+        if emptied {
+            self.staging_release(fingerprint, generation).await;
+        } else {
+            self.staging_checkin(fingerprint, generation).await;
+        }
+    }
+
+    async fn staging_return(
+        &mut self,
+        fingerprint: Fingerprint,
+        generation: Generation,
+        empty: bool,
     ) {
         for (oid, staging, epoch) in self.staging_pool.take(fingerprint, generation) {
             // A relation schema change since checkout makes this table's shape
@@ -735,10 +772,11 @@ impl WriterCore {
                 }
                 continue;
             }
-            if let Err(e) = self
-                .db_cache
-                .batch_execute(&format!("DELETE FROM pgcache_stage.{staging}"))
-                .await
+            if empty
+                && let Err(e) = self
+                    .db_cache
+                    .batch_execute(&format!("DELETE FROM pgcache_stage.{staging}"))
+                    .await
             {
                 error!("staging checkin: emptying {staging}: {e}");
             }

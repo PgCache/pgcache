@@ -438,6 +438,9 @@ fn query_invalidated_mark(core: &mut WriterCore, fingerprint: Fingerprint, gener
         query.invalidated = true;
         query.last_lifetime = lifetime;
     }
+    // A population staged for this generation will never merge: let its
+    // staging go now rather than when the tombstone surfaces (PGC-553).
+    core.population_staged_drop(fingerprint, generation);
     // Fold the MV dirty transition into the same get_mut block so dispatches
     // observe both transitions atomically — a reader that sees
     // state=Invalidated never sees the MV in a stale-Fresh state. `dirty_apply`

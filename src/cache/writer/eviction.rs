@@ -329,6 +329,7 @@ impl WriterCore {
 
         // 5. Now safe to remove old generation (rows are re-stamped)
         self.cache.generations.remove(&old_generation);
+        self.population_staged_drop(fingerprint, old_generation);
 
         // 6. Update CachedQuery in BiHashMap (generation is key2, must remove/reinsert)
         if let Some(mut cached) = self.cache.cached_queries.remove1(fingerprint) {
@@ -546,6 +547,7 @@ impl WriterCore {
 
         // Remove generation from tracking
         self.cache.generations.remove(&query.generation);
+        self.population_staged_drop(fingerprint, query.generation);
 
         // Drop the MV table (if any) before removing the state_view entry so we
         // can read the mv_state. Errors are logged but don't abort the eviction.

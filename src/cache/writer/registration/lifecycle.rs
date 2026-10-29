@@ -117,6 +117,7 @@ impl WriterRegistration {
             }),
         };
 
+        core.population_staged_drop(fingerprint, cached.generation);
         cached.generation = new_generation;
         cached.invalidated = false;
         cached.cached_bytes = 0;
@@ -271,6 +272,7 @@ impl WriterRegistration {
 
         let new_generation = core.cache.generation_allocate();
         core.cache.generations.remove(&old_generation);
+        core.population_staged_drop(fingerprint, old_generation);
 
         // Update cached query — must remove and reinsert because generation is key2
         if let Some(mut cached) = core.cache.cached_queries.remove1(fingerprint) {

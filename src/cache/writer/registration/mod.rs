@@ -4,7 +4,6 @@
 //! merge drain (`merge`). This module holds the shared types and the
 //! `QueryCommand` router.
 
-use std::cmp::Reverse;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -12,13 +11,13 @@ use std::time::Instant;
 
 use ecow::EcoString;
 use metrics::Histogram;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::spawn_local;
 use tokio_postgres::Client;
 use tracing::{debug, error, trace};
 
 use super::core::WriterCore;
-use super::merge_queue::PendingMerge;
+use super::merge_queue::StagingDiscard;
 use super::population::{
     PopulationSpawnContext, population_dispatcher, population_worker_connect, population_worker_run,
 };
@@ -170,6 +169,7 @@ fn command_histogram(cmd: &QueryCommand) -> &'static Histogram {
         QueryCommand::Register(_) => &reg.cmd_register,
         QueryCommand::Merge(_) => &reg.cmd_ready,
         QueryCommand::Failed { .. } => &reg.cmd_failed,
+        QueryCommand::Discarded { .. } => &reg.cmd_discarded,
         QueryCommand::LimitBump { .. } => &reg.cmd_limit_bump,
         QueryCommand::Readmit { .. } => &reg.cmd_readmit,
         QueryCommand::WaitersRelease { .. } => &reg.cmd_waiters_release,
@@ -271,6 +271,7 @@ impl WriterRegistration {
         settings: &Settings,
         db_origin: &Rc<Client>,
         query_tx: UnboundedSender<QueryCommand>,
+        discard_rx: UnboundedReceiver<StagingDiscard>,
         registration_throttled: Arc<AtomicBool>,
         pool: Arc<PopulationPool>,
     ) -> CacheResult<Self> {
@@ -285,6 +286,7 @@ impl WriterRegistration {
         let (idle_tx, idle_rx) = tokio::sync::mpsc::unbounded_channel();
         spawn_local(population_dispatcher(
             work_rx,
+            discard_rx,
             idle_rx,
             query_tx.clone(),
             Arc::clone(&pool),
@@ -330,21 +332,40 @@ impl WriterRegistration {
             QueryCommand::PrivilegeResolve(lookup) => core.privilege_lookup(&lookup).await,
             QueryCommand::Register(request) => self.register_command(core, request).await,
             QueryCommand::Merge(merge) => {
-                // Queue the merge; the writer loop drains it once no CDC frame
-                // is open (PGC-250) AND the apply watermark has reached its
-                // snapshot LSN (PGC-272). Running it here could be mid-frame,
-                // racing the CDC writer's frame txn on the shared cache table.
-                core.population_deleted_keys.snapshot_set(
-                    merge.fingerprint,
-                    merge.generation,
-                    Arc::clone(&merge.snapshot),
-                );
-                core.merges.pending.push(Reverse(PendingMerge(merge)));
+                if core.population_is_current(merge.fingerprint, merge.generation) {
+                    // Queue the merge; the writer loop drains it once no CDC
+                    // frame is open (PGC-250) AND the apply watermark has
+                    // reached its snapshot LSN (PGC-272). Running it here could
+                    // be mid-frame, racing the CDC writer's frame txn on the
+                    // shared cache table.
+                    core.population_deleted_keys.snapshot_set(
+                        merge.fingerprint,
+                        merge.generation,
+                        Arc::clone(&merge.snapshot),
+                    );
+                    core.merges.pending_push(merge);
+                } else {
+                    // Invalidated, superseded or evicted while the worker
+                    // loaded it: nothing to merge, so its staging never enters
+                    // the heap.
+                    core.population_deleted_keys
+                        .deactivate(merge.fingerprint, merge.generation);
+                    core.population_discard_send(merge.fingerprint, merge.generation);
+                    crate::metrics::handles().reg.merges_superseded.increment(1);
+                }
             }
             QueryCommand::Failed {
                 fingerprint,
                 generation,
             } => self.population_failed(core, fingerprint, generation),
+            QueryCommand::Discarded {
+                fingerprint,
+                generation,
+                emptied,
+            } => {
+                core.population_discarded(fingerprint, generation, emptied)
+                    .await;
+            }
             QueryCommand::LimitBump {
                 fingerprint,
                 max_limit,
@@ -388,10 +409,10 @@ impl WriterRegistration {
     ) {
         core.population_deleted_keys
             .deactivate(fingerprint, generation);
-        // Whatever the worker staged before failing is emptied in chunks, not
-        // with one DELETE on the writer (PGC-293 keeps the tables checked out
-        // until that check-in).
-        core.population_discard_enqueue(fingerprint, generation);
+        // Whatever the worker staged before failing is emptied by a worker,
+        // not with a DELETE on the writer (PGC-293 keeps the tables checked
+        // out until that ack).
+        core.population_discard_send(fingerprint, generation);
         self.query_failed_cleanup(core, fingerprint);
     }
 
@@ -443,6 +464,7 @@ impl WriterRegistration {
         // this fingerprint may have a superseded generation still in flight.
         match core.cache.cached_queries.remove1(fingerprint) {
             Some(query) => {
+                core.population_staged_drop(fingerprint, query.generation);
                 core.cache.generations.remove(&query.generation);
                 core.cache
                     .update_queries_remove_fingerprint(fingerprint, &query.relation_oids);

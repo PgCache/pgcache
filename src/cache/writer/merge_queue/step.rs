@@ -5,12 +5,12 @@ use std::time::{Duration, Instant};
 use ecow::EcoString;
 use rootcause::Report;
 use tokio_postgres::SimpleQueryMessage;
-use tracing::debug;
+use tracing::{debug, error};
 
-use super::sql::{MergePlan, chunk_result_parse, discard_result_parse, discard_sql};
+use super::sql::{MergePlan, chunk_result_parse};
 use super::{
-    ChunkStatement, ChunkTarget, ChunkWindow, DrainCursor, DrainTarget, KeyScope, MergeInProgress,
-    MergeStep, StagingDiscard,
+    ChunkStatement, ChunkTarget, ChunkWindow, DrainCursor, KeyScope, MergeInProgress, MergeStep,
+    StagingDiscard,
 };
 use crate::cache::Generation;
 use crate::cache::messages::PopulationMerge;
@@ -25,8 +25,7 @@ struct MergeStepInputs {
     chunk_blocks: u32,
     generation: Generation,
     staged: Vec<(Oid, EcoString)>,
-    /// `(fingerprint, generation)` of an applying merge; `None` for a discard.
-    population: Option<(Fingerprint, Generation)>,
+    population: (Fingerprint, Generation),
 }
 
 /// Test-only delay after each merge chunk (fault-injection feature): stretches
@@ -52,41 +51,17 @@ impl WriterCore {
     /// deactivates the deleted-key set, checks staging back in, and marks the
     /// query Ready / Failed when the step reports a terminal outcome.
     pub(crate) fn population_merge_start(&mut self, merge: PopulationMerge) {
-        // The staged list is copied onto the drain: a merge can switch to
-        // discarding mid-way (`population_merge_discard_remaining`) and keep
-        // draining the same tables after the target drops the population.
-        let staged = merge.staged.clone();
-        self.merges.drain_begin(|boundary| {
-            MergeInProgress::new(
-                merge.fingerprint,
-                merge.generation,
-                staged,
-                DrainTarget::Apply(merge),
-                boundary,
-            )
-        });
+        self.merges
+            .drain_begin(|boundary| MergeInProgress::new(merge, boundary));
     }
 
-    /// Begin emptying a superseded population's staging tables in chunks (it
-    /// never reached its merge — the tombstone path of the pending-merge drain).
-    pub(crate) fn population_discard_start(&mut self, discard: StagingDiscard) {
-        self.merges.drain_begin(|boundary| {
-            MergeInProgress::new(
-                discard.fingerprint,
-                discard.generation,
-                discard.staged,
-                DrainTarget::Discard,
-                boundary,
-            )
-        });
-    }
-
-    /// Queue a population's staging for a chunked discard once the merge slot
-    /// is free: a superseded population that never reached its merge, or one
-    /// whose worker failed mid-stream. The tables are read from the pool's
-    /// ledger, which keeps them checked out under the key until the discard's
-    /// check-in.
-    pub(crate) fn population_discard_enqueue(
+    /// Hand a population's staging tables to a population worker to empty, one
+    /// `DELETE` per table on the worker's own connection: the writer never runs
+    /// the statement and the merge slot stays free for merges (PGC-553). The
+    /// pool ledger keeps the tables checked out under the key until the
+    /// worker's `Discarded` ack releases them. No-op without a hold (never
+    /// checked out, or already handed off).
+    pub(crate) fn population_discard_send(
         &mut self,
         fingerprint: Fingerprint,
         generation: Generation,
@@ -95,30 +70,61 @@ impl WriterCore {
         if staged.is_empty() {
             return;
         }
-        self.merges.discards.push_back(StagingDiscard {
+        let discard = StagingDiscard {
             fingerprint,
             generation,
             staged,
-        });
+        };
+        if self.discard_tx.send(discard).is_err() {
+            // Shutdown: the workers are gone. The tables stay orphaned until
+            // the next cache reset, like a dispatch failure.
+            error!("staging discard channel closed; orphaning staging of {fingerprint}");
+            self.staging_pool.forget(fingerprint, generation);
+            return;
+        }
+        self.merges.discards_pending += 1;
+        crate::metrics::handles().reg.merge_discards.increment(1);
     }
 
-    /// Stop applying the in-progress merge — the query was superseded,
-    /// invalidated, evicted, aborted, or the merge failed — and switch it to
-    /// discarding its remaining staging rows from where it stopped. Rows already
-    /// merged stay: each was snapshot state behind the watermark, filtered
-    /// against a complete deleted-key set when it landed, and is maintained by
-    /// CDC from then on, so they cannot tear a bystander's result; they're
-    /// reclaimed by generation once nothing references them.
-    pub(crate) fn population_merge_discard_remaining(&mut self) {
-        if let Some(in_progress) = self.merges.active.as_mut()
-            && in_progress.is_applying()
-        {
-            debug!(
-                "population merge stopped after {} chunks / {} rows, discarding the rest {}",
-                in_progress.chunks, in_progress.drained_rows, in_progress.fingerprint
-            );
-            in_progress.target = DrainTarget::Discard;
+    /// Drop a staged population that stopped being current — invalidated,
+    /// superseded, evicted, or its query failed — at that moment rather than
+    /// when its tombstone surfaces at the heap head: release its deleted-key
+    /// tracking and send its staging for discard. True when this call claimed
+    /// it; false when it was not staged or was claimed already, so the eager
+    /// drop and the later tombstone pop never release twice.
+    pub(crate) fn population_staged_drop(
+        &mut self,
+        fingerprint: Fingerprint,
+        generation: Generation,
+    ) -> bool {
+        if !self.merges.staged_take((fingerprint, generation)) {
+            return false;
         }
+        self.population_deleted_keys
+            .deactivate(fingerprint, generation);
+        self.population_discard_send(fingerprint, generation);
+        crate::metrics::handles().reg.merges_superseded.increment(1);
+        true
+    }
+
+    /// Stop the in-progress merge — the query was superseded, invalidated,
+    /// evicted, aborted, or a chunk failed — freeing the slot at once and
+    /// sending its staging for discard. Rows already merged stay: each was
+    /// snapshot state behind the watermark, filtered against a complete
+    /// deleted-key set when it landed, and is maintained by CDC from then on,
+    /// so they cannot tear a bystander's result; they're reclaimed by
+    /// generation once nothing references them.
+    pub(crate) fn population_merge_abandon(&mut self) {
+        let Some(in_progress) = self.merges.active.take() else {
+            return;
+        };
+        debug!(
+            "population merge stopped after {} chunks / {} rows, discarding the rest {}",
+            in_progress.chunks, in_progress.drained_rows, in_progress.fingerprint
+        );
+        self.population_deleted_keys
+            .deactivate(in_progress.fingerprint, in_progress.generation);
+        self.population_discard_send(in_progress.fingerprint, in_progress.generation);
     }
 
     /// Run one chunk of the in-progress drain (PGC-418): size the relation the
@@ -161,24 +167,24 @@ impl WriterCore {
         if self.merge_keys_lost() || self.merge_fallback_missed() {
             return Ok(MergeStep::Aborted);
         }
-        // A relation evicted mid-population has no cache table to merge into;
-        // its staging rows are discarded in chunks like the rest.
-        let plan = step.population.and_then(|_| {
-            self.cache
-                .tables
-                .get1(&relation_oid)
-                .map(|t| MergePlan::build(t))
-        });
-        if let (Some(plan), Some(population)) = (&plan, step.population)
-            && self
-                .merge_toast_stale_hit(&target, plan, population)
-                .await?
+        // A relation evicted mid-population has no cache table to merge into.
+        let Some(plan) = self
+            .cache
+            .tables
+            .get1(&relation_oid)
+            .map(|t| MergePlan::build(t))
+        else {
+            return Ok(MergeStep::Aborted);
+        };
+        if self
+            .merge_toast_stale_hit(&target, &plan, step.population)
+            .await?
         {
             return Ok(MergeStep::Aborted);
         }
 
         let (count, elapsed) = self
-            .merge_chunk_run(plan.as_ref(), &target, step.generation)
+            .merge_chunk_run(&plan, &target, step.generation)
             .await?;
         if let Some(in_progress) = self.merges.active.as_mut() {
             in_progress.chunk_finish(&target.window, count, elapsed);
@@ -195,10 +201,7 @@ impl WriterCore {
             chunk_blocks: in_progress.chunk_blocks,
             generation: in_progress.generation,
             staged: in_progress.staged.clone(),
-            population: match &in_progress.target {
-                DrainTarget::Apply(merge) => Some((merge.fingerprint, merge.generation)),
-                DrainTarget::Discard => None,
-            },
+            population: (in_progress.fingerprint, in_progress.generation),
         })
     }
 
@@ -233,17 +236,14 @@ impl WriterCore {
     /// (overflow) or was bulk-invalidated (TRUNCATE / recovery) at an LSN past
     /// this population's snapshot — a later chunk could resurrect removed rows.
     /// Checked per chunk: either can happen in a CDC frame applied between
-    /// chunks. Discards never abort.
+    /// chunks.
     fn merge_keys_lost(&self) -> bool {
         let Some(in_progress) = self.merges.active.as_ref() else {
             return false;
         };
-        let DrainTarget::Apply(merge) = &in_progress.target else {
-            return false;
-        };
         in_progress.staged.iter().any(|(oid, _)| {
             self.population_deleted_keys
-                .should_abort(*oid, merge.snapshot_lsn)
+                .should_abort(*oid, in_progress.merge.snapshot_lsn)
         })
     }
 
@@ -254,12 +254,9 @@ impl WriterCore {
         let Some(in_progress) = self.merges.active.as_ref() else {
             return false;
         };
-        let DrainTarget::Apply(merge) = &in_progress.target else {
-            return false;
-        };
         let missed = self
             .population_deleted_keys
-            .fallback_missed(merge.fingerprint, merge.generation);
+            .fallback_missed(in_progress.fingerprint, in_progress.generation);
         if missed {
             crate::metrics::handles()
                 .cdc
@@ -312,11 +309,11 @@ impl WriterCore {
     }
 
     /// Drain one window of a staging table: a filtered upsert into the cache
-    /// table under `plan`, or a plain discard without one. Returns the rows
-    /// drained and the statement's wall time.
+    /// table under `plan`. Returns the rows drained and the statement's wall
+    /// time.
     async fn merge_chunk_run(
         &mut self,
-        plan: Option<&MergePlan>,
+        plan: &MergePlan,
         target: &ChunkTarget,
         generation: Generation,
     ) -> CacheResult<(u64, Duration)> {
@@ -326,19 +323,14 @@ impl WriterCore {
             lo_block: target.window.lo_block,
             hi_block: target.window.hi_block,
         };
-        let sql = match plan {
-            Some(plan) => {
-                let filter = self.merges.active.as_mut().and_then(|in_progress| {
-                    in_progress.filter_predicate(KeyScope {
-                        keys: &self.population_deleted_keys,
-                        relation_oid: target.relation_oid,
-                        pk_columns_paren: &plan.pk_columns_paren,
-                    })
-                });
-                plan.chunk_sql(statement, filter)
-            }
-            None => discard_sql(statement),
-        };
+        let filter = self.merges.active.as_mut().and_then(|in_progress| {
+            in_progress.filter_predicate(KeyScope {
+                keys: &self.population_deleted_keys,
+                relation_oid: target.relation_oid,
+                pk_columns_paren: &plan.pk_columns_paren,
+            })
+        });
+        let sql = plan.chunk_sql(statement, filter);
 
         let started = Instant::now();
         let messages = self
@@ -348,17 +340,11 @@ impl WriterCore {
             .map_into_report::<CacheError>()
             .attach_loc("population merge chunk")?;
         let elapsed = started.elapsed();
-        let count = match plan {
-            Some(_) => chunk_result_parse(&messages)?,
-            None => discard_result_parse(&messages),
-        };
+        let count = chunk_result_parse(&messages)?;
         fault_merge_chunk_delay().await;
 
         let mh = crate::metrics::handles();
-        match plan {
-            Some(_) => mh.reg.merge_chunks.increment(1),
-            None => mh.reg.merge_discard_chunks.increment(1),
-        }
+        mh.reg.merge_chunks.increment(1);
         mh.reg.merge_chunk.record(elapsed.as_secs_f64());
         Ok((count, elapsed))
     }

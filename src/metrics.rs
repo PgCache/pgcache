@@ -423,9 +423,17 @@ pub mod names {
     /// Wall time of one merge chunk statement — the longest a CDC frame waits
     /// behind an in-progress merge.
     pub const CACHE_MERGE_CHUNK_SECONDS: &str = "pgcache.cache.merge.chunk_seconds";
-    /// Discard chunks applied: staging of an abandoned, aborted, or superseded
-    /// population is emptied in the same bounded chunks rather than one DELETE.
-    pub const CACHE_MERGE_DISCARD_CHUNKS: &str = "pgcache.cache.merge.discard_chunks_total";
+    /// Populations whose staging was handed to a population worker to empty
+    /// (superseded, invalidated, evicted, aborted or failed) rather than
+    /// merged (PGC-553).
+    pub const CACHE_MERGE_DISCARDS: &str = "pgcache.cache.merge.discards_total";
+    /// Discards handed to the workers and not yet acked: the staging those
+    /// populations still hold is on its way back to the pool.
+    pub const CACHE_MERGE_DISCARDS_PENDING: &str = "pgcache.cache.merge.discards_pending";
+    /// Populations currently holding staging tables: loading, staged behind
+    /// the merge gate, merging, or awaiting discard. Every one holds a full
+    /// snapshot copy on the cache volume (PGC-553).
+    pub const CACHE_STAGING_HELD: &str = "pgcache.cache.staging.held";
     /// Per-worker time waiting on rx.recv() between tasks. With \`task_seconds\`
     /// and wall clock, gives a clear utilization signal at a given pool size.
     pub const CACHE_POPULATION_WORKER_IDLE_SECONDS: &str =
@@ -978,6 +986,7 @@ pub struct RegHandles {
     pub cmd_register: Histogram,
     pub cmd_ready: Histogram,
     pub cmd_failed: Histogram,
+    pub cmd_discarded: Histogram,
     pub cmd_limit_bump: Histogram,
     pub cmd_readmit: Histogram,
     pub cmd_waiters_release: Histogram,
@@ -1014,21 +1023,23 @@ pub struct RegHandles {
     pub merges_superseded: Counter,
     pub merge_chunks: Counter,
     pub merge_chunk: Histogram,
-    pub merge_discard_chunks: Counter,
+    pub merge_discards: Counter,
+    pub merge_discards_pending: Gauge,
+    pub staging_held: Gauge,
 }
 
 impl RegHandles {
     fn build() -> Self {
         use names::{
-            CACHE_MERGE_CHUNK_SECONDS, CACHE_MERGE_CHUNKS, CACHE_MERGE_DISCARD_CHUNKS,
-            CACHE_MERGE_HEAD_AGE_SECONDS, CACHE_MERGE_PENDING_DEPTH, CACHE_MERGE_WAIT_SECONDS,
-            CACHE_MERGES_APPLIED, CACHE_MERGES_SUPERSEDED, CACHE_POPULATION_BACKSTOP_GROWS,
-            CACHE_POPULATION_SCALE_DOWN, CACHE_POPULATION_SCALE_UP,
-            CACHE_POPULATION_STREAM_SECONDS, CACHE_POPULATION_TASK_SECONDS,
-            CACHE_POPULATION_WAIT_SECONDS, CACHE_POPULATION_WORKERS,
-            CACHE_SUBSUMPTION_LATENCY_SECONDS, CACHE_SUBSUMPTION_WAIT_FALLBACKS,
-            CACHE_SUBSUMPTION_WAITS, CACHE_SUBSUMPTIONS, CACHE_SUBSUMPTIONS_JOIN,
-            CACHE_SUBSUMPTIONS_SPLIT, CACHE_WRITER_COMMAND_HANDLE_SECONDS,
+            CACHE_MERGE_CHUNK_SECONDS, CACHE_MERGE_CHUNKS, CACHE_MERGE_DISCARDS,
+            CACHE_MERGE_DISCARDS_PENDING, CACHE_MERGE_HEAD_AGE_SECONDS, CACHE_MERGE_PENDING_DEPTH,
+            CACHE_MERGE_WAIT_SECONDS, CACHE_MERGES_APPLIED, CACHE_MERGES_SUPERSEDED,
+            CACHE_POPULATION_BACKSTOP_GROWS, CACHE_POPULATION_SCALE_DOWN,
+            CACHE_POPULATION_SCALE_UP, CACHE_POPULATION_STREAM_SECONDS,
+            CACHE_POPULATION_TASK_SECONDS, CACHE_POPULATION_WAIT_SECONDS, CACHE_POPULATION_WORKERS,
+            CACHE_STAGING_HELD, CACHE_SUBSUMPTION_LATENCY_SECONDS,
+            CACHE_SUBSUMPTION_WAIT_FALLBACKS, CACHE_SUBSUMPTION_WAITS, CACHE_SUBSUMPTIONS,
+            CACHE_SUBSUMPTIONS_JOIN, CACHE_SUBSUMPTIONS_SPLIT, CACHE_WRITER_COMMAND_HANDLE_SECONDS,
             CACHE_WRITER_REGISTER_BIND_SECONDS, CACHE_WRITER_REGISTER_INSERT_SECONDS,
             CACHE_WRITER_REGISTER_POPULATE_DISPATCH_SECONDS,
             CACHE_WRITER_REGISTER_PUBLICATION_UPDATE_SECONDS,
@@ -1042,6 +1053,7 @@ impl RegHandles {
             cmd_register: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "register"),
             cmd_ready: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "ready"),
             cmd_failed: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "failed"),
+            cmd_discarded: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "discarded"),
             cmd_limit_bump: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "limit_bump"),
             cmd_readmit: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "readmit"),
             cmd_waiters_release: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "waiters_release"),
@@ -1086,7 +1098,9 @@ impl RegHandles {
             merges_superseded: metrics::counter!(CACHE_MERGES_SUPERSEDED),
             merge_chunks: metrics::counter!(CACHE_MERGE_CHUNKS),
             merge_chunk: metrics::histogram!(CACHE_MERGE_CHUNK_SECONDS),
-            merge_discard_chunks: metrics::counter!(CACHE_MERGE_DISCARD_CHUNKS),
+            merge_discards: metrics::counter!(CACHE_MERGE_DISCARDS),
+            merge_discards_pending: metrics::gauge!(CACHE_MERGE_DISCARDS_PENDING),
+            staging_held: metrics::gauge!(CACHE_STAGING_HELD),
         }
     }
 }

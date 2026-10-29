@@ -3,16 +3,12 @@
 
 use std::time::{Duration, Instant};
 
-use ecow::EcoString;
-
 use super::{
-    ChunkBoundary, ChunkWindow, DrainCursor, DrainTarget, FilterCache, KeyScope, MergeInProgress,
+    ChunkBoundary, ChunkWindow, DrainCursor, FilterCache, KeyScope, MergeInProgress,
     StaleProbeCache,
 };
-use crate::cache::Generation;
+use crate::cache::messages::PopulationMerge;
 use crate::cache::writer::staging::PopulationKey;
-use crate::oid::Oid;
-use crate::query::Fingerprint;
 
 /// Heap blocks drained per merge chunk on a merge's first chunk; adapted
 /// afterwards so each chunk lands near `MERGE_CHUNK_TARGET`. Chunks are page
@@ -48,19 +44,14 @@ impl DrainCursor {
 }
 
 impl MergeInProgress {
-    pub(super) fn new(
-        fingerprint: Fingerprint,
-        generation: Generation,
-        staged: Vec<(Oid, EcoString)>,
-        target: DrainTarget,
-        boundary: ChunkBoundary,
-    ) -> Self {
+    pub(super) fn new(merge: PopulationMerge, boundary: ChunkBoundary) -> Self {
+        let staged = merge.staged.clone();
         let cursor = DrainCursor::first(staged.len());
         Self {
-            fingerprint,
-            generation,
+            fingerprint: merge.fingerprint,
+            generation: merge.generation,
             staged,
-            target,
+            merge,
             cursor,
             chunk_blocks: fault_merge_chunk_blocks().unwrap_or(MERGE_CHUNK_BLOCKS_INITIAL),
             boundary,
@@ -179,12 +170,17 @@ fn fault_merge_chunk_blocks() -> Option<u32> {
 #[cfg(test)]
 mod tests {
 
-    use super::*;
-    use crate::cache::messages::PopulationMerge;
-    use crate::cache::writer::staging::{EventStamp, PopulationDeletedKeys};
     use std::sync::Arc;
 
+    use ecow::EcoString;
+
+    use super::*;
+    use crate::cache::Generation;
+    use crate::cache::writer::merge_queue::merge_fixture;
+    use crate::cache::writer::staging::{EventStamp, PopulationDeletedKeys};
+    use crate::oid::Oid;
     use crate::pg::{Lsn, OriginSnapshot};
+    use crate::query::Fingerprint;
 
     const REL: Oid = Oid::from_raw(10);
     const POPULATION: PopulationKey = (Fingerprint::from_raw(1), Generation::from_raw(1));
@@ -197,13 +193,12 @@ mod tests {
     }
 
     fn drain() -> MergeInProgress {
-        MergeInProgress::new(
-            Fingerprint::from_raw(1),
-            Generation::from_raw(1),
+        let merge = merge_fixture(
+            POPULATION.0,
+            POPULATION.1,
             vec![(REL, EcoString::from("stage_10_0"))],
-            DrainTarget::Discard,
-            ChunkBoundary::default(),
-        )
+        );
+        MergeInProgress::new(merge, ChunkBoundary::default())
     }
 
     fn scope(keys: &PopulationDeletedKeys) -> KeyScope<'_> {
@@ -339,24 +334,8 @@ mod tests {
 
     #[test]
     fn test_chunk_blocks_adapt_targets_chunk_time_within_clamps() {
-        let merge = PopulationMerge {
-            fingerprint: Fingerprint::from_raw(1),
-            generation: Generation::from_raw(1),
-            staged: vec![],
-            cached_bytes: 0,
-            row_count: 0,
-            snapshot: Arc::new(OriginSnapshot::new(0, 0, vec![])),
-            snapshot_lsn: Lsn::from_raw(0),
-            enqueued_at: Instant::now(),
-            fetch_stage_ms: 0.0,
-        };
-        let mut m = MergeInProgress::new(
-            merge.fingerprint,
-            merge.generation,
-            merge.staged.clone(),
-            DrainTarget::Apply(merge),
-            ChunkBoundary::default(),
-        );
+        let merge = merge_fixture(Fingerprint::from_raw(1), Generation::from_raw(1), vec![]);
+        let mut m = MergeInProgress::new(merge, ChunkBoundary::default());
         assert_eq!(m.chunk_blocks, MERGE_CHUNK_BLOCKS_INITIAL);
         m.chunk_blocks_adapt(MERGE_CHUNK_TARGET / 2);
         assert_eq!(m.chunk_blocks, MERGE_CHUNK_BLOCKS_INITIAL * 2);

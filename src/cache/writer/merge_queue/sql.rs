@@ -100,32 +100,6 @@ impl MergePlan {
     }
 }
 
-/// One discard chunk: delete every staging row in heap blocks `[lo, hi)`.
-/// Same window shape as an apply chunk, so it is complete under any plan.
-pub(super) fn discard_sql(statement: ChunkStatement<'_>) -> String {
-    let ChunkStatement {
-        staging,
-        lo_block,
-        hi_block,
-        ..
-    } = statement;
-    format!(
-        "DELETE FROM pgcache_stage.{staging} \
-         WHERE ctid >= '({lo_block},0)'::tid AND ctid < '({hi_block},0)'::tid"
-    )
-}
-
-/// Read a discard statement's row count from its command tag.
-pub(super) fn discard_result_parse(messages: &[SimpleQueryMessage]) -> u64 {
-    messages
-        .iter()
-        .find_map(|m| match m {
-            SimpleQueryMessage::CommandComplete(rows) => Some(*rows),
-            SimpleQueryMessage::Row(_) | SimpleQueryMessage::RowDescription(_) | _ => None,
-        })
-        .unwrap_or(0)
-}
-
 /// Read a chunk statement's row count.
 pub(super) fn chunk_result_parse(messages: &[SimpleQueryMessage]) -> CacheResult<u64> {
     messages
@@ -197,15 +171,6 @@ mod tests {
         assert!(
             !sql.contains("BEGIN"),
             "explicit BEGIN would strand an aborted txn: {sql}"
-        );
-    }
-
-    #[test]
-    fn test_discard_sql_is_the_same_page_window_without_the_insert() {
-        let sql = discard_sql(statement("stage_1_0", Generation::from_raw(0), 3, 67));
-        assert_eq!(
-            sql,
-            "DELETE FROM pgcache_stage.stage_1_0 WHERE ctid >= '(3,0)'::tid AND ctid < '(67,0)'::tid"
         );
     }
 
