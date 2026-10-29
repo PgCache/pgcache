@@ -696,8 +696,10 @@ impl CacheDispatch {
         }
 
         let mut entry = self.state_view.cached_queries.get_mut(&fingerprint)?;
-        // An existing entry never consults the registration budget.
-        let guarded = serve_decide(Some(&EntrySnapshot::from(&*entry)), input, || false);
+        // The caller's decision already took the token a readmission needs
+        // (and the other transitions need none): the guarded re-decide must
+        // not forward on an empty bucket, or a readmit would loop and drain it.
+        let guarded = serve_decide(Some(&EntrySnapshot::from(&*entry)), input, || true);
         if std::mem::discriminant(&guarded) != std::mem::discriminant(&decision) {
             return None;
         }

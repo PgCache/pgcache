@@ -138,9 +138,11 @@ impl ServeDecision {
 }
 
 /// Decide how to serve a request against `entry`. `registration_budget` is
-/// consulted only for a cold fingerprint that would register; the runtime
-/// backs it with the new-registration token bucket (taking a token is the
-/// act of registering), offline replay with `|| true`.
+/// consulted for a cold fingerprint that would register and for a readmission
+/// (PGC-554: readmissions are most of the population demand under a write
+/// mix, so they draw on the same budget); the runtime backs it with the
+/// registration token bucket (taking a token is the act of populating),
+/// offline replay with `|| true`.
 pub fn serve_decide(
     entry: Option<&EntrySnapshot>,
     input: &DecisionInput,
@@ -216,7 +218,13 @@ pub fn serve_decide(
         CachedQueryState::Invalidated if input.throttled => {
             ServeDecision::Forward(ForwardReason::Throttled)
         }
-        // Fast readmission: skip the admission gate.
+        // A readmission is a population like any other and takes a token;
+        // denied, the entry stays Invalidated and the next read retries
+        // (PGC-554). Pinned queries readmit inside the writer, not here.
+        CachedQueryState::Invalidated if !registration_budget() => {
+            ServeDecision::Forward(ForwardReason::RegistrationRateLimited)
+        }
+        // Fast readmission: skip the hit-count admission gate.
         CachedQueryState::Invalidated => ServeDecision::Register {
             transition: Transition {
                 expected: from,
@@ -447,11 +455,27 @@ mod tests {
     }
 
     #[test]
+    fn test_invalidated_readmit_takes_a_token() {
+        let invalidated = state(CachedQueryState::Invalidated);
+        assert_eq!(
+            serve_decide(Some(&invalidated), &input(), || false),
+            ServeDecision::Forward(ForwardReason::RegistrationRateLimited),
+            "denied: forward, entry untouched"
+        );
+        assert!(matches!(
+            serve_decide(Some(&invalidated), &input(), || true),
+            ServeDecision::Register {
+                action: AdmitAction::Admit,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn test_budget_not_consulted_for_existing_entries() {
         for entry in [
             ready(None),
             state(CachedQueryState::Loading),
-            state(CachedQueryState::Invalidated),
             state(CachedQueryState::Pending {
                 hit_count: 1,
                 credit: 0,
