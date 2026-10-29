@@ -32,6 +32,8 @@ pub(crate) struct MetricsSnapshot {
     pub cache_subsumptions: u64,
     /// Subsumptions that needed an in-set column split to cover (PGC-494).
     pub cache_subsumptions_split: u64,
+    /// Subsumptions served by a cached join of the same shape (PGC-417).
+    pub cache_subsumptions_join: u64,
     pub cache_invalidations: u64,
     pub cache_readmissions: u64,
     pub cache_readmission_subsumptions: u64,
@@ -168,6 +170,7 @@ const SAMPLES: &[Sample] = samples! {
     "pgcache_queries_allowlist_skipped" => queries_allowlist_skipped,
     "pgcache_cache_subsumptions" => cache_subsumptions,
     "pgcache_cache_subsumptions_split" => cache_subsumptions_split,
+    "pgcache_cache_subsumptions_join" => cache_subsumptions_join,
     "pgcache_cache_invalidations" => cache_invalidations,
     "pgcache_cache_readmissions" => cache_readmissions,
     "pgcache_cache_readmission_subsumptions" => cache_readmission_subsumptions,

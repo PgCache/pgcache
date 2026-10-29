@@ -30,6 +30,15 @@ Examples:
 - **OR predicates**: Constraint extraction treats these as opaque
 - **Inequality constraints in cached query**: Implication checking (e.g. `id > 10` implies `id > 5`) not yet implemented
 
+### Same-Shape Join Parents
+
+A join's references are never exact, so a cached join offers no table of itself as a parent and a join child could only be covered table by table. A cached join is instead a parent of the whole join (PGC-417): its population loaded every FROM row of its join shape that passed its WHERE, so a query of the same shape whose WHERE implies the parent's finds every FROM row it needs among them. Serving the child over the shared tables then returns exactly origin's result, by the argument every parent rests on: a row the cache assembles from real rows is a FROM row origin has.
+
+* **Shape**: one SELECT over two or more base tables with no subquery, CTE or set operation, hashed over its FROM clause with tables as relation oids and columns as (slot, position), so aliases, the WHERE, the projection, grouping and ordering are not part of it. The join types and ON clauses are, literals included: a `b.x = 1` in the child's ON and the same in the parent's WHERE describe the same filters on `b` but not the same NULL-padded rows.
+* **Region**: the parent's WHERE as single-column constraints, each keyed by its slot, and nothing from ON. A parent whose WHERE the model can't read as such constraints (an OR, a column equality, a merged column under a FULL join) loaded rows no region describes and is no parent. The child's probe is the same projection of its WHERE; a conjunct it can't read only narrows it.
+* **Implication**: the child's constraints must contain the parent's column by column, as `table_ranges_subsumed` decides for a table. Both sides are evaluated on the same FROM row, NULL padding included, so a `WHERE b.x IS NULL` on the nullable side is covered by `b.x IS NULL` alone, and the per-reference `filters`, which fold ON-derived constraints in, are not used.
+* A join's LIMIT caps no population (ADR-060), so a limited join still parents. Per-shape indexes hold the parents; the join cover is tried before the per-reference one.
+
 ### Per-Reference Checking
 
 The subsumption check is per table reference, not across the full constraint set. Every base-table reference of the new query, in every branch (root, subqueries, derived tables, CTE bodies), must be covered by some candidate region on its relation, compared against that reference's own `filters`. This prevents false positives where one reference is covered but another isn't: a join of a covered and an uncovered table, or a self-join whose second reference needs rows the first's parent never loaded.
@@ -60,6 +69,7 @@ If the cache DB execution fails (e.g. table dropped by concurrent eviction), sub
 - **Per-reference exactness** rather than single-table candidates: population loads a reference's part of every FROM row that passes WHERE, so a reference no join can drop rows from, and that WHERE filters only through its own constraints, holds exactly what its filters describe. Join selectivity is never reasoned about
 - **Equality-only v1** covers the highest-value cases (multi-tenant filtering, reference tables) while keeping the logic simple and provably correct. Inequality subsumption can be added later with pairwise implication checks
 - **Reusing generation stamping** avoids duplicating data — the rows are already in the cache table, they just need their generation updated
+- **Whole-join parents over join-aware references**: reasoning about which rows of a joined table a parent loaded would need join selectivity; comparing two queries of one FROM clause needs only their WHEREs. The shape key keeps the comparison to queries whose FROM rows are the same set
 
 ## Consequences
 
@@ -72,13 +82,15 @@ If the cache DB execution fails (e.g. table dropped by concurrent eviction), sub
 ### Negative
 - Every first-miss now waits for the writer to process registration and check subsumption before being forwarded to origin (if not subsumed). This adds a few milliseconds to the non-subsumed path, small relative to a typical origin round-trip
 - Equality-only checking misses range-narrowing opportunities (e.g. `id > 10` implying `id > 5`)
-- Inner-joined tables are never candidates, even when a foreign key guarantees every row a partner
+- Inner-joined tables are never candidates for a single-table child, even when a foreign key guarantees every row a partner; a join child is covered only by a join of exactly its shape
+- A second index, per join shape, is maintained beside the per-relation ones
 
 ## Implementation Notes
-- Subsumption check: `subsumption_check()` and `query_subsume()` in `src/cache/writer/subsumption.rs`; the check also runs on readmission of an invalidated query (`query_readmit`), which stamps through the same `subsumed_ready_mark()` tail instead of repopulating (PGC-532)
+- Subsumption check: `subsumption_check()` and `query_subsume()` in `src/cache/writer/subsumption.rs`; the check also runs on readmission of an invalidated query (`query_readmit`), which stamps through the same `subsumed_ready_mark()` tail instead of repopulating (PGC-532). The check runs while the entry is still flagged invalidated, so the readiness gate never takes the query for its own parent; a pinned query is flagged at invalidation too, ahead of its deferred readmit, so no query registering in between is covered by its stale rows
 - Constraint comparison: `table_constraints_subsumed()` in `src/query/constraints/subsume.rs`; regions and references from `src/cache/admission/` over the predicate model (ADR-059)
+- Join shape and region: `query_join_region()` in `src/query/join_region.rs`; the per-shape parents in `src/cache/join_subsumers.rs`, maintained with the update queries
 - Coordinator flow: `subsumption_await()` in `src/cache/query_cache.rs`
 - Message types: `SubsumptionResult`, `AdmitAction` in `src/cache/messages.rs`
-- Metrics: `pgcache.cache.subsumptions` counter, `pgcache.cache.subsumption_latency_seconds` histogram in `src/metrics.rs`
+- Metrics: `pgcache.cache.subsumptions` counter, `pgcache.cache.subsumption_latency_seconds` histogram in `src/metrics.rs`; `pgcache.cache.subsumptions_split` and `pgcache.cache.subsumptions_join` count the covers by split and by join shape
 - Per-query metric: `subsumption_count` on `QueryMetrics` in `src/cache/types.rs`
 - Worked example: [docs/walkthroughs/subsumption-index.md](../docs/walkthroughs/subsumption-index.md)

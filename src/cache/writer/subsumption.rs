@@ -22,14 +22,25 @@ use crate::cache::{CacheError, CacheResult, MapIntoReport};
 use crate::query::Fingerprint;
 use crate::query::constraint_index::table_constraints_keyed;
 use crate::query::constraints::TableRanges;
+use crate::query::join_region::{JoinRegion, query_join_region};
 use crate::query::resolve::ResolvedQuery;
 use crate::result::error_chain_format;
 use crate::timing::duration_to_ns_u64;
 
-/// Candidate source over the writer's per-relation subsumption index plus
-/// parent readiness state.
+/// Candidate source over the writer's per-relation and per-shape
+/// subsumption indexes plus parent readiness state.
 struct WriterSubsumerSource<'a> {
     cache: &'a Cache,
+}
+
+impl WriterSubsumerSource<'_> {
+    /// The parent is Ready: populated, not invalidated.
+    fn parent_ready(&self, fingerprint: Fingerprint) -> bool {
+        self.cache
+            .cached_queries
+            .get1(&fingerprint)
+            .is_some_and(|q| !q.invalidated && q.registration_started_at.is_none())
+    }
 }
 
 impl SubsumerSource for WriterSubsumerSource<'_> {
@@ -58,25 +69,35 @@ impl SubsumerSource for WriterSubsumerSource<'_> {
                     .filter_map(move |key| {
                         let region = update_queries.subsumer_region(key)?;
                         let fingerprint = key.fingerprint;
-                        let parent = self.cache.cached_queries.get1(&fingerprint);
                         Some(SubsumerCandidate {
                             region: &region.ranges,
                             has_limit: update_queries
                                 .queries_of(fingerprint)
                                 .iter()
                                 .any(|update_query| update_query.has_limit),
-                            ready: parent.is_some_and(|q| {
-                                !q.invalidated && q.registration_started_at.is_none()
-                            }),
+                            ready: self.parent_ready(fingerprint),
                         })
                     })
+            })
+    }
+
+    fn join_candidates(&self, join: &JoinRegion) -> impl Iterator<Item = SubsumerCandidate<'_>> {
+        let keyed = join.keyed_ranges(&self.cache.tables);
+        self.cache
+            .join_subsumers
+            .candidates(join.shape, &keyed)
+            .map(|(fingerprint, candidate)| SubsumerCandidate {
+                region: candidate.region,
+                has_limit: candidate.has_limit,
+                ready: self.parent_ready(fingerprint),
             })
     }
 }
 
 impl WriterRegistration {
-    /// Whether every table reference of `bound` is covered by the regions of
-    /// Ready, LIMIT-free cached queries on its relation, and how.
+    /// Whether `bound` is covered by a Ready, LIMIT-free cached join of its
+    /// shape, or every table reference of it by the regions of such queries
+    /// on its relation, and how.
     pub(super) fn subsumption_check(
         &self,
         core: &WriterCore,
@@ -85,7 +106,12 @@ impl WriterRegistration {
         // A set operation is covered when every arm is (PGC-495).
         // A query without base references has none to cover and yields `None`.
         let references = subsumption_references(bound)?;
-        subsumption_covered(&references, &WriterSubsumerSource { cache: &core.cache })
+        let join = query_join_region(bound);
+        subsumption_covered(
+            &references,
+            join.as_ref(),
+            &WriterSubsumerSource { cache: &core.cache },
+        )
     }
 
     /// Handle a subsumed new query: insert its entry, then stamp its rows and
@@ -195,8 +221,10 @@ pub(super) async fn subsumed_ready_mark(
 
     let reg = &crate::metrics::handles().reg;
     reg.subsumptions.increment(1);
-    if cover == SubsumptionCover::Split {
-        reg.subsumptions_split.increment(1);
+    match cover {
+        SubsumptionCover::Whole => {}
+        SubsumptionCover::Split => reg.subsumptions_split.increment(1),
+        SubsumptionCover::Join => reg.subsumptions_join.increment(1),
     }
     reg.subsumption_latency
         .record(subsume_start.elapsed().as_secs_f64());

@@ -18,8 +18,9 @@ use crate::oid::Oid;
 use crate::query::Fingerprint;
 use crate::timing::{duration_to_ns_u64, duration_to_us_u64};
 
-/// Set the `has_limit` bit on the query's update queries, re-deriving what
-/// depends on it there. Limited queries are ineligible subsumption parents.
+/// Set the `has_limit` bit on the query's update queries and its join
+/// parent entry, re-deriving what depends on it there. Limited queries are
+/// ineligible subsumption parents.
 fn update_queries_limit_set(
     core: &mut WriterCore,
     fingerprint: Fingerprint,
@@ -31,6 +32,9 @@ fn update_queries_limit_set(
             queries.has_limit_set(fingerprint, has_limit);
         }
     }
+    core.cache
+        .join_subsumers
+        .has_limit_set(fingerprint, has_limit);
 }
 
 impl WriterRegistration {

@@ -12,6 +12,7 @@ use iddqd::{BiHashItem, BiHashMap, IdHashMap, bi_upcast};
 use rootcause::Report;
 
 use super::generation::Generation;
+use super::join_subsumers::JoinSubsumers;
 use super::population_pool::PopulationPool;
 use super::privileges::PrivilegeVerdicts;
 use super::reg_gate::RegGate;
@@ -151,6 +152,9 @@ impl BiHashItem for CachedQuery {
 pub struct Cache {
     pub tables: Catalog,
     pub update_queries: IdHashMap<UpdateQueries>,
+    /// The same-shape join parents, by shape over their WHERE regions
+    /// (PGC-417).
+    pub join_subsumers: JoinSubsumers,
     pub cached_queries: BiHashMap<CachedQuery>,
     /// Monotonically increasing generation counter (starts at 1)
     pub generation_counter: Generation,
@@ -165,6 +169,7 @@ impl Cache {
         Self {
             tables: BiHashMap::new(),
             update_queries: IdHashMap::new(),
+            join_subsumers: JoinSubsumers::default(),
             cached_queries: BiHashMap::new(),
             generation_counter: Generation::ZERO,
             generations: BTreeSet::new(),
@@ -189,16 +194,17 @@ impl Cache {
             .unwrap_or(self.generation_counter)
     }
 
-    /// Drop `fingerprint`'s entries from `update_queries` for each given OID.
-    /// No-op for OIDs without an `update_queries` entry. Also tears down the
-    /// subsumption index entry so the lookup path doesn't return a stale
-    /// candidate.
+    /// Drop `fingerprint`'s entries from `update_queries` for each given OID
+    /// and from the join parents. No-op for OIDs without an `update_queries`
+    /// entry. Also tears down the subsumption index entries so the lookup
+    /// path doesn't return a stale candidate.
     pub fn update_queries_remove_fingerprint(&mut self, fingerprint: Fingerprint, oids: &[Oid]) {
         for oid in oids {
             if let Some(mut queries) = self.update_queries.get_mut(*oid) {
                 queries.fingerprint_remove(fingerprint);
             }
         }
+        self.join_subsumers.fingerprint_remove(fingerprint);
     }
 }
 

@@ -31,6 +31,8 @@ mod fast_path;
 #[cfg(feature = "proxy")]
 mod generation;
 #[cfg(feature = "proxy")]
+mod join_subsumers;
+#[cfg(feature = "proxy")]
 pub(crate) mod memo;
 #[cfg(feature = "proxy")]
 pub(crate) mod messages;

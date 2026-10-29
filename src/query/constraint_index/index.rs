@@ -50,6 +50,10 @@ impl<K: IdHashable + Copy> ConstraintIndex<K> {
         Self::default()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.membership.is_empty()
+    }
+
     /// Index a query's ranges on a single table.
     ///
     /// Caller is responsible for skipping queries that should never be

@@ -1,9 +1,9 @@
 //! Offline subsumption registry. Admission gating and the coverage decision
 //! are the proxy's own (`pgcache_lib::cache::admission`); this module only
 //! stores admitted candidates per relation, one per exact reference as the
-//! writer does — indexed through the same `ConstraintIndex` (ADR-037) — and
-//! answers lookups with `ready` always true (infinite cache, nothing ever
-//! invalidates).
+//! writer does, and per join shape (PGC-417) — indexed through the same
+//! `ConstraintIndex` (ADR-037) — and answers lookups with `ready` always
+//! true (infinite cache, nothing ever invalidates).
 
 use std::collections::HashMap;
 
@@ -12,14 +12,24 @@ use pgcache_lib::cache::admission::{
     SubsumerCandidate, SubsumerSource, SubsumptionCover, SubsumptionReference, subsumption_covered,
 };
 use pgcache_lib::oid::Oid;
+use pgcache_lib::query::Fingerprint;
 use pgcache_lib::query::constraint_index::ConstraintIndex;
 use pgcache_lib::query::constraints::TableRanges;
+use pgcache_lib::query::join_region::{JoinRegion, JoinShape};
 
 use crate::classify::CacheableAnalysis;
 
 #[derive(Default)]
 pub struct SubsumerRegistry {
     by_relation: HashMap<Oid, RelationSubsumers>,
+    by_shape: HashMap<JoinShape, ShapeSubsumers>,
+}
+
+/// The join parents of one shape, over their WHERE regions.
+#[derive(Default)]
+struct ShapeSubsumers {
+    index: ConstraintIndex<Fingerprint>,
+    admitted: HashMap<Fingerprint, AdmittedSubsumer>,
 }
 
 struct RelationSubsumers {
@@ -48,10 +58,22 @@ impl SubsumerRegistry {
 
     /// Store the query's eligible per-table admissions as subsumption
     /// candidates, keyed like the writer's update queries: by fingerprint and
-    /// position among the query's references of the relation. Eligibility
-    /// was decided by the shared admission analysis; the remaining gates run
-    /// per lookup in `subsumption_covered`.
+    /// position among the query's references of the relation, and the query
+    /// itself as a parent of its join shape when its WHERE region is exact.
+    /// Eligibility was decided by the shared admission analysis; the
+    /// remaining gates run per lookup in `subsumption_covered`.
     pub fn subsumer_register(&mut self, analysis: &CacheableAnalysis) {
+        if let Some(region) = analysis.join_region.as_ref().filter(|region| region.exact) {
+            let shape = self.by_shape.entry(region.shape).or_default();
+            shape.index.insert(analysis.fingerprint, &region.ranges);
+            shape.admitted.insert(
+                analysis.fingerprint,
+                AdmittedSubsumer {
+                    region: region.ranges.clone(),
+                    has_limit: analysis.has_limit,
+                },
+            );
+        }
         let mut ordinals: HashMap<Oid, usize> = HashMap::new();
         for admission in &analysis.admissions {
             let ordinal = ordinals.entry(admission.relation_oid).or_default();
@@ -82,7 +104,11 @@ impl SubsumerRegistry {
     /// Whether every relation the query references is covered by registered
     /// subsumers, and how — the writer's `subsumption_check`, offline.
     pub fn query_cover(&self, analysis: &CacheableAnalysis) -> Option<SubsumptionCover> {
-        subsumption_covered(analysis.references.as_ref()?, self)
+        subsumption_covered(
+            analysis.references.as_ref()?,
+            analysis.join_region.as_ref(),
+            self,
+        )
     }
 
     #[cfg(test)]
@@ -108,6 +134,28 @@ impl SubsumerSource for SubsumerRegistry {
                         relation
                             .admitted
                             .get(&key)
+                            .map(|subsumer| SubsumerCandidate {
+                                region: &subsumer.region,
+                                has_limit: subsumer.has_limit,
+                                ready: true,
+                            })
+                    })
+            })
+    }
+
+    fn join_candidates(&self, join: &JoinRegion) -> impl Iterator<Item = SubsumerCandidate<'_>> {
+        self.by_shape
+            .get(&join.shape)
+            .into_iter()
+            .flat_map(move |shape| {
+                shape
+                    .index
+                    .candidates(&join.ranges)
+                    .into_iter()
+                    .filter_map(move |fingerprint| {
+                        shape
+                            .admitted
+                            .get(&fingerprint)
                             .map(|subsumer| SubsumerCandidate {
                                 region: &subsumer.region,
                                 has_limit: subsumer.has_limit,
@@ -321,6 +369,43 @@ mod tests {
         let mut registry = SubsumerRegistry::new();
         registry.subsumer_register(&analyses[0]);
         assert!(!registry.query_subsumed(&analyses[1]));
+    }
+
+    /// A cached join parents a join of its shape under a WHERE that implies
+    /// its own, whatever the join's references load (PGC-417); another
+    /// shape, a wider WHERE or a WHERE the model can't read whole is no
+    /// cover. A LIMIT on a join caps no population (ADR-060), so it still
+    /// parents.
+    #[test]
+    fn test_same_shape_join_parent_subsumes_narrower_where() {
+        let analyses = corpus_analyze(&[
+            "SELECT * FROM users u JOIN orders o ON u.id = o.user_id WHERE u.id > 0",
+            "SELECT * FROM users u JOIN orders o ON u.id = o.user_id WHERE u.id = 5 AND o.total = 1",
+            "SELECT * FROM users u JOIN orders o ON u.id = o.user_id WHERE o.total = 1",
+            "SELECT * FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE u.id = 5",
+            "SELECT * FROM users u JOIN orders o ON u.id = o.user_id WHERE u.id > 0 OR o.total = 1",
+            "SELECT * FROM users u JOIN orders o ON u.id = o.user_id WHERE u.id = 5",
+            "SELECT * FROM users u JOIN orders o ON u.id = o.user_id WHERE u.id > 0 LIMIT 10",
+        ]);
+        let mut registry = SubsumerRegistry::new();
+        registry.subsumer_register(&analyses[0]);
+        assert_eq!(
+            registry.query_cover(&analyses[1]),
+            Some(SubsumptionCover::Join)
+        );
+        assert!(!registry.query_subsumed(&analyses[2]), "wider WHERE");
+        assert!(!registry.query_subsumed(&analyses[3]), "another shape");
+
+        let mut registry = SubsumerRegistry::new();
+        registry.subsumer_register(&analyses[4]);
+        assert!(!registry.query_subsumed(&analyses[5]), "an OR is no parent");
+        let mut registry = SubsumerRegistry::new();
+        registry.subsumer_register(&analyses[6]);
+        assert!(!analyses[6].has_limit, "a join's LIMIT caps no population");
+        assert_eq!(
+            registry.query_cover(&analyses[5]),
+            Some(SubsumptionCover::Join)
+        );
     }
 
     #[test]

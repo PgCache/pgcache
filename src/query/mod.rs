@@ -7,6 +7,7 @@ pub mod decorrelate;
 pub mod evaluate;
 pub mod fingerprint;
 pub mod guc;
+pub mod join_region;
 pub mod keying_settings;
 pub mod literal_settings;
 pub mod predicates;

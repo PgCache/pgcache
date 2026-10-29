@@ -249,7 +249,8 @@ impl WriterRegistration {
     /// Run the pure admission analysis (decorrelation, per-table update
     /// queries, subsumer eligibility) and store the results: the update-query
     /// map plus the constraint indexes for sub-linear subsumption candidate
-    /// lookup. Returns the relation OIDs that have update queries registered.
+    /// lookup, and the query as a join parent when it can be one. Returns
+    /// the relation OIDs that have update queries registered.
     fn update_queries_register(
         &self,
         core: &mut WriterCore,
@@ -296,6 +297,14 @@ impl WriterRegistration {
                 .entry(relation_oid)
                 .or_insert_with(|| UpdateQueries::new(relation_oid))
                 .fingerprint_insert(fingerprint, group);
+        }
+        if let Some(region) = &analysis.join_region {
+            core.cache.join_subsumers.fingerprint_insert(
+                fingerprint,
+                region,
+                has_limit,
+                &core.cache.tables,
+            );
         }
         Ok(relation_oids)
     }

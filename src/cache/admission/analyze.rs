@@ -24,6 +24,7 @@ use crate::query::Fingerprint;
 use crate::query::ast::rope::{Body, NodeKind, QueryTree, TreeBuilder, View};
 use crate::query::compiled_predicate::CompiledPredicate;
 use crate::query::decorrelate::query_decorrelate;
+use crate::query::join_region::query_join_region;
 use crate::query::literal_settings::LiteralSettings;
 use crate::query::resolve::ResolveResult;
 use crate::query::resolve::{QueryBranch, ResolvedQuery};
@@ -208,9 +209,13 @@ pub fn query_admission_analyze(
         .into_iter()
         .map(|bound_update| context.table_admission_build(bound_update))
         .collect();
+    // A join with a region is one SELECT with no subquery, so nothing was
+    // decorrelated and the registered form is the one population loads.
+    let join_region = query_join_region(query.bound).filter(|region| region.exact);
     Ok(AdmissionAnalysis {
         transformed: query.decorrelated.is_some(),
         tables: admissions,
+        join_region,
     })
 }
 
@@ -383,6 +388,7 @@ mod tests {
     use crate::catalog::{ColumnMetadata, ColumnPosition, TableMetadata};
     use crate::oid::TypeOid;
     use crate::query::constraints::{TableRanges, table_constraints_subsumed};
+    use crate::query::join_region::JoinRegion;
 
     fn catalog() -> Catalog {
         let int_column = |name: &str, position: i16| ColumnMetadata {
@@ -676,6 +682,13 @@ mod tests {
                     ready: true,
                 })
         }
+
+        fn join_candidates(
+            &self,
+            _join: &JoinRegion,
+        ) -> impl Iterator<Item = SubsumerCandidate<'_>> {
+            std::iter::empty()
+        }
     }
 
     /// Whether the exact references of `cached` cover every reference of
@@ -697,7 +710,40 @@ mod tests {
         let tables = catalog();
         let bound = ResolvedQuery::parse_resolve(new, &tables, &["public"]).expect("resolve");
         let references = subsumption_references(&bound).expect("references");
-        subsumption_covered(&references, &parents).is_some()
+        subsumption_covered(&references, None, &parents).is_some()
+    }
+
+    /// Only one SELECT over several base tables whose WHERE the model
+    /// reads whole parents a join of its shape.
+    #[test]
+    fn test_join_region_parent_gate() {
+        let cases = [
+            ("SELECT * FROM a JOIN b ON b.id = a.id WHERE a.x = 1", true),
+            (
+                "SELECT * FROM a LEFT JOIN b ON b.id = a.id WHERE b.x IS NULL",
+                true,
+            ),
+            (
+                "SELECT * FROM a JOIN b ON b.id = a.id WHERE a.x = 1 OR a.y = 2",
+                false,
+            ),
+            (
+                "SELECT * FROM a JOIN b ON b.id = a.id WHERE a.x = b.y",
+                false,
+            ),
+            ("SELECT * FROM a WHERE x = 1", false),
+            (
+                "SELECT * FROM a JOIN b ON b.id = a.id WHERE EXISTS (SELECT 1 FROM c WHERE c.id = a.id)",
+                false,
+            ),
+        ];
+        for (sql, parent) in cases {
+            assert_eq!(
+                admission_analysis(sql).join_region.is_some(),
+                parent,
+                "{sql}"
+            );
+        }
     }
 
     /// Each exact reference of a relation parents a child under it on its

@@ -19,8 +19,11 @@ mod util;
 
 const JOIN: &str = "select b.id, a.name, b.title from authors a \
                     join books b on b.author_id = a.id where a.id <= 10 order by b.id";
+// The `b.id > 0` in the ON gives this join a shape of its own, so the
+// cached JOIN does not subsume it and its registration populates.
 const JOIN_AUTHOR_2: &str = "select b.id, a.name, b.title from authors a \
-                             join books b on b.author_id = a.id where a.id = 2 order by b.id";
+                             join books b on b.author_id = a.id and b.id > 0 \
+                             where a.id = 2 order by b.id";
 
 const LAG: Duration = Duration::from_millis(1500);
 const LAG_ENV: (&str, &str) = ("PGCACHE_FAULT_CDC_APPLY_LAG_MS", "1500");
@@ -80,11 +83,19 @@ async fn converged_assert(ctx: &mut TestContext, queries: &[&str]) -> Result<(),
 /// catalog entry, so every read must match origin, whether it was served
 /// from cache or forwarded.
 async fn lag_window_reads_assert(ctx: &mut TestContext, query: &str) -> Result<(), Error> {
+    let m = ctx.metrics().await?;
     let window_end = Instant::now() + LAG / 4 * 3;
     while Instant::now() < window_end {
         assert_proxy_rows_match_origin(ctx, query).await?;
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    // The scenario is a population under the dropped table's metadata; a
+    // cover from the lagging parent would skip it.
+    let delta = metrics_delta(&m, &ctx.metrics().await?);
+    assert_eq!(
+        delta.cache_subsumptions, 0,
+        "{query} populated, not covered"
+    );
     Ok(())
 }
 

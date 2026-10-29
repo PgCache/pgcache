@@ -12,6 +12,7 @@ use crate::query::constraints::{
     ColumnConstraintKind, TableConstraint, TableRanges, literal_value_canonical_order,
     table_ranges_subsumed,
 };
+use crate::query::join_region::JoinRegion;
 use crate::query::resolve::ResolvedQuery;
 use crate::query::update::query_base_references;
 
@@ -68,19 +69,28 @@ pub enum SubsumptionCover {
     /// Some reference was covered value by value: split on its in-set
     /// columns, each piece held by a parent of its own (PGC-494).
     Split,
+    /// The whole join held by a cached join of the same shape whose WHERE
+    /// the new query's implies (PGC-417).
+    Join,
 }
 
-/// Whether every reference of the new query is covered on its relation:
-/// by one registered candidate whose region holds every row the reference's
+/// Whether the new query is covered: as a whole by a parent of its join
+/// shape whose WHERE region holds every FROM row its own WHERE admits
+/// ([`join_covered`]), else reference by reference on each relation, by
+/// one registered candidate whose region holds every row the reference's
 /// filters admit, or, failing that, piece by piece once the reference is
 /// split on its in-set columns ([`reference_covered_split`]). Candidate
 /// gates: no LIMIT, parent Ready. An empty list is never covered.
 pub fn subsumption_covered(
     references: &[SubsumptionReference],
+    join: Option<&JoinRegion>,
     source: &impl SubsumerSource,
 ) -> Option<SubsumptionCover> {
     if references.is_empty() {
         return None;
+    }
+    if join.is_some_and(|join| join_covered(join, source)) {
+        return Some(SubsumptionCover::Join);
     }
     let mut cover = SubsumptionCover::Whole;
     for reference in references {
@@ -97,13 +107,30 @@ pub fn subsumption_covered(
 
 /// Whether one candidate on the reference's relation holds its whole region.
 fn reference_covered(reference: &SubsumptionReference, source: &impl SubsumerSource) -> bool {
-    source.candidates(reference).any(|candidate| {
+    candidate_holds(source.candidates(reference), &reference.ranges)
+}
+
+/// Whether one parent of the join's shape holds every FROM row its WHERE
+/// admits: the parent loaded every FROM row of the shape passing its own
+/// WHERE, and the new query's WHERE constraints imply that WHERE column by
+/// column, each column keyed by its slot, so a NULL-padded row answers like
+/// any other. A row the cache assembles from the parent's rows is a FROM
+/// row origin has, so serving the new query over them returns its result.
+fn join_covered(join: &JoinRegion, source: &impl SubsumerSource) -> bool {
+    candidate_holds(source.join_candidates(join), &join.ranges)
+}
+
+fn candidate_holds<'a>(
+    mut candidates: impl Iterator<Item = SubsumerCandidate<'a>>,
+    ranges: &TableRanges,
+) -> bool {
+    candidates.any(|candidate| {
         let SubsumerCandidate {
             region,
             has_limit,
             ready,
         } = candidate;
-        !has_limit && ready && table_ranges_subsumed(&reference.ranges, region)
+        !has_limit && ready && table_ranges_subsumed(ranges, region)
     })
 }
 

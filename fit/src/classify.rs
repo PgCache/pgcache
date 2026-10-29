@@ -17,6 +17,7 @@ use pgcache_lib::oid::Oid;
 use pgcache_lib::query::ast::rope::QueryTree;
 use pgcache_lib::query::ast::{AstError, RawStatement, WhereParseError, statement_convert_raw};
 use pgcache_lib::query::constraints::TableRanges;
+use pgcache_lib::query::join_region::{JoinRegion, query_join_region};
 use pgcache_lib::query::literal_settings::LiteralSettings;
 use pgcache_lib::query::transform::query_tree_parameters_replace;
 use pgcache_lib::query::write::{TransactionBoundary, WriteClass};
@@ -110,6 +111,7 @@ pub enum PassthroughReason {
     SchemaQualifiedFunction,
     HasLimit,
     SystemCatalogReference,
+    SessionTerm,
     ResolutionFailed,
     DecorrelationFailed,
 }
@@ -127,6 +129,7 @@ impl PassthroughReason {
             PassthroughReason::SchemaQualifiedFunction => "schema-qualified function",
             PassthroughReason::HasLimit => "LIMIT not cacheable here",
             PassthroughReason::SystemCatalogReference => "system catalog reference",
+            PassthroughReason::SessionTerm => "session-dependent term",
             PassthroughReason::ResolutionFailed => "column or table couldn't be resolved",
             PassthroughReason::DecorrelationFailed => "subquery can't be rewritten as a join",
         }
@@ -163,6 +166,9 @@ fn cacheability_reason(error: &CacheabilityError) -> (PassthroughReason, Option<
             PassthroughReason::SystemCatalogReference,
             Some(relation.to_string()),
         ),
+        CacheabilityError::SessionTerm { term } => {
+            (PassthroughReason::SessionTerm, Some(term.to_string()))
+        }
     }
 }
 
@@ -216,6 +222,10 @@ pub struct CacheableAnalysis {
     /// form with their filters, one per reference of every branch — the
     /// subsumed-side input; `None` when a table is no branch's reference.
     pub references: Option<Vec<SubsumptionReference>>,
+    /// The query's join shape and WHERE region when it is one SELECT over
+    /// several base tables: the probe against same-shape parents, and the
+    /// parent's own registration when `exact` (PGC-417).
+    pub join_region: Option<JoinRegion>,
     /// One entry per admitted update query (the subsumer side).
     pub admissions: Vec<FitAdmission>,
 }
@@ -368,6 +378,12 @@ pub fn statement_classify(
     // The subsumed side analyzes the original (pre-decorrelation) resolved
     // form, like the writer's subsumption_check.
     let references = subsumption_references(&bound);
+    let join_region = query_join_region(&bound);
+    debug_assert_eq!(
+        analysis.join_region.is_some(),
+        join_region.as_ref().is_some_and(|region| region.exact),
+        "the admission's join parent is the exact join region"
+    );
 
     Verdict::Cacheable(Box::new(CacheableAnalysis {
         fingerprint,
@@ -377,6 +393,7 @@ pub fn statement_classify(
         rows_needed: limit_rows_needed(&limit_clause_of(cacheable.tree().root())),
         max_limit,
         references,
+        join_region,
         admissions,
     }))
 }

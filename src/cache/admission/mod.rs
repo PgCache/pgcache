@@ -10,6 +10,7 @@ use ecow::EcoString;
 use super::update_query::UpdateQuery;
 use crate::oid::Oid;
 use crate::query::constraints::TableRanges;
+use crate::query::join_region::JoinRegion;
 
 mod analyze;
 mod subsume;
@@ -48,6 +49,12 @@ pub struct AdmissionAnalysis {
     /// Whether decorrelation transformed the query.
     pub transformed: bool,
     pub tables: Vec<TableAdmission>,
+    /// The query's join region when it can parent a join of its shape: one
+    /// SELECT over several base tables whose WHERE the model read whole, so
+    /// population loaded exactly the region (PGC-417). The index gates on
+    /// `has_limit` like a table's, though a join's population is never
+    /// capped (ADR-060), so today a limited join parents too.
+    pub join_region: Option<JoinRegion>,
 }
 
 /// One registered subsumption candidate as seen at lookup time.
@@ -60,12 +67,16 @@ pub struct SubsumerCandidate<'a> {
     pub ready: bool,
 }
 
-/// Source of subsumption candidates for one relation. The writer implements
-/// this over the per-relation subsumption `ConstraintIndex` plus parent
-/// state; pgcache-fit over its offline registry.
+/// Source of subsumption candidates: per relation, and per join shape. The
+/// writer implements this over its subsumption `ConstraintIndex`es plus
+/// parent state; pgcache-fit over its offline registry.
 pub trait SubsumerSource {
     fn candidates(
         &self,
         reference: &SubsumptionReference,
     ) -> impl Iterator<Item = SubsumerCandidate<'_>>;
+
+    /// The parents of `join`'s shape whose region might hold its rows; the
+    /// region is over the join's WHERE constraints keyed by slot.
+    fn join_candidates(&self, join: &JoinRegion) -> impl Iterator<Item = SubsumerCandidate<'_>>;
 }

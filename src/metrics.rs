@@ -168,6 +168,9 @@ pub mod names {
     /// Subsumptions that covered a reference value by value, split on its
     /// in-set columns (PGC-494).
     pub const CACHE_SUBSUMPTIONS_SPLIT: &str = "pgcache.cache.subsumptions_split";
+    /// Subsumptions served by a cached join of the same shape under a wider
+    /// WHERE (PGC-417).
+    pub const CACHE_SUBSUMPTIONS_JOIN: &str = "pgcache.cache.subsumptions_join";
     pub const CACHE_SUBSUMPTION_LATENCY_SECONDS: &str = "pgcache.cache.subsumption_latency_seconds";
 
     // Materialized result metrics
@@ -976,6 +979,7 @@ pub struct RegHandles {
     pub resolve_deparse: Histogram,
     pub subsumptions: Counter,
     pub subsumptions_split: Counter,
+    pub subsumptions_join: Counter,
     pub subsumption_latency: Histogram,
     pub registration_latency: Histogram,
     pub population_task: Histogram,
@@ -1001,9 +1005,10 @@ impl RegHandles {
             CACHE_POPULATION_BACKSTOP_GROWS, CACHE_POPULATION_SCALE_DOWN,
             CACHE_POPULATION_SCALE_UP, CACHE_POPULATION_STREAM_SECONDS,
             CACHE_POPULATION_TASK_SECONDS, CACHE_POPULATION_WAIT_SECONDS, CACHE_POPULATION_WORKERS,
-            CACHE_SUBSUMPTION_LATENCY_SECONDS, CACHE_SUBSUMPTIONS, CACHE_SUBSUMPTIONS_SPLIT,
-            CACHE_WRITER_COMMAND_HANDLE_SECONDS, CACHE_WRITER_REGISTER_BIND_SECONDS,
-            CACHE_WRITER_REGISTER_INSERT_SECONDS, CACHE_WRITER_REGISTER_POPULATE_DISPATCH_SECONDS,
+            CACHE_SUBSUMPTION_LATENCY_SECONDS, CACHE_SUBSUMPTIONS, CACHE_SUBSUMPTIONS_JOIN,
+            CACHE_SUBSUMPTIONS_SPLIT, CACHE_WRITER_COMMAND_HANDLE_SECONDS,
+            CACHE_WRITER_REGISTER_BIND_SECONDS, CACHE_WRITER_REGISTER_INSERT_SECONDS,
+            CACHE_WRITER_REGISTER_POPULATE_DISPATCH_SECONDS,
             CACHE_WRITER_REGISTER_PUBLICATION_UPDATE_SECONDS,
             CACHE_WRITER_REGISTER_RESOLVE_SECONDS, CACHE_WRITER_REGISTER_SUBSUME_SECONDS,
             CACHE_WRITER_REGISTER_SUBSUMPTION_CHECK_SECONDS, CACHE_WRITER_RESOLVE_DEPARSE_SECONDS,
@@ -1039,6 +1044,7 @@ impl RegHandles {
             resolve_deparse: metrics::histogram!(CACHE_WRITER_RESOLVE_DEPARSE_SECONDS),
             subsumptions: metrics::counter!(CACHE_SUBSUMPTIONS),
             subsumptions_split: metrics::counter!(CACHE_SUBSUMPTIONS_SPLIT),
+            subsumptions_join: metrics::counter!(CACHE_SUBSUMPTIONS_JOIN),
             subsumption_latency: metrics::histogram!(CACHE_SUBSUMPTION_LATENCY_SECONDS),
             registration_latency: metrics::histogram!(QUERY_REGISTRATION_LATENCY_SECONDS),
             population_task: metrics::histogram!(CACHE_POPULATION_TASK_SECONDS),

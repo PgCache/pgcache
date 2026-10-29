@@ -51,6 +51,8 @@ pub struct HitrateStats {
     /// Subsumption hits that covered a reference value by value, split on
     /// its in-set columns (PGC-494).
     pub subsumption_split_hits: u64,
+    /// Subsumption hits served by a cached join of the same shape (PGC-417).
+    pub subsumption_join_hits: u64,
     /// Admitted fingerprints that had to populate from origin.
     pub cold_misses: u64,
     /// Repeats asking for more rows than the cached window: a miss plus
@@ -168,8 +170,10 @@ pub fn hitrate_replay(items: &[AnalyzedStatement], config: ReplayConfig) -> Hitr
                     // ends up Ready becomes a subsumer itself.
                     if let Some(cover) = registry.query_cover(analysis) {
                         stats.subsumption_hits += 1;
-                        if cover == SubsumptionCover::Split {
-                            stats.subsumption_split_hits += 1;
+                        match cover {
+                            SubsumptionCover::Whole => {}
+                            SubsumptionCover::Split => stats.subsumption_split_hits += 1,
+                            SubsumptionCover::Join => stats.subsumption_join_hits += 1,
                         }
                         entries
                             .insert(fingerprint, claimed.population_complete(analysis.max_limit));

@@ -466,12 +466,18 @@ impl WriterCore {
         // under churn (waiting on it risks the same hang as the unpinned path).
         // A pinned invalidation is a real event (it queues a readmit), so it
         // counts — unlike the already-invalidated re-flag below.
-        if self
+        let pinned = self
             .cache
             .cached_queries
-            .get1(&fingerprint)
-            .is_some_and(|q| q.pinned)
-        {
+            .get1_mut(fingerprint)
+            .filter(|q| q.pinned)
+            .map(|mut query| {
+                // Not Ready until the readmit: a subsumption check in between
+                // must not take its stale rows for a parent's.
+                query.invalidated = true;
+            })
+            .is_some();
+        if pinned {
             debug!("pinned query invalidated, deferring readmit {fingerprint}");
             let _ = self.query_tx.send(QueryCommand::Readmit { fingerprint });
             self.waiters_fail(fingerprint);

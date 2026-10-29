@@ -1,8 +1,8 @@
 use std::io::Error;
 
 use crate::util::{
-    TestContext, assert_cache_hit, assert_cache_miss, assert_not_subsumed, assert_row_at,
-    assert_subsume_hit, metrics_delta,
+    MetricsSnapshot, TestContext, assert_cache_hit, assert_cache_miss, assert_not_subsumed,
+    assert_row_at, assert_subsume_hit, metrics_delta, origin_change_invalidates,
 };
 
 mod util;
@@ -185,53 +185,372 @@ async fn test_subsumption_inequality_subsumed() -> Result<(), Error> {
     Ok(())
 }
 
-/// Test that a cached JOIN query does NOT subsume, even with same tables and
-/// additional WHERE constraints. Multi-table cached queries are excluded from
-/// subsumption candidates because join conditions act as implicit filters.
+/// Assert that the last query was subsumed by a cached join of the same
+/// shape (PGC-417).
+async fn assert_join_subsume_hit(
+    ctx: &mut TestContext,
+    before: MetricsSnapshot,
+) -> Result<MetricsSnapshot, Error> {
+    let after = assert_subsume_hit(ctx, before.clone()).await?;
+    let delta = metrics_delta(&before, &after);
+    assert_eq!(delta.cache_subsumptions_join, 1, "expected a join cover");
+    Ok(after)
+}
+
+/// Orders and customers for the same-shape join tests: orders 1 and 3 are
+/// alice's, order 2 bob's; order 1 is pending.
+async fn setup_join_shape_tables(ctx: &mut TestContext) -> Result<(), Error> {
+    ctx.query(
+        "CREATE TABLE sj_orders (id integer PRIMARY KEY, customer_id integer, status text)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "CREATE TABLE sj_customers (id integer PRIMARY KEY, name text)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO sj_orders VALUES (1, 1, 'pending'), (2, 2, 'active'), (3, 1, 'active')",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO sj_customers VALUES (1, 'alice'), (2, 'bob')",
+        &[],
+    )
+    .await?;
+    ctx.cdc_decode_settle().await?;
+    Ok(())
+}
+
+const SJ_JOIN: &str =
+    "SELECT o.id, c.name FROM sj_orders o JOIN sj_customers c ON o.customer_id = c.id";
+
+/// A cached join subsumes the same join under a narrower WHERE (PGC-417):
+/// the parent loaded every FROM row of the shape, so the child's rows are
+/// there. A change that shrinks the child applies in place; one that grows
+/// it invalidates and repopulates.
 #[tokio::test]
-async fn test_subsumption_join_not_subsumed() -> Result<(), Error> {
+async fn test_subsumption_same_shape_join_subsumed() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
+    setup_join_shape_tables(&mut ctx).await?;
 
-    ctx.query(
-        "CREATE TABLE test_sub_orders (id integer PRIMARY KEY, customer_id integer, status text)",
-        &[],
-    )
-    .await?;
-    ctx.query(
-        "CREATE TABLE test_sub_customers (id integer PRIMARY KEY, name text)",
-        &[],
-    )
-    .await?;
-    ctx.query(
-        "INSERT INTO test_sub_orders VALUES (1, 1, 'pending'), (2, 2, 'active')",
-        &[],
-    )
-    .await?;
-    ctx.query(
-        "INSERT INTO test_sub_customers VALUES (1, 'alice'), (2, 'bob')",
-        &[],
+    let m = ctx.metrics().await?;
+    ctx.simple_query(SJ_JOIN).await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    let child = format!("{SJ_JOIN} WHERE o.status = 'pending' ORDER BY o.id");
+    let (proxied, origin) = ctx.proxy_and_origin_rows(&child).await?;
+    assert_eq!(origin.len(), 1, "one pending order");
+    assert_eq!(proxied, origin, "subsumed child");
+    let m = assert_join_subsume_hit(&mut ctx, m).await?;
+
+    ctx.origin_query("UPDATE sj_orders SET status = 'active' WHERE id = 1", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+    let (proxied, origin) = ctx.proxy_and_origin_rows(&child).await?;
+    assert!(origin.is_empty(), "no pending order after the update");
+    assert_eq!(proxied, origin, "child after the shrinking update");
+    let m = assert_cache_hit(&mut ctx, m).await?;
+
+    origin_change_invalidates(
+        &mut ctx,
+        m,
+        "INSERT INTO sj_orders VALUES (4, 2, 'pending')",
+        &child,
     )
     .await?;
 
-    // Cache the JOIN query
+    Ok(())
+}
+
+/// A range and an IN list under a wider range parent are covered, as on a
+/// single table.
+#[tokio::test]
+async fn test_subsumption_same_shape_join_narrower_range_subsumed() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_join_shape_tables(&mut ctx).await?;
+
+    let m = ctx.metrics().await?;
+    ctx.simple_query(&format!("{SJ_JOIN} WHERE o.customer_id > 0"))
+        .await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    let child =
+        format!("{SJ_JOIN} WHERE o.customer_id > 1 AND c.name IN ('bob', 'carol') ORDER BY o.id");
+    let (proxied, origin) = ctx.proxy_and_origin_rows(&child).await?;
+    assert_eq!(origin.len(), 1, "bob's order");
+    assert_eq!(proxied, origin, "subsumed child");
+    let _m = assert_join_subsume_hit(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+/// A same-shape parent covers only a WHERE that implies its own: another
+/// value, or no constraint on the parent's column, is not covered.
+#[tokio::test]
+async fn test_subsumption_same_shape_join_wider_where_not_subsumed() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_join_shape_tables(&mut ctx).await?;
+
+    let m = ctx.metrics().await?;
+    ctx.simple_query(&format!("{SJ_JOIN} WHERE o.status = 'pending'"))
+        .await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    for (child, expected) in [
+        (
+            format!("{SJ_JOIN} WHERE o.status = 'active' ORDER BY o.id"),
+            2,
+        ),
+        (format!("{SJ_JOIN} WHERE c.name = 'alice' ORDER BY o.id"), 2),
+    ] {
+        let (proxied, origin) = ctx.proxy_and_origin_rows(&child).await?;
+        assert_eq!(origin.len(), expected, "{child}");
+        assert_eq!(proxied, origin, "{child}");
+        assert_not_subsumed(&mut ctx, m.clone()).await?;
+        ctx.cache_settle().await?;
+    }
+
+    Ok(())
+}
+
+/// The shape carries the join type and the ON clause, literals included:
+/// a join that differs in either is no child of the parent.
+#[tokio::test]
+async fn test_subsumption_join_shape_differs_not_subsumed() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_join_shape_tables(&mut ctx).await?;
+
     let m = ctx.metrics().await?;
     ctx.simple_query(
-        "SELECT o.id, c.name FROM test_sub_orders o \
-         JOIN test_sub_customers c ON o.customer_id = c.id",
+        "SELECT o.id, c.name FROM sj_orders o JOIN sj_customers c \
+         ON o.customer_id = c.id AND o.id > 0",
     )
     .await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
-
     ctx.cache_settle().await?;
 
-    // Same JOIN with additional WHERE — not subsumed (multi-table cached query)
-    ctx.simple_query(
-        "SELECT o.id, c.name FROM test_sub_orders o \
-         JOIN test_sub_customers c ON o.customer_id = c.id \
-         WHERE o.status = 'pending'",
+    for child in [
+        "SELECT o.id, c.name FROM sj_orders o JOIN sj_customers c \
+         ON o.customer_id = c.id AND o.id > 1 WHERE o.status = 'active' ORDER BY o.id",
+        "SELECT o.id, c.name FROM sj_orders o LEFT JOIN sj_customers c \
+         ON o.customer_id = c.id AND o.id > 0 WHERE o.status = 'active' ORDER BY o.id",
+        "SELECT o.id, c.name FROM sj_customers c JOIN sj_orders o \
+         ON o.customer_id = c.id AND o.id > 0 WHERE o.status = 'active' ORDER BY o.id",
+    ] {
+        let (proxied, origin) = ctx.proxy_and_origin_rows(child).await?;
+        assert_eq!(origin.len(), 2, "{child}");
+        assert_eq!(proxied, origin, "{child}");
+        assert_not_subsumed(&mut ctx, m.clone()).await?;
+        ctx.cache_settle().await?;
+    }
+
+    Ok(())
+}
+
+/// A self-join's WHERE constraints are kept apart by reference position: a
+/// constraint the parent put on one reference does not cover the same
+/// constraint on the other.
+#[tokio::test]
+async fn test_subsumption_same_shape_self_join_covered_by_position() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE sj_emp (id integer PRIMARY KEY, name text, manager_id integer, dept text)",
+        &[],
     )
     .await?;
+    ctx.query(
+        "INSERT INTO sj_emp VALUES (1, 'ceo', NULL, 'exec'), (2, 'alice', 1, 'x'), \
+         (3, 'bob', 1, 'x'), (4, 'carl', 2, 'x')",
+        &[],
+    )
+    .await?;
+    ctx.cdc_decode_settle().await?;
+
+    const JOIN: &str = "SELECT e.id FROM sj_emp e JOIN sj_emp m ON m.id = e.manager_id";
+    let m = ctx.metrics().await?;
+    ctx.simple_query(&format!("{JOIN} WHERE e.dept = 'x'"))
+        .await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    let child = format!("{JOIN} WHERE e.dept = 'x' AND m.dept = 'exec' ORDER BY e.id");
+    let (proxied, origin) = ctx.proxy_and_origin_rows(&child).await?;
+    assert_eq!(origin.len(), 2, "alice and bob report to the ceo");
+    assert_eq!(proxied, origin, "subsumed child");
+    let m = assert_join_subsume_hit(&mut ctx, m).await?;
+
+    let other = format!("{JOIN} WHERE m.dept = 'x' ORDER BY e.id");
+    let (proxied, origin) = ctx.proxy_and_origin_rows(&other).await?;
+    assert_eq!(origin.len(), 1, "carl reports to alice");
+    assert_eq!(proxied, origin, "the other reference's constraint");
     let _m = assert_not_subsumed(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+/// A join whose WHERE the model can't read as single-column constraints
+/// loaded rows no region describes, so it parents nothing.
+#[tokio::test]
+async fn test_subsumption_join_parent_opaque_where_not_parent() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_join_shape_tables(&mut ctx).await?;
+
+    let m = ctx.metrics().await?;
+    ctx.simple_query(&format!(
+        "{SJ_JOIN} WHERE o.status = 'pending' OR c.name = 'bob'"
+    ))
+    .await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    let child = format!("{SJ_JOIN} WHERE o.status = 'pending' AND c.name = 'bob' ORDER BY o.id");
+    let (proxied, origin) = ctx.proxy_and_origin_rows(&child).await?;
+    assert!(origin.is_empty(), "no pending order of bob's");
+    assert_eq!(proxied, origin, "{child}");
+    let _m = assert_not_subsumed(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+/// A WHERE on the nullable side of a LEFT JOIN is part of the parent's
+/// region like any other: a child repeating it is covered, one without it
+/// reads NULL-padded rows the parent never loaded. The same constraint in a
+/// child's ON instead of its WHERE is another shape, so it is not covered
+/// either, though the child's filters on the table would match.
+#[tokio::test]
+async fn test_subsumption_same_shape_left_join_nullable_where() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE sj_users (id integer PRIMARY KEY, name text)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "CREATE TABLE sj_user_orders (id integer PRIMARY KEY, user_id integer, total integer)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO sj_users VALUES (1, 'a'), (2, 'a'), (3, 'b')",
+        &[],
+    )
+    .await?;
+    ctx.query("INSERT INTO sj_user_orders VALUES (10, 1, 5)", &[])
+        .await?;
+    ctx.cdc_decode_settle().await?;
+
+    const LEFT: &str =
+        "SELECT u.id, o.total FROM sj_users u LEFT JOIN sj_user_orders o ON o.user_id = u.id";
+    let m = ctx.metrics().await?;
+    ctx.simple_query(&format!("{LEFT} WHERE o.total IS NULL"))
+        .await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    let child = format!("{LEFT} WHERE o.total IS NULL AND u.name = 'a' ORDER BY u.id");
+    let (proxied, origin) = ctx.proxy_and_origin_rows(&child).await?;
+    assert_eq!(origin.len(), 1, "user 2 has no order");
+    assert_eq!(proxied, origin, "subsumed child");
+    let m = assert_join_subsume_hit(&mut ctx, m).await?;
+
+    let wider = format!("{LEFT} WHERE u.name = 'b' ORDER BY u.id");
+    let (proxied, origin) = ctx.proxy_and_origin_rows(&wider).await?;
+    assert_eq!(origin.len(), 1, "user 3, NULL-padded");
+    assert_eq!(proxied, origin, "{wider}");
+    let m = assert_not_subsumed(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    ctx.simple_query(&format!("{LEFT} WHERE o.total = 5"))
+        .await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    let on_child = "SELECT u.id, o.total FROM sj_users u LEFT JOIN sj_user_orders o \
+                    ON o.user_id = u.id AND o.total = 5 WHERE u.name = 'a' ORDER BY u.id";
+    let (proxied, origin) = ctx.proxy_and_origin_rows(on_child).await?;
+    assert_eq!(origin.len(), 2, "both 'a' users, user 2 NULL-padded");
+    assert_eq!(proxied, origin, "{on_child}");
+    let _m = assert_not_subsumed(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+/// A LIMIT on a join caps no population (ADR-060): the join loads every
+/// FROM row of its shape and parents like an unlimited one.
+#[tokio::test]
+async fn test_subsumption_join_limit_parent_still_parents() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_join_shape_tables(&mut ctx).await?;
+
+    let m = ctx.metrics().await?;
+    ctx.simple_query(&format!("{SJ_JOIN} ORDER BY o.id LIMIT 2"))
+        .await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    let child = format!("{SJ_JOIN} WHERE o.status = 'active' ORDER BY o.id");
+    let (proxied, origin) = ctx.proxy_and_origin_rows(&child).await?;
+    assert_eq!(origin.len(), 2, "{child}");
+    assert_eq!(proxied, origin, "{child}");
+    let _m = assert_join_subsume_hit(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+/// A growing change invalidates a join and its same-shape children alike;
+/// once the parent has repopulated, a child is readmitted from it without
+/// a population of its own (PGC-532). Under CLOCK an invalidated entry
+/// stays for readmission.
+#[tokio::test]
+async fn test_subsumption_join_readmitted_from_same_shape_parent() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_clock(1).await?;
+    setup_join_shape_tables(&mut ctx).await?;
+
+    let parent = format!("{SJ_JOIN} WHERE o.customer_id > 0 ORDER BY o.id");
+    let m = ctx.metrics().await?;
+    ctx.simple_query(&parent).await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    let child = format!("{SJ_JOIN} WHERE o.customer_id > 0 AND o.status = 'pending' ORDER BY o.id");
+    let (proxied, origin) = ctx.proxy_and_origin_rows(&child).await?;
+    assert_eq!(origin.len(), 1, "{child}");
+    assert_eq!(proxied, origin, "subsumed child");
+    let m = assert_join_subsume_hit(&mut ctx, m).await?;
+
+    let before = m.clone();
+    origin_change_invalidates(
+        &mut ctx,
+        m,
+        "INSERT INTO sj_orders VALUES (4, 2, 'pending')",
+        &parent,
+    )
+    .await?;
+
+    let m = ctx.metrics().await?;
+    let delta = metrics_delta(&before, &m);
+    assert_eq!(delta.cache_invalidations, 2, "parent and child invalidated");
+    assert_eq!(delta.cache_readmissions, 1, "the parent repopulated");
+    let (proxied, origin) = ctx.proxy_and_origin_rows(&child).await?;
+    assert_eq!(origin.len(), 2, "{child}");
+    assert_eq!(proxied, origin, "readmitted child");
+    let after = ctx.metrics_after_outcomes(&m, 1).await?;
+    let delta = metrics_delta(&m, &after);
+    assert_eq!(delta.queries_cache_hit, 1, "served from the cache");
+    assert_eq!(delta.cache_readmissions, 1, "the child readmitted");
+    assert_eq!(
+        delta.cache_readmission_subsumptions, 1,
+        "readmitted from the parent"
+    );
+    assert_eq!(delta.cache_subsumptions_join, 1, "by its join shape");
 
     Ok(())
 }

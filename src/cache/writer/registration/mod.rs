@@ -447,6 +447,7 @@ impl WriterRegistration {
                 for mut entry in core.cache.update_queries.iter_mut() {
                     entry.fingerprint_remove(fingerprint);
                 }
+                core.cache.join_subsumers.fingerprint_remove(fingerprint);
             }
         }
 

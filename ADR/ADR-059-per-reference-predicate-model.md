@@ -81,6 +81,7 @@ Every SELECT branch is described by a `QueryBranchPredicates` (`query/predicates
 * Consumers:
   * `cache/admission/analyze.rs` (update queries, subsumer regions);
   * `cache/admission/subsume.rs` (new-query references);
+  * `query/join_region.rs` (a single-branch join's WHERE constraints by slot, the same-shape subsumption parent and probe of ADR-024);
   * `query/update.rs` (sources from roles);
   * `cache/writer/core.rs` (read-after-write ranges, derived once at Ready publish).
 * `constraints/` holds the constraint vocabulary (`Constraint<C>` with its `ColumnConstraintKind`, keyed by binding in the model and by name for consumers) and the range algebra.

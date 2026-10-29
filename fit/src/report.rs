@@ -689,6 +689,9 @@ pub fn hitrate_report_render(report: &HitrateReport) -> String {
     if stats.subsumption_split_hits > 0 {
         let _ = writeln!(out, "    split on IN     {}", stats.subsumption_split_hits);
     }
+    if stats.subsumption_join_hits > 0 {
+        let _ = writeln!(out, "    same-shape join {}", stats.subsumption_join_hits);
+    }
     let _ = writeln!(out, "  cold misses       {}", stats.cold_misses);
     if stats.limit_bumps > 0 {
         let _ = writeln!(out, "  limit bumps       {}", stats.limit_bumps);
