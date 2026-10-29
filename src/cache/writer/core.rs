@@ -16,7 +16,7 @@ use super::merge_queue::{MergeQueue, StagingDiscard};
 use super::mv_build::MvBuildPool;
 use super::privileges::roles_digest_read;
 use super::rls::RlsCatalog;
-use super::staging::{PopulationDeletedKeys, PopulationKey, StagingPool};
+use super::staging::{PopulationDeletedKeys, PopulationKey, SharedStagingPool};
 use crate::cache::Generation;
 use crate::cache::reference_settings;
 use crate::cache::{
@@ -257,9 +257,10 @@ pub(super) struct WriterCore {
     /// `frame_cache_delete`, consulted/cleared at merge.
     pub(super) population_deleted_keys: PopulationDeletedKeys,
     /// Per-relation pool of reusable population staging tables (PGC-293):
-    /// checked out at dispatch, returned (emptied + vacuumed) at merge, so a
-    /// population emits no DDL.
-    pub(super) staging_pool: StagingPool,
+    /// checked out by the worker that picks a population up, returned
+    /// (emptied) at merge or discard, so a population emits no DDL. Shared
+    /// with the population workers (PGC-554).
+    pub(super) staging_pool: SharedStagingPool,
     /// Population merges and staging discards: the gated queue, the one drain
     /// in progress, and the gate's bookkeeping (PGC-272 / PGC-418).
     pub(super) merges: MergeQueue,
@@ -494,6 +495,7 @@ impl WriterCore {
         shared: WriterShared,
         query_tx: UnboundedSender<QueryCommand>,
         discard_tx: UnboundedSender<StagingDiscard>,
+        staging_pool: SharedStagingPool,
     ) -> CacheResult<Self> {
         let (cache_client, origin_client, disk) = writer_resources_open(settings).await?;
         let roles_digest = if settings.role_poll_interval.is_zero() {
@@ -550,7 +552,7 @@ impl WriterCore {
             frame_chunk_flushed: false,
             frame_buf_relations: HashSet::new(),
             population_deleted_keys: PopulationDeletedKeys::default(),
-            staging_pool: StagingPool::default(),
+            staging_pool,
             merges: MergeQueue::new(watermark_nudge),
             last_received_lsn: Lsn::from_raw(0),
             last_applied_lsn: Lsn::from_raw(0),

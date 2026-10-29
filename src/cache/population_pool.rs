@@ -27,6 +27,9 @@ pub struct PopulationPool {
     /// minimum loses to regime changes (ADR-052).
     task_us: AtomicU64,
     task_count: AtomicU64,
+    /// Recent mean task time in microseconds (EWMA, α = 1/8), for the wait a
+    /// new arrival should expect behind the queue (PGC-554).
+    task_ewma_us: AtomicU64,
     /// Monotonic sum of queue wait, in microseconds, and its count. The
     /// controller scales up only when the recent mean wait breaches its
     /// target, so an idle pool never grows.
@@ -66,11 +69,24 @@ pub struct PopulationPool {
     pending_connects: AtomicUsize,
 }
 
+/// Queue wait for the next arrival, `depth × task / workers`. A pool with no
+/// live worker is treated as one, so the estimate stays finite while the
+/// reconcile respawns.
+fn expected_wait_micros(queue_depth: usize, live_workers: usize, task_us: u64) -> u64 {
+    let depth = u64::try_from(queue_depth).unwrap_or(u64::MAX);
+    let workers = u64::try_from(live_workers.max(1)).unwrap_or(u64::MAX);
+    depth
+        .saturating_mul(task_us)
+        .checked_div(workers)
+        .unwrap_or(0)
+}
+
 impl PopulationPool {
     pub fn new(initial_workers: usize) -> Self {
         Self {
             task_us: AtomicU64::new(0),
             task_count: AtomicU64::new(0),
+            task_ewma_us: AtomicU64::new(0),
             wait_us: AtomicU64::new(0),
             wait_count: AtomicU64::new(0),
             desired_workers: AtomicUsize::new(initial_workers),
@@ -89,6 +105,29 @@ impl PopulationPool {
     pub fn task_observe(&self, micros: u64) {
         self.task_us.fetch_add(micros, Ordering::Relaxed);
         self.task_count.fetch_add(1, Ordering::Relaxed);
+        // Racy read-modify-write between workers only loses a sample's worth
+        // of smoothing; the estimate is advisory.
+        let prev = self.task_ewma_us.load(Ordering::Relaxed);
+        let next = if prev == 0 {
+            micros
+        } else {
+            prev - prev / 8 + micros / 8
+        };
+        self.task_ewma_us.store(next, Ordering::Relaxed);
+    }
+
+    /// The wait a population dispatched now should expect before a worker
+    /// picks it up: its turn behind the queue at the pool's recent service
+    /// rate (PGC-554). Little's law on the pool's own counters; zero on an
+    /// empty queue. The task's own duration is not congestion and is left
+    /// out: counting it would pin any query that lived less than one
+    /// population to forwarding, idle box or not.
+    pub fn expected_wait(&self) -> Duration {
+        Duration::from_micros(expected_wait_micros(
+            self.queue_depth(),
+            self.live_workers(),
+            self.task_ewma_us.load(Ordering::Relaxed),
+        ))
     }
 
     pub fn wait_observe(&self, micros: u64) {
@@ -370,5 +409,38 @@ mod tests {
         pool.task_observe(1_000);
         pool.wait_observe(250);
         assert_eq!(pool.counters(), (1_000, 1, 250, 1));
+    }
+
+    #[test]
+    fn test_expected_wait_is_the_queue_at_the_pools_rate() {
+        assert_eq!(
+            expected_wait_micros(0, 4, 300_000),
+            0,
+            "empty queue: no wait"
+        );
+        assert_eq!(expected_wait_micros(40, 4, 300_000), 3_000_000);
+        assert_eq!(
+            expected_wait_micros(40, 0, 300_000),
+            12_000_000,
+            "no worker counts as one"
+        );
+        assert_eq!(
+            expected_wait_micros(10_000, 2, 0),
+            0,
+            "no completion yet: no estimate"
+        );
+    }
+
+    #[test]
+    fn test_expected_wait_follows_observed_tasks() {
+        let pool = PopulationPool::new(2);
+        assert_eq!(pool.expected_wait(), Duration::ZERO);
+        pool.task_observe(400_000);
+        assert_eq!(pool.expected_wait(), Duration::ZERO, "empty queue: no wait");
+        pool.worker_reserve();
+        pool.pending_connect_done();
+        pool.queue_depth_set(10);
+        // 10 queued / 1 live × 400 ms (the first sample seeds the mean).
+        assert_eq!(pool.expected_wait(), Duration::from_millis(4_000));
     }
 }

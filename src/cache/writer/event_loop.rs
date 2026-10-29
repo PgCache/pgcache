@@ -21,6 +21,7 @@ use super::core::{WriterCore, WriterShared};
 use super::frame::FrameState;
 use super::merge_queue::InputQueues;
 use super::registration::WriterRegistration;
+use super::staging::SharedStagingPool;
 use crate::cache::messages::{CdcCommand, QueryCommand};
 use crate::cache::status::StatusRequest;
 use crate::cache::{CacheError, CacheResult, MapIntoReport};
@@ -136,12 +137,22 @@ impl WriterLoop {
         let (query_tx, internal_rx) = tokio::sync::mpsc::unbounded_channel();
         // Staging the population workers empty for the writer (PGC-553).
         let (discard_tx, discard_rx) = tokio::sync::mpsc::unbounded_channel();
-        let core = WriterCore::new(settings, shared, query_tx.clone(), discard_tx).await?;
+        // Staging tables: checked out by the workers, returned by the writer.
+        let staging_pool: SharedStagingPool = Arc::default();
+        let core = WriterCore::new(
+            settings,
+            shared,
+            query_tx.clone(),
+            discard_tx,
+            Arc::clone(&staging_pool),
+        )
+        .await?;
         let registration = WriterRegistration::new(
             settings,
             &core.db_origin,
             query_tx,
             discard_rx,
+            staging_pool,
             Arc::clone(&core.state_view.registration_throttled),
             Arc::clone(&core.state_view.population_pool),
         )
@@ -245,7 +256,13 @@ impl WriterLoop {
         crate::metrics::handles()
             .reg
             .staging_held
-            .set(core.staging_pool.held_count() as f64);
+            .set(core.staging_pool().held_count() as f64);
+        crate::metrics::handles().reg.population_expected_wait.set(
+            core.state_view
+                .population_pool
+                .expected_wait()
+                .as_secs_f64(),
+        );
         core.disk_stats_refresh();
         core.stale_entries_cleanup();
         core.state_gauges_update();

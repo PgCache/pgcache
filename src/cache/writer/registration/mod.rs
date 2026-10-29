@@ -21,6 +21,7 @@ use super::merge_queue::StagingDiscard;
 use super::population::{
     PopulationSpawnContext, population_dispatcher, population_worker_connect, population_worker_run,
 };
+use super::staging::SharedStagingPool;
 use crate::cache::Generation;
 use crate::cache::messages::{QueryCommand, RegisterRequest, ResolveRequest, ResolveResult};
 use crate::cache::mv_shape::ShapeGate;
@@ -53,10 +54,11 @@ pub(crate) struct PopulationWork {
     pub population: SharedResolvedQuery,
     /// Maximum rows to fetch during population. `None` = fetch all rows.
     pub max_limit: Option<u64>,
-    /// Staging table per relation, checked out from the pool at dispatch
-    /// (PGC-293): `(relation_oid, table_name, needs_create)`. The worker loads
-    /// these instead of minting per-population names; `needs_create` is set only
-    /// for a freshly minted slot (the worker `CREATE … IF NOT EXISTS`es it).
+    /// Staging table per relation, checked out from the pool by the worker
+    /// that picks the item up (PGC-293, PGC-554): `(relation_oid, table_name,
+    /// needs_create)`. Empty while queued, so a long queue holds no tables;
+    /// `needs_create` is set only for a freshly minted slot (the worker
+    /// `CREATE … IF NOT EXISTS`es it).
     pub staging: Vec<(Oid, EcoString, bool)>,
     /// Stamped at construction; used by the population worker to record
     /// `pgcache.cache.population.wait_seconds`.
@@ -272,6 +274,7 @@ impl WriterRegistration {
         db_origin: &Rc<Client>,
         query_tx: UnboundedSender<QueryCommand>,
         discard_rx: UnboundedReceiver<StagingDiscard>,
+        staging_pool: SharedStagingPool,
         registration_throttled: Arc<AtomicBool>,
         pool: Arc<PopulationPool>,
     ) -> CacheResult<Self> {
@@ -300,6 +303,7 @@ impl WriterRegistration {
             query_tx,
             throttled: registration_throttled,
             pool,
+            staging_pool,
         };
 
         // Spawn the initial worker set, failing writer startup if any

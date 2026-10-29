@@ -14,7 +14,7 @@
 //! population over that relation is in flight; the merge filters those keys out.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use ecow::EcoString;
 use postgres_protocol::escape;
@@ -513,6 +513,12 @@ impl PopulationDeletedKeys {
     }
 }
 
+/// The staging pool shared by the writer (check-in, release, purge) and the
+/// population workers, which check tables out when they pick an item up
+/// (PGC-554): a queued population holds no table until a worker runs it, so a
+/// long queue mints nothing. Every hold on the lock is a map operation.
+pub(crate) type SharedStagingPool = Arc<Mutex<StagingPool>>;
+
 /// Per-relation pool of reusable population staging tables (PGC-293).
 ///
 /// Each population checks out one staging table per relation it reads — at
@@ -528,7 +534,7 @@ impl PopulationDeletedKeys {
 /// maps suffice (no locking). The `pgcache_stage` schema is dropped wholesale on
 /// a cache-database reset, which recreates `WriterCore` and hence this pool.
 #[derive(Default)]
-pub(super) struct StagingPool {
+pub(crate) struct StagingPool {
     /// Empty tables ready for reuse, per relation (bloat reclaimed by autovacuum).
     free: HashMap<Oid, Vec<EcoString>>,
     /// Next slot id per relation, for minting new table names.
@@ -553,7 +559,7 @@ impl StagingPool {
     /// (empty) table when one is available, else mints a new slot
     /// (`needs_create`). Returns `(relation, table, needs_create)` per relation
     /// for the work item.
-    pub(super) fn checkout(
+    pub(crate) fn checkout(
         &mut self,
         fingerprint: Fingerprint,
         generation: Generation,
@@ -668,6 +674,13 @@ pub(super) fn pk_body_render(
 }
 
 impl WriterCore {
+    /// The staging pool, briefly: never held across an await.
+    pub(super) fn staging_pool(&self) -> MutexGuard<'_, StagingPool> {
+        self.staging_pool
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// A CDC insert/update re-wrote the row at `row_data`'s PK — cancel any
     /// tracked deletion of that key (PGC-260): the frame-pending entry (an
     /// earlier delete in this frame nets out, in event order) and the recorded
@@ -759,10 +772,11 @@ impl WriterCore {
         generation: Generation,
         empty: bool,
     ) {
-        for (oid, staging, epoch) in self.staging_pool.take(fingerprint, generation) {
+        let holds = self.staging_pool().take(fingerprint, generation);
+        for (oid, staging, epoch) in holds {
             // A relation schema change since checkout makes this table's shape
             // stale (`epoch_current` false) — drop it rather than reuse it.
-            if !self.staging_pool.epoch_current(oid, epoch) {
+            if !self.staging_pool().epoch_current(oid, epoch) {
                 if let Err(e) = self
                     .db_cache
                     .batch_execute(&format!("DROP TABLE IF EXISTS pgcache_stage.{staging}"))
@@ -780,7 +794,7 @@ impl WriterCore {
             {
                 error!("staging checkin: emptying {staging}: {e}");
             }
-            self.staging_pool.release(oid, staging);
+            self.staging_pool().release(oid, staging);
         }
     }
 
@@ -792,7 +806,8 @@ impl WriterCore {
     /// (rare) schema-change path — which already recreates the cache table — so
     /// the drops don't reintroduce per-population DDL.
     pub(super) async fn staging_pool_relation_purge(&mut self, relation_oid: Oid) {
-        for staging in self.staging_pool.relation_epoch_bump(relation_oid) {
+        let stale = self.staging_pool().relation_epoch_bump(relation_oid);
+        for staging in stale {
             if let Err(e) = self
                 .db_cache
                 .batch_execute(&format!("DROP TABLE IF EXISTS pgcache_stage.{staging}"))

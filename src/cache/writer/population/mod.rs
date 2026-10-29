@@ -13,6 +13,7 @@ use tokio_postgres::Client;
 
 use super::PopulationWork;
 use super::merge_queue::StagingDiscard;
+use super::staging::SharedStagingPool;
 use crate::cache::messages::QueryCommand;
 use crate::cache::population_pool::PopulationPool;
 use crate::oid::Oid;
@@ -46,6 +47,9 @@ pub(super) struct PopulationSpawnContext {
     pub(super) query_tx: UnboundedSender<QueryCommand>,
     pub(super) throttled: Arc<AtomicBool>,
     pub(super) pool: Arc<PopulationPool>,
+    /// Workers check staging tables out here when they pick a population up
+    /// (PGC-554); the writer returns them.
+    pub(super) staging_pool: SharedStagingPool,
 }
 
 /// One population worker's connection pair: it reads from origin and writes

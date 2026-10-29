@@ -66,7 +66,7 @@ impl WriterCore {
         fingerprint: Fingerprint,
         generation: Generation,
     ) {
-        let staged = self.staging_pool.held(fingerprint, generation);
+        let staged = self.staging_pool().held(fingerprint, generation);
         if staged.is_empty() {
             return;
         }
@@ -79,7 +79,7 @@ impl WriterCore {
             // Shutdown: the workers are gone. The tables stay orphaned until
             // the next cache reset, like a dispatch failure.
             error!("staging discard channel closed; orphaning staging of {fingerprint}");
-            self.staging_pool.forget(fingerprint, generation);
+            self.staging_pool().forget(fingerprint, generation);
             return;
         }
         self.merges.discards_pending += 1;

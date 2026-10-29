@@ -18,13 +18,17 @@ use crate::oid::Oid;
 use crate::query::Fingerprint;
 use crate::timing::{duration_to_ns_u64, duration_to_us_u64};
 
-/// Whether a readmission is deferred (PGC-553): the merge queue's head has
-/// already waited longer than the query's last Ready period lasted, so a
-/// population started now is expected to be invalidated again before its
-/// merge lands and would only hold staging. A query never invalidated has no
-/// horizon and admits.
-pub(super) fn readmission_deferred(head_age: Duration, last_lifetime: Option<Duration>) -> bool {
-    last_lifetime.is_some_and(|lifetime| head_age > lifetime)
+/// Whether a readmission is deferred (PGC-553): the waiting a population
+/// started now is expected to do — behind the population queue and behind
+/// the merge queue's head — exceeds how long the query's last Ready period
+/// lasted, so it would be invalidated again before it landed and would only
+/// hold staging. Waiting, not the population itself: on an idle pipeline
+/// every query readmits. A query never invalidated has no horizon and admits.
+pub(super) fn readmission_deferred(
+    expected_wait: Duration,
+    last_lifetime: Option<Duration>,
+) -> bool {
+    last_lifetime.is_some_and(|lifetime| expected_wait > lifetime)
 }
 
 /// Set the `has_limit` bit on the query's update queries and its join
@@ -63,9 +67,12 @@ impl WriterRegistration {
             .get1(&fingerprint)
             .and_then(|cached| cached.last_lifetime);
         let head_age = core.merges.head_age();
-        if readmission_deferred(head_age, last_lifetime) {
+        let population_wait = core.state_view.population_pool.expected_wait();
+        let expected_wait = population_wait + head_age;
+        if readmission_deferred(expected_wait, last_lifetime) {
             debug!(
-                "readmission deferred: merge head {head_age:?} outwaits last lifetime \
+                "readmission deferred: expected wait {expected_wait:?} (population \
+                 {population_wait:?}, merge head {head_age:?}) outwaits last lifetime \
                  {last_lifetime:?} {fingerprint}"
             );
             crate::metrics::handles()
@@ -76,7 +83,8 @@ impl WriterRegistration {
             return Ok(SubsumptionResult::NotSubsumed);
         }
         debug!(
-            "readmitting query (merge head {head_age:?}, last lifetime {last_lifetime:?}) {fingerprint}"
+            "readmitting query (expected wait {expected_wait:?}, last lifetime \
+             {last_lifetime:?}) {fingerprint}"
         );
         crate::metrics::handles().state.readmissions.increment(1);
         if let Some(mut m) = core.state_view.metrics.get_mut(&fingerprint) {
@@ -316,10 +324,10 @@ mod tests {
 
     const SECOND: Duration = Duration::from_secs(1);
 
-    /// The head has outwaited the query's last Ready period: its population
-    /// would be invalidated before its merge lands.
+    /// The expected wait outlasts the query's last Ready period: its
+    /// population would be invalidated before it landed.
     #[test]
-    fn test_readmission_deferred_when_head_outwaits_last_lifetime() {
+    fn test_readmission_deferred_when_expected_wait_outlasts_last_lifetime() {
         assert!(readmission_deferred(3 * SECOND, Some(SECOND)));
     }
 

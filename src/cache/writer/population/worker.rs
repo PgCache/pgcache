@@ -2,8 +2,8 @@
 //! rendezvous, retire / park (PGC-437), connection self-healing, deadlock
 //! retry, and handing the result back to the writer.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant};
 
 use metrics::Histogram;
@@ -23,7 +23,9 @@ use crate::cache::population_pool::{POPULATION_PARK_EXPIRY, PopulationPool};
 use crate::cache::reference_settings;
 use crate::cache::writer::deadlock::{SQLSTATE_DEADLOCK, cache_error_sqlstate};
 use crate::cache::writer::merge_queue::StagingDiscard;
+use crate::cache::writer::staging::SharedStagingPool;
 use crate::cache::{CacheError, CacheResult, MapIntoReport};
+use crate::oid::Oid;
 use crate::pg;
 use crate::result::error_chain_format;
 use crate::settings::PgSettings;
@@ -187,6 +189,7 @@ struct PopulationWorker {
     query_tx: UnboundedSender<QueryCommand>,
     throttled: Arc<AtomicBool>,
     pool: Arc<PopulationPool>,
+    staging_pool: SharedStagingPool,
     connections: PopulationConnections,
     idle_handle: Histogram,
     idle_start: Instant,
@@ -201,6 +204,7 @@ impl PopulationWorker {
             query_tx,
             throttled,
             pool,
+            staging_pool,
         } = ctx;
         Self {
             id,
@@ -210,6 +214,7 @@ impl PopulationWorker {
             query_tx,
             throttled,
             pool,
+            staging_pool,
             connections,
             idle_handle: crate::metrics::population_worker_idle_handle(id),
             idle_start: Instant::now(),
@@ -267,7 +272,7 @@ impl PopulationWorker {
         true
     }
 
-    async fn work_handle(&mut self, work: PopulationWork) {
+    async fn work_handle(&mut self, mut work: PopulationWork) {
         // Under memory pressure, skip populating the in-flight backlog: building
         // these cache tables/rows is what overshoots the budget after dispatch
         // stops admitting new queries. Fail them so `query_failed_cleanup`
@@ -298,6 +303,17 @@ impl PopulationWorker {
             let _ = population_failed_send(&self.query_tx, &work);
             return;
         }
+
+        // Check staging out only now (PGC-554): the item may have queued for
+        // minutes, and a population failed or superseded before this point
+        // never minted a table. The writer returns the tables at merge or
+        // discard under the same `(fingerprint, generation)`.
+        let relation_oids: Vec<Oid> = work.table_metadata.iter().map(|t| t.relation_oid).collect();
+        work.staging = self
+            .staging_pool
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .checkout(work.fingerprint, work.generation, &relation_oids);
 
         let task_start = Instant::now();
         let result = self.task_run(&work).await;

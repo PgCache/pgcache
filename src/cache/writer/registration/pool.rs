@@ -110,7 +110,7 @@ impl WriterRegistration {
             table_metadata,
             population,
             max_limit: target.max_limit,
-            // Filled in at dispatch from the staging pool (needs `&mut core`).
+            // Checked out by the worker at pickup (PGC-554).
             staging: Vec::new(),
             enqueued_at: Instant::now(),
         }
@@ -121,7 +121,7 @@ impl WriterRegistration {
     fn populate_work_dispatch(
         &mut self,
         core: &mut WriterCore,
-        mut work: PopulationWork,
+        work: PopulationWork,
     ) -> CacheResult<()> {
         let fingerprint = work.fingerprint;
         let generation = work.generation;
@@ -135,17 +135,12 @@ impl WriterRegistration {
             &relation_oids,
             core.last_received_lsn,
         );
-        // Check out a reusable staging table per relation (PGC-293); the writer
-        // returns them to the pool at merge / failure.
-        work.staging = core
-            .staging_pool
-            .checkout(fingerprint, generation, &relation_oids);
-
+        // Staging is checked out by the worker that picks the item up, so a
+        // population waiting in the queue holds no table (PGC-554).
         if self.populate_tx.send(work).is_err() {
             error!("population dispatcher channel closed");
             core.population_deleted_keys
                 .deactivate(fingerprint, generation);
-            core.staging_pool.forget(fingerprint, generation);
         }
 
         Ok(())
