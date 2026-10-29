@@ -23,7 +23,7 @@ use crate::query::ast::rope::deparse::{
 };
 use crate::query::ast::rope::{
     Column, CteRef, DeparseContext, Function, Join, OrderBy, QueryTree, Scalar, ScalarKind, Select,
-    SelectItem, Star, Table,
+    SelectItem, Star, Table, Where,
 };
 use crate::query::ast::{Clause, Deparse, LiteralValue, NodeId, separated_deparse};
 use crate::query::shape::{QueryShape, ShapeKey};
@@ -86,6 +86,8 @@ pub(super) struct Bound<'a> {
     bindings: &'a Bindings,
     mode: Mode,
     source: Option<&'a SourceOverride<'a>>,
+    /// Predicate conjuncts left out of the text.
+    dropped: &'a [NodeId],
 }
 
 impl<'a> Bound<'a> {
@@ -94,6 +96,14 @@ impl<'a> Bound<'a> {
             bindings,
             mode: Mode::Text,
             source: None,
+            dropped: &[],
+        }
+    }
+
+    fn text_dropping(bindings: &'a Bindings, dropped: &'a [NodeId]) -> Self {
+        Self {
+            dropped,
+            ..Self::text(bindings)
         }
     }
 
@@ -106,14 +116,14 @@ impl<'a> Bound<'a> {
                 projection_depth: 0,
             },
             source: None,
+            dropped: &[],
         }
     }
 
     fn with_source(bindings: &'a Bindings, source: &'a SourceOverride<'a>) -> Self {
         Self {
-            bindings,
-            mode: Mode::Text,
             source: Some(source),
+            ..Self::text(bindings)
         }
     }
 
@@ -418,6 +428,10 @@ impl DeparseContext for Bound<'_> {
         self.literal_render(literal, buf);
     }
 
+    fn conjunct_renders(&self, conjunct: Where<'_>) -> bool {
+        !self.dropped.contains(&conjunct.id())
+    }
+
     fn clause_enter(&mut self, clause: Clause) {
         self.clause_entered(clause);
     }
@@ -456,6 +470,15 @@ impl ResolvedQuery {
     /// them, for a caller composing its own SQL around parts of the tree.
     pub fn deparse_context(&self) -> impl DeparseContext + '_ {
         Bound::text(self.bindings())
+    }
+
+    /// [`ResolvedQuery::deparse_context`] with the predicate conjuncts at
+    /// `dropped` left out of every WHERE and ON.
+    pub fn deparse_context_dropping<'a>(
+        &'a self,
+        dropped: &'a [NodeId],
+    ) -> impl DeparseContext + 'a {
+        Bound::text_dropping(self.bindings(), dropped)
     }
 
     /// [`ResolvedQuery::deparse_context`] with `source` standing in for one

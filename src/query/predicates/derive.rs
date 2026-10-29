@@ -180,6 +180,20 @@ impl QueryBranchPredicates {
         })
     }
 
+    /// The conjuncts a NULL-padded row can satisfy: each mentions a
+    /// reference from above an unreduced outer join that NULL-fills it, so
+    /// it never reduces that join and holds on the padding where a real
+    /// partner would fail it. Population reads of a NULL-filled reference
+    /// leave them out, or a preserved row another query loaded would be
+    /// served without its partners (PGC-556).
+    pub fn null_padded_conjuncts(&self) -> impl Iterator<Item = &Conjunct> {
+        self.conjuncts.iter().filter(|conjunct| {
+            self.table_references
+                .iter()
+                .any(|reference| self.conjunct_above_padding(conjunct, reference))
+        })
+    }
+
     /// Whether every WHERE conjunct was recognized as a constraint or an
     /// equality.
     pub fn where_recognized(&self) -> bool {
@@ -434,23 +448,22 @@ impl QueryBranchPredicates {
     /// alone on its innermost NULL-filled side: a partner beside it there
     /// may never have been loaded.
     fn outer_join_role_derive(&self, reference: &TableReference) -> OuterJoinRole {
-        let mut role = OuterJoinRole::Kept;
-        let mut alone = true;
-        for (position, step) in reference.path.iter().enumerate() {
-            if !self.step_null_fills(step) {
-                continue;
-            }
-            alone = self.reference_alone_on_side(reference, step);
-            let above = reference.path.get(..position).unwrap_or_default();
-            if self.reference_mentioned_above(reference, above) {
-                return OuterJoinRole::Optional;
-            }
-            role = OuterJoinRole::Terminal;
-        }
-        if role == OuterJoinRole::Terminal && !alone {
+        let Some(innermost) = reference
+            .path
+            .iter()
+            .rev()
+            .find(|step| self.step_null_fills(step))
+        else {
+            return OuterJoinRole::Kept;
+        };
+        let mentioned = self
+            .conjuncts
+            .iter()
+            .any(|conjunct| self.conjunct_above_padding(conjunct, reference));
+        if mentioned || !self.reference_alone_on_side(reference, innermost) {
             return OuterJoinRole::Optional;
         }
-        role
+        OuterJoinRole::Terminal
     }
 
     /// Whether the reference is the only source under `step`'s side.
@@ -464,19 +477,23 @@ impl QueryBranchPredicates {
         })
     }
 
-    /// Whether WHERE or the ON of a join in `above` mentions the reference.
-    fn reference_mentioned_above(
-        &self,
-        reference: &TableReference,
-        above: &[JoinPathStep],
-    ) -> bool {
-        self.conjuncts.iter().any(|conjunct| {
-            conjunct.mentions(reference.slot)
-                && match conjunct.scope {
-                    ConjunctScope::Where => true,
-                    ConjunctScope::On(id) => above.iter().any(|step| step.join == id),
-                }
-        })
+    /// Whether `conjunct` mentions the reference from above an unreduced
+    /// outer join that NULL-fills it: from WHERE, or from the ON of a join
+    /// enclosing that one.
+    fn conjunct_above_padding(&self, conjunct: &Conjunct, reference: &TableReference) -> bool {
+        conjunct.mentions(reference.slot)
+            && reference.path.iter().enumerate().any(|(position, step)| {
+                self.step_null_fills(step)
+                    && match conjunct.scope {
+                        ConjunctScope::Where => true,
+                        ConjunctScope::On(id) => reference
+                            .path
+                            .get(..position)
+                            .unwrap_or_default()
+                            .iter()
+                            .any(|above| above.join == id),
+                    }
+            })
     }
 }
 
@@ -684,6 +701,55 @@ mod tests {
             .expect("the ON conjunct");
         assert!(!branch.conjunct_filters(on_conjunct, a));
         assert!(branch.conjunct_filters(on_conjunct, b));
+    }
+
+    /// Each conjunct a NULL-padded row can satisfy, as its scope and the
+    /// references it mentions.
+    fn null_padded_lines(sql: &str) -> Vec<String> {
+        let bound = resolve(sql);
+        let branch = root_predicates(&bound);
+        branch
+            .null_padded_conjuncts()
+            .map(|conjunct| {
+                let mut names: Vec<&str> = conjunct
+                    .columns
+                    .iter()
+                    .filter_map(|column| bound.bindings().slot(column.slot))
+                    .map(|slot| slot.qualifier())
+                    .collect();
+                names.sort_unstable();
+                names.dedup();
+                format!("{:?} [{}]", conjunct.scope, names.join(", "))
+            })
+            .collect()
+    }
+
+    /// A conjunct can hold on padding when it mentions a reference from
+    /// above an unreduced outer join that NULL-fills it: from WHERE or an
+    /// enclosing ON, whichever side of that join it sits on. A
+    /// NULL-rejecting conjunct reduces the join instead, and a join's own
+    /// ON decides which partner attaches.
+    #[test]
+    fn test_null_padded_conjuncts() {
+        #[rustfmt::skip]
+        let cases: &[(&str, &[&str])] = &[
+            ("SELECT * FROM a LEFT JOIN b ON b.id = a.id WHERE b.x IS NULL", &["Where [b]"]),
+            ("SELECT * FROM a LEFT JOIN b ON b.id = a.id WHERE b.x IS NOT NULL", &[]),
+            ("SELECT * FROM a LEFT JOIN b ON b.id = a.id WHERE a.x = 1", &[]),
+            ("SELECT * FROM a LEFT JOIN b ON b.id = a.id AND b.x IS NULL", &[]),
+            ("SELECT * FROM a LEFT JOIN b ON b.id = a.id WHERE b.x + 1 = 2", &["Where [b]"]),
+            ("SELECT * FROM a LEFT JOIN b ON b.id = a.id WHERE b.x BETWEEN 1 AND 2", &[]),
+            ("SELECT * FROM a LEFT JOIN (b LEFT JOIN c ON c.id = b.id) ON b.id = a.id WHERE c.x IS NULL",
+             &["Where [c]"]),
+            ("SELECT * FROM a LEFT JOIN (b LEFT JOIN c ON c.id = b.id) ON b.id = a.id AND c.x IS NULL",
+             &["On(JoinId(0)) [c]"]),
+            ("SELECT * FROM a LEFT JOIN b ON b.id = a.id LEFT JOIN c ON c.id = a.id AND b.x IS NULL",
+             &["On(JoinId(0)) [b]"]),
+            ("SELECT * FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.id = a.id)", &["Where [b]"]),
+        ];
+        for (sql, expected) in cases {
+            assert_eq!(null_padded_lines(sql), *expected, "{sql}");
+        }
     }
 
     /// Each reference's filters, exactness, link columns and role, per

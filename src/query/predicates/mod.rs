@@ -87,6 +87,9 @@ pub enum ConjunctScope {
 pub struct Conjunct {
     pub scope: ConjunctScope,
     pub form: ConjunctForm,
+    /// The predicate node it was read from; a split `BETWEEN` or `NOT IN`
+    /// shares one. `None` for a merged column's equality, which has none.
+    pub node: Option<NodeId>,
     /// Every column it mentions, a nested subquery's included.
     pub columns: Vec<ColumnBinding>,
     /// Mentions a column of an enclosing SELECT.

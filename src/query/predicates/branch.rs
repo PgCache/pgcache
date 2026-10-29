@@ -196,6 +196,7 @@ impl ConjunctCollector<'_> {
                         .map(|merged| Conjunct {
                             scope,
                             form: ConjunctForm::Equality(merged.left, merged.right),
+                            node: None,
                             columns: vec![merged.left, merged.right],
                             external: false,
                             correlated: false,
@@ -234,6 +235,7 @@ impl ConjunctCollector<'_> {
         Conjunct {
             scope,
             form: part.form,
+            node: Some(part.node),
             columns: scan.columns,
             external,
             correlated,

@@ -8,9 +8,9 @@ use ecow::EcoString;
 
 use super::tree::QueryTree;
 use super::view::{
-    Binary, Body, Case, Column, Cte, CteRef, Frame, FrameBound, Function, Join, JoinQual, Multi,
-    OrderBy, Query, Run, Scalar, ScalarKind, Select, SelectItem, Source, Star, Subquery, Table,
-    Unary, Values, Where, WhereKind, Window,
+    Binary, Body, Case, Column, Conjuncts, Cte, CteRef, Frame, FrameBound, Function, Join,
+    JoinQual, Multi, OrderBy, Query, Run, Scalar, ScalarKind, Select, SelectItem, Source, Star,
+    Subquery, Table, Unary, Values, Where, WhereKind, Window,
 };
 use crate::query::ast::{
     BinaryOp, Clause, CteMaterialization, Deparse, LiteralValue, MultiOp, SubLinkType, UnaryOp,
@@ -58,6 +58,12 @@ pub trait DeparseContext: Sized {
 
     fn literal_deparse(&mut self, literal: &LiteralValue, buf: &mut String) {
         literal.deparse(buf);
+    }
+
+    /// Whether a top-level conjunct of a WHERE, HAVING or ON renders. A
+    /// clause left with none is omitted, or `ON TRUE`.
+    fn conjunct_renders(&self, _conjunct: Where<'_>) -> bool {
+        true
     }
 
     fn clause_enter(&mut self, _clause: Clause) {}
@@ -305,10 +311,45 @@ pub fn where_clause_deparse_with<C: DeparseContext>(
     let Some(expr) = expr else {
         return;
     };
+    let kept = conjuncts_kept(expr, cx);
+    if kept.is_empty() {
+        return;
+    }
     cx.clause_enter(clause);
     buf.push_str(keyword);
-    where_deparse_with(expr, cx, buf);
+    conjuncts_deparse_with(&kept, cx, buf);
     cx.clause_leave(clause);
+}
+
+/// The top-level conjuncts of `expr` the context renders.
+fn conjuncts_kept<'t, C: DeparseContext>(expr: Where<'t>, cx: &C) -> Conjuncts<'t> {
+    expr.conjuncts()
+        .into_iter()
+        .filter(|conjunct| cx.conjunct_renders(*conjunct))
+        .collect()
+}
+
+/// `conjuncts` joined by `AND`, as the AND they were split from renders;
+/// one alone renders as the whole predicate it is.
+fn conjuncts_deparse_with<C: DeparseContext>(
+    conjuncts: &[Where<'_>],
+    cx: &mut C,
+    buf: &mut String,
+) {
+    if let [conjunct] = conjuncts {
+        return where_deparse_with(*conjunct, cx, buf);
+    }
+    let mut sep = "";
+    for &conjunct in conjuncts {
+        buf.push_str(sep);
+        where_parenthesized_deparse_with(
+            conjunct,
+            binary_child_needs_parens(BinaryOp::And, conjunct),
+            cx,
+            buf,
+        );
+        sep = " AND ";
+    }
 }
 
 /// ` GROUP BY a, b` when the select groups.
@@ -458,7 +499,12 @@ fn join_deparse_with<C: DeparseContext>(join: Join<'_>, cx: &mut C, buf: &mut St
         JoinQualText::On(condition) => {
             cx.clause_enter(Clause::JoinOn);
             buf.push_str(" ON ");
-            where_deparse_with(condition, cx, buf);
+            let kept = conjuncts_kept(condition, cx);
+            if kept.is_empty() {
+                buf.push_str("TRUE");
+            } else {
+                conjuncts_deparse_with(&kept, cx, buf);
+            }
             cx.clause_leave(Clause::JoinOn);
         }
         JoinQualText::Using(names) => {

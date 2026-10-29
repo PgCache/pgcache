@@ -14,8 +14,9 @@
 use std::io::Error;
 
 use crate::util::{
-    TestContext, assert_cache_hit, assert_cache_miss, assert_not_subsumed, assert_row_at,
-    assert_subsume_hit, origin_change_applied_in_place, origin_change_invalidates, query_warm,
+    MetricsSnapshot, TestContext, assert_cache_hit, assert_cache_miss, assert_not_subsumed,
+    assert_row_at, assert_subsume_hit, origin_change_applied_in_place, origin_change_invalidates,
+    query_warm,
 };
 
 mod util;
@@ -1296,6 +1297,101 @@ async fn test_anti_join_filtered_optional_delete_invalidates() -> Result<(), Err
                  ON b.author_id = a.id AND b.flag = 1 WHERE b.id IS NULL ORDER BY a.id";
     let m = query_warm(&mut ctx, query).await?;
     origin_change_invalidates(&mut ctx, m, "DELETE FROM bios WHERE id = 101", query).await
+}
+
+// =============================================================================
+// Preserved rows another query loaded (PGC-556)
+// =============================================================================
+
+/// Warms `other` and `query` in the order given, then reads `query` from
+/// cache: `other` put a preserved row with partners into the shared tables,
+/// and the hit must serve origin's rows, not one padded over missing
+/// partners.
+async fn shared_preserved_row_hit_matches_origin(
+    ctx: &mut TestContext,
+    other: &str,
+    query: &str,
+    other_first: bool,
+) -> Result<MetricsSnapshot, Error> {
+    if other_first {
+        query_warm(ctx, other).await?;
+    }
+    query_warm(ctx, query).await?;
+    if !other_first {
+        query_warm(ctx, other).await?;
+    }
+    let m = ctx.metrics().await?;
+    let (proxied, origin) = ctx.proxy_and_origin_rows(query).await?;
+    assert_eq!(proxied, origin, "other_first={other_first}");
+    assert_cache_hit(ctx, m).await
+}
+
+/// An anti-join's population loads every bio of every author, not only the
+/// bios its result shows (none), so an author another query loaded is not
+/// served as bio-less.
+#[tokio::test]
+async fn test_anti_join_shared_preserved_row_keeps_partners() -> Result<(), Error> {
+    const OTHER: &str = "SELECT id FROM authors WHERE country = 'NZ'";
+    const QUERY: &str = "SELECT a.id FROM authors a \
+                         LEFT JOIN bios b ON b.author_id = a.id WHERE b.id IS NULL ORDER BY a.id";
+    for other_first in [true, false] {
+        let mut ctx = TestContext::setup().await?;
+        setup_authors_bios(&mut ctx).await?;
+        shared_preserved_row_hit_matches_origin(&mut ctx, OTHER, QUERY, other_first).await?;
+    }
+    Ok(())
+}
+
+/// The same through the decorrelated form of `NOT EXISTS`.
+#[tokio::test]
+async fn test_not_exists_shared_preserved_row_keeps_partners() -> Result<(), Error> {
+    const OTHER: &str = "SELECT id FROM authors WHERE country = 'NZ'";
+    const QUERY: &str = "SELECT a.id FROM authors a \
+                         WHERE NOT EXISTS (SELECT 1 FROM bios b WHERE b.author_id = a.id) \
+                         ORDER BY a.id";
+    for other_first in [true, false] {
+        let mut ctx = TestContext::setup().await?;
+        setup_authors_bios(&mut ctx).await?;
+        shared_preserved_row_hit_matches_origin(&mut ctx, OTHER, QUERY, other_first).await?;
+    }
+    Ok(())
+}
+
+/// A nested anti-join loads both NULL-filled sides in full for every
+/// preserved row; a partner inserted later still invalidates it.
+#[tokio::test]
+async fn test_nested_anti_join_shared_preserved_row_keeps_partners() -> Result<(), Error> {
+    const OTHER: &str = "SELECT id FROM pp_a WHERE id = 1";
+    const QUERY: &str = "SELECT a.id, b.id, c.id FROM pp_a a \
+                         LEFT JOIN (pp_b b LEFT JOIN pp_c c ON c.bid = b.id) ON b.aid = a.id \
+                         WHERE c.id IS NULL ORDER BY a.id";
+    for other_first in [true, false] {
+        let mut ctx = TestContext::setup().await?;
+        ctx.query("CREATE TABLE pp_a (id INTEGER PRIMARY KEY)", &[])
+            .await?;
+        ctx.query(
+            "CREATE TABLE pp_b (id INTEGER PRIMARY KEY, aid INTEGER)",
+            &[],
+        )
+        .await?;
+        ctx.query(
+            "CREATE TABLE pp_c (id INTEGER PRIMARY KEY, bid INTEGER)",
+            &[],
+        )
+        .await?;
+        // a 1 has a b with a c, a 2 a b without one, a 3 no b.
+        ctx.query("INSERT INTO pp_a VALUES (1), (2), (3)", &[])
+            .await?;
+        ctx.query("INSERT INTO pp_b VALUES (10, 1), (11, 2)", &[])
+            .await?;
+        ctx.query("INSERT INTO pp_c VALUES (100, 10)", &[]).await?;
+        ctx.cdc_decode_settle().await?;
+
+        let m =
+            shared_preserved_row_hit_matches_origin(&mut ctx, OTHER, QUERY, other_first).await?;
+        origin_change_invalidates(&mut ctx, m, "INSERT INTO pp_c VALUES (101, 11)", QUERY).await?;
+    }
+    Ok(())
 }
 
 // =============================================================================

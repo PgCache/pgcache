@@ -15,6 +15,7 @@ use ecow::EcoString;
 use futures_util::SinkExt;
 use postgres_protocol::escape;
 use postgres_types::PgLsn;
+use rootcause::Report;
 #[cfg(feature = "fault-injection")]
 use tokio::time::sleep;
 use tokio_postgres::Client;
@@ -26,10 +27,11 @@ use crate::cache::{CacheError, CacheResult, MapIntoReport, ReportExt};
 use crate::catalog::TableMetadata;
 use crate::oid::Oid;
 use crate::pg::{Lsn, OriginSnapshot};
-use crate::query::ast::Clause;
 use crate::query::ast::rope::deparse::{from_deparse_with, where_clause_deparse_with};
 use crate::query::ast::rope::{Select, Table};
-use crate::query::resolve::ResolvedQuery;
+use crate::query::ast::{Clause, NodeId};
+use crate::query::predicates::{OuterJoinRole, query_branch_predicates_build};
+use crate::query::resolve::{ResolvedQuery, SlotId};
 use crate::query::update::select_branches_with_source;
 
 /// Test-only population delay (fault-injection feature, PGC-250). Sleeps after
@@ -98,7 +100,7 @@ pub(super) async fn population_task(
         .map_into_report::<CacheError>()
         .attach_loc("reading the population's origin snapshot")?;
 
-    for PopulationRead { table_node, select } in population_reads(&work.population, work.max_limit)
+    for PopulationRead { table_node, select } in population_reads(&work.population, work.max_limit)?
     {
         let table = table_metadata_find(&work.table_metadata, &work.population, table_node)?;
         let (staging, needs_create) = staging_table_find(&work.staging, table)?;
@@ -143,21 +145,84 @@ struct PopulationRead<'a> {
 /// Every (branch, table) read of the population in order, skipping a read
 /// another already issued. Each reference to a CTE carries its own copy of
 /// the body, and all reads share one origin snapshot.
-fn population_reads(population: &ResolvedQuery, max_limit: Option<u64>) -> Vec<PopulationRead<'_>> {
+fn population_reads(
+    population: &ResolvedQuery,
+    max_limit: Option<u64>,
+) -> CacheResult<Vec<PopulationRead<'_>>> {
     let root = population.select();
     let mut issued = HashSet::new();
     let mut reads = Vec::new();
     for (branch, _) in select_branches_with_source(population.tree().root()) {
         // A LIMIT bounds the result's rows, never a subquery's.
         let limit = max_limit.filter(|_| root.is_some_and(|root| root.id() == branch.id()));
+        let padding = padding_scope_build(population, branch)?;
         for table_node in branch.direct_tables() {
-            let select = population_select_build(population, table_node, branch, limit);
+            let dropped = padding.dropped_for(population, table_node);
+            let select = population_select_build(population, table_node, branch, limit, dropped);
             if issued.insert((table_relation_oid(population, table_node), select.clone())) {
                 reads.push(PopulationRead { table_node, select });
             }
         }
     }
-    reads
+    Ok(reads)
+}
+
+/// The conjuncts of a branch a NULL-padded row can satisfy, and the
+/// references whose reads leave them out: those an unreduced outer join
+/// NULL-fills. Cache tables are shared, so a preserved row another query
+/// loaded is served over whatever partners the cache holds; loading every
+/// partner of every preserved row the other conjuncts admit keeps the
+/// padding the cache assembles the padding origin has (PGC-556).
+#[derive(Default)]
+struct PaddingScope {
+    conjuncts: Vec<NodeId>,
+    null_filled: Vec<SlotId>,
+}
+
+impl PaddingScope {
+    /// The conjuncts `table_node`'s read leaves out.
+    fn dropped_for(&self, population: &ResolvedQuery, table_node: Table<'_>) -> &[NodeId] {
+        let widened = population
+            .bindings()
+            .source(table_node.id())
+            .is_some_and(|slot| self.null_filled.contains(&slot));
+        if widened { &self.conjuncts } else { &[] }
+    }
+}
+
+fn padding_scope_build(
+    population: &ResolvedQuery,
+    branch: Select<'_>,
+) -> CacheResult<PaddingScope> {
+    let predicates = query_branch_predicates_build(population, branch);
+    let conjuncts = predicates
+        .null_padded_conjuncts()
+        .map(|conjunct| {
+            // A merged column's equality has no conjunct to drop from the
+            // text, so such a read cannot be widened.
+            conjunct
+                .node
+                .ok_or_else(|| Report::<CacheError>::from(CacheError::InvalidQuery))
+                .attach_loc("a USING column's equality can hold on NULL padding")
+        })
+        .collect::<CacheResult<Vec<NodeId>>>()?;
+    if conjuncts.is_empty() {
+        return Ok(PaddingScope::default());
+    }
+    let null_filled = predicates
+        .table_references()
+        .iter()
+        .map(|reference| reference.slot)
+        .filter(|&slot| {
+            predicates
+                .table_reference_predicates(slot)
+                .is_some_and(|reference| reference.outer_join_role != OuterJoinRole::Kept)
+        })
+        .collect();
+    Ok(PaddingScope {
+        conjuncts,
+        null_filled,
+    })
 }
 
 fn table_relation_oid(population: &ResolvedQuery, table_node: Table<'_>) -> Option<Oid> {
@@ -230,9 +295,9 @@ async fn staging_table_create(
 }
 
 /// The origin SELECT for one table of a branch: the branch's FROM and WHERE
-/// with the table's columns as the select list. DISTINCT folds join fan-out;
-/// GROUP BY and HAVING are dropped because the cache holds raw rows and
-/// aggregates at retrieval.
+/// with the table's columns as the select list, less the conjuncts at
+/// `dropped`. DISTINCT folds join fan-out; GROUP BY and HAVING are dropped
+/// because the cache holds raw rows and aggregates at retrieval.
 ///
 /// `limit` is the root's cap, which only a query reading one table with an
 /// ORDER BY it can render has (`population_max_limit`): the read is sorted as
@@ -243,6 +308,7 @@ fn population_select_build(
     table_node: Table<'_>,
     branch: Select<'_>,
     limit: Option<u64>,
+    dropped: &[NodeId],
 ) -> String {
     let single_table = branch.from().len() == 1 && branch.direct_tables().len() == 1;
     debug_assert!(
@@ -255,7 +321,7 @@ fn population_select_build(
         Some((order_by?, limit))
     });
     let mut buf = String::with_capacity(1024);
-    let mut cx = population.deparse_context();
+    let mut cx = population.deparse_context_dropping(dropped);
     buf.push_str(if window.is_some() {
         "SELECT"
     } else {
@@ -449,6 +515,7 @@ mod tests {
             table_metadata("users", 1, &["id", "name"], 1),
             table_metadata("orders", 2, &["id", "user_id", "total"], 1),
             table_metadata("Odd Table", 3, &["Region", "id", "it's"], 2),
+            table_metadata("items", 4, &["id", "order_id"], 1),
         ] {
             tables.insert_overwrite(table.into());
         }
@@ -460,6 +527,7 @@ mod tests {
         let catalog = population_catalog();
         let population = ResolvedQuery::parse_resolve(sql, &catalog, &["public"]).expect("resolve");
         population_reads(&population, max_limit)
+            .expect("population reads")
             .into_iter()
             .map(|read| read.select)
             .collect()
@@ -533,6 +601,61 @@ mod tests {
                 expected,
                 "{label}: {sql}"
             );
+        }
+    }
+
+    /// A NULL-filled reference is read without the conjuncts a padded row
+    /// can satisfy, so every partner of every preserved row the rest admit
+    /// is loaded; a preserved reference's read keeps them all (PGC-556).
+    #[test]
+    fn test_population_select_null_filled_reads_widened() {
+        const ANTI: &str = "FROM public.users u LEFT JOIN public.orders o ON o.user_id = u.id";
+        // A nested join renders without parentheses: the inner ON binds first.
+        const NESTED: &str = "FROM public.users u LEFT JOIN public.orders o LEFT JOIN public.items i \
+                              ON i.order_id = o.id";
+        #[rustfmt::skip]
+        let cases: [(&str, &str, &[&str]); 9] = [
+            ("anti-join", "SELECT u.id FROM users u LEFT JOIN orders o ON o.user_id = u.id WHERE o.total IS NULL", &[
+                &format!("SELECT DISTINCT u.id, u.name {ANTI} WHERE o.total IS NULL"),
+                &format!("SELECT DISTINCT o.id, o.user_id, o.total {ANTI}"),
+            ]),
+            ("preserved-side conjunct kept", "SELECT u.id FROM users u LEFT JOIN orders o ON o.user_id = u.id WHERE u.name = 'a' AND o.total IS NULL", &[
+                &format!("SELECT DISTINCT u.id, u.name {ANTI} WHERE u.name = 'a' AND o.total IS NULL"),
+                &format!("SELECT DISTINCT o.id, o.user_id, o.total {ANTI} WHERE u.name = 'a'"),
+            ]),
+            ("OR conjunct keeps its parentheses beside another", "SELECT u.id FROM users u LEFT JOIN orders o ON o.user_id = u.id WHERE o.total IS NULL AND u.id > 0 AND (u.name = 'a' OR u.name = 'b')", &[
+                &format!("SELECT DISTINCT u.id, u.name {ANTI} WHERE o.total IS NULL AND u.id > 0 AND (u.name = 'a' OR u.name = 'b')"),
+                &format!("SELECT DISTINCT o.id, o.user_id, o.total {ANTI} WHERE u.id > 0 AND (u.name = 'a' OR u.name = 'b')"),
+            ]),
+            ("OR conjunct left alone renders whole", "SELECT u.id FROM users u LEFT JOIN orders o ON o.user_id = u.id WHERE o.total IS NULL AND (u.name = 'a' OR u.name = 'b')", &[
+                &format!("SELECT DISTINCT u.id, u.name {ANTI} WHERE o.total IS NULL AND (u.name = 'a' OR u.name = 'b')"),
+                &format!("SELECT DISTINCT o.id, o.user_id, o.total {ANTI} WHERE u.name = 'a' OR u.name = 'b'"),
+            ]),
+            ("NULL-rejecting conjunct reduces the join", "SELECT u.id FROM users u LEFT JOIN orders o ON o.user_id = u.id WHERE o.total > 1", &[
+                &format!("SELECT DISTINCT u.id, u.name {ANTI} WHERE o.total > 1"),
+                &format!("SELECT DISTINCT o.id, o.user_id, o.total {ANTI} WHERE o.total > 1"),
+            ]),
+            ("opaque conjunct over the NULL-filled side", "SELECT u.id FROM users u LEFT JOIN orders o ON o.user_id = u.id WHERE o.total + 1 = 1", &[
+                &format!("SELECT DISTINCT u.id, u.name {ANTI} WHERE (o.total + 1) = 1"),
+                &format!("SELECT DISTINCT o.id, o.user_id, o.total {ANTI}"),
+            ]),
+            ("own ON is the partner test", "SELECT u.id FROM users u LEFT JOIN orders o ON o.user_id = u.id AND o.total IS NULL WHERE u.name = 'a'", &[
+                &format!("SELECT DISTINCT u.id, u.name {ANTI} AND o.total IS NULL WHERE u.name = 'a'"),
+                &format!("SELECT DISTINCT o.id, o.user_id, o.total {ANTI} AND o.total IS NULL WHERE u.name = 'a'"),
+            ]),
+            ("nested: every NULL-filled read widens", "SELECT u.id FROM users u LEFT JOIN (orders o LEFT JOIN items i ON i.order_id = o.id) ON o.user_id = u.id WHERE i.id IS NULL", &[
+                &format!("SELECT DISTINCT u.id, u.name {NESTED} ON o.user_id = u.id WHERE i.id IS NULL"),
+                &format!("SELECT DISTINCT o.id, o.user_id, o.total {NESTED} ON o.user_id = u.id"),
+                &format!("SELECT DISTINCT i.id, i.order_id {NESTED} ON o.user_id = u.id"),
+            ]),
+            ("enclosing ON emptied to TRUE", "SELECT u.id FROM users u LEFT JOIN (orders o LEFT JOIN items i ON i.order_id = o.id) ON i.id IS NULL WHERE u.name = 'a'", &[
+                &format!("SELECT DISTINCT u.id, u.name {NESTED} ON i.id IS NULL WHERE u.name = 'a'"),
+                &format!("SELECT DISTINCT o.id, o.user_id, o.total {NESTED} ON TRUE WHERE u.name = 'a'"),
+                &format!("SELECT DISTINCT i.id, i.order_id {NESTED} ON TRUE WHERE u.name = 'a'"),
+            ]),
+        ];
+        for (label, sql, expected) in cases {
+            assert_eq!(population_selects(sql, None), expected, "{label}: {sql}");
         }
     }
 

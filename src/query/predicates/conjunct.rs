@@ -9,7 +9,7 @@ use super::{ColumnConstraint, ConjunctForm};
 use crate::query::ast::rope::{
     Binary, Column, Literal, Multi, NodeRef, Run, Scalar, ScalarKind, Unary, View, Where, WhereKind,
 };
-use crate::query::ast::{BinaryOp, LiteralValue, MultiOp, UnaryOp};
+use crate::query::ast::{BinaryOp, LiteralValue, MultiOp, NodeId, UnaryOp};
 use crate::query::cast::{cast_target_is_coercion_supported, comparison_canonicalize, scalar_leaf};
 use crate::query::constraints::{
     ColumnConstraintKind, NullTest, literal_value_canonical_order, literal_value_is_incomparable,
@@ -21,6 +21,7 @@ use crate::query::resolve::{ColumnBinding, ResolvedQuery};
 /// reads. A `BETWEEN` or `NOT IN` is several parts over shared operands.
 pub(super) struct ConjunctPart<'t> {
     pub(super) form: ConjunctForm,
+    pub(super) node: NodeId,
     pub(super) operands: SmallVec<[NodeRef<'t>; 2]>,
 }
 
@@ -28,6 +29,7 @@ impl<'t> ConjunctPart<'t> {
     fn whole(form: ConjunctForm, expr: Where<'t>) -> Self {
         Self {
             form,
+            node: expr.id(),
             operands: smallvec![expr.node_ref()],
         }
     }
@@ -249,6 +251,7 @@ fn between_parts_collect<'t>(
         };
         parts.push(ConjunctPart {
             form,
+            node: expr.id(),
             operands: smallvec![subject.node_ref(), limit.node_ref()],
         });
     }
@@ -284,6 +287,7 @@ fn not_in_parts_collect<'t>(
         };
         parts.push(ConjunctPart {
             form,
+            node: expr.id(),
             operands: smallvec![subject.node_ref(), element.node_ref()],
         });
     }
