@@ -337,12 +337,14 @@ pub fn statement_classify(
         user_max_limit,
     );
     let has_limit = max_limit.is_some();
+    let join_region = query_join_region(&bound);
     let analysis = match query_admission_analyze(
         AdmissionQuery {
             bound: &bound,
             decorrelated: decorrelated.as_ref(),
             fingerprint,
             has_limit,
+            join_region: join_region.as_ref(),
         },
         &builtins.aggregates,
         catalog,
@@ -378,12 +380,6 @@ pub fn statement_classify(
     // The subsumed side analyzes the original (pre-decorrelation) resolved
     // form, like the writer's subsumption_check.
     let references = subsumption_references(&bound);
-    let join_region = query_join_region(&bound);
-    debug_assert_eq!(
-        analysis.join_region.is_some(),
-        join_region.as_ref().is_some_and(|region| region.exact),
-        "the admission's join parent is the exact join region"
-    );
 
     Verdict::Cacheable(Box::new(CacheableAnalysis {
         fingerprint,

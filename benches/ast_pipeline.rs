@@ -40,6 +40,7 @@ use pgcache_lib::query::ast::rope::{Node, NodeKind, QueryTree};
 use pgcache_lib::query::ast::{LiteralValue, query_tree_convert_raw, query_tree_session_key};
 use pgcache_lib::query::compiled_predicate::CompiledPredicate;
 use pgcache_lib::query::decorrelate::query_decorrelate;
+use pgcache_lib::query::join_region::query_join_region;
 use pgcache_lib::query::literal_settings::LiteralSettings;
 use pgcache_lib::query::resolve::{
     Bindings, ColumnBinding, ColumnTarget, ResolvedQuery, StarItem, TableSlot,
@@ -414,6 +415,7 @@ fn admission_cost(
     aggregates: &HashSet<EcoString>,
     catalog: &Catalog,
 ) -> Cost {
+    let join_region = query_join_region(bound);
     let (admission, allocations, bytes) = allocations_count(|| {
         query_admission_analyze(
             AdmissionQuery {
@@ -421,6 +423,7 @@ fn admission_cost(
                 decorrelated: None,
                 fingerprint,
                 has_limit: bound.tree().root().has_limit(),
+                join_region: join_region.as_ref(),
             },
             aggregates,
             catalog,

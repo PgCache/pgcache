@@ -24,6 +24,7 @@ use crate::cache::{CacheError, CacheResult, ReportExt};
 use crate::oid::Oid;
 use crate::query::Fingerprint;
 use crate::query::ast::rope::QueryTree;
+use crate::query::join_region::{JoinRegion, query_join_region};
 use crate::query::keying_settings::KeyingSettings;
 use crate::query::resolve::ResolvedQuery;
 
@@ -154,6 +155,8 @@ fn resolution_limits(
 /// resolution is never built for it.
 pub(super) struct BoundQuery {
     pub(super) bound: SharedResolvedQuery,
+    /// Built once for the subsumption check and the admission.
+    pub(super) join_region: Option<JoinRegion>,
     user_max_limit: Option<u64>,
     reference_only: bool,
 }
@@ -181,8 +184,10 @@ impl WriterRegistration {
             .map_err(|e| e.context_transform(CacheError::from))
             .attach_loc("enum order-dependence gate")?;
 
+        let join_region = query_join_region(&bound);
         Ok(BoundQuery {
             bound,
+            join_region,
             user_max_limit,
             reference_only: literals.residual,
         })
@@ -199,6 +204,7 @@ impl WriterRegistration {
     ) -> CacheResult<QueryResolution> {
         let BoundQuery {
             bound,
+            join_region,
             user_max_limit,
             reference_only,
         } = query;
@@ -225,6 +231,7 @@ impl WriterRegistration {
             &bound,
             decorrelated.as_ref(),
             max_limit.is_some(),
+            join_region.as_ref(),
         )?;
         crate::metrics::handles()
             .reg
@@ -258,6 +265,7 @@ impl WriterRegistration {
         bound: &Arc<ResolvedQuery>,
         decorrelated: Option<&Arc<ResolvedQuery>>,
         has_limit: bool,
+        join_region: Option<&JoinRegion>,
     ) -> CacheResult<Vec<Oid>> {
         let analysis = query_admission_analyze(
             AdmissionQuery {
@@ -265,6 +273,7 @@ impl WriterRegistration {
                 decorrelated,
                 fingerprint,
                 has_limit,
+                join_region,
             },
             &self.aggregate_functions,
             &core.cache.tables,

@@ -740,6 +740,7 @@ mod tests {
                 decorrelated: None,
                 fingerprint: FINGERPRINT,
                 has_limit,
+                join_region: None,
             },
             &HashSet::new(),
             &tables,

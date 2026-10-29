@@ -24,7 +24,7 @@ use crate::query::Fingerprint;
 use crate::query::ast::rope::{Body, NodeKind, QueryTree, TreeBuilder, View};
 use crate::query::compiled_predicate::CompiledPredicate;
 use crate::query::decorrelate::query_decorrelate;
-use crate::query::join_region::query_join_region;
+use crate::query::join_region::JoinRegion;
 use crate::query::literal_settings::LiteralSettings;
 use crate::query::resolve::ResolveResult;
 use crate::query::resolve::{QueryBranch, ResolvedQuery};
@@ -181,6 +181,9 @@ pub struct AdmissionQuery<'a> {
     pub decorrelated: Option<&'a Arc<ResolvedQuery>>,
     pub fingerprint: Fingerprint,
     pub has_limit: bool,
+    /// `bound`'s join region, built once by the caller for the subsumption
+    /// check and the admission alike.
+    pub join_region: Option<&'a JoinRegion>,
 }
 
 /// Derive one [`TableAdmission`] per update query of the query, or of its
@@ -211,7 +214,7 @@ pub fn query_admission_analyze(
         .collect();
     // A join with a region is one SELECT with no subquery, so nothing was
     // decorrelated and the registered form is the one population loads.
-    let join_region = query_join_region(query.bound).filter(|region| region.exact);
+    let join_region = query.join_region.filter(|region| region.exact).cloned();
     Ok(AdmissionAnalysis {
         transformed: query.decorrelated.is_some(),
         tables: admissions,
@@ -388,7 +391,7 @@ mod tests {
     use crate::catalog::{ColumnMetadata, ColumnPosition, TableMetadata};
     use crate::oid::TypeOid;
     use crate::query::constraints::{TableRanges, table_constraints_subsumed};
-    use crate::query::join_region::JoinRegion;
+    use crate::query::join_region::query_join_region;
 
     fn catalog() -> Catalog {
         let int_column = |name: &str, position: i16| ColumnMetadata {
@@ -422,12 +425,14 @@ mod tests {
         let decorrelated = query_decorrelate_checked(&bound, &aggregate_functions)
             .expect("decorrelate")
             .map(Arc::new);
+        let join_region = query_join_region(&bound);
         query_admission_analyze(
             AdmissionQuery {
                 bound: &bound,
                 decorrelated: decorrelated.as_ref(),
                 fingerprint: Fingerprint::from_raw(1),
                 has_limit: false,
+                join_region: join_region.as_ref(),
             },
             &aggregate_functions,
             &tables,

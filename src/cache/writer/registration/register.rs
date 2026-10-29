@@ -75,7 +75,7 @@ impl WriterRegistration {
 
         // Phase 2: Subsumption check
         let subsumption_start = Instant::now();
-        let cover = self.subsumption_check(core, &query.bound);
+        let cover = self.subsumption_check(core, &query.bound, query.join_region.as_ref());
         crate::metrics::handles()
             .reg
             .register_subsumption_check

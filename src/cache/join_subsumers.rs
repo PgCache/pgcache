@@ -7,19 +7,18 @@
 
 use std::collections::HashMap;
 
+use super::update_query::SubsumerRegion;
 use crate::catalog::Catalog;
 use crate::query::constraint_index::ConstraintIndex;
 use crate::query::constraints::TableRanges;
 use crate::query::join_region::{JoinRegion, JoinShape};
 use crate::query::{Fingerprint, FingerprintMap};
 
-/// A registered parent's region, raw for the precise check and keyed for
-/// the index (PGC-478), with the shape it is indexed under.
+/// A registered parent's region, with the shape it is indexed under.
 #[derive(Debug)]
 struct JoinParent {
     shape: JoinShape,
-    ranges: TableRanges,
-    keyed_ranges: TableRanges,
+    region: SubsumerRegion,
     has_limit: bool,
 }
 
@@ -48,15 +47,17 @@ impl JoinSubsumers {
         self.fingerprint_remove(fingerprint);
         let parent = JoinParent {
             shape: region.shape,
-            ranges: region.ranges.clone(),
-            keyed_ranges: region.keyed_ranges(tables),
+            region: SubsumerRegion {
+                ranges: region.ranges.clone(),
+                keyed_ranges: region.keyed_ranges(tables),
+            },
             has_limit,
         };
         if !has_limit {
             self.by_shape
                 .entry(region.shape)
                 .or_default()
-                .insert(fingerprint, &parent.keyed_ranges);
+                .insert(fingerprint, &parent.region.keyed_ranges);
         }
         self.parents.insert(fingerprint, parent);
     }
@@ -92,7 +93,7 @@ impl JoinSubsumers {
             self.by_shape
                 .entry(parent.shape)
                 .or_default()
-                .insert(fingerprint, &parent.keyed_ranges);
+                .insert(fingerprint, &parent.region.keyed_ranges);
         }
     }
 
@@ -114,7 +115,7 @@ impl JoinSubsumers {
             Some((
                 fingerprint,
                 JoinCandidate {
-                    region: &parent.ranges,
+                    region: &parent.region.ranges,
                     has_limit: parent.has_limit,
                 },
             ))

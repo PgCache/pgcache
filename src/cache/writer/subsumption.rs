@@ -22,7 +22,7 @@ use crate::cache::{CacheError, CacheResult, MapIntoReport};
 use crate::query::Fingerprint;
 use crate::query::constraint_index::table_constraints_keyed;
 use crate::query::constraints::TableRanges;
-use crate::query::join_region::{JoinRegion, query_join_region};
+use crate::query::join_region::JoinRegion;
 use crate::query::resolve::ResolvedQuery;
 use crate::result::error_chain_format;
 use crate::timing::duration_to_ns_u64;
@@ -97,19 +97,19 @@ impl SubsumerSource for WriterSubsumerSource<'_> {
 impl WriterRegistration {
     /// Whether `bound` is covered by a Ready, LIMIT-free cached join of its
     /// shape, or every table reference of it by the regions of such queries
-    /// on its relation, and how.
+    /// on its relation, and how. `join` is `bound`'s join region.
     pub(super) fn subsumption_check(
         &self,
         core: &WriterCore,
         bound: &ResolvedQuery,
+        join: Option<&JoinRegion>,
     ) -> Option<SubsumptionCover> {
         // A set operation is covered when every arm is (PGC-495).
         // A query without base references has none to cover and yields `None`.
         let references = subsumption_references(bound)?;
-        let join = query_join_region(bound);
         subsumption_covered(
             &references,
-            join.as_ref(),
+            join,
             &WriterSubsumerSource { cache: &core.cache },
         )
     }

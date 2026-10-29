@@ -6,11 +6,13 @@
 //! true (infinite cache, nothing ever invalidates).
 
 use std::collections::HashMap;
+use std::hash::Hash;
 
 use pgcache_lib::cache::UpdateQueryKey;
 use pgcache_lib::cache::admission::{
     SubsumerCandidate, SubsumerSource, SubsumptionCover, SubsumptionReference, subsumption_covered,
 };
+use pgcache_lib::id_hash::IdHashable;
 use pgcache_lib::oid::Oid;
 use pgcache_lib::query::Fingerprint;
 use pgcache_lib::query::constraint_index::ConstraintIndex;
@@ -21,20 +23,16 @@ use crate::classify::CacheableAnalysis;
 
 #[derive(Default)]
 pub struct SubsumerRegistry {
-    by_relation: HashMap<Oid, RelationSubsumers>,
-    by_shape: HashMap<JoinShape, ShapeSubsumers>,
+    /// Per relation, keyed by update query: the exact references.
+    by_relation: HashMap<Oid, Subsumers<UpdateQueryKey>>,
+    /// Per join shape, keyed by fingerprint: the parents' WHERE regions.
+    by_shape: HashMap<JoinShape, Subsumers<Fingerprint>>,
 }
 
-/// The join parents of one shape, over their WHERE regions.
-#[derive(Default)]
-struct ShapeSubsumers {
-    index: ConstraintIndex<Fingerprint>,
-    admitted: HashMap<Fingerprint, AdmittedSubsumer>,
-}
-
-struct RelationSubsumers {
-    index: ConstraintIndex<UpdateQueryKey>,
-    admitted: HashMap<UpdateQueryKey, AdmittedSubsumer>,
+/// The parents of one relation or shape: their regions, indexed.
+struct Subsumers<K> {
+    index: ConstraintIndex<K>,
+    admitted: HashMap<K, AdmittedSubsumer>,
 }
 
 struct AdmittedSubsumer {
@@ -42,12 +40,39 @@ struct AdmittedSubsumer {
     has_limit: bool,
 }
 
-impl RelationSubsumers {
-    fn new() -> Self {
-        RelationSubsumers {
+impl<K: IdHashable + Copy> Default for Subsumers<K> {
+    fn default() -> Self {
+        Subsumers {
             index: ConstraintIndex::new(),
             admitted: HashMap::new(),
         }
+    }
+}
+
+impl<K: IdHashable + Copy + Hash + Eq> Subsumers<K> {
+    fn insert(&mut self, key: K, region: &TableRanges, has_limit: bool) {
+        self.index.insert(key, region);
+        self.admitted.insert(
+            key,
+            AdmittedSubsumer {
+                region: region.clone(),
+                has_limit,
+            },
+        );
+    }
+
+    /// The parents whose region might hold every row `ranges` admits.
+    fn candidates(&self, ranges: &TableRanges) -> impl Iterator<Item = SubsumerCandidate<'_>> {
+        self.index
+            .candidates(ranges)
+            .into_iter()
+            .filter_map(move |key| {
+                self.admitted.get(&key).map(|subsumer| SubsumerCandidate {
+                    region: &subsumer.region,
+                    has_limit: subsumer.has_limit,
+                    ready: true,
+                })
+            })
     }
 }
 
@@ -64,14 +89,10 @@ impl SubsumerRegistry {
     /// remaining gates run per lookup in `subsumption_covered`.
     pub fn subsumer_register(&mut self, analysis: &CacheableAnalysis) {
         if let Some(region) = analysis.join_region.as_ref().filter(|region| region.exact) {
-            let shape = self.by_shape.entry(region.shape).or_default();
-            shape.index.insert(analysis.fingerprint, &region.ranges);
-            shape.admitted.insert(
+            self.by_shape.entry(region.shape).or_default().insert(
                 analysis.fingerprint,
-                AdmittedSubsumer {
-                    region: region.ranges.clone(),
-                    has_limit: analysis.has_limit,
-                },
+                &region.ranges,
+                analysis.has_limit,
             );
         }
         let mut ordinals: HashMap<Oid, usize> = HashMap::new();
@@ -86,18 +107,10 @@ impl SubsumerRegistry {
             else {
                 continue;
             };
-            let relation = self
-                .by_relation
+            self.by_relation
                 .entry(admission.relation_oid)
-                .or_insert_with(RelationSubsumers::new);
-            relation.index.insert(key, region);
-            relation.admitted.insert(
-                key,
-                AdmittedSubsumer {
-                    region: region.clone(),
-                    has_limit: analysis.has_limit,
-                },
-            );
+                .or_default()
+                .insert(key, region, analysis.has_limit);
         }
     }
 
@@ -125,44 +138,14 @@ impl SubsumerSource for SubsumerRegistry {
         self.by_relation
             .get(&reference.relation_oid)
             .into_iter()
-            .flat_map(move |relation| {
-                relation
-                    .index
-                    .candidates(&reference.ranges)
-                    .into_iter()
-                    .filter_map(move |key| {
-                        relation
-                            .admitted
-                            .get(&key)
-                            .map(|subsumer| SubsumerCandidate {
-                                region: &subsumer.region,
-                                has_limit: subsumer.has_limit,
-                                ready: true,
-                            })
-                    })
-            })
+            .flat_map(move |relation| relation.candidates(&reference.ranges))
     }
 
     fn join_candidates(&self, join: &JoinRegion) -> impl Iterator<Item = SubsumerCandidate<'_>> {
         self.by_shape
             .get(&join.shape)
             .into_iter()
-            .flat_map(move |shape| {
-                shape
-                    .index
-                    .candidates(&join.ranges)
-                    .into_iter()
-                    .filter_map(move |fingerprint| {
-                        shape
-                            .admitted
-                            .get(&fingerprint)
-                            .map(|subsumer| SubsumerCandidate {
-                                region: &subsumer.region,
-                                has_limit: subsumer.has_limit,
-                                ready: true,
-                            })
-                    })
-            })
+            .flat_map(move |shape| shape.candidates(&join.ranges))
     }
 }
 

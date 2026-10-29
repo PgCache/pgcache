@@ -16,6 +16,7 @@ use crate::cache::writer::core::WriterCore;
 use crate::cache::writer::subsumption::subsumed_ready_mark;
 use crate::oid::Oid;
 use crate::query::Fingerprint;
+use crate::query::join_region::query_join_region;
 use crate::timing::{duration_to_ns_u64, duration_to_us_u64};
 
 /// Set the `has_limit` bit on the query's update queries and its join
@@ -60,7 +61,10 @@ impl WriterRegistration {
             .cache
             .cached_queries
             .get1(&fingerprint)
-            .and_then(|cached| self.subsumption_check(core, &cached.bound));
+            .and_then(|cached| {
+                let join = query_join_region(&cached.bound);
+                self.subsumption_check(core, &cached.bound, join.as_ref())
+            });
 
         let new_generation = core.cache.generation_allocate();
 
