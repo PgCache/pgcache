@@ -9,17 +9,18 @@ use std::sync::Arc;
 use ecow::EcoString;
 use pg_query::pg_nodes as pg;
 
-use super::ParseContext;
-use super::where_clause::{const_value_extract, param_ref_extract, where_emit};
+use super::scalar::operator_name_single;
+use super::where_clause::{
+    binary_op_from_str, column_ref_extract, const_value_extract, param_ref_extract,
+};
+use crate::query::ast::LiteralValue;
 use crate::query::ast::raw::{NodePtr, cast, cstr, list_is_empty, list_nodes, node_tag};
-use crate::query::ast::rope::{Binary, ScalarKind, TreeBuilder, View, Where, WhereKind};
-use crate::query::ast::{BinaryOp, LiteralValue};
 use crate::query::constraints::{ColumnConstraintKind, TableConstraint};
 use crate::query::guc::Guc;
 use crate::query::write::{
     CustomSettingEffect, CustomSettingEffects, DeleteStatement, INSERT_MAX_ROWS, InsertRow,
-    InsertStatement, IsolationEffect, IsolationLevel, RelationRef, SetAssignment, SettingsEffect,
-    TransactionBoundary, UpdateStatement, WriteClass,
+    InsertStatement, IsolationEffect, IsolationLevel, RelationRef, SetAssignments, SettingsEffect,
+    TransactionBoundary, UpdateStatement, WriteClass, WriteComparisons,
 };
 
 /// Classification of a non-SELECT root statement.
@@ -664,7 +665,7 @@ unsafe fn update_classify(s: *const pg::UpdateStmt) -> WriteClass {
 /// An UPDATE's WHERE comparisons and SET list, or `None` to degrade.
 unsafe fn update_parts_extract(
     s: *const pg::UpdateStmt,
-) -> Option<(Vec<TableConstraint>, Vec<SetAssignment>)> {
+) -> Option<(WriteComparisons, SetAssignments)> {
     unsafe {
         // A FROM clause joins other tables into the predicate — not single-table.
         if !list_is_empty((*s).fromClause) {
@@ -678,20 +679,16 @@ unsafe fn update_parts_extract(
 }
 
 /// The WHERE's comparisons, or `None` when there is no WHERE (any read of the
-/// table intersects a whole-table write), it doesn't convert, or it doesn't
-/// reduce to bare-column comparisons.
-unsafe fn where_comparisons_extract(where_node: NodePtr) -> Option<Vec<TableConstraint>> {
+/// table intersects a whole-table write) or it doesn't reduce to bare-column
+/// comparisons. Read straight off the raw nodes: the predicate is wanted
+/// only for AND-ed `column op literal` conjuncts, so nothing is converted.
+unsafe fn where_comparisons_extract(where_node: NodePtr) -> Option<WriteComparisons> {
     unsafe {
         if where_node.is_null() {
             return None;
         }
-        let mut builder = TreeBuilder::new();
-        // A write's own WITH list is not in scope: the predicate is read only
-        // for its bare-column comparisons, which no subquery contributes.
-        where_emit(&mut builder, where_node, &ParseContext::empty()).ok()?;
-        let (tree, _) = builder.finish();
-        let where_expr = Where::from_ref(tree.root().node_ref());
-        where_comparisons(where_expr).filter(|comparisons| !comparisons.is_empty())
+        let mut out = WriteComparisons::new();
+        (where_comparisons_collect(where_node, &mut out) && !out.is_empty()).then_some(out)
     }
 }
 
@@ -699,9 +696,9 @@ unsafe fn where_comparisons_extract(where_node: NodePtr) -> Option<Vec<TableCons
 /// any target isn't a plain single-column assignment (multi-column `SET (a,b) =
 /// …`, subscripted `SET a[1] = …`). A non-literal RHS keeps the column with a
 /// `None` value — its post-update value is unknown (PGC-382).
-unsafe fn update_set_extract(target_list: *const pg::List) -> Option<Vec<SetAssignment>> {
+unsafe fn update_set_extract(target_list: *const pg::List) -> Option<SetAssignments> {
     unsafe {
-        let mut set = Vec::new();
+        let mut set = SetAssignments::new();
         for node in list_nodes(target_list) {
             if node_tag(node) != pg::NodeTag_T_ResTarget {
                 return None;
@@ -720,56 +717,66 @@ unsafe fn update_set_extract(target_list: *const pg::List) -> Option<Vec<SetAssi
     }
 }
 
-/// Reduce a WHERE to its bare-column AND-conjunct comparisons, or `None` if any
-/// part isn't a single-column `col op literal` comparison (OR, NOT, IN/BETWEEN,
-/// subquery, function, cast, cross-column) — the whole predicate then degrades
-/// to opaque. Shared by DELETE (and UPDATE, PGC-382).
-fn where_comparisons(where_expr: Where<'_>) -> Option<Vec<TableConstraint>> {
-    let mut out = Vec::new();
-    where_comparisons_collect(where_expr, &mut out).then_some(out)
-}
-
-fn where_comparisons_collect(where_expr: Where<'_>, out: &mut Vec<TableConstraint>) -> bool {
-    let WhereKind::Binary(binary) = where_expr.kind() else {
-        return false;
-    };
-    if binary.op() == BinaryOp::And {
-        return where_comparisons_collect(binary.lexpr(), out)
-            && where_comparisons_collect(binary.rexpr(), out);
-    }
-    match comparison_extract(binary) {
-        Some(comparison) => {
-            out.push(comparison);
-            true
+/// Collect a WHERE's bare-column AND-conjunct comparisons into `out`; `false`
+/// if any part isn't a single-column `col op literal` comparison (OR, NOT,
+/// IN/BETWEEN, subquery, function, cast, cross-column) — the whole predicate
+/// then degrades to opaque. Shared by DELETE (and UPDATE, PGC-382).
+unsafe fn where_comparisons_collect(node: NodePtr, out: &mut WriteComparisons) -> bool {
+    unsafe {
+        match node_tag(node) {
+            pg::NodeTag_T_BoolExpr => {
+                let expr = cast::<pg::BoolExpr>(node);
+                (*expr).boolop == pg::BoolExprType_AND_EXPR
+                    && list_nodes((*expr).args).all(|arg| where_comparisons_collect(arg, out))
+            }
+            pg::NodeTag_T_A_Expr => {
+                let expr = cast::<pg::A_Expr>(node);
+                (*expr).kind == pg::A_Expr_Kind_AEXPR_OP
+                    && comparison_extract(expr).is_some_and(|comparison| {
+                        out.push(comparison);
+                        true
+                    })
+            }
+            _ => false,
         }
-        None => false,
     }
 }
 
-/// `column op literal` (or `literal op column`, flipped) from a binary
-/// comparison; `None` for logical/LIKE ops or non-bare-column operands.
-fn comparison_extract(binary: Binary<'_>) -> Option<TableConstraint> {
-    // `op_flip` returns `None` for non-comparison ops (AND/OR/LIKE/…); the
-    // flipped op also normalizes `literal op column` to `column op literal`.
-    let op = binary.op();
-    let flipped = op.op_flip()?;
-    let operand = |side: Where<'_>| match side.kind() {
-        WhereKind::Scalar(scalar) => match scalar.kind() {
-            ScalarKind::Column(column) => Some(Operand::Column(column.column().clone())),
-            ScalarKind::Literal(literal) => Some(Operand::Literal(literal.value().clone())),
-            _ => None,
-        },
-        _ => None,
-    };
-    let (column, op, value) = match (operand(binary.lexpr())?, operand(binary.rexpr())?) {
-        (Operand::Column(column), Operand::Literal(value)) => (column, op, value),
-        (Operand::Literal(value), Operand::Column(column)) => (column, flipped, value),
-        _ => return None,
-    };
-    Some(TableConstraint {
-        column,
-        kind: ColumnConstraintKind::Comparison { op, value },
-    })
+/// `column op literal` (or `literal op column`, flipped) from a plain
+/// operator expression; `None` for logical/LIKE ops or non-bare operands.
+unsafe fn comparison_extract(expr: *const pg::A_Expr) -> Option<TableConstraint> {
+    unsafe {
+        // `op_flip` returns `None` for non-comparison ops (AND/OR/LIKE/…); the
+        // flipped op also normalizes `literal op column` to `column op literal`.
+        let op = binary_op_from_str(operator_name_single((*expr).name)?)?;
+        let flipped = op.op_flip()?;
+        let lexpr = (*expr).lexpr as NodePtr;
+        let rexpr = (*expr).rexpr as NodePtr;
+        if lexpr.is_null() || rexpr.is_null() {
+            return None;
+        }
+        let (column, op, value) = match (operand_extract(lexpr)?, operand_extract(rexpr)?) {
+            (Operand::Column(column), Operand::Literal(value)) => (column, op, value),
+            (Operand::Literal(value), Operand::Column(column)) => (column, flipped, value),
+            _ => return None,
+        };
+        Some(TableConstraint {
+            column,
+            kind: ColumnConstraintKind::Comparison { op, value },
+        })
+    }
+}
+
+/// A comparison side that is a column reference or a literal; anything else
+/// (cast, function, expression, subquery) is `None`.
+unsafe fn operand_extract(node: NodePtr) -> Option<Operand> {
+    unsafe {
+        if node_tag(node) == pg::NodeTag_T_ColumnRef {
+            let (_, column) = column_ref_extract(cast::<pg::ColumnRef>(node)).ok()?;
+            return Some(Operand::Column(column));
+        }
+        insert_cell_extract(node).map(Operand::Literal)
+    }
 }
 
 /// One side of a write comparison, when it is bare.

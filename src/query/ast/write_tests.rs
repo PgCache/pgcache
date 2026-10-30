@@ -405,12 +405,12 @@ fn test_update_extracts_where_and_set() {
     let upd = update_rows("UPDATE t SET status = 'done', qty = 5 WHERE id = 5");
     assert_eq!(upd.relation.name, "t");
     assert_eq!(
-        upd.where_comparisons,
-        vec![comparison("id", BinaryOp::Equal, LiteralValue::Integer(5))]
+        upd.where_comparisons.as_slice(),
+        &[comparison("id", BinaryOp::Equal, LiteralValue::Integer(5))]
     );
     assert_eq!(
-        upd.set,
-        vec![
+        upd.set.as_slice(),
+        &[
             (
                 EcoString::from("status"),
                 Some(LiteralValue::String("done".into()))
@@ -425,8 +425,8 @@ fn test_update_non_literal_set_is_unknown() {
     // Expression / column / param RHS → `None` (unknown post-update value).
     let upd = update_rows("UPDATE t SET v = v + 1, w = other WHERE id = 5");
     assert_eq!(
-        upd.set,
-        vec![(EcoString::from("v"), None), (EcoString::from("w"), None),]
+        upd.set.as_slice(),
+        &[(EcoString::from("v"), None), (EcoString::from("w"), None),]
     );
 }
 
@@ -456,8 +456,8 @@ fn test_delete_extracts_bare_column_predicate() {
     let del = delete_rows("DELETE FROM t WHERE id = 5 AND qty > 10");
     assert_eq!(del.relation.name, "t");
     assert_eq!(
-        del.comparisons,
-        vec![
+        del.comparisons.as_slice(),
+        &[
             comparison("id", BinaryOp::Equal, LiteralValue::Integer(5)),
             comparison("qty", BinaryOp::GreaterThan, LiteralValue::Integer(10)),
         ]
@@ -469,8 +469,8 @@ fn test_delete_flips_literal_op_column() {
     // `5 = id` normalizes to `id = 5`.
     let del = delete_rows("DELETE FROM t WHERE 5 = id");
     assert_eq!(
-        del.comparisons,
-        vec![comparison("id", BinaryOp::Equal, LiteralValue::Integer(5))]
+        del.comparisons.as_slice(),
+        &[comparison("id", BinaryOp::Equal, LiteralValue::Integer(5))]
     );
 }
 

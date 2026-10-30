@@ -86,6 +86,7 @@ pub(crate) fn update_statement_parameterize(
 mod tests {
     use bytes::Bytes;
     use postgres_types::Type as PgType;
+    use smallvec::smallvec;
 
     use super::*;
     use crate::oid::TypeOid;
@@ -127,7 +128,7 @@ mod tests {
     fn test_delete_statement_parameterize() {
         let stmt = DeleteStatement {
             relation: relation("t"),
-            comparisons: vec![
+            comparisons: smallvec![
                 id_equals(LiteralValue::Parameter("$1".into())),
                 TableConstraint {
                     column: "v".into(),
@@ -149,8 +150,8 @@ mod tests {
     fn test_update_statement_parameterize() {
         let stmt = UpdateStatement {
             relation: relation("t"),
-            where_comparisons: vec![id_equals(LiteralValue::Parameter("$1".into()))],
-            set: vec![
+            where_comparisons: smallvec![id_equals(LiteralValue::Parameter("$1".into()))],
+            set: smallvec![
                 ("v".into(), Some(LiteralValue::Parameter("$2".into()))),
                 // A non-literal SET stays unknown after substitution.
                 ("w".into(), None),
@@ -171,8 +172,8 @@ mod tests {
     fn test_update_statement_parameterize_out_of_bounds_errors() {
         let stmt = UpdateStatement {
             relation: relation("t"),
-            where_comparisons: vec![id_equals(LiteralValue::Parameter("$2".into()))],
-            set: vec![("v".into(), Some(LiteralValue::Integer(1)))],
+            where_comparisons: smallvec![id_equals(LiteralValue::Parameter("$2".into()))],
+            set: smallvec![("v".into(), Some(LiteralValue::Integer(1)))],
         };
         let params = typed_text_params(vec![(Some(b"7"), PgType::INT4)]);
         assert!(update_statement_parameterize(&stmt, &params).is_err());

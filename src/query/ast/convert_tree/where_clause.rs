@@ -490,7 +490,7 @@ unsafe fn like_operator_extract(name: *const pg::List) -> Result<BinaryOp, Where
     }
 }
 
-fn binary_op_from_str(op: &str) -> Option<BinaryOp> {
+pub(super) fn binary_op_from_str(op: &str) -> Option<BinaryOp> {
     match op {
         "=" => Some(BinaryOp::Equal),
         "!=" | "<>" => Some(BinaryOp::NotEqual),

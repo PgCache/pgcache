@@ -1,3 +1,4 @@
+use smallvec::smallvec;
 use std::sync::Arc;
 
 use ecow::EcoString;
@@ -490,7 +491,7 @@ fn delete_eq(table: &str, col: &str, value: i64) -> WriteClass {
             schema: None,
             name: table.into(),
         },
-        comparisons: vec![comparison(
+        comparisons: smallvec![comparison(
             col,
             BinaryOp::Equal,
             LiteralValue::Integer(value),
@@ -547,7 +548,7 @@ fn delete_range(table: &str, col: &str, below: i64) -> WriteClass {
             schema: None,
             name: table.into(),
         },
-        comparisons: vec![comparison(
+        comparisons: smallvec![comparison(
             col,
             BinaryOp::LessThan,
             LiteralValue::Integer(below),
@@ -651,7 +652,7 @@ fn test_delete_multi_column_equality_tuples() {
                 schema: None,
                 name: "orders".into(),
             },
-            comparisons: vec![
+            comparisons: smallvec![
                 comparison("a", BinaryOp::Equal, LiteralValue::Integer(a)),
                 comparison("b", BinaryOp::Equal, LiteralValue::Integer(b)),
             ],
@@ -713,7 +714,7 @@ fn test_delete_duplicate_column_routes_legacy() {
                 schema: None,
                 name: "orders".into(),
             },
-            comparisons: vec![
+            comparisons: smallvec![
                 comparison("id", BinaryOp::Equal, LiteralValue::Integer(1)),
                 comparison("id", BinaryOp::Equal, LiteralValue::Integer(2)),
             ],
@@ -756,7 +757,7 @@ fn update_eq(
             schema: None,
             name: table.into(),
         },
-        where_comparisons: vec![comparison(
+        where_comparisons: smallvec![comparison(
             where_col,
             BinaryOp::Equal,
             LiteralValue::Integer(where_val),
@@ -1500,12 +1501,12 @@ fn test_update_of_unreferenced_column_serves_read_for_range_shape() {
                 schema: None,
                 name: "actor".into(),
             },
-            where_comparisons: vec![comparison(
+            where_comparisons: smallvec![comparison(
                 "actor_id",
                 BinaryOp::GreaterThan,
                 LiteralValue::Integer(5),
             )],
-            set: vec![("last_update".into(), None)],
+            set: smallvec![("last_update".into(), None)],
         })),
         None,
         None,

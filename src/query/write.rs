@@ -313,8 +313,16 @@ pub struct InsertStatement {
 #[derive(Debug)]
 pub struct DeleteStatement {
     pub relation: RelationRef,
-    pub comparisons: Vec<TableConstraint>,
+    pub comparisons: WriteComparisons,
 }
+
+/// A write's bare-column WHERE conjuncts; inline for the one- or two-column
+/// keys most writes name, since the statement lives only until the write
+/// log folds it.
+pub type WriteComparisons = SmallVec<[TableConstraint; 2]>;
+
+/// An UPDATE's SET list, inline for a handful of columns.
+pub type SetAssignments = SmallVec<[SetAssignment; 4]>;
 
 /// One `SET column = value` assignment. `None` = the new value isn't a literal
 /// (subquery, expression, column reference, DEFAULT, or parameter), so the
@@ -327,8 +335,8 @@ pub type SetAssignment = (EcoString, Option<LiteralValue>);
 #[derive(Debug)]
 pub struct UpdateStatement {
     pub relation: RelationRef,
-    pub where_comparisons: Vec<TableConstraint>,
-    pub set: Vec<SetAssignment>,
+    pub where_comparisons: WriteComparisons,
+    pub set: SetAssignments,
 }
 
 #[cfg(test)]
