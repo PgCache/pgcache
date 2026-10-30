@@ -993,3 +993,48 @@ async fn test_self_join_rows_batch_per_reference() -> Result<(), Error> {
     assert_cache_hit(&mut ctx, after).await?;
     Ok(())
 }
+
+/// A registration reuses the binding the Resolve command made for its
+/// session key: the Register command binds nothing itself, for a query
+/// that resolves on the search path as for one naming its schema.
+#[tokio::test]
+async fn test_register_reuses_resolve_binding() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    ctx.query(
+        "create table bind_once (id integer primary key, data text)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "insert into bind_once (id, data) select g, 'row-' || g from generate_series(1, 20) g",
+        &[],
+    )
+    .await?;
+
+    for i in 1..=10 {
+        ctx.query(
+            &format!("select id, data from bind_once where id = {i}"),
+            &[],
+        )
+        .await?;
+    }
+    for i in 11..=20 {
+        ctx.query(
+            &format!("select id, data from public.bind_once where id = {i}"),
+            &[],
+        )
+        .await?;
+    }
+    ctx.cache_settle().await?;
+
+    let m = ctx.metrics().await?;
+    assert_eq!(
+        m.queries_cache_miss, 20,
+        "every distinct literal registered"
+    );
+    assert_eq!(
+        m.cache_writer_register_binds, 0,
+        "the Register command bound a query the Resolve command had bound"
+    );
+    Ok(())
+}

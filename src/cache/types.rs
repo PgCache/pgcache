@@ -34,13 +34,28 @@ use crate::{
 /// stamped with the writer's sweep tick at insertion. The sweep spares an
 /// alias inserted since the previous sweep: its dispatch may not have
 /// inserted the entry under the fingerprint yet.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Alias {
     pub fingerprint: Fingerprint,
     pub tick: u64,
     /// The key carries an RLS context (PGC-113): the fingerprint depends on
     /// the role's policies, so a role or policy change drops the alias.
     pub rls: bool,
+    /// What the Resolve command bound, for the Register command that
+    /// follows; the first registration takes it, so the query is bound once.
+    pub resolution: Option<AliasResolution>,
+}
+
+/// A query bound and canonicalised under its session key's settings, as
+/// the Resolve command built it and the Register command would build it
+/// again.
+#[derive(Debug, Clone)]
+pub struct AliasResolution {
+    pub(crate) bound: Arc<ResolvedQuery>,
+    /// A date-time literal was left as written (`LiteralCanonOutcome::residual`).
+    pub(crate) reference_only: bool,
+    /// The user's LIMIT split off before binding.
+    pub(crate) user_max_limit: Option<u64>,
 }
 
 /// The relations origin applies row-level security to, by bare name (any

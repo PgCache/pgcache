@@ -102,6 +102,9 @@ pub(crate) struct MetricsSnapshot {
     pub txn_forward_isolation_strict: u64,
     pub txn_forward_pending_write: u64,
     pub conn_settings_probes: u64,
+    /// Registrations that bound their query in the Register command instead
+    /// of reusing the Resolve command's binding.
+    pub cache_writer_register_binds: u64,
 }
 
 /// Fetch metrics via HTTP from the Prometheus endpoint.
@@ -143,6 +146,7 @@ macro_rules! samples {
 /// Every sample the snapshot records, by its exported name.
 const SAMPLES: &[Sample] = samples! {
     "pgcache_queries_total" => queries_total,
+    "pgcache_cache_writer_register_bind_seconds_count" => cache_writer_register_binds,
     "pgcache_queries_cacheable" => queries_cacheable,
     "pgcache_queries_uncacheable" => queries_uncacheable,
     "pgcache_queries_unsupported" => queries_unsupported,

@@ -66,12 +66,7 @@ impl WriterRegistration {
 
         // Phase 1: Bind. The subsumption check reads only the bound query;
         // the rest of the resolution is built once an entry will be created.
-        let bind_start = Instant::now();
         let query = self.query_bind(core, &request).await?;
-        crate::metrics::handles()
-            .reg
-            .register_bind
-            .record(bind_start.elapsed().as_secs_f64());
 
         // Phase 2: Subsumption check
         let subsumption_start = Instant::now();

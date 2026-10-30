@@ -17,7 +17,7 @@ use crate::cache::admission::{
 };
 use crate::cache::messages::RegisterRequest;
 use crate::cache::mv::{query_has_join, query_has_window};
-use crate::cache::types::{ReadFacts, SharedQueryShape, SharedResolvedQuery};
+use crate::cache::types::{AliasResolution, ReadFacts, SharedQueryShape, SharedResolvedQuery};
 use crate::cache::update_query::{UpdateQueries, UpdateQueryRegistration};
 use crate::cache::writer::core::WriterCore;
 use crate::cache::{CacheError, CacheResult, ReportExt};
@@ -26,7 +26,7 @@ use crate::query::Fingerprint;
 use crate::query::ast::rope::QueryTree;
 use crate::query::join_region::{JoinRegion, query_join_region};
 use crate::query::keying_settings::KeyingSettings;
-use crate::query::resolve::ResolvedQuery;
+use crate::query::resolve::{ResolvedQuery, TableSlot};
 
 /// Resolve schema for a table: use explicit schema if provided, otherwise lookup via search path.
 async fn table_schema_resolve(
@@ -97,17 +97,53 @@ async fn query_bind_canonical(
     Ok((resolution, user_max_limit))
 }
 
-/// The fingerprint of a query under the session's keying settings: the hash
-/// of its serve SQL (schema-qualified tables, canonical literals).
+/// The fingerprint of a query under the session's keying settings, the hash
+/// of its serve SQL (schema-qualified tables, canonical literals), with the
+/// binding that produced it for the registration to reuse.
 pub(super) async fn query_fingerprint_resolve(
     core: &mut WriterCore,
     query: &QueryTree,
     keying: &KeyingSettings,
-) -> CacheResult<Fingerprint> {
-    let (resolution, _) = query_bind_canonical(core, query, keying)
-        .await
-        .attach_loc("resolving query expression for its fingerprint")?;
-    Ok(resolution.bound.fingerprint())
+) -> CacheResult<(Fingerprint, AliasResolution)> {
+    let (CanonicalResolution { bound, literals }, user_max_limit) =
+        query_bind_canonical(core, query, keying)
+            .await
+            .attach_loc("resolving query expression for its fingerprint")?;
+    let fingerprint = bound.fingerprint();
+    Ok((
+        fingerprint,
+        AliasResolution {
+            bound,
+            reference_only: literals.residual,
+            user_max_limit,
+        },
+    ))
+}
+
+/// The binding the Resolve command left on the request's alias, when every
+/// table it bound is still the catalog's entry; a table replaced since
+/// (schema change) binds afresh against the current catalog.
+fn alias_resolution_take(core: &WriterCore, request: &RegisterRequest) -> Option<AliasResolution> {
+    let resolution = core
+        .state_view
+        .aliases
+        .get_mut(&request.session_key)?
+        .resolution
+        .take()?;
+    let current = resolution
+        .bound
+        .bindings()
+        .slots()
+        .iter()
+        .all(|slot| match slot {
+            TableSlot::Base { table, .. } => core
+                .cache
+                .tables
+                .get1(&table.relation_oid)
+                .is_some_and(|catalog| Arc::ptr_eq(catalog.shared(), table)),
+            TableSlot::Derived { .. } => true,
+        });
+    current.then_some(resolution)
 }
 
 fn search_path(keying: &KeyingSettings) -> Vec<&str> {
@@ -162,14 +198,36 @@ pub(super) struct BoundQuery {
 }
 
 impl WriterRegistration {
-    /// Ensure the query's tables exist in the cache and bind it to them.
+    /// The query bound to its cache tables: the Resolve command's binding
+    /// when its alias still holds it, else bound here (a pinned query, a
+    /// re-registration, or a schema change since).
     pub(super) async fn query_bind(
         &self,
         core: &mut WriterCore,
         request: &RegisterRequest,
     ) -> CacheResult<BoundQuery> {
-        let (CanonicalResolution { bound, literals }, user_max_limit) =
-            query_bind_canonical(core, request.cacheable_query.tree(), &request.keying).await?;
+        let AliasResolution {
+            bound,
+            reference_only,
+            user_max_limit,
+        } = match alias_resolution_take(core, request) {
+            Some(resolution) => resolution,
+            None => {
+                let bind_start = Instant::now();
+                let (CanonicalResolution { bound, literals }, user_max_limit) =
+                    query_bind_canonical(core, request.cacheable_query.tree(), &request.keying)
+                        .await?;
+                crate::metrics::handles()
+                    .reg
+                    .register_bind
+                    .record(bind_start.elapsed().as_secs_f64());
+                AliasResolution {
+                    bound,
+                    reference_only: literals.residual,
+                    user_max_limit,
+                }
+            }
+        };
         // The identity dispatch resolved this pair to must be the one this
         // resolution produces.
         debug_assert_eq!(
@@ -189,7 +247,7 @@ impl WriterRegistration {
             bound,
             join_region,
             user_max_limit,
-            reference_only: literals.residual,
+            reference_only,
         })
     }
 

@@ -19,6 +19,7 @@ use crate::cache::reference_settings;
 use crate::cache::types::{CachedQueryState, CachedQueryView, PinnedQuery, QueryMetrics};
 use crate::cache::{CacheError, CacheResult};
 use crate::query::Fingerprint;
+use crate::query::SessionKey;
 use crate::query::keying_settings::KeyingSettings;
 use crate::timing::duration_to_ns_u64;
 
@@ -72,6 +73,7 @@ impl CacheDispatch {
             let (subsumption_tx, _subsumption_rx) = oneshot::channel();
             self.register_send(RegisterRequest {
                 fingerprint,
+                session_key,
                 cacheable_query: Arc::clone(&pq.cacheable_query),
                 keying: Arc::clone(&keying),
                 started_at: Instant::now(),
@@ -97,6 +99,7 @@ impl CacheDispatch {
     pub(super) async fn subsumption_await(
         &self,
         msg: QueryRequest,
+        session_key: SessionKey,
         fingerprint: Fingerprint,
         admit_action: AdmitAction,
     ) -> CacheResult<()> {
@@ -109,6 +112,7 @@ impl CacheDispatch {
 
         let request = RegisterRequest {
             fingerprint,
+            session_key,
             cacheable_query,
             keying: Arc::clone(&msg.keying),
             started_at: Instant::now(),

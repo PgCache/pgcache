@@ -115,6 +115,9 @@ pub enum ResolveResult {
 /// Payload for `QueryCommand::Register`.
 pub struct RegisterRequest {
     pub fingerprint: Fingerprint,
+    /// The key the request resolved under: its alias holds the binding the
+    /// Resolve command made.
+    pub session_key: SessionKey,
     pub cacheable_query: Arc<CacheableQuery>,
     pub keying: Arc<KeyingSettings>,
     pub started_at: Instant,

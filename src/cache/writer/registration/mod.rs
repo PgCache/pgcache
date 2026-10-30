@@ -229,13 +229,14 @@ async fn resolve_command(core: &mut WriterCore, request: ResolveRequest) {
     )
     .await
     {
-        Ok(fingerprint) => {
+        Ok((fingerprint, resolution)) => {
             core.state_view.aliases.insert(
                 session_key,
                 Alias {
                     fingerprint,
                     tick: core.alias_tick,
                     rls: request.keying.rls.is_some(),
+                    resolution: Some(resolution),
                 },
             );
             ResolveResult::Resolved(fingerprint)

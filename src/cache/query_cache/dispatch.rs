@@ -330,7 +330,7 @@ impl CacheDispatch {
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn query_dispatch(&mut self, mut msg: QueryRequest) -> CacheResult<()> {
         let cfg = self.dynamic.load();
-        let Some(fingerprint) = self.identity_resolve(&msg, &cfg).await else {
+        let Some((session_key, fingerprint)) = self.identity_resolve(&msg, &cfg).await else {
             return msg.forward();
         };
         let target = self.dispatch_target(fingerprint, &msg.limit, &cfg);
@@ -390,7 +390,9 @@ impl CacheDispatch {
                     if let Some(ServeDecision::Register { action, .. }) =
                         self.transition_apply(fingerprint, decision, &target.input)
                     {
-                        return self.subsumption_await(msg, fingerprint, action).await;
+                        return self
+                            .subsumption_await(msg, session_key, fingerprint, action)
+                            .await;
                     }
                 }
 
@@ -412,16 +414,17 @@ impl CacheDispatch {
         }
     }
 
-    /// The identity of an admissible request: through the alias map, or —
-    /// once per (query, keying settings) pair — by asking the writer to
-    /// resolve the query. `None` forwards: a table outside the allowlist, a
-    /// brand-new pair under throttle (before resolving, as a brand-new entry
-    /// would), or a query that does not resolve.
+    /// The identity of an admissible request, with the session key it was
+    /// found under: through the alias map, or — once per (query, keying
+    /// settings) pair — by asking the writer to resolve the query. `None`
+    /// forwards: a table outside the allowlist, a brand-new pair under
+    /// throttle (before resolving, as a brand-new entry would), or a query
+    /// that does not resolve.
     async fn identity_resolve(
         &self,
         msg: &QueryRequest,
         cfg: &DynamicConfig,
-    ) -> Option<Fingerprint> {
+    ) -> Option<(SessionKey, Fingerprint)> {
         if !fast_path::query_allowlist_check(&cfg.allowed_tables_parsed, msg.query.tree()) {
             crate::metrics::handles()
                 .query
@@ -433,7 +436,7 @@ impl CacheDispatch {
             .session_key
             .unwrap_or_else(|| msg.query.session_key(&msg.keying));
         if let Some(fingerprint) = self.fingerprint_for_key(session_key) {
-            return Some(fingerprint);
+            return Some((session_key, fingerprint));
         }
         if self.state_view.throttled() {
             crate::metrics::handles()
@@ -446,8 +449,10 @@ impl CacheDispatch {
             debug!("session key {session_key} has bind values that do not substitute; forwarding");
             return None;
         };
-        self.session_key_resolve(session_key, cacheable_query, &msg.keying)
-            .await
+        let fingerprint = self
+            .session_key_resolve(session_key, cacheable_query, &msg.keying)
+            .await?;
+        Some((session_key, fingerprint))
     }
 
     /// Whether `role` may be served a read needing `needs` (PGC-463). A
