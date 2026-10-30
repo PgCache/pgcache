@@ -6,6 +6,7 @@ use std::sync::Arc;
 use ecow::EcoString;
 
 use super::ResolveResult;
+use super::analysis::PrivilegeNeeds;
 use super::entry::query_tree_resolve;
 use crate::catalog::Catalog;
 use crate::catalog::{ColumnMetadata, ColumnPosition, TableMetadata};
@@ -439,15 +440,19 @@ pub struct ResolvedQuery {
     tree: QueryTree,
     bindings: Bindings,
     predicates: Arc<QueryPredicates>,
+    privilege_needs: Arc<PrivilegeNeeds>,
 }
 
 impl ResolvedQuery {
     pub fn new(tree: QueryTree, bindings: Bindings) -> Self {
-        let predicates = Arc::new(QueryPredicates::build(BoundView::new(&tree, &bindings)));
+        let view = BoundView::new(&tree, &bindings);
+        let predicates = Arc::new(QueryPredicates::build(view));
+        let privilege_needs = Arc::new(view.privilege_needs());
         Self {
             tree,
             bindings,
             predicates,
+            privilege_needs,
         }
     }
 
@@ -465,6 +470,13 @@ impl ResolvedQuery {
     /// per SELECT branch, with its join region.
     pub fn predicates(&self) -> &QueryPredicates {
         &self.predicates
+    }
+
+    /// The privileges a read of this query needs at origin
+    /// ([`BoundView::privilege_needs`]), built once with the query and
+    /// shared with its read facts.
+    pub fn privilege_needs(&self) -> &Arc<PrivilegeNeeds> {
+        &self.privilege_needs
     }
 
     /// `sql` parsed and resolved against `tables` on `search_path`.

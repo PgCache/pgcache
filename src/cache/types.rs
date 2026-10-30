@@ -535,8 +535,9 @@ impl CacheStateView {
 /// serving handoff (PGC-543).
 #[derive(Debug)]
 pub(crate) struct ReadFacts {
-    /// What a role must be allowed to read for a hit (PGC-463).
-    pub(crate) privilege_needs: PrivilegeNeeds,
+    /// What a role must be allowed to read for a hit (PGC-463), shared
+    /// with the bound query.
+    pub(crate) privilege_needs: Arc<PrivilegeNeeds>,
     /// The relations the read touches, with the columns it references and
     /// its per-reference ranges on each, for the read-after-write gate
     /// (PGC-512, PGC-542).
@@ -545,7 +546,7 @@ pub(crate) struct ReadFacts {
 
 impl ReadFacts {
     pub(crate) fn build(bound: &ResolvedQuery) -> Self {
-        let privilege_needs = bound.privilege_needs();
+        let privilege_needs = Arc::clone(bound.privilege_needs());
         let relations = ReadRelations::build(bound, &privilege_needs.relations);
         Self {
             privilege_needs,

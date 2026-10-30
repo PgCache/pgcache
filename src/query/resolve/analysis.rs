@@ -106,71 +106,6 @@ impl ResolvedQuery {
         self.view().column_type_at(id)
     }
 
-    /// The privileges a read of this query needs at origin: the columns it
-    /// references per base relation, keyed by OID so same-named tables in
-    /// two schemas stay apart, and the functions it calls. The columns are
-    /// read anywhere: select list, predicates, join conditions (a
-    /// `USING`/`NATURAL` join through both sides of each merged column),
-    /// grouping, ordering and subqueries, with stars expanded; every base
-    /// relation has an entry, possibly empty.
-    pub fn privilege_needs(&self) -> PrivilegeNeeds {
-        let relations = self.columns_collect(|table| table.relation_oid);
-        let mut functions: Vec<EcoString> = self
-            .tree()
-            .nodes()
-            .filter_map(|node| match &node.kind {
-                NodeKind::Function { name, .. } => Some(name.clone()),
-                _ => None,
-            })
-            .collect();
-        functions.sort_unstable();
-        functions.dedup();
-        PrivilegeNeeds {
-            relations,
-            functions,
-        }
-    }
-
-    /// The columns read from each base table, keyed by `key` of the table.
-    fn columns_collect<K: std::hash::Hash + Eq>(
-        &self,
-        key: impl Fn(&TableMetadata) -> K,
-    ) -> HashMap<K, HashSet<EcoString>> {
-        let bindings = self.bindings();
-        let mut columns: HashMap<K, HashSet<EcoString>> = HashMap::new();
-        for slot in bindings.slots() {
-            if let TableSlot::Base { table, .. } = slot {
-                columns.entry(key(table)).or_default();
-            }
-        }
-        for position in self.tree().root().node_ref().subtree() {
-            match position.kind() {
-                NodeKind::Column { .. } => {
-                    if let Some(ColumnTarget::Column(binding)) =
-                        bindings.column_by_id(position.id())
-                    {
-                        column_add(bindings, &mut columns, &key, binding);
-                    }
-                    // A merged-column reference reads the join's side columns, which
-                    // the merged-column loop below already adds.
-                }
-                NodeKind::Star { .. } => {
-                    for item in bindings.star_by_id(position.id()).unwrap_or(&[]) {
-                        if let StarItem::Column(binding) = item {
-                            column_add(bindings, &mut columns, &key, binding);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        for merged in bindings.merged_columns() {
-            column_add(bindings, &mut columns, &key, &merged.left);
-            column_add(bindings, &mut columns, &key, &merged.right);
-        }
-        columns
-    }
-
     /// The output names of `query`, one per output position with stars
     /// expanded: an alias, else the column name of a column reference, else
     /// nothing. A set operation's outputs are its leftmost branch's.
@@ -285,4 +220,71 @@ pub(super) fn binding_type(bindings: &Bindings, binding: ColumnBinding) -> Optio
     bindings
         .binding_column(&binding)
         .map(|column| &column.data_type)
+}
+
+impl BoundView<'_> {
+    /// The privileges a read of this query needs at origin: the columns it
+    /// references per base relation, keyed by OID so same-named tables in
+    /// two schemas stay apart, and the functions it calls. The columns are
+    /// read anywhere: select list, predicates, join conditions (a
+    /// `USING`/`NATURAL` join through both sides of each merged column),
+    /// grouping, ordering and subqueries, with stars expanded; every base
+    /// relation has an entry, possibly empty.
+    pub fn privilege_needs(self) -> PrivilegeNeeds {
+        let relations = self.columns_collect(|table| table.relation_oid);
+        let mut functions: Vec<EcoString> = self
+            .tree()
+            .nodes()
+            .filter_map(|node| match &node.kind {
+                NodeKind::Function { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        functions.sort_unstable();
+        functions.dedup();
+        PrivilegeNeeds {
+            relations,
+            functions,
+        }
+    }
+
+    /// The columns read from each base table, keyed by `key` of the table.
+    fn columns_collect<K: std::hash::Hash + Eq>(
+        self,
+        key: impl Fn(&TableMetadata) -> K,
+    ) -> HashMap<K, HashSet<EcoString>> {
+        let bindings = self.bindings();
+        let mut columns: HashMap<K, HashSet<EcoString>> = HashMap::new();
+        for slot in bindings.slots() {
+            if let TableSlot::Base { table, .. } = slot {
+                columns.entry(key(table)).or_default();
+            }
+        }
+        for position in self.tree().root().node_ref().subtree() {
+            match position.kind() {
+                NodeKind::Column { .. } => {
+                    if let Some(ColumnTarget::Column(binding)) =
+                        bindings.column_by_id(position.id())
+                    {
+                        column_add(bindings, &mut columns, &key, binding);
+                    }
+                    // A merged-column reference reads the join's side columns, which
+                    // the merged-column loop below already adds.
+                }
+                NodeKind::Star { .. } => {
+                    for item in bindings.star_by_id(position.id()).unwrap_or(&[]) {
+                        if let StarItem::Column(binding) = item {
+                            column_add(bindings, &mut columns, &key, binding);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        for merged in bindings.merged_columns() {
+            column_add(bindings, &mut columns, &key, &merged.left);
+            column_add(bindings, &mut columns, &key, &merged.right);
+        }
+        columns
+    }
 }

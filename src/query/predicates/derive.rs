@@ -119,7 +119,7 @@ impl RelationPredicates {
     /// filter, not exact, and every column a link column.
     pub(crate) fn unknown(table: &TableMetadata) -> Self {
         Self {
-            filters: Vec::new(),
+            filters: Vec::new().into(),
             ranges: TableRanges::default(),
             keyed_ranges: TableRanges::default(),
             link_columns: table
@@ -528,7 +528,7 @@ fn relation_predicates_project(
         TableSlot::Derived { .. } => ranges.clone(),
     };
     Some(RelationPredicates {
-        filters,
+        filters: filters.into(),
         ranges,
         keyed_ranges,
         link_columns,

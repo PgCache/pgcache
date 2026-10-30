@@ -1,6 +1,7 @@
 //! The per-table admission derivation, extracted verbatim from the writer's
 //! registration path (PGC-391) so pgcache-fit runs the identical analysis.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ptr;
 use std::sync::Arc;
@@ -224,17 +225,22 @@ pub fn query_admission_analyze(
 
 /// The columns each relation is read through, in the registered form and,
 /// when it differs, the decorrelated form the update queries come from.
-fn read_columns_collect(
-    bound: &ResolvedQuery,
+fn read_columns_collect<'a>(
+    bound: &'a ResolvedQuery,
     update_source: &ResolvedQuery,
-) -> HashMap<Oid, HashSet<EcoString>> {
-    let mut columns = bound.privilege_needs().relations;
-    if !ptr::eq(bound, update_source) {
-        for (relation_oid, names) in update_source.privilege_needs().relations {
-            columns.entry(relation_oid).or_default().extend(names);
-        }
+) -> Cow<'a, HashMap<Oid, HashSet<EcoString>>> {
+    let registered = &bound.privilege_needs().relations;
+    if ptr::eq(bound, update_source) {
+        return Cow::Borrowed(registered);
     }
-    columns
+    let mut columns = registered.clone();
+    for (relation_oid, names) in &update_source.privilege_needs().relations {
+        columns
+            .entry(*relation_oid)
+            .or_default()
+            .extend(names.iter().cloned());
+    }
+    Cow::Owned(columns)
 }
 
 /// What every table's admission is derived against.
@@ -248,7 +254,7 @@ struct AdmissionContext<'a> {
     depth: AdmissionDepth,
     /// The read columns per relation (`UpdateQuery::read_columns`); only a
     /// full admission derives them.
-    read_columns: Option<HashMap<Oid, HashSet<EcoString>>>,
+    read_columns: Option<Cow<'a, HashMap<Oid, HashSet<EcoString>>>>,
 }
 
 impl AdmissionContext<'_> {
@@ -629,7 +635,7 @@ mod tests {
             .tables
             .into_iter()
             .find(|admission| admission.subsumer_shape)
-            .map(|admission| admission.update_query.predicates.filters.clone());
+            .map(|admission| Arc::clone(&admission.update_query.predicates.filters));
         let tables = catalog();
         let bound = ResolvedQuery::parse_resolve(new, &tables, &["public"]).expect("resolve");
         let references = subsumption_references(&bound).expect("references");

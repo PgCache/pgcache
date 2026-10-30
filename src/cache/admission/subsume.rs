@@ -3,6 +3,8 @@
 //! supplies candidates from its per-relation index plus parent state,
 //! pgcache-fit from its offline registry.
 
+use std::sync::Arc;
+
 use ecow::EcoString;
 
 use super::{CandidateState, SubsumerCandidate, SubsumerSource};
@@ -18,13 +20,16 @@ use crate::query::resolve::ResolvedQuery;
 use crate::query::update::query_base_references;
 
 /// One table reference of a new query: its relation and the filters every
-/// row it reads satisfies, as constraints for the source to key and as
-/// ranges for the coverage check.
+/// row it reads satisfies, as constraints and as ranges for the coverage
+/// check. A whole reference shares the model's; a split piece owns its own.
 #[derive(Debug, Clone)]
 pub struct SubsumptionReference {
     pub relation_oid: Oid,
-    pub filters: Vec<TableConstraint>,
+    pub filters: Arc<[TableConstraint]>,
     pub ranges: TableRanges,
+    /// `ranges` in their index-key forms as the model keyed them (PGC-478);
+    /// `None` for a split piece, whose filters the source keys itself.
+    pub keyed_ranges: Option<TableRanges>,
 }
 
 /// Every base table reference of `bound` across its SELECT branches (root,
@@ -47,8 +52,9 @@ pub fn subsumption_references(bound: &ResolvedQuery) -> Option<Vec<SubsumptionRe
             let relation = reference.predicates?;
             Some(SubsumptionReference {
                 relation_oid: reference.table.relation_oid,
-                filters: relation.filters.clone(),
+                filters: Arc::clone(&relation.filters),
                 ranges: relation.ranges.clone(),
+                keyed_ranges: Some(relation.keyed_ranges.clone()),
             })
         })
         .collect()
@@ -314,7 +320,8 @@ fn reference_piece(
     SubsumptionReference {
         relation_oid: reference.relation_oid,
         ranges: TableRanges::build(&filters),
-        filters,
+        filters: filters.into(),
+        keyed_ranges: None,
     }
 }
 

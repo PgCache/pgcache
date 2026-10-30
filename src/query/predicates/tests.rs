@@ -93,7 +93,7 @@ fn select_table_filters(bound: &ResolvedQuery, select: Select<'_>) -> TableFilte
             .table()
             .name
             .clone();
-        let previous = table_constraints.insert(name.clone(), relation.filters.clone());
+        let previous = table_constraints.insert(name.clone(), relation.filters.to_vec());
         assert!(previous.is_none(), "{name} filtered by two references");
     }
     TableFilters {

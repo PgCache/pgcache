@@ -149,7 +149,9 @@ pub struct TableReferencePredicates {
 /// A reference's predicates by column name, as CDC rows are matched.
 #[derive(Debug, Clone)]
 pub struct RelationPredicates {
-    pub filters: Vec<TableConstraint>,
+    /// Shared with every reference built on them, so a probe borrows
+    /// instead of copying.
+    pub filters: Arc<[TableConstraint]>,
     /// `filters` reduced once to per-column ranges, for subsumption and
     /// read-after-write.
     pub ranges: TableRanges,

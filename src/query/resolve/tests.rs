@@ -4,6 +4,8 @@ use ecow::EcoString;
 use iddqd::BiHashMap;
 use postgres_types::Type;
 
+use std::sync::Arc;
+
 use super::*;
 use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
 use crate::oid::{Oid, TypeOid};
@@ -1036,7 +1038,7 @@ fn test_privilege_needs_lists_referenced_columns_per_relation_and_functions() {
          WHERE o.total > 10 ORDER BY lower(c.name)",
         &tables,
     );
-    let needs = query.privilege_needs();
+    let needs = Arc::clone(query.privilege_needs());
     let columns = |oid: u32| {
         let mut columns: Vec<&str> = needs.relations[&Oid::from_raw(oid)]
             .iter()
@@ -1057,7 +1059,7 @@ fn test_privilege_needs_lists_referenced_columns_per_relation_and_functions() {
     );
     assert_eq!(needs.functions, ["lower", "upper"]);
 
-    let count = bound("SELECT count(*) FROM orders", &tables).privilege_needs();
+    let count = Arc::clone(bound("SELECT count(*) FROM orders", &tables).privilege_needs());
     assert!(
         count.relations[&Oid::from_raw(1001)].is_empty(),
         "no column referenced"
@@ -1065,7 +1067,8 @@ fn test_privilege_needs_lists_referenced_columns_per_relation_and_functions() {
     assert_eq!(count.functions, ["count"]);
 
     // A column read only by ORDER BY still decides the result's order.
-    let ordered = bound("SELECT id FROM orders ORDER BY total", &tables).privilege_needs();
+    let ordered =
+        Arc::clone(bound("SELECT id FROM orders ORDER BY total", &tables).privilege_needs());
     let mut ordered_columns: Vec<&str> = ordered.relations[&Oid::from_raw(1001)]
         .iter()
         .map(EcoString::as_str)
@@ -1075,11 +1078,13 @@ fn test_privilege_needs_lists_referenced_columns_per_relation_and_functions() {
 
     // A CTE or FROM subquery is no relation at origin: only the base
     // columns its body reads count.
-    let cte = bound(
-        "WITH big AS (SELECT id, total FROM orders WHERE total > 10) SELECT total FROM big",
-        &tables,
-    )
-    .privilege_needs();
+    let cte = Arc::clone(
+        bound(
+            "WITH big AS (SELECT id, total FROM orders WHERE total > 10) SELECT total FROM big",
+            &tables,
+        )
+        .privilege_needs(),
+    );
     assert_eq!(cte.relations.len(), 1);
     let mut cte_columns: Vec<&str> = cte.relations[&Oid::from_raw(1001)]
         .iter()

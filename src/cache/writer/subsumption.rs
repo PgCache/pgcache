@@ -59,11 +59,14 @@ impl SubsumerSource for WriterSubsumerSource<'_> {
     ) -> impl Iterator<Item = SubsumerCandidate<'_>> {
         let relation_oid = reference.relation_oid;
         // Probe with the new query's constraints in their key forms, the way
-        // the index was built (PGC-478).
-        let keyed = TableRanges::build(&self.cache.tables.get1(&relation_oid).map_or_else(
-            || reference.filters.clone(),
-            |t| table_constraints_keyed(&reference.filters, t),
-        ));
+        // the index was built (PGC-478): as the model keyed them, or keyed
+        // here for a split piece.
+        let keyed = reference.keyed_ranges.clone().unwrap_or_else(|| {
+            TableRanges::build(&self.cache.tables.get1(&relation_oid).map_or_else(
+                || reference.filters.to_vec(),
+                |t| table_constraints_keyed(&reference.filters, t),
+            ))
+        });
         self.cache
             .update_queries
             .get(&relation_oid)
