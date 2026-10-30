@@ -10,6 +10,122 @@ use super::ChunkStatement;
 use crate::cache::{CacheError, CacheResult, ReportExt};
 use crate::catalog::TableMetadata;
 
+/// A relation's primary-key columns as the merge's key predicates render
+/// them: the recorded-delete filter on a chunk and the toast-stale probe.
+///
+/// Both predicates test whether a row of the source aliased `d` has its key
+/// in a set of recorded key tuples. A scalar key renders as `IN (...)`,
+/// which PostgreSQL folds into one array operator however long the list. A
+/// composite key cannot: the parser expands a row-valued `IN` list into one
+/// row comparison per tuple chained by OR, and planning that recurses once
+/// per tuple, so a few thousand tuples exceed `max_stack_depth` (PGC-564).
+/// It renders instead as an (anti-)join against a `VALUES` list, whose depth
+/// does not grow with the set. The key tuples are stored as escaped literal
+/// bodies, so the `VALUES` columns resolve to text and are cast back to each
+/// column's cache type — the coercion the `IN` form applies to its literals.
+pub(crate) struct MergeKey {
+    /// `("p1","p2")`.
+    paren: String,
+    /// Quoted column name and the cache table's type for it, key order.
+    columns: Vec<(String, EcoString)>,
+}
+
+impl MergeKey {
+    pub(crate) fn build(table: &TableMetadata) -> Self {
+        let columns = table
+            .primary_key_columns
+            .iter()
+            .map(|c| {
+                let cache_type = table
+                    .columns
+                    .get(c.as_str())
+                    .map(|m| m.cache_type_name.clone());
+                debug_assert!(
+                    cache_type.is_some(),
+                    "primary-key column {c} missing from columns"
+                );
+                (
+                    escape::escape_identifier(c),
+                    cache_type.unwrap_or_else(|| EcoString::from("text")),
+                )
+            })
+            .collect();
+        Self::from_columns(columns)
+    }
+
+    fn from_columns(columns: Vec<(String, EcoString)>) -> Self {
+        let paren = format!(
+            "({})",
+            columns
+                .iter()
+                .map(|(c, _)| c.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        Self { paren, columns }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(columns: &[(&str, &str)]) -> Self {
+        Self::from_columns(
+            columns
+                .iter()
+                .map(|(name, cache_type)| {
+                    (
+                        escape::escape_identifier(name),
+                        EcoString::from(*cache_type),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// `("p1","p2")`.
+    pub(crate) fn paren(&self) -> &str {
+        &self.paren
+    }
+
+    /// Whether the key of a row of `d` is (`negated`: is not) one of `tuples`,
+    /// rendered key bodies (`'v1','v2'`). `None` for an empty set.
+    pub(crate) fn membership<'a>(
+        &self,
+        tuples: impl Iterator<Item = &'a str>,
+        negated: bool,
+    ) -> Option<String> {
+        let mut list = String::new();
+        for body in tuples {
+            if !list.is_empty() {
+                list.push(',');
+            }
+            list.push('(');
+            list.push_str(body);
+            list.push(')');
+        }
+        if list.is_empty() {
+            return None;
+        }
+        let not = if negated { "NOT " } else { "" };
+        if let [(column, _)] = self.columns.as_slice() {
+            return Some(format!("({column}) {not}IN ({list})"));
+        }
+        let names = self
+            .columns
+            .iter()
+            .map(|(c, _)| c.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        let on = self
+            .columns
+            .iter()
+            .map(|(c, cache_type)| format!("CAST(k.{c} AS {cache_type}) = d.{c}"))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        Some(format!(
+            "{not}EXISTS (SELECT 1 FROM (VALUES {list}) AS k({names}) WHERE {on})"
+        ))
+    }
+}
+
 /// Pre-rendered, owned SQL fragments for merging one relation's staging table
 /// into its shared cache table. Built while borrowing `TableMetadata`, so the
 /// borrow doesn't span the async DB calls.
@@ -18,8 +134,7 @@ pub(super) struct MergePlan {
     name: EcoString,
     /// `"c1","c2",...` — all columns, position order.
     columns_csv: String,
-    /// `("p1","p2")` — primary-key columns.
-    pub(super) pk_columns_paren: String,
+    pub(super) key_columns: MergeKey,
     /// `ON CONFLICT ("p1") DO UPDATE SET "p1" = EXCLUDED."p1"` — re-stamps the
     /// generation of pre-existing rows without overwriting data (CDC owns it).
     conflict: String,
@@ -33,23 +148,22 @@ impl MergePlan {
             .map(|c| escape::escape_identifier(&c.name))
             .collect::<Vec<_>>()
             .join(",");
-        let pk_quoted: Vec<String> = table
-            .primary_key_columns
+        let key_columns = MergeKey::build(table);
+        let conflict_assign = key_columns
+            .columns
             .iter()
-            .map(|c| escape::escape_identifier(c))
-            .collect();
-        let pk_columns_paren = format!("({})", pk_quoted.join(","));
-        let conflict_assign = pk_quoted
-            .iter()
-            .map(|c| format!("{c} = EXCLUDED.{c}"))
+            .map(|(c, _)| format!("{c} = EXCLUDED.{c}"))
             .collect::<Vec<_>>()
             .join(", ");
-        let conflict = format!("ON CONFLICT {pk_columns_paren} DO UPDATE SET {conflict_assign}");
+        let conflict = format!(
+            "ON CONFLICT {} DO UPDATE SET {conflict_assign}",
+            key_columns.paren()
+        );
         Self {
             schema: table.schema.clone(),
             name: table.name.clone(),
             columns_csv,
-            pk_columns_paren,
+            key_columns,
             conflict,
         }
     }
@@ -94,7 +208,7 @@ impl MergePlan {
             schema = escape::escape_identifier(&self.schema),
             name = escape::escape_identifier(&self.name),
             cols = self.columns_csv,
-            pk = self.pk_columns_paren,
+            pk = self.key_columns.paren(),
             conflict = self.conflict,
         )
     }
@@ -141,7 +255,7 @@ mod tests {
             schema: "public".into(),
             name: "t".into(),
             columns_csv: "\"id\",\"v\"".to_owned(),
-            pk_columns_paren: "(\"id\")".to_owned(),
+            key_columns: MergeKey::for_test(&[("id", "integer")]),
             conflict: "ON CONFLICT (\"id\") DO UPDATE SET \"id\" = EXCLUDED.\"id\"".to_owned(),
         }
     }
@@ -188,6 +302,66 @@ mod tests {
         assert!(
             !delete.contains("NOT IN"),
             "filter must not gate the drain: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_scalar_key_membership_renders_an_in_list() {
+        let key = MergeKey::for_test(&[("id", "integer")]);
+        assert_eq!(
+            key.membership(["4", "5"].into_iter(), true).as_deref(),
+            Some("(\"id\") NOT IN ((4),(5))")
+        );
+        assert_eq!(
+            key.membership(["4"].into_iter(), false).as_deref(),
+            Some("(\"id\") IN ((4))")
+        );
+    }
+
+    /// A row-valued `IN` list recurses once per tuple in the parser, so the
+    /// composite form is an anti-join against VALUES, cast back to the cache
+    /// types and correlated on the row source `d`.
+    #[test]
+    fn test_composite_key_membership_renders_a_values_anti_join() {
+        let key = MergeKey::for_test(&[("post_id", "integer"), ("tag", "text")]);
+        assert_eq!(
+            key.membership(["'1','a'", "'2','b'"].into_iter(), true)
+                .as_deref(),
+            Some(
+                "NOT EXISTS (SELECT 1 FROM (VALUES ('1','a'),('2','b')) AS k(\"post_id\",\"tag\") \
+                 WHERE CAST(k.\"post_id\" AS integer) = d.\"post_id\" AND CAST(k.\"tag\" AS text) = d.\"tag\")"
+            )
+        );
+        assert!(
+            key.membership(["'1','a'"].into_iter(), false)
+                .is_some_and(|p| p.starts_with("EXISTS (SELECT 1 FROM (VALUES ('1','a'))"))
+        );
+    }
+
+    #[test]
+    fn test_membership_of_an_empty_set_renders_nothing() {
+        let key = MergeKey::for_test(&[("post_id", "integer"), ("tag", "text")]);
+        assert_eq!(key.membership(std::iter::empty(), true), None);
+        assert_eq!(key.membership(std::iter::empty(), false), None);
+    }
+
+    #[test]
+    fn test_chunk_sql_correlates_a_composite_filter_on_the_drained_rows() {
+        let key = MergeKey::for_test(&[("post_id", "integer"), ("tag", "text")]);
+        let filter = key
+            .membership(["'1','a'"].into_iter(), true)
+            .expect("filter present");
+        let sql = plan().chunk_sql(
+            statement("s", Generation::from_raw(1), 0, 10),
+            Some(&filter),
+        );
+        assert!(
+            sql.contains("FROM d WHERE NOT EXISTS (SELECT 1 FROM (VALUES ('1','a')) AS k("),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("= d.\"post_id\" AND") && sql.contains(") ON CONFLICT"),
+            "{sql}"
         );
     }
 }

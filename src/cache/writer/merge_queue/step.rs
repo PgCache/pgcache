@@ -281,14 +281,14 @@ impl WriterCore {
             let scope = KeyScope {
                 keys: &self.population_deleted_keys,
                 relation_oid,
-                pk_columns_paren: &plan.pk_columns_paren,
+                key_columns: &plan.key_columns,
             };
             in_progress.stale_probe_predicate(scope, population)
         }) else {
             return Ok(false);
         };
         let probe = format!(
-            "SELECT 1 FROM pgcache_stage.{} WHERE {predicate} LIMIT 1",
+            "SELECT 1 FROM pgcache_stage.{} AS d WHERE {predicate} LIMIT 1",
             target.staging
         );
         let hit = self
@@ -327,7 +327,7 @@ impl WriterCore {
             in_progress.filter_predicate(KeyScope {
                 keys: &self.population_deleted_keys,
                 relation_oid: target.relation_oid,
-                pk_columns_paren: &plan.pk_columns_paren,
+                key_columns: &plan.key_columns,
             })
         });
         let sql = plan.chunk_sql(statement, filter);

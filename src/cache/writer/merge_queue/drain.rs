@@ -71,7 +71,7 @@ impl MergeInProgress {
         let KeyScope {
             keys,
             relation_oid,
-            pk_columns_paren,
+            key_columns,
         } = scope;
         let version = keys.filter_version(relation_oid)?;
         let current = self
@@ -79,7 +79,7 @@ impl MergeInProgress {
             .as_ref()
             .is_some_and(|c| c.relation_oid == relation_oid && c.version == version);
         if !current {
-            let predicate = keys.filter_predicate(relation_oid, pk_columns_paren)?;
+            let predicate = keys.filter_predicate(relation_oid, key_columns)?;
             self.filter = Some(FilterCache {
                 relation_oid,
                 version,
@@ -100,7 +100,7 @@ impl MergeInProgress {
         let KeyScope {
             keys,
             relation_oid,
-            pk_columns_paren,
+            key_columns,
         } = scope;
         let version = keys.stale_version_for(relation_oid, population)?;
         let probed = self
@@ -109,7 +109,7 @@ impl MergeInProgress {
         if probed {
             return None;
         }
-        let predicate = keys.stale_predicate(relation_oid, population, pk_columns_paren)?;
+        let predicate = keys.stale_predicate(relation_oid, population, key_columns)?;
         self.stale_probe = Some(StaleProbeCache {
             relation_oid,
             version,
@@ -176,7 +176,7 @@ mod tests {
 
     use super::*;
     use crate::cache::Generation;
-    use crate::cache::writer::merge_queue::merge_fixture;
+    use crate::cache::writer::merge_queue::{MergeKey, merge_fixture};
     use crate::cache::writer::staging::{EventStamp, PopulationDeletedKeys};
     use crate::oid::Oid;
     use crate::pg::{Lsn, OriginSnapshot};
@@ -201,12 +201,16 @@ mod tests {
         MergeInProgress::new(merge, ChunkBoundary::default())
     }
 
-    fn scope(keys: &PopulationDeletedKeys) -> KeyScope<'_> {
+    fn scope<'a>(keys: &'a PopulationDeletedKeys, key: &'a MergeKey) -> KeyScope<'a> {
         KeyScope {
             keys,
             relation_oid: REL,
-            pk_columns_paren: "(id)",
+            key_columns: key,
         }
+    }
+
+    fn key_id() -> MergeKey {
+        MergeKey::for_test(&[("id", "integer")])
     }
 
     fn keys_recording() -> PopulationDeletedKeys {
@@ -219,30 +223,31 @@ mod tests {
     /// re-rendered as soon as a key lands or is cancelled between chunks.
     #[test]
     fn test_filter_cache_follows_key_set_changes() {
+        let key = key_id();
         let mut keys = keys_recording();
         let mut drain = drain();
-        assert!(drain.filter_predicate(scope(&keys)).is_none());
+        assert!(drain.filter_predicate(scope(&keys, &key)).is_none());
 
         keys.record(REL, EcoString::from("4"), stamp(10, 10));
         let first = drain
-            .filter_predicate(scope(&keys))
+            .filter_predicate(scope(&keys, &key))
             .expect("filter present")
             .as_ptr();
         let again = drain
-            .filter_predicate(scope(&keys))
+            .filter_predicate(scope(&keys, &key))
             .expect("filter present")
             .as_ptr();
         assert_eq!(first, again, "unchanged key set reuses the rendering");
 
         keys.record(REL, EcoString::from("7"), stamp(11, 11));
         let grown = drain
-            .filter_predicate(scope(&keys))
+            .filter_predicate(scope(&keys, &key))
             .expect("filter present");
         assert!(grown.contains("(4)") && grown.contains("(7)"), "{grown}");
 
         assert!(keys.cancel(REL, "4"));
         let shrunk = drain
-            .filter_predicate(scope(&keys))
+            .filter_predicate(scope(&keys, &key))
             .expect("filter present");
         assert!(
             !shrunk.contains("(4)") && shrunk.contains("(7)"),
@@ -250,7 +255,7 @@ mod tests {
         );
 
         assert!(keys.cancel(REL, "7"));
-        assert!(drain.filter_predicate(scope(&keys)).is_none());
+        assert!(drain.filter_predicate(scope(&keys, &key)).is_none());
     }
 
     /// PGC-464/PGC-484: toast-stale keys render only when the population's
@@ -259,6 +264,7 @@ mod tests {
     /// key, and a stale key cancels a tracked delete.
     #[test]
     fn test_stale_probe_follows_key_set_and_snapshot() {
+        let key = key_id();
         let mut keys = keys_recording();
         // Sees xids below 20 except 15.
         keys.snapshot_set(
@@ -269,7 +275,7 @@ mod tests {
         let mut drain = drain();
         assert!(
             drain
-                .stale_probe_predicate(scope(&keys), POPULATION)
+                .stale_probe_predicate(scope(&keys, &key), POPULATION)
                 .is_none()
         );
 
@@ -277,18 +283,18 @@ mod tests {
         keys.record_toast_stale(REL, EcoString::from("4"), stamp(5, 12));
         assert!(
             drain
-                .stale_probe_predicate(scope(&keys), POPULATION)
+                .stale_probe_predicate(scope(&keys, &key), POPULATION)
                 .is_none()
         );
 
         keys.record_toast_stale(REL, EcoString::from("7"), stamp(10, 15));
         let first = drain
-            .stale_probe_predicate(scope(&keys), POPULATION)
+            .stale_probe_predicate(scope(&keys, &key), POPULATION)
             .expect("predicate present");
         assert!(first.contains("(7)") && !first.contains("(4)"), "{first}");
         assert!(
             drain
-                .stale_probe_predicate(scope(&keys), POPULATION)
+                .stale_probe_predicate(scope(&keys, &key), POPULATION)
                 .is_none(),
             "unchanged set is not re-probed"
         );
@@ -296,21 +302,21 @@ mod tests {
         // A stale key cancels a tracked delete of the same row (alive at origin).
         keys.record(REL, EcoString::from("9"), stamp(11, 21));
         assert!(
-            keys.filter_predicate(REL, "(id)")
+            keys.filter_predicate(REL, &key)
                 .expect("delete filter")
                 .contains("(9)")
         );
         keys.record_toast_stale(REL, EcoString::from("9"), stamp(12, 22));
-        assert!(keys.filter_predicate(REL, "(id)").is_none());
+        assert!(keys.filter_predicate(REL, &key).is_none());
         let grown = drain
-            .stale_probe_predicate(scope(&keys), POPULATION)
+            .stale_probe_predicate(scope(&keys, &key), POPULATION)
             .expect("predicate present");
         assert!(grown.contains("(7)") && grown.contains("(9)"), "{grown}");
 
         // A later delete supersedes the stale key: the merge omits the row.
         keys.record(REL, EcoString::from("9"), stamp(13, 23));
         let shrunk = drain
-            .stale_probe_predicate(scope(&keys), POPULATION)
+            .stale_probe_predicate(scope(&keys, &key), POPULATION)
             .expect("predicate present");
         assert!(
             shrunk.contains("(7)") && !shrunk.contains("(9)"),

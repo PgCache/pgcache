@@ -28,6 +28,8 @@ use crate::query::Fingerprint;
 
 mod drain;
 mod sql;
+
+pub(crate) use sql::MergeKey;
 mod step;
 
 /// How long a population merge may stay gated on the apply watermark before the
@@ -114,13 +116,13 @@ struct ChunkWindow {
     blocks: u32,
 }
 
-/// One relation's deleted-key set in a drain, with its PK columns as
-/// rendered for the key predicates.
+/// One relation's deleted-key set in a drain, with the PK columns its key
+/// predicates render over.
 #[derive(Clone, Copy)]
 struct KeyScope<'a> {
     keys: &'a PopulationDeletedKeys,
     relation_oid: Oid,
-    pk_columns_paren: &'a str,
+    key_columns: &'a MergeKey,
 }
 
 /// One chunk statement's staging window and generation stamp.

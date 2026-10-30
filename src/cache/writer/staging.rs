@@ -21,6 +21,7 @@ use postgres_protocol::escape;
 use tracing::error;
 
 use super::core::WriterCore;
+use super::merge_queue::MergeKey;
 use crate::cache::Generation;
 use crate::catalog::TableMetadata;
 use crate::oid::Oid;
@@ -414,32 +415,22 @@ impl PopulationDeletedKeys {
             .then_some(entry.stale_version)
     }
 
-    /// Render the `(<pk cols>) IN (...)` membership predicate over the
-    /// toast-stale keys `population` can be missing, or `None` when there are
-    /// none.
+    /// Render the membership predicate over the toast-stale keys `population`
+    /// can be missing, or `None` when there are none.
     pub(super) fn stale_predicate(
         &self,
         relation_oid: Oid,
         population: PopulationKey,
-        pk_columns_paren: &str,
+        key_columns: &MergeKey,
     ) -> Option<String> {
         let entry = self.relations.get(&relation_oid)?;
         let inflight = self.inflight.get(&population)?;
-        let mut tuples = String::new();
-        for key in entry
+        let stale = entry
             .stale_keys
             .iter()
             .filter(|(_, stamp)| inflight.misses(**stamp))
-            .map(|(key, _)| key)
-        {
-            if !tuples.is_empty() {
-                tuples.push(',');
-            }
-            tuples.push('(');
-            tuples.push_str(key);
-            tuples.push(')');
-        }
-        (!tuples.is_empty()).then(|| format!("{pk_columns_paren} IN ({tuples})"))
+            .map(|(key, _)| key.as_str());
+        key_columns.membership(stale, false)
     }
 
     /// Whether any population is recording deletes for `relation_oid`. Lets the
@@ -489,27 +480,18 @@ impl PopulationDeletedKeys {
         entry.filters().then_some(entry.version)
     }
 
-    /// Build the `(<pk cols>) NOT IN (...)` predicate excluding recorded deletes,
-    /// or `None` when there's nothing to exclude.
+    /// Build the predicate excluding recorded deletes, or `None` when there's
+    /// nothing to exclude.
     pub(super) fn filter_predicate(
         &self,
         relation_oid: Oid,
-        pk_columns_paren: &str,
+        key_columns: &MergeKey,
     ) -> Option<String> {
         let entry = self.relations.get(&relation_oid)?;
         if !entry.filters() {
             return None;
         }
-        let mut tuples = String::new();
-        for (i, key) in entry.keys.keys().enumerate() {
-            if i > 0 {
-                tuples.push(',');
-            }
-            tuples.push('(');
-            tuples.push_str(key);
-            tuples.push(')');
-        }
-        Some(format!("{pk_columns_paren} NOT IN ({tuples})"))
+        key_columns.membership(entry.keys.keys().map(EcoString::as_str), true)
     }
 }
 
@@ -842,8 +824,12 @@ mod tests {
         keys.record(REL, EcoString::from(body), stamp(lsn.get()));
     }
 
+    fn key_id() -> MergeKey {
+        MergeKey::for_test(&[("id", "integer")])
+    }
+
     fn filtered(keys: &PopulationDeletedKeys) -> String {
-        keys.filter_predicate(REL, "(id)").unwrap_or_default()
+        keys.filter_predicate(REL, &key_id()).unwrap_or_default()
     }
 
     /// The filter version moves exactly when the rendered filter would: on a
@@ -906,13 +892,17 @@ mod tests {
         record(&mut keys, "25", Lsn::from_raw(250));
 
         // Min floor is 100 (fp1); the merge still filters all three.
-        let before = keys.filter_predicate(REL, "(id)").expect("filter present");
+        let before = keys
+            .filter_predicate(REL, &key_id())
+            .expect("filter present");
         assert!(before.contains("(5)") && before.contains("(15)") && before.contains("(25)"));
 
         // fp1 leaves → deletes received before fp2 activated (LSN <= 200) are
         // irrelevant to fp2 and pruned.
         keys.deactivate(Fingerprint::from_raw(1), GEN);
-        let after = keys.filter_predicate(REL, "(id)").expect("filter present");
+        let after = keys
+            .filter_predicate(REL, &key_id())
+            .expect("filter present");
         assert!(after.contains("(25)"), "kept recent delete: {after}");
         assert!(
             !after.contains("(5)") && !after.contains("(15)"),
@@ -943,7 +933,7 @@ mod tests {
         assert!(keys.is_recording(REL), "gen 8 still in flight");
         record(&mut keys, "5", Lsn::from_raw(150));
         assert!(
-            keys.filter_predicate(REL, "(id)").is_some(),
+            keys.filter_predicate(REL, &key_id()).is_some(),
             "gen 8 still records deletes"
         );
 
@@ -959,7 +949,7 @@ mod tests {
         keys.activate(Fingerprint::from_raw(1), GEN, &[REL], Lsn::from_raw(100));
         record(&mut keys, "5", Lsn::from_raw(150));
         keys.deactivate(Fingerprint::from_raw(1), GEN);
-        assert!(keys.filter_predicate(REL, "(id)").is_none());
+        assert!(keys.filter_predicate(REL, &key_id()).is_none());
     }
 
     /// Deletes for a relation no population is reading are dropped on the floor.
@@ -967,7 +957,7 @@ mod tests {
     fn test_record_without_active_population_is_noop() {
         let mut keys = PopulationDeletedKeys::default();
         record(&mut keys, "5", Lsn::from_raw(150));
-        assert!(keys.filter_predicate(REL, "(id)").is_none());
+        assert!(keys.filter_predicate(REL, &key_id()).is_none());
     }
 
     /// Exceeding the cap drops keys and aborts every merge over the relation.
@@ -980,7 +970,7 @@ mod tests {
         }
         // Overflow aborts regardless of snapshot LSN, and there's no filter.
         assert!(keys.should_abort(REL, Lsn::from_raw(u64::MAX)));
-        assert!(keys.filter_predicate(REL, "(id)").is_none());
+        assert!(keys.filter_predicate(REL, &key_id()).is_none());
     }
 
     /// A bulk invalidation aborts only merges whose snapshot predates it; a
@@ -1011,7 +1001,9 @@ mod tests {
         );
 
         // Keys at/below the truncate LSN are pruned; later ones survive.
-        let filter = keys.filter_predicate(REL, "(id)").expect("filter present");
+        let filter = keys
+            .filter_predicate(REL, &key_id())
+            .expect("filter present");
         assert!(
             filter.contains("(25)") && !filter.contains("(5)"),
             "filter: {filter}"
@@ -1050,7 +1042,10 @@ mod tests {
         assert!(filtered(&keys).contains("(5)"), "fp2 may still need it");
 
         keys.snapshot_set(FP2, GEN, Arc::new(OriginSnapshot::new(200, 200, vec![])));
-        assert!(keys.filter_predicate(REL, "(id)").is_none(), "both saw it");
+        assert!(
+            keys.filter_predicate(REL, &key_id()).is_none(),
+            "both saw it"
+        );
     }
 
     /// Fallback matches held before the snapshot arrives are settled by it: a
