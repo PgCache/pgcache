@@ -49,6 +49,7 @@ const CONTROLLER_CONFIG: PoolControllerConfig = PoolControllerConfig {
     // (PGC-554).
     shed_pressure: 0.8,
     shed_ticks: 5,
+    pressure_window: 8,
 };
 
 /// Controller tick.

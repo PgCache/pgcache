@@ -27,6 +27,7 @@ const CONFIG: PoolControllerConfig = PoolControllerConfig {
     // worker is a cache-PG backend plus an origin connection (PGC-554).
     shed_pressure: 0.5,
     shed_ticks: 5,
+    pressure_window: 8,
 };
 
 /// Elastic population pool controller (PGC-437, ADR-052). Probes the pool
