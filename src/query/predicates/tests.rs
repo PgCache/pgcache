@@ -82,7 +82,7 @@ fn select_table_filters(bound: &ResolvedQuery, select: Select<'_>) -> TableFilte
     let mut table_constraints = HashMap::new();
     for reference in predicates.table_references() {
         let relation = predicates
-            .relation_predicates(bindings, reference.slot)
+            .relation_predicates(reference.slot)
             .expect("relation predicates");
         if relation.filters.is_empty() {
             continue;
@@ -93,7 +93,7 @@ fn select_table_filters(bound: &ResolvedQuery, select: Select<'_>) -> TableFilte
             .table()
             .name
             .clone();
-        let previous = table_constraints.insert(name.clone(), relation.filters);
+        let previous = table_constraints.insert(name.clone(), relation.filters.clone());
         assert!(previous.is_none(), "{name} filtered by two references");
     }
     TableFilters {
@@ -904,7 +904,7 @@ fn reference_filter_lines(bound: &ResolvedQuery, select: Select<'_>) -> Vec<(Str
         .filter(|reference| matches!(bindings.slot(reference.slot), Some(TableSlot::Base { .. })))
         .map(|reference| {
             let relation = predicates
-                .relation_predicates(bindings, reference.slot)
+                .relation_predicates(reference.slot)
                 .expect("relation predicates");
             let mut filters: Vec<String> = relation.filters.iter().map(constraint_line).collect();
             filters.sort();

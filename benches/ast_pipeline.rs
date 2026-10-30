@@ -339,10 +339,13 @@ fn resolve_bound(tree: &QueryTree, catalog: &Catalog) -> ResolvedQuery {
     ResolvedQuery::resolve(tree.clone(), catalog, &["public"]).expect("the fixture SQL resolves")
 }
 
-/// The bound query with its literals canonicalised, as registration
-/// builds it; the clone is what registration's own copy costs.
+/// The bound query with its literals canonicalised and its predicate model
+/// built, as registration builds it; the clones are what registration's
+/// own copy costs.
 fn canonicalise(bound: &ResolvedQuery, settings: &LiteralSettings) -> ResolvedQuery {
-    query_literals_canonicalise(bound.clone(), settings).0
+    let (tree, bindings, _) =
+        query_literals_canonicalise(bound.tree().clone(), bound.bindings().clone(), settings);
+    ResolvedQuery::new(tree, bindings)
 }
 
 fn predicate_compile(bound: &ResolvedQuery, table: &str) -> Option<CompiledPredicate> {
@@ -423,7 +426,7 @@ fn admission_cost(
                 decorrelated: None,
                 fingerprint,
                 has_limit: bound.tree().root().has_limit(),
-                join_region: join_region.as_ref(),
+                join_region,
             },
             aggregates,
             catalog,

@@ -14,7 +14,6 @@ use crate::cache::types::{QueryServing, ServingAt, SharedResolvedQuery};
 use crate::cache::writer::core::WriterCore;
 use crate::cache::writer::subsumption::subsumed_ready_mark;
 use crate::query::Fingerprint;
-use crate::query::join_region::query_join_region;
 use crate::result::error_chain_format;
 
 /// What a parked entry needs to be stamped or populated.
@@ -107,8 +106,8 @@ impl WriterRegistration {
             return Ok(());
         };
         let bound = Arc::clone(&waiting.at.serving.bound);
-        let join = query_join_region(&bound);
-        match self.subsumption_check(core, child, &bound, join.as_ref()) {
+        let join = bound.predicates().join_region();
+        match self.subsumption_check(core, child, &bound, join) {
             Some(cover) => {
                 let generation = waiting.at.generation;
                 let max_limit = waiting.at.serving.max_limit;
@@ -121,9 +120,7 @@ impl WriterRegistration {
                 self.waiter_populate(core, child, generation, &waiting.population, max_limit)
             }
             None => {
-                if let Some(next) =
-                    self.subsumption_pending_parent(core, child, &bound, join.as_ref())
-                {
+                if let Some(next) = self.subsumption_pending_parent(core, child, &bound, join) {
                     core.query_park(child, next);
                     return Ok(());
                 }

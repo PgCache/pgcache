@@ -24,7 +24,6 @@ use crate::cache::{CacheError, CacheResult, ReportExt};
 use crate::oid::Oid;
 use crate::query::Fingerprint;
 use crate::query::ast::rope::QueryTree;
-use crate::query::join_region::{JoinRegion, query_join_region};
 use crate::query::keying_settings::KeyingSettings;
 use crate::query::resolve::{ResolvedQuery, TableSlot};
 
@@ -191,8 +190,6 @@ fn resolution_limits(
 /// resolution is never built for it.
 pub(super) struct BoundQuery {
     pub(super) bound: SharedResolvedQuery,
-    /// Built once for the subsumption check and the admission.
-    pub(super) join_region: Option<JoinRegion>,
     user_max_limit: Option<u64>,
     reference_only: bool,
 }
@@ -243,10 +240,8 @@ impl WriterRegistration {
             .map_err(|e| e.context_transform(CacheError::from))
             .attach_loc("enum order-dependence gate")?;
 
-        let join_region = query_join_region(&bound);
         Ok(BoundQuery {
             bound,
-            join_region,
             user_max_limit,
             reference_only,
         })
@@ -264,7 +259,6 @@ impl WriterRegistration {
     ) -> CacheResult<QueryResolution> {
         let BoundQuery {
             bound,
-            join_region,
             user_max_limit,
             reference_only,
         } = query;
@@ -291,7 +285,6 @@ impl WriterRegistration {
             &bound,
             decorrelated.as_ref(),
             max_limit.is_some(),
-            join_region.as_ref(),
         )?;
         crate::metrics::handles()
             .reg
@@ -325,7 +318,6 @@ impl WriterRegistration {
         bound: &Arc<ResolvedQuery>,
         decorrelated: Option<&Arc<ResolvedQuery>>,
         has_limit: bool,
-        join_region: Option<&JoinRegion>,
     ) -> CacheResult<Vec<Oid>> {
         let analysis = query_admission_analyze(
             AdmissionQuery {
@@ -333,7 +325,7 @@ impl WriterRegistration {
                 decorrelated,
                 fingerprint,
                 has_limit,
-                join_region,
+                join_region: bound.predicates().join_region(),
             },
             &self.aggregate_functions,
             &core.cache.tables,
@@ -346,11 +338,8 @@ impl WriterRegistration {
             let relation_oid = admission.relation_oid;
             // Index under each literal's key form for its column's type, so
             // the row probe and the region probe match on value (PGC-478).
-            let registration = UpdateQueryRegistration::new(
-                admission.update_query,
-                admission.subsumer_shape,
-                core.cache.tables.get1(&relation_oid).map(|table| &**table),
-            );
+            let registration =
+                UpdateQueryRegistration::new(admission.update_query, admission.subsumer_shape);
             match registrations
                 .iter_mut()
                 .find(|(oid, _)| *oid == relation_oid)
@@ -368,12 +357,9 @@ impl WriterRegistration {
                 .fingerprint_insert(fingerprint, group);
         }
         if let Some(region) = &analysis.join_region {
-            core.cache.join_subsumers.fingerprint_insert(
-                fingerprint,
-                region,
-                has_limit,
-                &core.cache.tables,
-            );
+            core.cache
+                .join_subsumers
+                .fingerprint_insert(fingerprint, region, has_limit);
         }
         Ok(relation_oids)
     }

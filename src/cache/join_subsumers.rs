@@ -8,7 +8,6 @@
 use std::collections::HashMap;
 
 use super::update_query::SubsumerRegion;
-use crate::catalog::Catalog;
 use crate::query::constraint_index::ConstraintIndex;
 use crate::query::constraints::TableRanges;
 use crate::query::join_region::{JoinRegion, JoinShape};
@@ -42,14 +41,13 @@ impl JoinSubsumers {
         fingerprint: Fingerprint,
         region: &JoinRegion,
         has_limit: bool,
-        tables: &Catalog,
     ) {
         self.fingerprint_remove(fingerprint);
         let parent = JoinParent {
             shape: region.shape,
             region: SubsumerRegion {
                 ranges: region.ranges.clone(),
-                keyed_ranges: region.keyed_ranges(tables),
+                keyed_ranges: region.keyed_ranges.clone(),
             },
             has_limit,
         };
@@ -129,6 +127,7 @@ impl JoinSubsumers {
 
 #[cfg(test)]
 mod tests {
+    use crate::catalog::Catalog;
     use iddqd::BiHashMap;
     use postgres_types::Type;
 
@@ -160,14 +159,14 @@ mod tests {
 
     fn region(tables: &Catalog, sql: &str) -> JoinRegion {
         let bound = ResolvedQuery::parse_resolve(sql, tables, &["public"]).expect("resolve");
-        query_join_region(&bound).expect("a join region")
+        query_join_region(&bound).expect("a join region").clone()
     }
 
     /// The fingerprints offered to a probe of `sql`.
     fn offered(subsumers: &JoinSubsumers, tables: &Catalog, sql: &str) -> Vec<u64> {
         let probe = region(tables, sql);
         let mut found: Vec<u64> = subsumers
-            .candidates(probe.shape, &probe.keyed_ranges(tables))
+            .candidates(probe.shape, &probe.keyed_ranges)
             .map(|(fingerprint, _)| fingerprint.get())
             .collect();
         found.sort_unstable();
@@ -184,12 +183,11 @@ mod tests {
         let mut subsumers = JoinSubsumers::default();
         let wide = Fingerprint::from_raw(1);
         let narrow = Fingerprint::from_raw(2);
-        subsumers.fingerprint_insert(wide, &region(&tables, JOIN), false, &tables);
+        subsumers.fingerprint_insert(wide, &region(&tables, JOIN), false);
         subsumers.fingerprint_insert(
             narrow,
             &region(&tables, &format!("{JOIN} WHERE a.x = 1")),
             false,
-            &tables,
         );
         let child = format!("{JOIN} WHERE a.x = 1 AND b.x = 2");
         assert_eq!(offered(&subsumers, &tables, &child), [1, 2]);

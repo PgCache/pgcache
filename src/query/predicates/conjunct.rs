@@ -15,7 +15,7 @@ use crate::query::constraints::{
     ColumnConstraintKind, NullTest, literal_value_canonical_order, literal_value_is_incomparable,
     literal_value_order,
 };
-use crate::query::resolve::{ColumnBinding, ResolvedQuery};
+use crate::query::resolve::{BoundView, ColumnBinding};
 
 /// One AND-ed part of a predicate: its form and the operand subtrees it
 /// reads. A `BETWEEN` or `NOT IN` is several parts over shared operands.
@@ -37,7 +37,7 @@ impl<'t> ConjunctPart<'t> {
 
 /// The parts of `expr`, left to right.
 pub(super) fn conjunct_parts_collect<'t>(
-    bound: &ResolvedQuery,
+    bound: BoundView<'_>,
     expr: Where<'t>,
     parts: &mut Vec<ConjunctPart<'t>>,
 ) {
@@ -87,7 +87,7 @@ fn operand(expr: Where<'_>) -> Operand<'_> {
 }
 
 fn column_constraint_form(
-    bound: &ResolvedQuery,
+    bound: BoundView<'_>,
     column: Column<'_>,
     kind: ColumnConstraintKind,
 ) -> ConjunctForm {
@@ -99,7 +99,7 @@ fn column_constraint_form(
 
 /// `column op value`, `column::cast op value` under a supported coercion,
 /// or `column = column`.
-fn comparison_form(bound: &ResolvedQuery, binary: Binary<'_>) -> ConjunctForm {
+fn comparison_form(bound: BoundView<'_>, binary: Binary<'_>) -> ConjunctForm {
     if let Some((column, target, op, value)) = comparison_canonicalize(bound, binary) {
         let Some(base) = bound.column_type_at(column.id()) else {
             return ConjunctForm::Opaque;
@@ -126,7 +126,7 @@ fn comparison_form(bound: &ResolvedQuery, binary: Binary<'_>) -> ConjunctForm {
 }
 
 /// `column IS [NOT] NULL`; a null test over anything else is opaque.
-fn null_test_form(bound: &ResolvedQuery, unary: Unary<'_>) -> ConjunctForm {
+fn null_test_form(bound: BoundView<'_>, unary: Unary<'_>) -> ConjunctForm {
     let test = match unary.op() {
         UnaryOp::IsNull => NullTest::IsNull,
         UnaryOp::IsNotNull => NullTest::IsNotNull,
@@ -144,10 +144,7 @@ fn null_test_form(bound: &ResolvedQuery, unary: Unary<'_>) -> ConjunctForm {
     }
 }
 
-fn column_pair(
-    bound: &ResolvedQuery,
-    binary: Binary<'_>,
-) -> Option<(ColumnBinding, ColumnBinding)> {
+fn column_pair(bound: BoundView<'_>, binary: Binary<'_>) -> Option<(ColumnBinding, ColumnBinding)> {
     if binary.op() != BinaryOp::Equal {
         return None;
     }
@@ -163,7 +160,7 @@ fn column_pair(
 }
 
 fn multi_parts_collect<'t>(
-    bound: &ResolvedQuery,
+    bound: BoundView<'_>,
     expr: Where<'t>,
     multi: Multi<'t>,
     parts: &mut Vec<ConjunctPart<'t>>,
@@ -204,7 +201,7 @@ fn any_of_form(column: ColumnBinding, mut values: Vec<LiteralValue>) -> Conjunct
 /// `x BETWEEN low AND high` as `x >= low` and `x <= high`. A SYMMETRIC one
 /// is only split once its bounds are known to be in order.
 fn between_parts_collect<'t>(
-    bound: &ResolvedQuery,
+    bound: BoundView<'_>,
     expr: Where<'t>,
     multi: Multi<'t>,
     parts: &mut Vec<ConjunctPart<'t>>,
@@ -259,7 +256,7 @@ fn between_parts_collect<'t>(
 
 /// `x NOT IN (v1, v2, ...)` as `x <> v1`, `x <> v2`, ...
 fn not_in_parts_collect<'t>(
-    bound: &ResolvedQuery,
+    bound: BoundView<'_>,
     expr: Where<'t>,
     multi: Multi<'t>,
     parts: &mut Vec<ConjunctPart<'t>>,
@@ -296,7 +293,7 @@ fn not_in_parts_collect<'t>(
 /// The subject column and the literal values after it, when the operands
 /// are exactly that.
 fn column_and_literals<'t>(
-    bound: &ResolvedQuery,
+    bound: BoundView<'_>,
     mut exprs: Run<'t, Where<'t>>,
 ) -> Option<(ColumnBinding, Vec<LiteralValue>)> {
     let Some(Operand::Column(column)) = exprs.next().map(operand) else {
@@ -317,7 +314,7 @@ fn column_and_literals<'t>(
 }
 
 fn any_eq_array<'t>(
-    bound: &ResolvedQuery,
+    bound: BoundView<'_>,
     mut exprs: Run<'t, Where<'t>>,
 ) -> Option<(ColumnBinding, Vec<LiteralValue>)> {
     let (Some(first), Some(second), None) = (exprs.next(), exprs.next(), exprs.next()) else {

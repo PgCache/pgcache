@@ -71,8 +71,8 @@ pub type ResolveResult<T> = Result<T, Report<ResolveError>>;
 pub use analysis::PrivilegeNeeds;
 pub(crate) use bindings::BindingsBuilder;
 pub use bindings::{
-    Bindings, ColumnBinding, ColumnTarget, MergedColumnBinding, MergedId, ResolvedQuery, SlotId,
-    StarItem, TableSlot,
+    Bindings, BoundView, ColumnBinding, ColumnTarget, MergedColumnBinding, MergedId, ResolvedQuery,
+    SlotId, StarItem, TableSlot,
 };
 pub use branch::QueryBranch;
 pub use entry::query_tree_resolve;

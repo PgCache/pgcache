@@ -47,8 +47,8 @@ pub fn subsumption_references(bound: &ResolvedQuery) -> Option<Vec<SubsumptionRe
             let relation = reference.predicates?;
             Some(SubsumptionReference {
                 relation_oid: reference.table.relation_oid,
-                filters: relation.filters,
-                ranges: relation.ranges,
+                filters: relation.filters.clone(),
+                ranges: relation.ranges.clone(),
             })
         })
         .collect()

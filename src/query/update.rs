@@ -1,6 +1,7 @@
 #[cfg(feature = "proxy")]
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 #[cfg(feature = "proxy")]
 use ecow::EcoString;
@@ -14,7 +15,7 @@ use crate::query::ast::rope::{
 use crate::query::ast::{SubLinkType, UnaryOp};
 #[cfg(feature = "proxy")]
 use crate::query::constraints::TableRanges;
-use crate::query::predicates::{OuterJoinRole, RelationPredicates, query_branch_predicates_build};
+use crate::query::predicates::{OuterJoinRole, RelationPredicates};
 use crate::query::resolve::{QueryBranch, ResolvedQuery, TableSlot};
 
 /// One base-table reference of a read with what its branch's predicate
@@ -22,7 +23,7 @@ use crate::query::resolve::{QueryBranch, ResolvedQuery, TableSlot};
 /// filters onto the table's columns.
 pub struct BaseReference<'a> {
     pub table: &'a TableMetadata,
-    pub predicates: Option<RelationPredicates>,
+    pub predicates: Option<Arc<RelationPredicates>>,
 }
 
 /// The base-table references of a read across its SELECT branches: the
@@ -38,8 +39,8 @@ pub fn query_base_references(bound: &ResolvedQuery) -> BaseReferences<'_> {
     let bindings = bound.bindings();
     let mut references = Vec::new();
     let mut seen = HashSet::new();
-    for (select, _) in select_branches_with_source(bound.tree().root()) {
-        let predicates = query_branch_predicates_build(bound, select);
+    for branch in bound.predicates().branches() {
+        let predicates = &branch.predicates;
         for reference in predicates.table_references() {
             let Some(TableSlot::Base { table, .. }) = bindings.slot(reference.slot) else {
                 continue;
@@ -47,7 +48,7 @@ pub fn query_base_references(bound: &ResolvedQuery) -> BaseReferences<'_> {
             seen.insert(reference.slot.index());
             references.push(BaseReference {
                 table,
-                predicates: predicates.relation_predicates(bindings, reference.slot),
+                predicates: predicates.relation_predicates(reference.slot).cloned(),
             });
         }
     }
@@ -177,7 +178,7 @@ pub struct TableUpdateQuery<'a> {
     pub branch: QueryBranch<'a>,
     pub source: UpdateQuerySource,
     /// What the table's reference answers to in its branch.
-    pub predicates: RelationPredicates,
+    pub predicates: Arc<RelationPredicates>,
 }
 
 /// Every (table, branch) pair of the query: each SELECT, the root and
@@ -185,8 +186,13 @@ pub struct TableUpdateQuery<'a> {
 pub fn query_table_update_queries(bound: &ResolvedQuery) -> Vec<TableUpdateQuery<'_>> {
     let mut result = Vec::new();
     let bindings = bound.bindings();
-    for (select, source) in select_branches_with_source(bound.tree().root()) {
-        let predicates = query_branch_predicates_build(bound, select);
+    for model_branch in bound.predicates().branches() {
+        let Some(select) = bound.select_node(model_branch.select) else {
+            debug_assert!(false, "a branch of the model is a SELECT of the tree");
+            continue;
+        };
+        let source = model_branch.source;
+        let predicates = &model_branch.predicates;
         let branch = QueryBranch { bound, select };
         for table in select.direct_tables() {
             let slot = bindings.source(table.id());
@@ -200,10 +206,11 @@ pub fn query_table_update_queries(bound: &ResolvedQuery) -> Vec<TableUpdateQuery
                 .table_reference_predicates(slot)
                 .map(|reference| reference.outer_join_role);
             let relation = predicates
-                .relation_predicates(bindings, slot)
+                .relation_predicates(slot)
+                .cloned()
                 .unwrap_or_else(|| {
                     debug_assert!(false, "a direct table is a reference of its branch");
-                    RelationPredicates::unknown(table_slot.table())
+                    Arc::new(RelationPredicates::unknown(table_slot.table()))
                 });
             let effective_source = match (source, role) {
                 (UpdateQuerySource::FromClause, Some(OuterJoinRole::Terminal)) => {

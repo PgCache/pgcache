@@ -13,6 +13,7 @@ use crate::query::ast::NodeId;
 #[cfg(test)]
 use crate::query::ast::query_tree_parse;
 use crate::query::ast::rope::{NodeKind, QueryTree, Remap};
+use crate::query::predicates::QueryPredicates;
 
 /// Index of a table source in [`Bindings::slots`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -407,23 +408,63 @@ impl Bindings {
     }
 }
 
-/// A query tree with its bindings: the only way to hold resolved facts
-/// about a tree (ADR-057). Cloning shares the tree.
+/// A tree with its bindings, borrowed: what reads resolved facts before
+/// a [`ResolvedQuery`] holds them (its predicate model is built from one),
+/// and what a [`ResolvedQuery`] lends out.
+#[derive(Clone, Copy)]
+pub struct BoundView<'a> {
+    tree: &'a QueryTree,
+    bindings: &'a Bindings,
+}
+
+impl<'a> BoundView<'a> {
+    pub fn new(tree: &'a QueryTree, bindings: &'a Bindings) -> Self {
+        Self { tree, bindings }
+    }
+
+    pub fn tree(self) -> &'a QueryTree {
+        self.tree
+    }
+
+    pub fn bindings(self) -> &'a Bindings {
+        self.bindings
+    }
+}
+
+/// A query tree with its bindings and the predicate model derived from
+/// them once: the only way to hold resolved facts about a tree (ADR-057).
+/// Cloning shares the tree and the model.
 #[derive(Debug, Clone)]
 pub struct ResolvedQuery {
     tree: QueryTree,
     bindings: Bindings,
+    predicates: Arc<QueryPredicates>,
 }
 
 impl ResolvedQuery {
     pub fn new(tree: QueryTree, bindings: Bindings) -> Self {
-        Self { tree, bindings }
+        let predicates = Arc::new(QueryPredicates::build(BoundView::new(&tree, &bindings)));
+        Self {
+            tree,
+            bindings,
+            predicates,
+        }
     }
 
     /// `tree` resolved against `tables` on `search_path`.
     pub fn resolve(tree: QueryTree, tables: &Catalog, search_path: &[&str]) -> ResolveResult<Self> {
         let bindings = query_tree_resolve(&tree, tables, search_path)?;
-        Ok(Self { tree, bindings })
+        Ok(Self::new(tree, bindings))
+    }
+
+    pub fn view(&self) -> BoundView<'_> {
+        BoundView::new(&self.tree, &self.bindings)
+    }
+
+    /// What the query's predicates say about each of its table references,
+    /// per SELECT branch, with its join region.
+    pub fn predicates(&self) -> &QueryPredicates {
+        &self.predicates
     }
 
     /// `sql` parsed and resolved against `tables` on `search_path`.

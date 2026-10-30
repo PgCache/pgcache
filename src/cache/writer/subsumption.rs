@@ -92,10 +92,9 @@ impl SubsumerSource for WriterSubsumerSource<'_> {
     }
 
     fn join_candidates(&self, join: &JoinRegion) -> impl Iterator<Item = SubsumerCandidate<'_>> {
-        let keyed = join.keyed_ranges(&self.cache.tables);
         self.cache
             .join_subsumers
-            .candidates(join.shape, &keyed)
+            .candidates(join.shape, &join.keyed_ranges)
             .map(|(fingerprint, candidate)| SubsumerCandidate {
                 fingerprint,
                 region: candidate.region,

@@ -7,7 +7,10 @@ use super::{
     JoinPathStep, JoinSide, OuterJoinRole, QueryBranchPredicates, RelationPredicates,
     TableReference, TableReferencePredicates,
 };
+use std::sync::Arc;
+
 use crate::catalog::{ColumnPosition, TableMetadata};
+use crate::query::constraint_index::table_constraints_keyed;
 use crate::query::constraints::{ColumnConstraintKind, NullTest, TableRanges};
 use crate::query::resolve::{Bindings, ColumnBinding, SlotId, TableSlot};
 
@@ -118,6 +121,7 @@ impl RelationPredicates {
         Self {
             filters: Vec::new(),
             ranges: TableRanges::default(),
+            keyed_ranges: TableRanges::default(),
             link_columns: table
                 .columns
                 .iter()
@@ -146,38 +150,27 @@ impl QueryBranchPredicates {
         self.reference_predicates.get(self.reference_index(slot)?)
     }
 
-    /// The predicates of the reference `slot` by column name.
-    pub fn relation_predicates(
+    /// The predicates of the reference `slot` by column name, as the model
+    /// projected them once; `None` for a slot the branch does not reference
+    /// or whose filters the model can't project onto its columns.
+    pub fn relation_predicates(&self, slot: SlotId) -> Option<&Arc<RelationPredicates>> {
+        self.relation_predicates
+            .get(self.reference_index(slot)?)?
+            .as_ref()
+    }
+
+    /// Every reference's predicates by column name, in reference order.
+    pub(super) fn relation_predicates_project(
         &self,
         bindings: &Bindings,
-        slot: SlotId,
-    ) -> Option<RelationPredicates> {
-        let predicates = self.table_reference_predicates(slot)?;
-        let filters = predicates
-            .filters
+    ) -> Vec<Option<Arc<RelationPredicates>>> {
+        self.table_references
             .iter()
-            .map(|constraint| {
-                let name = bindings.binding_column(&constraint.column)?.name.clone();
-                Some(constraint.clone().map_column(|_| name))
+            .zip(&self.reference_predicates)
+            .map(|(reference, predicates)| {
+                relation_predicates_project(bindings, reference.slot, predicates).map(Arc::new)
             })
-            .collect::<Option<Vec<_>>>()?;
-        let link_columns = predicates
-            .link_columns
-            .iter()
-            .map(|&position| {
-                let binding = ColumnBinding { slot, position };
-                bindings
-                    .binding_column(&binding)
-                    .map(|column| column.name.clone())
-            })
-            .collect::<Option<Vec<_>>>()?;
-        Some(RelationPredicates {
-            ranges: TableRanges::build(&filters),
-            filters,
-            link_columns,
-            unrecognized: predicates.unrecognized,
-            exact: predicates.exact,
-        })
+            .collect()
     }
 
     /// The conjuncts a NULL-padded row can satisfy: each mentions a
@@ -501,6 +494,49 @@ impl QueryBranchPredicates {
 type FilterEdge = (ColumnBinding, ColumnBinding);
 
 /// The step through join `id`, with its position, when the path has one.
+/// The reference `slot`'s predicates by column name: its filters and link
+/// columns named through `bindings`, the filters reduced to ranges, and
+/// keyed for the slot's table when it is a catalog table (PGC-478).
+fn relation_predicates_project(
+    bindings: &Bindings,
+    slot: SlotId,
+    predicates: &TableReferencePredicates,
+) -> Option<RelationPredicates> {
+    let filters = predicates
+        .filters
+        .iter()
+        .map(|constraint| {
+            let name = bindings.binding_column(&constraint.column)?.name.clone();
+            Some(constraint.clone().map_column(|_| name))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let link_columns = predicates
+        .link_columns
+        .iter()
+        .map(|&position| {
+            let binding = ColumnBinding { slot, position };
+            bindings
+                .binding_column(&binding)
+                .map(|column| column.name.clone())
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let ranges = TableRanges::build(&filters);
+    let keyed_ranges = match bindings.slot(slot)? {
+        TableSlot::Base { table, .. } => {
+            TableRanges::build(&table_constraints_keyed(&filters, table))
+        }
+        TableSlot::Derived { .. } => ranges.clone(),
+    };
+    Some(RelationPredicates {
+        filters,
+        ranges,
+        keyed_ranges,
+        link_columns,
+        unrecognized: predicates.unrecognized,
+        exact: predicates.exact,
+    })
+}
+
 fn path_step(path: &[JoinPathStep], id: JoinId) -> Option<(usize, &JoinPathStep)> {
     path.iter().enumerate().find(|(_, step)| step.join == id)
 }
@@ -619,7 +655,7 @@ mod tests {
             .map(|reference| {
                 let slot = reference.slot;
                 let relation = branch
-                    .relation_predicates(bindings, slot)
+                    .relation_predicates(slot)
                     .expect("relation predicates");
                 let role = branch
                     .table_reference_predicates(slot)
@@ -929,7 +965,7 @@ mod tests {
         let branch = root_predicates(&bound);
         for name in ["a", "b"] {
             let relation = branch
-                .relation_predicates(bound.bindings(), slot_of(&bound, &branch, name))
+                .relation_predicates(slot_of(&bound, &branch, name))
                 .expect("relation predicates");
             assert!(
                 relation.unrecognized,
@@ -967,7 +1003,7 @@ mod tests {
         let branch = root_predicates(&bound);
         let unrecognized = |name: &str| {
             branch
-                .relation_predicates(bound.bindings(), slot_of(&bound, &branch, name))
+                .relation_predicates(slot_of(&bound, &branch, name))
                 .expect("relation predicates")
                 .unrecognized
         };
@@ -983,7 +1019,7 @@ mod tests {
             let bound = resolve(sql);
             let branch = root_predicates(&bound);
             branch
-                .relation_predicates(bound.bindings(), slot_of(&bound, &branch, name))
+                .relation_predicates(slot_of(&bound, &branch, name))
                 .expect("relation predicates")
                 .unrecognized
         };
@@ -1004,7 +1040,7 @@ mod tests {
         let filters = |name: &str| {
             let slot = slot_of(&bound, &branch, name);
             let relation = branch
-                .relation_predicates(bound.bindings(), slot)
+                .relation_predicates(slot)
                 .expect("relation predicates");
             relation
                 .filters
@@ -1024,9 +1060,10 @@ mod tests {
         let links = |name: &str| {
             let slot = slot_of(&bound, &branch, name);
             branch
-                .relation_predicates(bound.bindings(), slot)
+                .relation_predicates(slot)
                 .expect("relation predicates")
                 .link_columns
+                .clone()
         };
         assert_eq!(links("e"), ["x"]);
         assert_eq!(links("m"), ["id"]);
@@ -1066,9 +1103,7 @@ mod tests {
         let b = slot_of(&bound, &branch, "b");
         let external: Vec<bool> = branch.conjuncts().iter().map(|c| c.external).collect();
         assert_eq!(external, [true, false, true]);
-        let relation = branch
-            .relation_predicates(bound.bindings(), b)
-            .expect("relation predicates");
+        let relation = branch.relation_predicates(b).expect("relation predicates");
         let filters: Vec<String> = relation.filters.iter().map(constraint_text).collect();
         assert_eq!(filters, ["x Equal Integer(1)"]);
         assert_eq!(relation.link_columns, ["id"]);

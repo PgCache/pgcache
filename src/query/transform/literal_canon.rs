@@ -11,13 +11,13 @@
 //! sessions on the reference settings it will be populated under.
 
 use crate::query::ast::rope::{
-    Body, Case, Function, JoinQual, NodeKind, Query, Replacement, Replacements, Scalar, ScalarKind,
-    Select, SelectItem, Source, TreeBuilder, Values, View, Where, WhereKind,
+    Body, Case, Function, JoinQual, NodeKind, Query, QueryTree, Replacement, Replacements, Scalar,
+    ScalarKind, Select, SelectItem, Source, TreeBuilder, Values, View, Where, WhereKind,
 };
 use crate::query::ast::{LiteralValue, NodeId};
 use crate::query::cast::{CastTarget, cast_target_from_canonical};
 use crate::query::literal_settings::LiteralSettings;
-use crate::query::resolve::{BindingsBuilder, ResolvedQuery};
+use crate::query::resolve::{Bindings, BindingsBuilder, BoundView};
 use crate::query::typed_compare::{ValueKind, literal_canonical_text};
 
 /// What the pass found.
@@ -37,36 +37,37 @@ pub struct LiteralCanonOutcome {
 /// binds only the copy each reference embeds, and that copy is
 /// canonicalised in its place.
 pub fn query_literals_canonicalise(
-    bound: ResolvedQuery,
+    tree: QueryTree,
+    bindings: Bindings,
     settings: &LiteralSettings,
-) -> (ResolvedQuery, LiteralCanonOutcome) {
+) -> (QueryTree, Bindings, LiteralCanonOutcome) {
     let (mut replacements, outcome) = {
         let mut pass = TreePass {
-            bound: &bound,
+            bound: BoundView::new(&tree, &bindings),
             literals: Pass {
                 settings,
                 outcome: LiteralCanonOutcome::default(),
             },
             replacements: Replacements::new(),
         };
-        pass.query(bound.tree().root());
+        pass.query(tree.root());
         (pass.replacements, pass.literals.outcome)
     };
     if replacements.is_empty() {
-        return (bound, outcome);
+        return (tree, bindings, outcome);
     }
-    let mut builder = TreeBuilder::over(bound.tree());
-    builder.copy(bound.tree().root().node_ref(), &mut replacements);
-    let (tree, remap) = builder.finish();
-    let bindings = BindingsBuilder::from_remapped(bound.bindings(), &remap).finish();
-    (ResolvedQuery::new(tree, bindings), outcome)
+    let mut builder = TreeBuilder::over(&tree);
+    builder.copy(tree.root().node_ref(), &mut replacements);
+    let (rewritten, remap) = builder.finish();
+    let rewritten_bindings = BindingsBuilder::from_remapped(&bindings, &remap).finish();
+    (rewritten, rewritten_bindings, outcome)
 }
 
 /// The walk over views: literals rewritten on a copy of their value and
 /// recorded by position when they change; the type context of each
 /// position is the bindings'.
 struct TreePass<'a> {
-    bound: &'a ResolvedQuery,
+    bound: BoundView<'a>,
     literals: Pass<'a>,
     replacements: Replacements,
 }
@@ -403,7 +404,8 @@ mod tests {
     use super::*;
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
     use crate::oid::TypeOid;
-    use crate::query::resolve::ResolvedQuery;
+    use crate::query::ast::query_tree_parse;
+    use crate::query::resolve::{ResolvedQuery, query_tree_resolve};
 
     fn events() -> Catalog {
         let column = |name: &str, position: i16, ty: Type| ColumnMetadata {
@@ -435,23 +437,21 @@ mod tests {
     }
 
     fn canon(sql: &str, settings: &LiteralSettings) -> (String, LiteralCanonOutcome) {
-        let bound = ResolvedQuery::parse_resolve(sql, &events(), &["public"]).expect("resolve");
-        let (bound, outcome) = query_literals_canonicalise(bound, settings);
-        (bound.sql(), outcome)
+        let tree = query_tree_parse(sql).expect("parse");
+        let bindings = query_tree_resolve(&tree, &events(), &["public"]).expect("resolve");
+        let (tree, bindings, outcome) = query_literals_canonicalise(tree, bindings, settings);
+        (ResolvedQuery::new(tree, bindings).sql(), outcome)
     }
 
     /// A query no setting can change comes back sharing its tree.
     #[test]
     fn test_unaffected_query_keeps_its_tree() {
-        let bound = ResolvedQuery::parse_resolve(
-            "SELECT id FROM events WHERE label = 'x' AND id = 7",
-            &events(),
-            &["public"],
-        )
-        .expect("resolve");
-        let before = bound.tree().clone();
-        let (after, outcome) = query_literals_canonicalise(bound, &tokyo_dmy());
-        assert_eq!(*after.tree(), before);
+        let tree =
+            query_tree_parse("SELECT id FROM events WHERE label = 'x' AND id = 7").expect("parse");
+        let bindings = query_tree_resolve(&tree, &events(), &["public"]).expect("resolve");
+        let before = tree.clone();
+        let (after, _, outcome) = query_literals_canonicalise(tree, bindings, &tokyo_dmy());
+        assert_eq!(after, before);
         assert!(!outcome.residual);
     }
 

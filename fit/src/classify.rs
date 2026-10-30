@@ -337,7 +337,7 @@ pub fn statement_classify(
         user_max_limit,
     );
     let has_limit = max_limit.is_some();
-    let join_region = query_join_region(&bound);
+    let join_region = query_join_region(&bound).cloned();
     let analysis = match query_admission_analyze(
         AdmissionQuery {
             bound: &bound,

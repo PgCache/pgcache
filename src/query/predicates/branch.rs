@@ -10,11 +10,27 @@ use super::{
 };
 use crate::query::ast::rope::{Join, JoinQual, NodeKind, NodeRef, Select, Source, Where};
 use crate::query::ast::{JoinType, NodeId};
-use crate::query::resolve::{Bindings, ColumnBinding, ColumnTarget, ResolvedQuery, SlotId};
+use crate::query::resolve::{
+    Bindings, BoundView, ColumnBinding, ColumnTarget, ResolvedQuery, SlotId,
+};
 
-/// The predicates of `select`, a SELECT of `bound`'s rope.
+/// The predicates of `select`, a SELECT of `bound`'s rope, as the model
+/// built them with the query.
 pub fn query_branch_predicates_build(
     bound: &ResolvedQuery,
+    select: Select<'_>,
+) -> QueryBranchPredicates {
+    bound
+        .predicates()
+        .branch(select.id())
+        .cloned()
+        .unwrap_or_else(|| branch_predicates_build(bound.view(), select))
+}
+
+/// The predicates of `select`, a SELECT of `bound`'s rope, built from the
+/// tree and bindings.
+pub(super) fn branch_predicates_build(
+    bound: BoundView<'_>,
     select: Select<'_>,
 ) -> QueryBranchPredicates {
     let mut builder = Builder {
@@ -30,6 +46,7 @@ pub fn query_branch_predicates_build(
         joins: builder.joins,
         conjuncts: Vec::new(),
         reference_predicates: Vec::new(),
+        relation_predicates: Vec::new(),
     };
     let mut collector = ConjunctCollector {
         bound,
@@ -46,11 +63,12 @@ pub fn query_branch_predicates_build(
     branch.conjuncts = conjuncts;
     branch.joins_reduce();
     branch.reference_predicates = branch.reference_predicates_derive(bound.bindings());
+    branch.relation_predicates = branch.relation_predicates_project(bound.bindings());
     branch
 }
 
 struct Builder<'b, 't> {
-    bound: &'b ResolvedQuery,
+    bound: BoundView<'b>,
     table_references: Vec<TableReference>,
     joins: Vec<FromJoin>,
     /// The join node behind each of `joins` but the comma joins.
@@ -163,7 +181,7 @@ impl<'t> Builder<'_, 't> {
 /// Collects a branch's conjuncts, each with the columns its operands
 /// mention.
 struct ConjunctCollector<'a> {
-    bound: &'a ResolvedQuery,
+    bound: BoundView<'a>,
     branch: &'a QueryBranchPredicates,
     conjuncts: Vec<Conjunct>,
 }

@@ -8,7 +8,9 @@ use std::collections::{HashMap, HashSet};
 use ecow::EcoString;
 use postgres_types::Type;
 
-use super::bindings::{Bindings, ColumnBinding, ColumnTarget, ResolvedQuery, StarItem, TableSlot};
+use super::bindings::{
+    Bindings, BoundView, ColumnBinding, ColumnTarget, ResolvedQuery, StarItem, TableSlot,
+};
 use crate::catalog::TableMetadata;
 use crate::oid::Oid;
 use crate::query::ast::NodeId;
@@ -29,9 +31,9 @@ pub struct PrivilegeNeeds {
     pub functions: Vec<EcoString>,
 }
 
-impl ResolvedQuery {
+impl<'a> BoundView<'a> {
     /// The root SELECT, when the query is one.
-    pub fn select(&self) -> Option<Select<'_>> {
+    pub fn select(self) -> Option<Select<'a>> {
         match self.tree().root().body() {
             Body::Select(select) => Some(select),
             Body::SetOp(_) | Body::Values(_) => None,
@@ -39,13 +41,13 @@ impl ResolvedQuery {
     }
 
     /// The SELECT at position `id`, when the node there is one.
-    pub fn select_node(&self, id: NodeId) -> Option<Select<'_>> {
+    pub fn select_node(self, id: NodeId) -> Option<Select<'a>> {
         matches!(self.tree().node(id).kind, NodeKind::Select { .. })
             .then(|| Select::from_ref(self.tree().root().node_ref().at_position(id)))
     }
 
     /// [`Bindings::column_by_id`] for the column at `id`.
-    pub fn column_target_at(&self, id: NodeId) -> Option<&ColumnTarget> {
+    pub fn column_target_at(self, id: NodeId) -> Option<&'a ColumnTarget> {
         self.bindings().column_by_id(id)
     }
 
@@ -53,20 +55,55 @@ impl ResolvedQuery {
     /// the left column of an inner-join merged column (which is exactly
     /// that column); nothing for an outer-join merged column or an output
     /// name.
-    pub fn column_binding_at(&self, id: NodeId) -> Option<ColumnBinding> {
+    pub fn column_binding_at(self, id: NodeId) -> Option<ColumnBinding> {
         binding_of_target(self.bindings(), self.column_target_at(id)?)
     }
 
-    pub fn column_table_at(&self, id: NodeId) -> Option<&TableMetadata> {
+    pub fn column_table_at(self, id: NodeId) -> Option<&'a TableMetadata> {
         binding_table(self.bindings(), self.column_binding_at(id)?)
     }
 
-    pub fn column_name_at(&self, id: NodeId) -> Option<&EcoString> {
+    pub fn column_name_at(self, id: NodeId) -> Option<&'a EcoString> {
         binding_name(self.bindings(), self.column_binding_at(id)?)
     }
 
-    pub fn column_type_at(&self, id: NodeId) -> Option<&Type> {
+    pub fn column_type_at(self, id: NodeId) -> Option<&'a Type> {
         binding_type(self.bindings(), self.column_binding_at(id)?)
+    }
+}
+
+impl ResolvedQuery {
+    /// The root SELECT, when the query is one.
+    pub fn select(&self) -> Option<Select<'_>> {
+        self.view().select()
+    }
+
+    /// The SELECT at position `id`, when the node there is one.
+    pub fn select_node(&self, id: NodeId) -> Option<Select<'_>> {
+        self.view().select_node(id)
+    }
+
+    /// [`Bindings::column_by_id`] for the column at `id`.
+    pub fn column_target_at(&self, id: NodeId) -> Option<&ColumnTarget> {
+        self.view().column_target_at(id)
+    }
+
+    /// The catalog column the reference at `id` stands for
+    /// ([`BoundView::column_binding_at`]).
+    pub fn column_binding_at(&self, id: NodeId) -> Option<ColumnBinding> {
+        self.view().column_binding_at(id)
+    }
+
+    pub fn column_table_at(&self, id: NodeId) -> Option<&TableMetadata> {
+        self.view().column_table_at(id)
+    }
+
+    pub fn column_name_at(&self, id: NodeId) -> Option<&EcoString> {
+        self.view().column_name_at(id)
+    }
+
+    pub fn column_type_at(&self, id: NodeId) -> Option<&Type> {
+        self.view().column_type_at(id)
     }
 
     /// The privileges a read of this query needs at origin: the columns it

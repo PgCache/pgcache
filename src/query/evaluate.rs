@@ -144,7 +144,7 @@ pub fn where_expr_supported(bound: &ResolvedQuery, expr: Where<'_>) -> bool {
 /// `column op literal` (either order), through an identity cast, or through
 /// a coercion the cast module supports; a `::date` literal must be canonical.
 pub fn comparison_is_simple(bound: &ResolvedQuery, binary: Binary<'_>) -> bool {
-    let Some((column, target, op, literal)) = comparison_canonicalize(bound, binary) else {
+    let Some((column, target, op, literal)) = comparison_canonicalize(bound.view(), binary) else {
         return false;
     };
     let Some(base) = bound.column_type_at(column.id()) else {

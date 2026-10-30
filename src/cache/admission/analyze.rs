@@ -27,7 +27,7 @@ use crate::query::decorrelate::query_decorrelate;
 use crate::query::join_region::JoinRegion;
 use crate::query::literal_settings::LiteralSettings;
 use crate::query::resolve::ResolveResult;
-use crate::query::resolve::{QueryBranch, ResolvedQuery};
+use crate::query::resolve::{QueryBranch, ResolvedQuery, query_tree_resolve};
 use crate::query::transform::{
     LiteralCanonOutcome, PgEvalTemplate, query_literals_canonicalise, query_predicate_pushdown,
 };
@@ -132,10 +132,10 @@ pub fn query_resolve_canonical(
     search_path: &[&str],
     settings: &LiteralSettings,
 ) -> ResolveResult<CanonicalResolution> {
-    let bound = ResolvedQuery::resolve(base_query, tables, search_path)?;
-    let (bound, literals) = query_literals_canonicalise(bound, settings);
+    let bindings = query_tree_resolve(&base_query, tables, search_path)?;
+    let (tree, bindings, literals) = query_literals_canonicalise(base_query, bindings, settings);
     Ok(CanonicalResolution {
-        bound: Arc::new(bound),
+        bound: Arc::new(ResolvedQuery::new(tree, bindings)),
         literals,
     })
 }
@@ -432,7 +432,7 @@ mod tests {
                 decorrelated: decorrelated.as_ref(),
                 fingerprint: Fingerprint::from_raw(1),
                 has_limit: false,
-                join_region: join_region.as_ref(),
+                join_region,
             },
             &aggregate_functions,
             &tables,
@@ -629,7 +629,7 @@ mod tests {
             .tables
             .into_iter()
             .find(|admission| admission.subsumer_shape)
-            .map(|admission| admission.update_query.predicates.filters);
+            .map(|admission| admission.update_query.predicates.filters.clone());
         let tables = catalog();
         let bound = ResolvedQuery::parse_resolve(new, &tables, &["public"]).expect("resolve");
         let references = subsumption_references(&bound).expect("references");
@@ -720,7 +720,7 @@ mod tests {
                         .map(move |admission| Parent {
                             fingerprint: Fingerprint::from_raw(fingerprint),
                             relation_oid: admission.relation_oid,
-                            region: admission.update_query.predicates.ranges,
+                            region: admission.update_query.predicates.ranges.clone(),
                             has_limit,
                             state,
                         })

@@ -74,7 +74,7 @@ impl CompiledPredicate {
                 | BinaryOp::LessThanOrEqual
                 | BinaryOp::GreaterThan
                 | BinaryOp::GreaterThanOrEqual => {
-                    let compare = comparison_canonicalize(bound, binary).and_then(
+                    let compare = comparison_canonicalize(bound.view(), binary).and_then(
                         |(column, target, op, value)| {
                             let binding = bound.column_binding_at(column.id())?;
                             let table = bound.column_table_at(column.id())?;

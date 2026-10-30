@@ -8,8 +8,6 @@ use rootcause::Report;
 
 use crate::cache::{CacheError, CacheResult};
 use crate::catalog::ColumnMask;
-#[cfg(feature = "proxy")]
-use crate::catalog::TableMetadata;
 use crate::id_hash::{BuildIdHasher, impl_id_hashable};
 use crate::oid::Oid;
 use crate::query::ast::NodeId;
@@ -17,8 +15,6 @@ use crate::query::compiled_predicate::CompiledPredicate;
 #[cfg(feature = "proxy")]
 use crate::query::constraint_index::ColumnForms;
 use crate::query::constraint_index::ConstraintIndex;
-#[cfg(feature = "proxy")]
-use crate::query::constraint_index::table_constraints_keyed;
 use crate::query::constraints::TableRanges;
 use crate::query::predicates::RelationPredicates;
 use crate::query::resolve::{QueryBranch, ResolvedQuery};
@@ -153,8 +149,8 @@ pub struct UpdateQuery {
     pub table: NodeId,
     /// What that reference's rows answer to, by column name: the filters CDC
     /// matches rows against and the link columns whose change can move a row
-    /// to partners that were never loaded.
-    pub predicates: RelationPredicates,
+    /// to partners that were never loaded. Shared with the query's model.
+    pub predicates: Arc<RelationPredicates>,
     /// Whether the parent cached query's population is capped
     /// (`max_limit.is_some()`). CDC then invalidates on any change that could
     /// open a gap at the window's boundary: every DELETE on a FromClause
@@ -305,19 +301,10 @@ pub struct UpdateQueryRegistration {
 
 #[cfg(feature = "proxy")]
 impl UpdateQueryRegistration {
-    /// `update_query`'s registration, its filters keyed once for `table`'s
-    /// column types (PGC-478) and shared by both indexes.
-    pub(crate) fn new(
-        update_query: UpdateQuery,
-        subsumer_shape: bool,
-        table: Option<&TableMetadata>,
-    ) -> Self {
-        let filters = &update_query.predicates.filters;
-        let keyed = table.map_or_else(
-            || filters.clone(),
-            |table| table_constraints_keyed(filters, table),
-        );
-        let index_ranges = TableRanges::build(&keyed);
+    /// `update_query`'s registration: its ranges in their key forms
+    /// (PGC-478), as the model keyed them, shared by both indexes.
+    pub(crate) fn new(update_query: UpdateQuery, subsumer_shape: bool) -> Self {
+        let index_ranges = update_query.predicates.keyed_ranges.clone();
         let subsumer_region = subsumer_shape.then(|| SubsumerRegion {
             ranges: update_query.predicates.ranges.clone(),
             keyed_ranges: index_ranges.clone(),
@@ -751,11 +738,7 @@ mod tests {
             .tables
             .into_iter()
             .map(|admission| {
-                UpdateQueryRegistration::new(
-                    admission.update_query,
-                    admission.subsumer_shape,
-                    Some(&items()),
-                )
+                UpdateQueryRegistration::new(admission.update_query, admission.subsumer_shape)
             })
             .collect()
     }

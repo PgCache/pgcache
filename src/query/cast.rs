@@ -22,7 +22,7 @@ use postgres_types::Type;
 
 use crate::query::ast::rope::{Binary, Column, Scalar, ScalarKind, Where, WhereKind};
 use crate::query::ast::{BinaryOp, LiteralValue};
-use crate::query::resolve::ResolvedQuery;
+use crate::query::resolve::BoundView;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CastTarget {
@@ -196,7 +196,7 @@ pub fn bool_literal_parse(s: &str) -> Option<bool> {
 
 /// `expr` without an identity cast: `column::text` on a text column is the
 /// column itself. Any other cast, or a cast of a non-column, is kept.
-pub fn identity_cast_strip<'t>(bound: &ResolvedQuery, expr: Scalar<'t>) -> Scalar<'t> {
+pub fn identity_cast_strip<'t>(bound: BoundView<'_>, expr: Scalar<'t>) -> Scalar<'t> {
     let ScalarKind::TypeCast(cast) = expr.kind() else {
         return expr;
     };
@@ -211,7 +211,7 @@ pub fn identity_cast_strip<'t>(bound: &ResolvedQuery, expr: Scalar<'t>) -> Scala
 }
 
 /// The scalar a WHERE operand holds, without an identity cast.
-pub fn scalar_leaf<'t>(bound: &ResolvedQuery, expr: Where<'t>) -> Option<Scalar<'t>> {
+pub fn scalar_leaf<'t>(bound: BoundView<'_>, expr: Where<'t>) -> Option<Scalar<'t>> {
     match expr.kind() {
         WhereKind::Scalar(scalar) => Some(identity_cast_strip(bound, scalar)),
         WhereKind::Unary(_)
@@ -222,7 +222,7 @@ pub fn scalar_leaf<'t>(bound: &ResolvedQuery, expr: Where<'t>) -> Option<Scalar<
 }
 
 pub fn comparison_canonicalize<'t>(
-    bound: &ResolvedQuery,
+    bound: BoundView<'_>,
     binary: Binary<'t>,
 ) -> Option<(
     Column<'t>,

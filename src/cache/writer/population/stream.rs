@@ -30,7 +30,7 @@ use crate::pg::{Lsn, OriginSnapshot};
 use crate::query::ast::rope::deparse::{from_deparse_with, where_clause_deparse_with};
 use crate::query::ast::rope::{Select, Table};
 use crate::query::ast::{Clause, NodeId};
-use crate::query::predicates::{OuterJoinRole, query_branch_predicates_build};
+use crate::query::predicates::OuterJoinRole;
 use crate::query::resolve::{ResolvedQuery, SlotId};
 use crate::query::update::select_branches_with_source;
 
@@ -194,7 +194,11 @@ fn padding_scope_build(
     population: &ResolvedQuery,
     branch: Select<'_>,
 ) -> CacheResult<PaddingScope> {
-    let predicates = query_branch_predicates_build(population, branch);
+    let predicates = population
+        .predicates()
+        .branch(branch.id())
+        .ok_or_else(|| Report::<CacheError>::from(CacheError::InvalidQuery))
+        .attach_loc("a population branch is a SELECT of its query")?;
     let conjuncts = predicates
         .null_padded_conjuncts()
         .map(|conjunct| {

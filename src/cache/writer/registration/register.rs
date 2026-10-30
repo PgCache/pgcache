@@ -70,8 +70,12 @@ impl WriterRegistration {
 
         // Phase 2: Subsumption check
         let subsumption_start = Instant::now();
-        let cover =
-            self.subsumption_check(core, fingerprint, &query.bound, query.join_region.as_ref());
+        let cover = self.subsumption_check(
+            core,
+            fingerprint,
+            &query.bound,
+            query.bound.predicates().join_region(),
+        );
         crate::metrics::handles()
             .reg
             .register_subsumption_check
@@ -89,7 +93,7 @@ impl WriterRegistration {
                 core,
                 fingerprint,
                 &query.bound,
-                query.join_region.as_ref(),
+                query.bound.predicates().join_region(),
             )
         });
 

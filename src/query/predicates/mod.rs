@@ -8,12 +8,17 @@
 //! * [`derive`] — the per-reference facts read off that model: necessary
 //!   condition, exact description, dependency footprint, outer-join role.
 
+use std::sync::Arc;
+
 use ecow::EcoString;
 
+use crate::cache::UpdateQuerySource;
 use crate::catalog::ColumnPosition;
 use crate::query::ast::NodeId;
 use crate::query::constraints::{Constraint, TableConstraint, TableRanges};
-use crate::query::resolve::{ColumnBinding, SlotId};
+use crate::query::join_region::{JoinRegion, join_region_build};
+use crate::query::resolve::{BoundView, ColumnBinding, SlotId};
+use crate::query::update::select_branches_with_source;
 
 mod branch;
 mod conjunct;
@@ -21,6 +26,7 @@ mod derive;
 #[cfg(test)]
 mod tests;
 
+use branch::branch_predicates_build;
 pub use branch::query_branch_predicates_build;
 
 /// Index of a join in [`QueryBranchPredicates::joins`].
@@ -147,6 +153,10 @@ pub struct RelationPredicates {
     /// `filters` reduced once to per-column ranges, for subsumption and
     /// read-after-write.
     pub ranges: TableRanges,
+    /// `ranges` with every literal in its index-key form for its column's
+    /// type (PGC-478), as the constraint indexes are built and probed; the
+    /// same as `ranges` for a reference with no catalog table.
+    pub keyed_ranges: TableRanges,
     pub link_columns: Vec<EcoString>,
     pub unrecognized: bool,
     pub exact: bool,
@@ -160,4 +170,65 @@ pub struct QueryBranchPredicates {
     conjuncts: Vec<Conjunct>,
     /// One per reference, in `table_references` order.
     reference_predicates: Vec<TableReferencePredicates>,
+    /// Each reference's predicates by column name, in `table_references`
+    /// order, shared by every owner that keeps them; `None` where the
+    /// model can't project the reference's filters onto its columns.
+    relation_predicates: Vec<Option<Arc<RelationPredicates>>>,
+}
+
+/// One SELECT branch of a query with where it sits.
+#[derive(Debug, Clone)]
+pub struct SelectBranch {
+    pub select: NodeId,
+    pub source: UpdateQuerySource,
+    pub predicates: QueryBranchPredicates,
+}
+
+/// What a query's predicates say about every table reference of every
+/// SELECT branch, built once with the bound query and read by subsumption,
+/// admission, the read facts and population alike.
+#[derive(Debug, Clone, Default)]
+pub struct QueryPredicates {
+    /// In [`select_branches_with_source`] order.
+    branches: Vec<SelectBranch>,
+    /// The root's join region, when the query is one SELECT over base
+    /// tables ([`crate::query::join_region::query_join_region`]).
+    join_region: Option<JoinRegion>,
+}
+
+impl QueryPredicates {
+    pub(crate) fn build(bound: BoundView<'_>) -> Self {
+        let branches: Vec<SelectBranch> = select_branches_with_source(bound.tree().root())
+            .into_iter()
+            .map(|(select, source)| SelectBranch {
+                select: select.id(),
+                source,
+                predicates: branch_predicates_build(bound, select),
+            })
+            .collect();
+        let join_region = match branches.as_slice() {
+            [root] => join_region_build(bound, &root.predicates),
+            _ => None,
+        };
+        Self {
+            branches,
+            join_region,
+        }
+    }
+
+    pub fn branches(&self) -> &[SelectBranch] {
+        &self.branches
+    }
+
+    /// The branch whose SELECT node is `select`.
+    pub fn branch(&self, select: NodeId) -> Option<&QueryBranchPredicates> {
+        self.branches
+            .iter()
+            .find(|branch| branch.select == select)
+            .map(|branch| &branch.predicates)
+    }
+
+    pub fn join_region(&self) -> Option<&JoinRegion> {
+        self.join_region.as_ref()
+    }
 }

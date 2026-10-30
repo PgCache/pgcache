@@ -7,16 +7,12 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 
 use ecow::EcoString;
 
-#[cfg(feature = "proxy")]
-use crate::catalog::Catalog;
 use crate::oid::Oid;
 use crate::query::ast::rope::{NodeKind, View};
-#[cfg(feature = "proxy")]
 use crate::query::constraint_index::table_constraints_keyed;
 use crate::query::constraints::{TableConstraint, TableRanges};
-use crate::query::predicates::{ConjunctForm, ConjunctScope, query_branch_predicates_build};
-use crate::query::resolve::{ColumnTarget, ResolvedQuery, SlotId, TableSlot};
-use crate::query::update::select_branches_with_source;
+use crate::query::predicates::{ConjunctForm, ConjunctScope, QueryBranchPredicates};
+use crate::query::resolve::{BoundView, ColumnTarget, ResolvedQuery, SlotId, TableSlot};
 
 /// Hash of a single-branch query's FROM clause with its tables as relation
 /// oids and its columns as (slot, position): two queries of one shape read
@@ -41,6 +37,9 @@ pub struct JoinRegion {
     pub constraints: Vec<SlotConstraint>,
     /// `constraints` as one table's ranges, each column keyed by its slot.
     pub ranges: TableRanges,
+    /// `ranges` with every literal in its index-key form for its column's
+    /// type (PGC-478), as the shape index is built and probed.
+    pub keyed_ranges: TableRanges,
     /// Every WHERE conjunct is one of `constraints`, so the region is
     /// exactly what population loaded and the query can parent a join of
     /// its shape. A WHERE the model can't read whole still probes.
@@ -49,10 +48,18 @@ pub struct JoinRegion {
 
 /// The join region of `bound`: `None` unless it is one SELECT over two or
 /// more base tables with no subquery, CTE or set operation anywhere.
-pub fn query_join_region(bound: &ResolvedQuery) -> Option<JoinRegion> {
-    let root = bound.tree().root();
+pub fn query_join_region(bound: &ResolvedQuery) -> Option<&JoinRegion> {
+    bound.predicates().join_region()
+}
+
+/// [`query_join_region`] built with the model: `root` is the predicates of
+/// the query's only SELECT branch.
+pub(crate) fn join_region_build(
+    bound: BoundView<'_>,
+    root: &QueryBranchPredicates,
+) -> Option<JoinRegion> {
     let select = bound.select()?;
-    if root.ctes().len() != 0 || select_branches_with_source(root).len() != 1 {
+    if bound.tree().root().ctes().len() != 0 {
         return None;
     }
     let bindings = bound.bindings();
@@ -93,10 +100,9 @@ pub fn query_join_region(bound: &ResolvedQuery) -> Option<JoinRegion> {
     }
     let shape = JoinShape(hasher.finish());
 
-    let predicates = query_branch_predicates_build(bound, select);
     let mut constraints = Vec::new();
     let mut exact = true;
-    for conjunct in predicates.conjuncts() {
+    for conjunct in root.conjuncts() {
         if conjunct.scope != ConjunctScope::Where {
             continue;
         }
@@ -127,10 +133,29 @@ pub fn query_join_region(bound: &ResolvedQuery) -> Option<JoinRegion> {
         });
     }
     let ranges = slot_constraints_ranges(constraints.iter().map(|c| (c.slot, &c.constraint)));
+    let keyed: Vec<(SlotId, TableConstraint)> = constraints
+        .iter()
+        .map(|constraint| {
+            let keyed = bindings
+                .slot(constraint.slot)
+                .and_then(|slot| match slot {
+                    TableSlot::Base { table, .. } => {
+                        table_constraints_keyed(std::slice::from_ref(&constraint.constraint), table)
+                            .pop()
+                    }
+                    TableSlot::Derived { .. } => None,
+                })
+                .unwrap_or_else(|| constraint.constraint.clone());
+            (constraint.slot, keyed)
+        })
+        .collect();
+    let keyed_ranges =
+        slot_constraints_ranges(keyed.iter().map(|(slot, constraint)| (*slot, constraint)));
     Some(JoinRegion {
         shape,
         constraints,
         ranges,
+        keyed_ranges,
         exact,
     })
 }
@@ -148,32 +173,11 @@ fn slot_constraints_ranges<'a>(
     TableRanges::build(&keyed)
 }
 
-#[cfg(feature = "proxy")]
-impl JoinRegion {
-    /// `ranges` with every literal in its index-key form for its column's
-    /// type (PGC-478), as the shape index is built and probed.
-    pub fn keyed_ranges(&self, tables: &Catalog) -> TableRanges {
-        let keyed: Vec<(SlotId, TableConstraint)> = self
-            .constraints
-            .iter()
-            .map(|constraint| {
-                let keyed = tables
-                    .get1(&constraint.relation_oid)
-                    .and_then(|table| {
-                        table_constraints_keyed(std::slice::from_ref(&constraint.constraint), table)
-                            .pop()
-                    })
-                    .unwrap_or_else(|| constraint.constraint.clone());
-                (constraint.slot, keyed)
-            })
-            .collect();
-        slot_constraints_ranges(keyed.iter().map(|(slot, constraint)| (*slot, constraint)))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use iddqd::BiHashMap;
+
+    use crate::catalog::Catalog;
     use postgres_types::Type;
 
     use super::*;
@@ -209,7 +213,7 @@ mod tests {
     fn region(sql: &str) -> Option<JoinRegion> {
         let tables = catalog();
         let bound = ResolvedQuery::parse_resolve(sql, &tables, &["public"]).expect("resolve");
-        query_join_region(&bound)
+        query_join_region(&bound).cloned()
     }
 
     fn shape(sql: &str) -> JoinShape {
@@ -435,13 +439,13 @@ mod tests {
         let tables = catalog();
         let region = |sql: &str| {
             let bound = ResolvedQuery::parse_resolve(sql, &tables, &["public"]).expect("resolve");
-            query_join_region(&bound).expect("a join region")
+            query_join_region(&bound).expect("a join region").clone()
         };
         let parent = region("SELECT * FROM a JOIN b ON b.id = a.id WHERE a.x = 1 AND b.y = 2");
         let child = region("SELECT * FROM a JOIN b ON b.id = a.id WHERE a.x = '1' AND b.y = 2");
         assert!(table_ranges_subsumed(
-            &child.keyed_ranges(&tables),
-            &parent.keyed_ranges(&tables)
+            &child.keyed_ranges,
+            &parent.keyed_ranges
         ));
     }
 }
