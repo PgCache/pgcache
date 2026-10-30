@@ -8,7 +8,9 @@ use rootcause::Report;
 
 use crate::cache::{CacheError, CacheResult};
 use crate::catalog::ColumnMask;
-use crate::id_hash::{BuildIdHasher, impl_id_hashable};
+#[cfg(feature = "proxy")]
+use crate::id_hash::BuildIdHasher;
+use crate::id_hash::impl_id_hashable;
 use crate::oid::Oid;
 use crate::query::ast::NodeId;
 use crate::query::compiled_predicate::CompiledPredicate;
@@ -126,9 +128,6 @@ impl_id_hashable!(UpdateQueryKey);
 /// `HashSet` of `UpdateQueryKey` with the passthrough hasher.
 #[cfg(feature = "proxy")]
 pub(crate) type UpdateQueryKeySet = HashSet<UpdateQueryKey, BuildIdHasher<UpdateQueryKey>>;
-
-/// `HashMap` keyed by `UpdateQueryKey` with the passthrough hasher.
-type UpdateQueryKeyMap<V> = HashMap<UpdateQueryKey, V, BuildIdHasher<UpdateQueryKey>>;
 
 /// Query used to update cached results when data changes
 #[derive(Debug, Clone)]
@@ -255,15 +254,6 @@ impl UpdateQuery {
     }
 }
 
-/// The rows a subsumption parent holds in full on the relation.
-#[derive(Debug, Clone)]
-pub struct SubsumerRegion {
-    /// As the parent's filters read, for the precise coverage check.
-    pub ranges: TableRanges,
-    /// In their key forms, for the candidate index (PGC-478).
-    pub keyed_ranges: TableRanges,
-}
-
 /// Whether a CDC row change can alter a candidate query's result
 /// (PGC-247/404). An UPDATE that keeps its PK and changes no column a query
 /// reads leaves membership, output and order as they were, so its memo and
@@ -289,34 +279,6 @@ impl ChangeRelevance<'_> {
     }
 }
 
-/// An update query to register, with what the relation's indexes take.
-pub struct UpdateQueryRegistration {
-    pub update_query: UpdateQuery,
-    /// Its filters' ranges to index under, in their key forms.
-    pub index_ranges: TableRanges,
-    /// Its region when it could parent a subsumption but for a LIMIT, which
-    /// can change after registration.
-    pub subsumer_region: Option<SubsumerRegion>,
-}
-
-#[cfg(feature = "proxy")]
-impl UpdateQueryRegistration {
-    /// `update_query`'s registration: its ranges in their key forms
-    /// (PGC-478), as the model keyed them, shared by both indexes.
-    pub(crate) fn new(update_query: UpdateQuery, subsumer_shape: bool) -> Self {
-        let index_ranges = update_query.predicates.keyed_ranges.clone();
-        let subsumer_region = subsumer_shape.then(|| SubsumerRegion {
-            ranges: update_query.predicates.ranges.clone(),
-            keyed_ranges: index_ranges.clone(),
-        });
-        Self {
-            update_query,
-            index_ranges,
-            subsumer_region,
-        }
-    }
-}
-
 /// Collection of update queries for a specific relation.
 ///
 /// `queries` holds every update query of a fingerprint on the relation: one
@@ -328,13 +290,11 @@ pub struct UpdateQueries {
     pub relation_oid: Oid,
     queries: FingerprintMap<Vec<UpdateQuery>>,
     /// Typed index over subsumption parents' regions, for sub-linear
-    /// candidate lookup (PGC-119). Holds the `subsumer_regions` keys whose
-    /// fingerprint has no LIMIT.
+    /// candidate lookup (PGC-119). Holds each exact reference of a
+    /// fingerprint without a LIMIT, under its keyed ranges: population loads
+    /// that region in full whatever the fingerprint's other references on
+    /// the relation load (PGC-511).
     subsumption: ConstraintIndex<UpdateQueryKey>,
-    /// The region each exact reference holds in full, one per update query
-    /// that could parent a subsumption: population loads it whatever the
-    /// fingerprint's other references on the relation load (PGC-511).
-    subsumer_regions: UpdateQueryKeyMap<SubsumerRegion>,
     /// Per-table constraint index over the *full* update-query population of
     /// this relation — LocalEval and PgEval alike (PGC-292). Probed point-wise
     /// (`eval_candidates_into`) to narrow CDC per-row work: the upsert matcher
@@ -381,7 +341,6 @@ impl UpdateQueries {
             relation_oid,
             queries: HashMap::default(),
             subsumption: ConstraintIndex::new(),
-            subsumer_regions: HashMap::default(),
             eval_index: ConstraintIndex::new(),
             always_check: FingerprintSet::default(),
             has_limit_from: FingerprintSet::default(),
@@ -438,9 +397,15 @@ impl UpdateQueries {
     }
 
     /// The region the update query `key` holds in full, when it can parent
-    /// a subsumption on this relation.
-    pub fn subsumer_region(&self, key: UpdateQueryKey) -> Option<&SubsumerRegion> {
-        self.subsumer_regions.get(&key)
+    /// a subsumption on this relation: an exact reference's ranges, which
+    /// population loads whatever the fingerprint's other references load
+    /// (PGC-511).
+    pub fn subsumer_region(&self, key: UpdateQueryKey) -> Option<&TableRanges> {
+        let update_query = self.queries_of(key.fingerprint).get(key.ordinal)?;
+        update_query
+            .predicates
+            .exact
+            .then_some(&update_query.predicates.ranges)
     }
 
     /// Carve-out membership for a query: `(always_check, has_limit_fromclause)`.
@@ -569,33 +534,23 @@ impl UpdateQueries {
     /// Register `fingerprint`'s update queries on this relation, replacing
     /// any it had: one entry per table reference, each exact one a
     /// subsumption parent of its own.
-    pub fn fingerprint_insert(
-        &mut self,
-        fingerprint: Fingerprint,
-        registrations: Vec<UpdateQueryRegistration>,
-    ) {
+    pub fn fingerprint_insert(&mut self, fingerprint: Fingerprint, mut entries: Vec<UpdateQuery>) {
         self.fingerprint_remove(fingerprint);
         self.epoch += 1;
-        let mut entries: Vec<UpdateQuery> = Vec::with_capacity(registrations.len());
-        let mut regions = Vec::new();
-        for registration in registrations {
-            let mut update_query = registration.update_query;
+        for (ordinal, update_query) in entries.iter_mut().enumerate() {
             update_query.fingerprint = fingerprint;
-            update_query.ordinal = entries.len();
+            update_query.ordinal = ordinal;
+            // Indexed under each literal's key form for its column's type,
+            // so the row probe and the region probe match on value (PGC-478).
             self.eval_index
-                .insert(update_query.key(), &registration.index_ranges);
+                .insert(update_query.key(), &update_query.predicates.keyed_ranges);
             self.change_dependent_account(update_query.change_dependent, true);
-            if let Some(region) = registration.subsumer_region {
-                regions.push((update_query.key(), region));
-            }
-            entries.push(update_query);
         }
-        let unlimited = entries.iter().all(|entry| !entry.has_limit);
-        for (key, region) in regions {
-            if unlimited {
-                self.subsumption.insert(key, &region.keyed_ranges);
+        if entries.iter().all(|entry| !entry.has_limit) {
+            for entry in entries.iter().filter(|entry| entry.predicates.exact) {
+                self.subsumption
+                    .insert(entry.key(), &entry.predicates.keyed_ranges);
             }
-            self.subsumer_regions.insert(key, region);
         }
         self.carveout_account(fingerprint, &entries, true);
         self.queries.insert(fingerprint, entries);
@@ -610,7 +565,6 @@ impl UpdateQueries {
         self.epoch += 1;
         for entry in &entries {
             self.subsumption.remove(entry.key());
-            self.subsumer_regions.remove(&entry.key());
             self.eval_index.remove(entry.key());
             self.change_dependent_account(entry.change_dependent, false);
         }
@@ -637,8 +591,8 @@ impl UpdateQueries {
         for entry in &entries {
             let key = entry.key();
             self.subsumption.remove(key);
-            if !has_limit && let Some(region) = self.subsumer_regions.get(&key) {
-                self.subsumption.insert(key, &region.keyed_ranges);
+            if !has_limit && entry.predicates.exact {
+                self.subsumption.insert(key, &entry.predicates.keyed_ranges);
             }
         }
         self.queries.insert(fingerprint, entries);
@@ -716,8 +670,8 @@ mod tests {
         tables
     }
 
-    /// The registrations of `sql` on `items`, built as the writer builds them.
-    fn registrations(sql: &str, has_limit: bool) -> Vec<UpdateQueryRegistration> {
+    /// The update queries of `sql` on `items`, built as the writer builds them.
+    fn registrations(sql: &str, has_limit: bool) -> Vec<UpdateQuery> {
         let tables = catalog();
         let bound =
             Arc::new(ResolvedQuery::parse_resolve(sql, &tables, &["public"]).expect("resolve"));
@@ -737,9 +691,7 @@ mod tests {
         analysis
             .tables
             .into_iter()
-            .map(|admission| {
-                UpdateQueryRegistration::new(admission.update_query, admission.subsumer_shape)
-            })
+            .map(|admission| admission.update_query)
             .collect()
     }
 

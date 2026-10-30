@@ -80,7 +80,7 @@ impl SubsumerSource for WriterSubsumerSource<'_> {
                         let fingerprint = key.fingerprint;
                         Some(SubsumerCandidate {
                             fingerprint,
-                            region: &region.ranges,
+                            region,
                             has_limit: update_queries
                                 .queries_of(fingerprint)
                                 .iter()

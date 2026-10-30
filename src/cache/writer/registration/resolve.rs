@@ -18,7 +18,7 @@ use crate::cache::admission::{
 use crate::cache::messages::RegisterRequest;
 use crate::cache::mv::{query_has_join, query_has_window};
 use crate::cache::types::{AliasResolution, ReadFacts, SharedQueryShape, SharedResolvedQuery};
-use crate::cache::update_query::{UpdateQueries, UpdateQueryRegistration};
+use crate::cache::update_query::{UpdateQueries, UpdateQuery};
 use crate::cache::writer::core::WriterCore;
 use crate::cache::{CacheError, CacheResult, ReportExt};
 use crate::oid::Oid;
@@ -333,19 +333,16 @@ impl WriterRegistration {
         )?;
 
         let mut relation_oids = Vec::new();
-        let mut registrations: Vec<(Oid, Vec<UpdateQueryRegistration>)> = Vec::new();
+        let mut registrations: Vec<(Oid, Vec<UpdateQuery>)> = Vec::new();
         for admission in analysis.tables {
             let relation_oid = admission.relation_oid;
-            // Index under each literal's key form for its column's type, so
-            // the row probe and the region probe match on value (PGC-478).
-            let registration =
-                UpdateQueryRegistration::new(admission.update_query, admission.subsumer_shape);
+            let update_query = admission.update_query;
             match registrations
                 .iter_mut()
                 .find(|(oid, _)| *oid == relation_oid)
             {
-                Some((_, group)) => group.push(registration),
-                None => registrations.push((relation_oid, vec![registration])),
+                Some((_, group)) => group.push(update_query),
+                None => registrations.push((relation_oid, vec![update_query])),
             }
             relation_oids.push(relation_oid);
         }

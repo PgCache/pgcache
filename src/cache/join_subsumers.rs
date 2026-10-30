@@ -7,7 +7,6 @@
 
 use std::collections::HashMap;
 
-use super::update_query::SubsumerRegion;
 use crate::query::constraint_index::ConstraintIndex;
 use crate::query::constraints::TableRanges;
 use crate::query::join_region::{JoinRegion, JoinShape};
@@ -17,7 +16,10 @@ use crate::query::{Fingerprint, FingerprintMap};
 #[derive(Debug)]
 struct JoinParent {
     shape: JoinShape,
-    region: SubsumerRegion,
+    /// As the parent's WHERE reads, for the precise coverage check.
+    ranges: TableRanges,
+    /// In their key forms, for the shape index (PGC-478).
+    keyed_ranges: TableRanges,
     has_limit: bool,
 }
 
@@ -45,17 +47,15 @@ impl JoinSubsumers {
         self.fingerprint_remove(fingerprint);
         let parent = JoinParent {
             shape: region.shape,
-            region: SubsumerRegion {
-                ranges: region.ranges.clone(),
-                keyed_ranges: region.keyed_ranges.clone(),
-            },
+            ranges: region.ranges.clone(),
+            keyed_ranges: region.keyed_ranges.clone(),
             has_limit,
         };
         if !has_limit {
             self.by_shape
                 .entry(region.shape)
                 .or_default()
-                .insert(fingerprint, &parent.region.keyed_ranges);
+                .insert(fingerprint, &parent.keyed_ranges);
         }
         self.parents.insert(fingerprint, parent);
     }
@@ -91,7 +91,7 @@ impl JoinSubsumers {
             self.by_shape
                 .entry(parent.shape)
                 .or_default()
-                .insert(fingerprint, &parent.region.keyed_ranges);
+                .insert(fingerprint, &parent.keyed_ranges);
         }
     }
 
@@ -113,7 +113,7 @@ impl JoinSubsumers {
             Some((
                 fingerprint,
                 JoinCandidate {
-                    region: &parent.region.ranges,
+                    region: &parent.ranges,
                     has_limit: parent.has_limit,
                 },
             ))
