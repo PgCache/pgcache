@@ -71,7 +71,7 @@ Conventions: files are `ADR-XXX-brief-title.md` with the next sequential number;
 - [ADR-038](ADR-038-memory-pressure-governance.md) — Memory-pressure governance: count cap from measured marginal cost
 - [ADR-043](ADR-043-disk-pressure-governance.md) — Disk-pressure governance: statvfs + escalating reclaim ladder
 - [ADR-041](ADR-041-registration-admission-control.md) — Adaptive registration admission control (BBR-lite backpressure)
-- [ADR-063](ADR-063-box-cpu-pressure-feedback.md) — Box-level CPU pressure feedback: Linux PSI on a two-window rule sheds pool members and admission before the writer and the fold bgworker starve *(amends ADR-041, ADR-052, ADR-053)*
+- [ADR-063](ADR-063-box-cpu-pressure-feedback.md) — Box-level CPU pressure feedback: Linux PSI on a two-window rule backs admission off before the writer and the fold bgworker starve; pool shedding withdrawn after A/B *(amends ADR-041)*
 - [ADR-044](ADR-044-generation-tracking-garbage-collection.md) — Generation tracking as garbage collection (not visibility); eviction by lowest active generation
 
 ## Observability & operations

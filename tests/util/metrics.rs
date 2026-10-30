@@ -56,14 +56,8 @@ pub(crate) struct MetricsSnapshot {
     pub cache_staging_held: u64,
     /// Gauge: live population workers.
     pub cache_population_workers: u64,
-    /// Population workers released under box CPU pressure (PGC-554).
-    pub cache_population_pressure_sheds: u64,
-    /// Shed workers given back because the shed did not ease pressure.
-    pub cache_population_pressure_shed_restores: u64,
     /// Gauge: live serve-pool connections.
     pub cache_serve_pool_size: u64,
-    /// Serve-pool connections released under box CPU pressure (PGC-554).
-    pub cache_serve_pool_pressure_sheds: u64,
     pub cache_coalesce_served: u64,
     /// Coalesced waiters forwarded to origin on the population deadline (PGC-335).
     pub cache_coalesce_deadline_forward: u64,
@@ -215,10 +209,7 @@ const SAMPLES: &[Sample] = samples! {
     "pgcache_cache_merge_pending_depth" => cache_merge_pending_depth,
     "pgcache_cache_staging_held" => cache_staging_held,
     "pgcache_cache_population_workers" => cache_population_workers,
-    "pgcache_cache_population_pressure_sheds" => cache_population_pressure_sheds,
-    "pgcache_cache_population_pressure_shed_restores" => cache_population_pressure_shed_restores,
     "pgcache_cache_serve_pool_size" => cache_serve_pool_size,
-    "pgcache_cache_serve_pool_pressure_sheds" => cache_serve_pool_pressure_sheds,
     "pgcache_cache_coalesce_served" => cache_coalesce_served,
     "pgcache_cache_coalesce_deadline_forward_total" => cache_coalesce_deadline_forward,
     "pgcache_cache_coalesce_waiting" => cache_coalesce_waiting,

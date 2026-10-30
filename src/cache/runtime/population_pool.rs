@@ -22,12 +22,6 @@ const CONFIG: PoolControllerConfig = PoolControllerConfig {
     spawn_wait_ticks: 5,
     rho_shrink: 0.6,
     down_ticks: 30,
-    // Populations shed first under box pressure: a shed population is a
-    // forward to origin, the sanctioned relief valve (ADR-041), and each
-    // worker is a cache-PG backend plus an origin connection (PGC-554).
-    shed_pressure: 0.5,
-    shed_ticks: 5,
-    pressure_window: 8,
 };
 
 /// Elastic population pool controller (PGC-437, ADR-052). Probes the pool
@@ -71,7 +65,6 @@ pub(super) async fn population_pool_controller(
             live: pool.live_workers().saturating_sub(pool.pending_connects()),
             backlog: pool.queue_depth(),
             tick_seconds: elapsed,
-            pressure: state_view.cpu_pressure.get(),
         };
         prev = now;
 
@@ -86,21 +79,11 @@ pub(super) async fn population_pool_controller(
                     handles.population_backstop_grows.increment(1);
                 }
                 StepKind::Shrink => handles.population_scale_down.increment(1),
-                StepKind::Shed => {
-                    handles.population_scale_down.increment(1);
-                    handles.population_pressure_sheds.increment(1);
-                }
-                StepKind::Restore => {
-                    handles.population_scale_up.increment(1);
-                    handles.population_pressure_shed_restores.increment(1);
-                }
                 StepKind::Hold => {}
             }
             tracing::debug!(
-                "population pool target {desired} -> {next} ({kind:?}, tasks/tick={}, cpu pressure {:.2}/{:.2})",
+                "population pool target {desired} -> {next} ({kind:?}, tasks/tick={})",
                 sample.task_count,
-                sample.pressure.avg10,
-                sample.pressure.avg60,
             );
         }
     }

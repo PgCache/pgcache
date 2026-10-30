@@ -2,19 +2,9 @@
 //! population worker pool and the cache serve pool. Growth is a measured
 //! experiment — step up one while queue wait is breached, verify completion
 //! throughput actually rose — and shrink follows sustained low utilization.
-//! Box CPU pressure (PGC-554) refutes growth that only steals cycles and
-//! sheds members while the box is saturated: own queue wait is blind to the
-//! writer, the fold bgworker and the other pool on a shared CPU. PSI decides
-//! *whether* the box is short of CPU; the run queue's waiting-task count,
-//! which keeps moving where PSI saturates, decides whether a step helped or
-//! hurt. A shed is an experiment like a probe: kept only if waiting fell,
-//! restored otherwise, so a pool never sheds into pressure it does not cause.
 //! Thresholds vary per pool through [`PoolControllerConfig`].
 
-use std::collections::VecDeque;
 use std::time::Duration;
-
-use crate::cache::pressure::CpuPressure;
 
 /// Per-pool thresholds for the probe-and-verify policy.
 #[derive(Debug, Clone, Copy)]
@@ -51,64 +41,6 @@ pub(super) struct PoolControllerConfig {
     /// Consecutive low-utilization ticks before shrinking by one — scale up
     /// fast, down slowly.
     pub down_ticks: u32,
-    /// Box CPU pressure (PSI `some` share) at which the pool sheds members
-    /// regardless of its own queue wait (PGC-554). Shedding needs both the
-    /// 60 s and the 10 s window at or above it — sustained and still there —
-    /// and stops once the 60 s window drops below: hysteresis from the
-    /// kernel's own smoothing. Population sheds before serve (forwarding to
-    /// origin is the sanctioned shed; a smaller serve pool costs latency).
-    pub shed_pressure: f64,
-    /// Ticks between shed steps while pressure holds.
-    pub shed_ticks: u32,
-    /// Samples of the waiting-task count on each side of a step — the window
-    /// before it is the baseline, the window after it the verdict — so one
-    /// noisy second cannot decide an experiment. Also how long a step waits to
-    /// be judged under pressure.
-    pub pressure_window: u32,
-}
-
-/// The mark one member leaves on the box's run queue: a backend that is
-/// runnable whenever it has work adds about one waiting task; half of that,
-/// like `verify_beta`, is the step's expected effect with slack for noise. A
-/// shed whose fall in waiting tasks reaches it was part of the pressure and
-/// is kept; a probe whose rise reaches it took its gain from everyone else
-/// and is refuted. PSI is not used here: it saturates, and read the same at
-/// load 9 and load 34 on the bench box.
-const WAITING_STEP: f64 = 0.5;
-
-/// Standard errors of the two-window mean difference a change must reach
-/// besides [`WAITING_STEP`]: the run queue on a saturated 2-vCPU box wobbled
-/// by half a task to a task between seconds with the pools doing nothing, and
-/// a per-sample verdict let that wobble confirm sheds and refute probes at
-/// random.
-const WAITING_Z: f64 = 2.0;
-
-/// Mean and standard deviation of a window of waiting-task samples.
-fn mean_sd(samples: &[f64]) -> (f64, f64) {
-    if samples.is_empty() {
-        return (0.0, 0.0);
-    }
-    // Windows hold a handful of samples; the count is exact in an f64.
-    #[allow(clippy::cast_precision_loss)]
-    let n = samples.len() as f64;
-    let mean = samples.iter().sum::<f64>() / n;
-    let var = samples.iter().map(|s| (s - mean).powi(2)).sum::<f64>() / n;
-    (mean, var.sqrt())
-}
-
-/// Whether a change in the windowed mean counts as the step's doing: at least
-/// one member's mark, and at least [`WAITING_Z`] standard errors of the
-/// difference of two `window`-sample means at the baseline's spread.
-fn significant(delta: f64, sd: f64, window: u32) -> bool {
-    let standard_error = sd * (2.0 / f64::from(window.max(1))).sqrt();
-    delta >= WAITING_STEP.max(WAITING_Z * standard_error)
-}
-
-/// The run queue around the time a step was taken.
-#[derive(Debug, Clone, Copy, Default)]
-struct Baseline {
-    mean: f64,
-    sd: f64,
 }
 
 /// One tick's worth of pool activity, as deltas of the shared monotonic
@@ -127,8 +59,6 @@ pub(super) struct TickSample {
     /// (PGC-452).
     pub backlog: usize,
     pub tick_seconds: f64,
-    /// Box CPU pressure at the tick (PGC-554).
-    pub pressure: CpuPressure,
 }
 
 impl TickSample {
@@ -177,12 +107,6 @@ pub(super) enum StepKind {
     /// verify signal was indeterminate (too few completions to judge).
     GrowBackstop,
     Shrink,
-    /// A member released because the box is under CPU pressure, whatever the
-    /// pool's own queue says (PGC-554).
-    Shed,
-    /// A shed member given back: releasing it did not ease the pressure, so
-    /// the pool was not its cause (PGC-554).
-    Restore,
 }
 
 /// Upward-probe state: growth is a measured experiment, not a model.
@@ -197,36 +121,13 @@ enum ProbeState {
     },
 }
 
-/// A shed in flight or held back, mirroring [`ProbeState`] for the downward
-/// direction (PGC-554).
-#[derive(Debug, Clone, Copy)]
-enum ShedState {
-    Idle,
-    /// A member was released against `baseline`; judge whether the run
-    /// queue eased once a full window of samples has followed.
-    AwaitRelief {
-        baseline: Baseline,
-        ticks_waited: u32,
-    },
-    /// A shed that bought nothing was restored; no new shed until this
-    /// expires, doubling per consecutive useless shed like the refute hold.
-    Hold {
-        ticks_left: u32,
-    },
-}
-
 /// An in-flight upward step to `target` members, judged by the throughput
 /// delta against `baseline_x` once the member is live.
 #[derive(Debug, Clone, Copy)]
 struct Verify {
     baseline_x: f64,
-    /// The run queue when the step was taken; under pressure the verdict
-    /// compares a full window after the member is live against it.
-    baseline: Baseline,
     target: usize,
     ticks_waited: u32,
-    /// Ticks the member has been live, for the pressure window.
-    ticks_live: u32,
 }
 
 /// Consecutive healthy (sub-target wait) ticks before the probe state and the
@@ -246,14 +147,6 @@ pub(super) struct PoolController {
     /// drives the escalating hold.
     consecutive_refutes: u32,
     healthy_streak: u32,
-    /// Consecutive ticks under shedding pressure since the last shed step.
-    shed_streak: u32,
-    shed: ShedState,
-    /// Sheds restored since the last confirmed shed or clearing of pressure;
-    /// drives the escalating shed hold.
-    consecutive_shed_restores: u32,
-    /// The last `pressure_window` waiting-task samples.
-    waiting_history: VecDeque<f64>,
 }
 
 impl PoolController {
@@ -267,41 +160,11 @@ impl PoolController {
             shrink_streak: 0,
             consecutive_refutes: 0,
             healthy_streak: 0,
-            shed_streak: 0,
-            shed: ShedState::Idle,
-            consecutive_shed_restores: 0,
-            waiting_history: VecDeque::with_capacity(config.pressure_window as usize + 1),
         }
-    }
-
-    fn waiting_observe(&mut self, waiting: f64) {
-        self.waiting_history.push_back(waiting);
-        while self.waiting_history.len() > self.config.pressure_window as usize {
-            self.waiting_history.pop_front();
-        }
-    }
-
-    /// The run queue over the window up to now.
-    fn baseline(&self) -> Baseline {
-        let (front, back) = self.waiting_history.as_slices();
-        let samples: Vec<f64> = front.iter().chain(back).copied().collect();
-        let (mean, sd) = mean_sd(&samples);
-        Baseline { mean, sd }
     }
 
     /// Advance one tick and return the new desired member count.
     pub(super) fn step(&mut self, sample: TickSample, desired: usize) -> (usize, StepKind) {
-        self.waiting_observe(sample.pressure.waiting);
-        // The box's queue outranks ours: under sustained CPU pressure the pool
-        // sheds, whatever its own wait says (PGC-554).
-        if self.shedding(sample.pressure) {
-            return self.shed_tick(&sample, desired);
-        }
-        self.shed_streak = 0;
-        self.shed = ShedState::Idle;
-        if sample.pressure.avg60 < self.config.shed_pressure {
-            self.consecutive_shed_restores = 0;
-        }
         // A saturated pool gives no signal — freeze all streaks and holds
         // rather than shrink at the moment capacity is most needed (PGC-452).
         if sample.saturated_without_signal() {
@@ -315,124 +178,6 @@ impl PoolController {
 
     fn clamped(&self, n: usize) -> usize {
         n.clamp(self.min, self.max)
-    }
-
-    /// Both PSI windows at or above the shed level: the box has been short of
-    /// CPU for a minute and still is.
-    fn shedding(&self, pressure: CpuPressure) -> bool {
-        pressure.avg60 >= self.config.shed_pressure && pressure.avg10 >= self.config.shed_pressure
-    }
-
-    /// The 10 s window at or above the level: the box is short of CPU now, so
-    /// a probe's gain is judged against the run queue over a full window.
-    /// Below it the run queue is nobody's shortage and the throughput verdict
-    /// stands alone, as in ADR-052.
-    fn above_level(&self, pressure: CpuPressure) -> bool {
-        pressure.avg10 >= self.config.shed_pressure
-    }
-
-    /// Under shedding pressure: run the shed experiment — release one member
-    /// per `shed_ticks`, judge it by whether the waiting-task count fell,
-    /// restore it and hold if it did not. While a useless shed is held, or at
-    /// the floor, there is nothing to shed: the pool is then on its own queue
-    /// again and grows by the ordinary probe, whose verdict the run queue
-    /// refutes if the member only took cycles from the box. Without that, a
-    /// box saturated by its own useful serving pins every pool to its floor.
-    fn shed_tick(&mut self, sample: &TickSample, desired: usize) -> (usize, StepKind) {
-        self.healthy_streak = 0;
-        self.shrink_streak = 0;
-        match self.shed {
-            ShedState::Hold { ticks_left } => {
-                self.shed = if ticks_left > 1 {
-                    ShedState::Hold {
-                        ticks_left: ticks_left - 1,
-                    }
-                } else {
-                    ShedState::Idle
-                };
-                self.grow_or_hold(sample, desired)
-            }
-            ShedState::AwaitRelief {
-                baseline,
-                ticks_waited,
-            } => self.shed_verify_tick(desired, baseline, ticks_waited),
-            ShedState::Idle if desired <= self.min => {
-                self.shed_streak = 0;
-                self.grow_or_hold(sample, desired)
-            }
-            // A probe started at the floor or during a hold is judged before
-            // the shed cadence may void it.
-            ShedState::Idle if matches!(self.probe, ProbeState::AwaitVerify(_)) => {
-                self.grow_or_hold(sample, desired)
-            }
-            ShedState::Idle => {
-                self.shed_streak += 1;
-                if self.shed_streak < self.config.shed_ticks {
-                    return (self.clamped(desired), StepKind::Hold);
-                }
-                self.shed_streak = 0;
-                // A probe in flight is void: its verdict would measure the
-                // shed, not the member.
-                self.probe = ProbeState::Idle;
-                self.backstop_ticks = 0;
-                self.shed = ShedState::AwaitRelief {
-                    baseline: self.baseline(),
-                    ticks_waited: 0,
-                };
-                (self.clamped(desired - 1), StepKind::Shed)
-            }
-        }
-    }
-
-    /// Nothing to shed this tick: grow on a breached queue by the ordinary
-    /// probe-and-verify, else hold.
-    fn grow_or_hold(&mut self, sample: &TickSample, desired: usize) -> (usize, StepKind) {
-        if sample.saturated_without_signal() || sample.wait_mean() <= self.config.wait_target {
-            return (self.clamped(desired), StepKind::Hold);
-        }
-        self.breached_tick(*sample, desired)
-    }
-
-    /// Judge the last shed once a full window of samples has followed it:
-    /// significant relief confirms it (the next shed follows on the cadence);
-    /// anything less restores the member and holds on the escalating ladder.
-    fn shed_verify_tick(
-        &mut self,
-        desired: usize,
-        baseline: Baseline,
-        ticks_waited: u32,
-    ) -> (usize, StepKind) {
-        if ticks_waited + 1 < self.config.pressure_window {
-            self.shed = ShedState::AwaitRelief {
-                baseline,
-                ticks_waited: ticks_waited + 1,
-            };
-            return (self.clamped(desired), StepKind::Hold);
-        }
-        let relief = baseline.mean - self.baseline().mean;
-        if significant(relief, baseline.sd, self.config.pressure_window) {
-            self.shed = ShedState::Idle;
-            self.consecutive_shed_restores = 0;
-            self.shed_streak = 0;
-            return (self.clamped(desired), StepKind::Hold);
-        }
-        self.shed = ShedState::Hold {
-            ticks_left: self.shed_hold(),
-        };
-        (self.clamped(desired + 1), StepKind::Restore)
-    }
-
-    /// The hold after a useless shed, doubling per consecutive one so a box
-    /// whose pressure this pool does not cause is re-probed at a decaying
-    /// cadence instead of churning a member every cycle.
-    fn shed_hold(&mut self) -> u32 {
-        let hold = self
-            .config
-            .shed_ticks
-            .saturating_mul(1 << self.consecutive_shed_restores.min(6))
-            .min(self.config.probe_hold_max_ticks);
-        self.consecutive_shed_restores = self.consecutive_shed_restores.saturating_add(1);
-        hold
     }
 
     /// Healthy queue: after a sustained streak (not one noisy tick at a
@@ -466,10 +211,8 @@ impl PoolController {
             ProbeState::Hold { ticks_left } => self.hold_tick(ticks_left, desired),
             // Step only when prior steps have materialized: if spawn is
             // stuck, running `desired` further ahead of `live` helps nothing.
-            // A busy box does not block the probe; its verdict judges the
-            // step by what it did to the run queue (PGC-554).
             ProbeState::Idle if sample.live >= desired => {
-                self.probe_step(&sample, desired, StepKind::Grow)
+                self.probe_step(sample.throughput(), desired, StepKind::Grow)
             }
             ProbeState::Idle => (self.clamped(desired), StepKind::Hold),
             ProbeState::AwaitVerify(verify) => self.verify_tick(verify, sample, desired),
@@ -501,33 +244,14 @@ impl PoolController {
         }
         self.backstop_ticks = 0;
         let expected = self.config.verify_beta / sample.service_seconds().max(1e-6);
-        let delivered = sample.throughput() - verify.baseline_x >= expected;
-        if delivered && self.above_level(sample.pressure) {
-            // The box is short of CPU: a gain bought with its cycles is no gain
-            // — the rest of the box (writer, fold bgworker, the other pool)
-            // paid for it (PGC-554). Judge on a full window after the member
-            // went live, so a noisy second decides nothing.
-            if verify.ticks_live + 1 < self.config.pressure_window {
-                self.probe = ProbeState::AwaitVerify(Verify {
-                    ticks_live: verify.ticks_live + 1,
-                    ..verify
-                });
-                return (self.clamped(desired), StepKind::Hold);
-            }
-            let rise = self.baseline().mean - verify.baseline.mean;
-            if !significant(rise, verify.baseline.sd, self.config.pressure_window) {
-                self.consecutive_refutes = 0;
-                return self.probe_step(&sample, desired, StepKind::Grow);
-            }
-        } else if delivered {
+        if sample.throughput() - verify.baseline_x >= expected {
             // Confirmed: the added member delivered; keep stepping, and reset
             // the hold ladder — the ceiling moved.
             self.consecutive_refutes = 0;
-            return self.probe_step(&sample, desired, StepKind::Grow);
+            return self.probe_step(sample.throughput(), desired, StepKind::Grow);
         }
         // Refuted with a valid measurement: adding a member did not raise
-        // throughput (the backend is the bottleneck) or lengthened the box's
-        // run queue. Back off and hold.
+        // throughput — the backend is the bottleneck. Back off and hold.
         self.probe = ProbeState::Hold {
             ticks_left: self.refute_hold(),
         };
@@ -558,7 +282,7 @@ impl PoolController {
             return (self.clamped(desired), StepKind::Hold);
         }
         self.backstop_ticks = 0;
-        self.probe_step(&sample, desired, StepKind::GrowBackstop)
+        self.probe_step(sample.throughput(), desired, StepKind::GrowBackstop)
     }
 
     /// The hold after a refute, doubling per consecutive refute so a stable
@@ -573,23 +297,16 @@ impl PoolController {
         hold
     }
 
-    fn probe_step(
-        &mut self,
-        sample: &TickSample,
-        desired: usize,
-        kind: StepKind,
-    ) -> (usize, StepKind) {
+    fn probe_step(&mut self, x_now: f64, desired: usize, kind: StepKind) -> (usize, StepKind) {
         if desired >= self.max {
             self.probe = ProbeState::Idle;
             return (self.max, StepKind::Hold);
         }
         let target = desired + 1;
         self.probe = ProbeState::AwaitVerify(Verify {
-            baseline_x: sample.throughput(),
-            baseline: self.baseline(),
+            baseline_x: x_now,
             target,
             ticks_waited: 0,
-            ticks_live: 0,
         });
         (self.clamped(target), kind)
     }
@@ -610,9 +327,6 @@ mod tests {
         spawn_wait_ticks: 5,
         rho_shrink: 0.6,
         down_ticks: 30,
-        shed_pressure: 0.5,
-        shed_ticks: 5,
-        pressure_window: 8,
     };
 
     /// A tick where `live` members complete `count` tasks of `task_ms`, each
@@ -626,29 +340,6 @@ mod tests {
             live,
             backlog: 0,
             tick_seconds: 1.0,
-            pressure: CpuPressure::default(),
-        }
-    }
-
-    /// `sample` under the given PSI windows, with nothing waiting.
-    pub(super) fn pressured(sample: TickSample, avg10: f64, avg60: f64) -> TickSample {
-        pressured_waiting(sample, avg10, avg60, 0.0)
-    }
-
-    /// `sample` under the given PSI windows and waiting-task count.
-    pub(super) fn pressured_waiting(
-        sample: TickSample,
-        avg10: f64,
-        avg60: f64,
-        waiting: f64,
-    ) -> TickSample {
-        TickSample {
-            pressure: CpuPressure {
-                avg10,
-                avg60,
-                waiting,
-            },
-            ..sample
         }
     }
 
@@ -834,7 +525,6 @@ mod tests {
             live: 6,
             backlog: 40,
             tick_seconds: 1.0,
-            pressure: CpuPressure::default(),
         };
         for _ in 0..(CFG.down_ticks * 3) {
             let (next, kind) = c.step(frozen, desired);
@@ -861,7 +551,6 @@ mod tests {
             live: 6,
             backlog: 0,
             tick_seconds: 1.0,
-            pressure: CpuPressure::default(),
         };
         for _ in 0..CFG.down_ticks - 1 {
             let (next, _) = c.step(idle, desired);
@@ -877,228 +566,6 @@ mod tests {
         let mut c = PoolController::new(2, 16, CFG);
         let (next, kind) = c.step(calm(2, 0, 0, 0), 2);
         assert_eq!((next, kind), (2, StepKind::Hold));
-    }
-}
-
-/// Box CPU pressure (PGC-554): shedding and probing judged on windowed means
-/// of the run queue.
-#[cfg(test)]
-mod pressure_tests {
-    #![allow(clippy::cast_precision_loss)]
-
-    use super::tests::{CFG, calm, pressured, pressured_waiting, storm};
-    use super::*;
-
-    const W: u32 = CFG.pressure_window;
-
-    /// Run `ticks` ticks of a breached storm at the given PSI and the waiting
-    /// values `waiting(tick)`, returning every non-Hold step.
-    fn run(
-        c: &mut PoolController,
-        desired: &mut usize,
-        ticks: u32,
-        psi: f64,
-        waiting: impl Fn(u32, usize) -> f64,
-    ) -> Vec<(StepKind, usize)> {
-        let mut steps = Vec::new();
-        for tick in 0..ticks {
-            let w = waiting(tick, *desired);
-            let (next, kind) = c.step(
-                pressured_waiting(storm(*desired, 12, 80), psi, psi, w),
-                *desired,
-            );
-            if kind != StepKind::Hold {
-                steps.push((kind, next));
-            }
-            *desired = next;
-        }
-        steps
-    }
-
-    #[test]
-    fn test_significance_needs_the_member_mark_and_the_noise() {
-        assert!(
-            significant(0.5, 0.0, W),
-            "noise-free: the member mark suffices"
-        );
-        assert!(!significant(0.4, 0.0, W));
-        // sd 1 over two 8-sample windows: standard error 0.5, threshold 1.0.
-        assert!(!significant(0.9, 1.0, W));
-        assert!(significant(1.0, 1.0, W));
-        let (mean, sd) = mean_sd(&[5.0, 7.0, 5.0, 7.0]);
-        assert_eq!(mean, 6.0);
-        assert_eq!(sd, 1.0);
-    }
-
-    /// PSI pinned at saturation the whole time — it cannot tell the pool
-    /// anything — while each member released takes one task off the run
-    /// queue, noise-free: every shed is confirmed after its window and the
-    /// pool walks to its floor, though its own queue is breached throughout.
-    #[test]
-    fn test_shedding_continues_while_each_shed_eases_the_run_queue() {
-        let mut c = PoolController::new(2, 16, CFG);
-        let mut desired = 16;
-        let steps = run(
-            &mut c,
-            &mut desired,
-            16 * (W + CFG.shed_ticks),
-            0.95,
-            |_, d| d as f64,
-        );
-        // Fourteen confirmed sheds walk the pool to its floor; from there the
-        // breached queue probes up and the member, adding its task, is
-        // refuted after its window.
-        let sheds: Vec<_> = steps
-            .iter()
-            .take_while(|(k, _)| *k == StepKind::Shed)
-            .map(|(_, n)| *n)
-            .collect();
-        assert_eq!(sheds, (2..16).rev().collect::<Vec<_>>(), "{steps:?}");
-        assert!(
-            !steps.iter().any(|(k, _)| *k == StepKind::Restore),
-            "no shed was useless: {steps:?}"
-        );
-    }
-
-    /// The same sheds under run-queue noise of ±1.5 are not confirmed: a
-    /// one-task relief is inside two standard errors of such a window, so the
-    /// member is restored. Noise decides nothing either way.
-    #[test]
-    fn test_noise_cannot_confirm_a_shed() {
-        let mut c = PoolController::new(2, 16, CFG);
-        let mut desired = 8;
-        let noisy =
-            |tick: u32, d: usize| d as f64 + if tick.is_multiple_of(2) { 1.5 } else { -1.5 };
-        let steps = run(&mut c, &mut desired, CFG.shed_ticks + W + 1, 0.95, noisy);
-        assert_eq!(
-            steps[..2],
-            [(StepKind::Shed, 7), (StepKind::Restore, 8)],
-            "a one-task relief under ±1.5 noise is not evidence: {steps:?}"
-        );
-        // Twice the relief clears the bar at the same noise.
-        let mut c = PoolController::new(2, 16, CFG);
-        let mut desired = 8;
-        let noisy2 =
-            |tick: u32, d: usize| 2.0 * d as f64 + if tick.is_multiple_of(2) { 1.5 } else { -1.5 };
-        let steps = run(&mut c, &mut desired, CFG.shed_ticks + W + 1, 0.95, noisy2);
-        assert_eq!(
-            steps,
-            vec![(StepKind::Shed, 7)],
-            "confirmed, awaiting the next cadence"
-        );
-    }
-
-    /// Pressure the pool is not causing: the run queue does not move when a
-    /// member leaves, so the shed is judged useless after its window and the
-    /// member is restored. Held from shedding, the pool is back on its own
-    /// breached queue and grows by the ordinary probe, which a flat run queue
-    /// never refutes; the shed is retried once the hold expires.
-    #[test]
-    fn test_useless_shed_is_restored_and_the_pool_grows_on_its_own_queue() {
-        let mut c = PoolController::new(2, 16, CFG);
-        let mut desired = 8;
-        let steps = run(&mut c, &mut desired, 12 * W, 0.95, |_, _| 20.0);
-        assert_eq!(
-            steps[..2],
-            [(StepKind::Shed, 7), (StepKind::Restore, 8)],
-            "shed, judged useless after its window, restored: {steps:?}"
-        );
-        assert!(
-            steps[2..].iter().any(|(k, _)| *k == StepKind::Grow),
-            "held from shedding, the breached pool probes up: {steps:?}"
-        );
-        let sheds = steps.iter().filter(|(k, _)| *k == StepKind::Shed).count();
-        assert!(sheds >= 2, "the shed is retried after the hold: {steps:?}");
-        assert!(
-            !steps.iter().any(|(k, _)| *k == StepKind::Shrink),
-            "a flat run queue refutes no probe: {steps:?}"
-        );
-        assert!(
-            desired > 8,
-            "the pool ends larger than it started: {desired}"
-        );
-    }
-
-    /// At the floor there is nothing to shed: a breached queue probes up as it
-    /// would without pressure, and the run queue, over a window, judges it.
-    #[test]
-    fn test_at_the_floor_under_pressure_the_probe_is_judged_on_the_window() {
-        // The member adds its task: refuted after the window.
-        let mut c = PoolController::new(2, 16, CFG);
-        let mut desired = 2;
-        let steps = run(&mut c, &mut desired, W + 2, 0.95, |tick, _| {
-            if tick == 0 { 9.0 } else { 10.0 }
-        });
-        assert_eq!(
-            steps,
-            vec![(StepKind::Grow, 3), (StepKind::Shrink, 2)],
-            "{steps:?}"
-        );
-        // The run queue stays put: confirmed after the window, and the next
-        // step follows.
-        let mut c = PoolController::new(2, 16, CFG);
-        let mut desired = 2;
-        let steps = run(&mut c, &mut desired, W + 2, 0.95, |_, _| 9.0);
-        assert_eq!(
-            steps,
-            vec![(StepKind::Grow, 3), (StepKind::Grow, 4)],
-            "{steps:?}"
-        );
-        // A healthy queue at the floor just holds.
-        let mut c = PoolController::new(2, 16, CFG);
-        let (next, kind) = c.step(pressured_waiting(calm(2, 20, 3, 1), 0.95, 0.95, 9.0), 2);
-        assert_eq!((next, kind), (2, StepKind::Hold));
-    }
-
-    /// Below the level the box is not short of CPU: the probe is confirmed
-    /// on throughput alone, at once, whatever the run queue did (ADR-052).
-    #[test]
-    fn test_below_the_level_the_probe_confirms_at_once() {
-        let mut c = PoolController::new(2, 16, CFG);
-        let (next, kind) = c.step(pressured_waiting(storm(2, 25, 20), 0.3, 0.3, 1.0), 2);
-        assert_eq!((next, kind), (3, StepKind::Grow));
-        let (next, kind) = c.step(pressured_waiting(storm(3, 25, 20), 0.3, 0.3, 6.0), next);
-        assert_eq!((next, kind), (4, StepKind::Grow));
-    }
-
-    /// A short spike (10 s window up, 60 s window not yet) does not shed, and
-    /// a falling tail (60 s still up, 10 s already down) does not shed either:
-    /// both windows must stand at the level. Neither blocks the probe.
-    #[test]
-    fn test_shedding_needs_both_windows() {
-        let mut c = PoolController::new(2, 16, CFG);
-        let (next, kind) = c.step(pressured(storm(8, 12, 80), 0.9, 0.2), 8);
-        assert_eq!(
-            (next, kind),
-            (9, StepKind::Grow),
-            "spike: no shed, probe runs"
-        );
-        let mut c = PoolController::new(2, 16, CFG);
-        let (next, kind) = c.step(pressured(storm(8, 12, 80), 0.2, 0.9), 8);
-        assert_eq!(
-            (next, kind),
-            (9, StepKind::Grow),
-            "falling: no shed, probe runs"
-        );
-    }
-
-    /// Pressure that clears mid-shed stops the shed where it is.
-    #[test]
-    fn test_shed_stops_when_the_minute_window_clears() {
-        let mut c = PoolController::new(2, 16, CFG);
-        let mut desired = 16;
-        for _ in 0..CFG.shed_ticks {
-            let (next, _) = c.step(pressured(storm(desired, 12, 80), 0.9, 0.9), desired);
-            desired = next;
-        }
-        assert_eq!(desired, 15);
-        // The shed is never judged: pressure cleared, the member is not
-        // restored either (the pool's own queue decides from here).
-        for _ in 0..(CFG.shed_ticks * 2) {
-            let (next, kind) = c.step(pressured(calm(desired, 40, 10, 1), 0.9, 0.4), desired);
-            assert_eq!((next, kind), (15, StepKind::Hold));
-            desired = next;
-        }
     }
 }
 

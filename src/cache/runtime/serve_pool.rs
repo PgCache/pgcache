@@ -44,12 +44,6 @@ const CONTROLLER_CONFIG: PoolControllerConfig = PoolControllerConfig {
     spawn_wait_ticks: 5,
     rho_shrink: 0.6,
     down_ticks: 30,
-    // The serve pool sheds last: a smaller pool costs serve latency, not
-    // correctness, so it gives way only when the box is deep in pressure
-    // (PGC-554).
-    shed_pressure: 0.8,
-    shed_ticks: 5,
-    pressure_window: 8,
 };
 
 /// Controller tick.
@@ -611,7 +605,6 @@ pub(super) async fn serve_pool_controller(
             live: pool.live(),
             backlog: pool.queue_depth(),
             tick_seconds: elapsed,
-            pressure: state_view.cpu_pressure.get(),
         };
         prev = now;
 
@@ -625,20 +618,12 @@ pub(super) async fn serve_pool_controller(
                     handles.serve_pool_scale_up.increment(1);
                     handles.serve_pool_backstop_grows.increment(1);
                 }
-                // Shed and shrink are applied lazily by `pool_shrink_apply`
-                // and counted there; the shed is also counted here as a shed.
-                StepKind::Shed => handles.serve_pool_pressure_sheds.increment(1),
-                StepKind::Restore => {
-                    handles.serve_pool_scale_up.increment(1);
-                    handles.serve_pool_pressure_shed_restores.increment(1);
-                }
+                // Applied lazily by `pool_shrink_apply`; counted there.
                 StepKind::Shrink | StepKind::Hold => {}
             }
             tracing::debug!(
-                "serve pool target {desired} -> {next} ({kind:?}, serves/tick={}, cpu pressure {:.2}/{:.2})",
+                "serve pool target {desired} -> {next} ({kind:?}, serves/tick={})",
                 sample.task_count,
-                sample.pressure.avg10,
-                sample.pressure.avg60,
             );
         }
         // Live count as a gauge; pool sizes never approach 2^53.

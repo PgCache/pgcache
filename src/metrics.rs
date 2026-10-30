@@ -257,13 +257,6 @@ pub mod names {
     /// to judge). Sustained firing means the controller is flying blind —
     /// long-task storm or origin saturation (ADR-052).
     pub const CACHE_POPULATION_BACKSTOP_GROWS: &str = "pgcache.cache.population_backstop_grows";
-    /// Population workers released because the box was under CPU pressure
-    /// (PGC-554), whatever the pool's own queue wait said.
-    pub const CACHE_POPULATION_PRESSURE_SHEDS: &str = "pgcache.cache.population_pressure_sheds";
-    /// Shed population workers given back because releasing them did not
-    /// ease box pressure: the pool was not its cause (PGC-554).
-    pub const CACHE_POPULATION_PRESSURE_SHED_RESTORES: &str =
-        "pgcache.cache.population_pressure_shed_restores";
     /// The wait a population dispatched now should expect before a worker
     /// picks it up: its turn behind the queue at the pool's recent service
     /// rate. With the merge head age, the readmission horizon (PGC-554).
@@ -349,13 +342,6 @@ pub mod names {
     pub const CACHE_SERVE_POOL_SCALE_UP: &str = "pgcache.cache.serve_pool_scale_up";
     pub const CACHE_SERVE_POOL_SCALE_DOWN: &str = "pgcache.cache.serve_pool_scale_down";
     pub const CACHE_SERVE_POOL_BACKSTOP_GROWS: &str = "pgcache.cache.serve_pool_backstop_grows";
-    /// Serve-pool connections released because the box was under CPU
-    /// pressure (PGC-554).
-    pub const CACHE_SERVE_POOL_PRESSURE_SHEDS: &str = "pgcache.cache.serve_pool_pressure_sheds";
-    /// Shed serve-pool connections given back because releasing them did not
-    /// ease box pressure (PGC-554).
-    pub const CACHE_SERVE_POOL_PRESSURE_SHED_RESTORES: &str =
-        "pgcache.cache.serve_pool_pressure_shed_restores";
     /// Serves that exceeded the stall deadline (poisoned + forwarded to origin) —
     /// a stuck cache-DB read or a response desync (PGC-278).
     pub const CACHE_SERVE_STALL_TOTAL: &str = "pgcache.cache.serve_stall_total";
@@ -802,8 +788,6 @@ pub struct CacheHandles {
     pub serve_pool_scale_up: Counter,
     pub serve_pool_scale_down: Counter,
     pub serve_pool_backstop_grows: Counter,
-    pub serve_pool_pressure_sheds: Counter,
-    pub serve_pool_pressure_shed_restores: Counter,
     pub serve_stall_total: Counter,
     pub serve_dirty_return_total: Counter,
     pub serve_desync_total: Counter,
@@ -830,7 +814,6 @@ impl CacheHandles {
             CACHE_REGISTRATION_THROTTLED, CACHE_REGISTRATION_THROTTLED_TOTAL, CACHE_RESTARTS_TOTAL,
             CACHE_ROLE_CHANGES, CACHE_RSS_BYTES, CACHE_SERVE_DESYNC_TOTAL,
             CACHE_SERVE_DIRTY_RETURN_TOTAL, CACHE_SERVE_POOL_BACKSTOP_GROWS,
-            CACHE_SERVE_POOL_PRESSURE_SHED_RESTORES, CACHE_SERVE_POOL_PRESSURE_SHEDS,
             CACHE_SERVE_POOL_SCALE_DOWN, CACHE_SERVE_POOL_SCALE_UP, CACHE_SERVE_POOL_SIZE,
             CACHE_SERVE_SETTINGS_APPLIED, CACHE_SERVE_STALL_TOTAL, CACHE_SERVES_IN_FLIGHT,
         };
@@ -871,10 +854,6 @@ impl CacheHandles {
             serve_pool_scale_up: metrics::counter!(CACHE_SERVE_POOL_SCALE_UP),
             serve_pool_scale_down: metrics::counter!(CACHE_SERVE_POOL_SCALE_DOWN),
             serve_pool_backstop_grows: metrics::counter!(CACHE_SERVE_POOL_BACKSTOP_GROWS),
-            serve_pool_pressure_sheds: metrics::counter!(CACHE_SERVE_POOL_PRESSURE_SHEDS),
-            serve_pool_pressure_shed_restores: metrics::counter!(
-                CACHE_SERVE_POOL_PRESSURE_SHED_RESTORES
-            ),
             serve_stall_total: metrics::counter!(CACHE_SERVE_STALL_TOTAL),
             serve_dirty_return_total: metrics::counter!(CACHE_SERVE_DIRTY_RETURN_TOTAL),
             serve_desync_total: metrics::counter!(CACHE_SERVE_DESYNC_TOTAL),
@@ -1059,8 +1038,6 @@ pub struct RegHandles {
     pub population_scale_up: Counter,
     pub population_scale_down: Counter,
     pub population_backstop_grows: Counter,
-    pub population_pressure_sheds: Counter,
-    pub population_pressure_shed_restores: Counter,
     pub population_expected_wait: Gauge,
     pub merge_pending_depth: Gauge,
     pub merge_head_age: Gauge,
@@ -1081,7 +1058,6 @@ impl RegHandles {
             CACHE_MERGE_DISCARDS_PENDING, CACHE_MERGE_HEAD_AGE_SECONDS, CACHE_MERGE_PENDING_DEPTH,
             CACHE_MERGE_WAIT_SECONDS, CACHE_MERGES_APPLIED, CACHE_MERGES_SUPERSEDED,
             CACHE_POPULATION_BACKSTOP_GROWS, CACHE_POPULATION_EXPECTED_WAIT_SECONDS,
-            CACHE_POPULATION_PRESSURE_SHED_RESTORES, CACHE_POPULATION_PRESSURE_SHEDS,
             CACHE_POPULATION_SCALE_DOWN, CACHE_POPULATION_SCALE_UP,
             CACHE_POPULATION_STREAM_SECONDS, CACHE_POPULATION_TASK_SECONDS,
             CACHE_POPULATION_WAIT_SECONDS, CACHE_POPULATION_WORKERS, CACHE_STAGING_HELD,
@@ -1139,10 +1115,6 @@ impl RegHandles {
             population_scale_up: metrics::counter!(CACHE_POPULATION_SCALE_UP),
             population_scale_down: metrics::counter!(CACHE_POPULATION_SCALE_DOWN),
             population_backstop_grows: metrics::counter!(CACHE_POPULATION_BACKSTOP_GROWS),
-            population_pressure_sheds: metrics::counter!(CACHE_POPULATION_PRESSURE_SHEDS),
-            population_pressure_shed_restores: metrics::counter!(
-                CACHE_POPULATION_PRESSURE_SHED_RESTORES
-            ),
             population_expected_wait: metrics::gauge!(CACHE_POPULATION_EXPECTED_WAIT_SECONDS),
             merge_pending_depth: metrics::gauge!(CACHE_MERGE_PENDING_DEPTH),
             merge_head_age: metrics::gauge!(CACHE_MERGE_HEAD_AGE_SECONDS),
