@@ -5,6 +5,7 @@ use std::sync::atomic::AtomicU64;
 use lru::LruCache;
 use tokio_postgres::{Client, Statement};
 
+use crate::cache::update_query::UpdateQueryKey;
 use crate::catalog::TableMetadata;
 use crate::oid::Oid;
 use crate::pg::Lsn;
@@ -167,6 +168,12 @@ pub(super) struct WriterCdc {
     /// row in `pg_eval_matches`/`pg_eval_any`. Lives for the writer's lifetime
     /// so steady-state membership evaluation allocates no SQL string.
     pg_eval_buf: String,
+    /// Reused per-row queues of the PgEval candidates the segment matrix did
+    /// not cover: the dirtyable Fresh-MV ones evaluated in full, and the
+    /// rest evaluated until one matches. Keys, not references, so the
+    /// queues outlive the borrow of the relation's update queries.
+    fresh_keys: Vec<UpdateQueryKey>,
+    rest_keys: Vec<UpdateQueryKey>,
     /// Prepared membership statements per (relation, query), LRU-bounded
     /// (PGC-241 stage 4). Stale entries — evicted queries — age out on their
     /// own (they are never selected for execution again), and dropping a

@@ -16,7 +16,9 @@ use super::{
     eval_candidates_into, memo_frame_accumulate, toast_fallback_structural_invalidate,
     update_queries_check_invalidate, update_query_matches_locally,
 };
-use crate::cache::update_query::{ChangeRelevance, RowChanges, UpdateEvalStrategy, UpdateQuery};
+use crate::cache::update_query::{
+    ChangeRelevance, RowChanges, UpdateEvalStrategy, UpdateQuery, UpdateQueryKey,
+};
 use crate::cache::writer::core::WriterCore;
 use crate::cache::writer::staging::pk_body_render;
 use crate::cache::{CacheError, CacheResult, ReportExt};
@@ -760,7 +762,7 @@ impl WriterCdc {
             row_changes: None,
             delete_image: None,
         };
-        let mut pg_eval: Vec<&UpdateQuery> = Vec::new();
+        let mut pg_eval: Vec<UpdateQueryKey> = Vec::new();
         for update_query in update_queries.iter() {
             if core.frame_invalidations.contains(&update_query.fingerprint) {
                 continue;
@@ -768,16 +770,20 @@ impl WriterCdc {
             match toast_fallback_decide(update_query, table_metadata, &toast_event, toasted_columns)
             {
                 ToastFallbackDecision::Invalidate => fp_list.push(update_query.fingerprint),
-                ToastFallbackDecision::PgEval => pg_eval.push(update_query),
+                ToastFallbackDecision::PgEval => pg_eval.push(update_query.key()),
                 ToastFallbackDecision::Unaffected => {}
             }
         }
         if !pg_eval.is_empty() {
-            let matched = self
-                .pg_eval_matches(&pg_eval, table_metadata, update.new_row_data)
-                .await
-                .attach_loc("toast fallback membership eval")?;
-            fp_list.extend(matched);
+            self.pg_eval_matches(
+                update_queries,
+                &pg_eval,
+                table_metadata,
+                update.new_row_data,
+                |hit| fp_list.push(hit),
+            )
+            .await
+            .attach_loc("toast fallback membership eval")?;
         }
         Ok(fp_list)
     }

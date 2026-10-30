@@ -4,8 +4,11 @@ use super::WriterCdc;
 use super::row_match::update_query_matches_locally;
 use super::segment_eval::BatchEvalView;
 use crate::cache::CacheResult;
-use crate::cache::update_query::{ChangeRelevance, UpdateEvalStrategy, UpdateQueries, UpdateQuery};
+use crate::cache::update_query::{
+    ChangeRelevance, UpdateEvalStrategy, UpdateQueries, UpdateQuery, UpdateQueryKey,
+};
 use crate::cache::writer::core::WriterCore;
+use crate::catalog::TableMetadata;
 use crate::oid::Oid;
 use crate::pg::protocol::ByteString;
 use crate::query::FingerprintSet;
@@ -24,6 +27,13 @@ pub(super) struct MembershipRow<'a> {
     /// Which candidates' MVs a match may dirty: an in-place UPDATE that kept
     /// every column a query reads leaves its MV current (PGC-404).
     pub(super) relevance: ChangeRelevance<'a>,
+}
+
+/// The PgEval candidates the segment matrix did not cover, queued for
+/// per-row evaluation: the dirtyable Fresh-MV ones apart from the rest.
+struct FallbackQueues<'a> {
+    fresh: &'a [UpdateQueryKey],
+    rest: &'a [UpdateQueryKey],
 }
 
 /// LocalEval: Rust evaluation over the candidates. Cheap, so always evaluated
@@ -70,39 +80,6 @@ fn maintained_candidates<'a>(
         .iter()
         .filter(|fingerprint| !core.frame_invalidations.contains(fingerprint))
         .flat_map(|fingerprint| update_queries.queries_of(*fingerprint))
-}
-
-/// Batch-covered PgEval queries consult the segment matrix — no round-trip.
-/// `frame_invalidations` is already applied (the matrix is built unfiltered);
-/// the Fresh-MV dirty-mark self-gates, mirroring the per-row fresh/rest split.
-/// Returns whether any batched query hit, and the uncovered queries left for
-/// per-row evaluation.
-fn pg_eval_batched_match<'a>(
-    core: &WriterCore,
-    update_queries: &UpdateQueries,
-    pg_eval: Vec<&'a UpdateQuery>,
-    row: &MembershipRow<'_>,
-) -> (bool, Vec<&'a UpdateQuery>) {
-    let Some(view) = row.batch.as_ref() else {
-        return (false, pg_eval);
-    };
-    let (batched, fallback): (Vec<&UpdateQuery>, Vec<&UpdateQuery>) =
-        pg_eval.into_iter().partition(|q| view.covers(q.key()));
-    let mut matched = false;
-    for update_query in batched.iter().filter(|q| view.hit(q.key())) {
-        trace!(
-            "update_queries batched pg-eval matched fingerprint {}",
-            update_query.fingerprint
-        );
-        if row
-            .relevance
-            .touches(update_queries, update_query.fingerprint)
-        {
-            core.mv_dirty_mark(update_query.fingerprint);
-        }
-        matched = true;
-    }
-    (matched, fallback)
 }
 
 impl WriterCdc {
@@ -168,49 +145,83 @@ impl WriterCdc {
 
         let mut matched = local_eval_match(core, update_queries, row);
 
-        let pg_eval: Vec<&UpdateQuery> =
-            maintained_candidates(core, update_queries, row.candidates)
-                .filter(|q| q.eval_strategy == UpdateEvalStrategy::PgEval)
-                .collect();
-        if pg_eval.is_empty() {
-            return Ok(matched);
+        // One pass over the PgEval candidates. A batch-covered query reads
+        // the segment matrix here, no round-trip (`frame_invalidations` is
+        // already applied; the matrix is built unfiltered). An uncovered one
+        // queues for per-row evaluation: a dirtyable Fresh MV the change can
+        // touch apart, since every match of it must be reported, the rest
+        // only to decide the upsert. The queues are the writer's scratch, so
+        // steady state allocates nothing for them.
+        let mut fresh_keys = std::mem::take(&mut self.fresh_keys);
+        let mut rest_keys = std::mem::take(&mut self.rest_keys);
+        fresh_keys.clear();
+        rest_keys.clear();
+        for update_query in maintained_candidates(core, update_queries, row.candidates)
+            .filter(|q| q.eval_strategy == UpdateEvalStrategy::PgEval)
+        {
+            let key = update_query.key();
+            let fingerprint = update_query.fingerprint;
+            if let Some(view) = row.batch.as_ref().filter(|view| view.covers(key)) {
+                if view.hit(key) {
+                    trace!("update_queries batched pg-eval matched fingerprint {fingerprint}");
+                    if row.relevance.touches(update_queries, fingerprint) {
+                        core.mv_dirty_mark(fingerprint);
+                    }
+                    matched = true;
+                }
+            } else if core.mv_dirty_eval_required(fingerprint)
+                && row.relevance.touches(update_queries, fingerprint)
+            {
+                fresh_keys.push(key);
+            } else {
+                rest_keys.push(key);
+            }
         }
+        let queues = FallbackQueues {
+            fresh: &fresh_keys,
+            rest: &rest_keys,
+        };
+        let result = self
+            .pg_eval_fallback(core, update_queries, table_metadata, row, queues, matched)
+            .await;
+        self.fresh_keys = fresh_keys;
+        self.rest_keys = rest_keys;
+        result
+    }
 
-        let (batched_hit, fallback) = pg_eval_batched_match(core, update_queries, pg_eval, row);
-        matched |= batched_hit;
-
-        // Per-row fallback for non-batchable shapes / uncovered rows. A
-        // dirtyable MV the change cannot touch needs no full evaluation.
-        let (fresh_pg, rest_pg): (Vec<&UpdateQuery>, Vec<&UpdateQuery>) =
-            fallback.into_iter().partition(|q| {
-                core.mv_dirty_eval_required(q.fingerprint)
-                    && row.relevance.touches(update_queries, q.fingerprint)
-            });
-
-        let fresh_hits = self
-            .pg_eval_matches(&fresh_pg, table_metadata, row.row_data)
+    /// Per-row fallback for non-batchable shapes and uncovered rows:
+    /// `fresh` in full so each match dirty-marks its MV, `rest` only until
+    /// something matches, since one match is enough for the upsert.
+    async fn pg_eval_fallback(
+        &mut self,
+        core: &WriterCore,
+        update_queries: &UpdateQueries,
+        table_metadata: &TableMetadata,
+        row: &MembershipRow<'_>,
+        queues: FallbackQueues<'_>,
+        mut matched: bool,
+    ) -> CacheResult<bool> {
+        let mut pg_hit = self
+            .pg_eval_matches(
+                update_queries,
+                queues.fresh,
+                table_metadata,
+                row.row_data,
+                |hit| core.mv_dirty_mark(hit),
+            )
             .await?;
-        for &fingerprint in &fresh_hits {
-            core.mv_dirty_mark(fingerprint);
-        }
-        let mut pg_hit = !fresh_hits.is_empty();
         matched |= pg_hit;
-
-        // Non-Fresh queries only decide the upsert: skip them entirely once
-        // anything matched, else stop at the first match.
         if !matched
             && self
-                .pg_eval_any(&rest_pg, table_metadata, row.row_data)
+                .pg_eval_any(update_queries, queues.rest, table_metadata, row.row_data)
                 .await?
         {
             matched = true;
             pg_hit = true;
         }
-
         if pg_hit {
             crate::metrics::handles().cdc.pg_eval_hits.increment(1);
         }
-
         Ok(matched)
     }
 }

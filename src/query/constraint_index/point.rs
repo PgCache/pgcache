@@ -107,25 +107,45 @@ pub(crate) fn row_value_forms(
     [Some(ColumnRange::Equal(lexical)), typed, boolean]
 }
 
-/// Cartesian product of per-column key sets, for the point-probe equality
-/// lookup. Empty input → one empty tuple (the unconstrained class). Each
-/// column carries ≤3 forms and classes have few columns, so the product stays
-/// tiny.
-fn value_key_product(key_sets: &[ColumnKeys]) -> Vec<Vec<ValueKey>> {
-    let mut result: Vec<Vec<ValueKey>> = vec![Vec::new()];
-    for ks in key_sets {
-        let present = ks.iter().flatten().count();
-        let mut next = Vec::with_capacity(result.len() * present);
-        for prefix in &result {
-            for k in ks.iter().flatten() {
-                let mut tuple = prefix.clone();
-                tuple.push(k.clone());
-                next.push(tuple);
-            }
-        }
-        result = next;
+/// Every joint tuple of the per-column key sets, for the point-probe
+/// equality lookup, visited one at a time in a buffer reused across them.
+/// Empty input visits one empty tuple (the unconstrained class). Each column
+/// carries ≤3 forms and classes have few columns, so the product stays
+/// tiny and, up to four columns, on the stack (PGC-341).
+fn value_key_tuples(key_sets: &[ColumnKeys], mut visit: impl FnMut(&[ValueKey])) {
+    let columns: SmallVec<[SmallVec<[&ValueKey; 3]>; 4]> = key_sets
+        .iter()
+        .map(|keys| keys.iter().flatten().collect())
+        .collect();
+    if columns.iter().any(SmallVec::is_empty) {
+        return;
     }
-    result
+    let mut positions: SmallVec<[usize; 4]> = SmallVec::new();
+    positions.resize(columns.len(), 0);
+    let mut tuple: SmallVec<[ValueKey; 4]> = SmallVec::new();
+    loop {
+        tuple.clear();
+        tuple.extend(
+            columns
+                .iter()
+                .zip(&positions)
+                .filter_map(|(keys, &position)| keys.get(position).map(|key| (*key).clone())),
+        );
+        visit(&tuple);
+        // Advance the last column; on wrap, carry into the one before it.
+        let mut advanced = false;
+        for (position, keys) in positions.iter_mut().zip(&columns).rev() {
+            *position += 1;
+            if *position < keys.len() {
+                advanced = true;
+                break;
+            }
+            *position = 0;
+        }
+        if !advanced {
+            return;
+        }
+    }
 }
 
 impl<K: IdHashable + Copy> ConstraintIndex<K> {
@@ -185,11 +205,11 @@ impl<K: IdHashable + Copy> ConstraintIndex<K> {
                 })
                 .collect();
             if key_sets.iter().all(|ks| ks.iter().any(Option::is_some)) {
-                for tuple in value_key_product(&key_sets) {
-                    if let Some(fps) = class.equality.get(&tuple) {
+                value_key_tuples(&key_sets, |tuple| {
+                    if let Some(fps) = class.equality.get(tuple) {
                         candidates.extend(fps.iter().copied().map(&project));
                     }
-                }
+                });
             } else {
                 for (tuple, fps) in &class.equality {
                     let matches = key_sets.iter().zip(tuple).all(|(ks, t)| {

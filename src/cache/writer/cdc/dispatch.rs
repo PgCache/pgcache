@@ -606,6 +606,8 @@ impl WriterCdc {
             last_applied_lsn: Lsn::from_raw(0),
             settled_lsn,
             pg_eval_buf: String::with_capacity(SQL_BUFFER_CAPACITY),
+            fresh_keys: Vec::new(),
+            rest_keys: Vec::new(),
             prepared_membership: LruCache::new(PREPARED_EVAL_CACHE_CAPACITY),
             prepared_row_change: LruCache::new(PREPARED_EVAL_CACHE_CAPACITY),
         })

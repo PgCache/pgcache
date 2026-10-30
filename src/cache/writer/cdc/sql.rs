@@ -3,7 +3,7 @@ use tokio_postgres::{Client, SimpleQueryMessage, SimpleQueryRow};
 use tracing::{error, instrument, trace, warn};
 
 use super::{PG_EVAL_CHUNK, SQL_BUFFER_CAPACITY, WriterCdc};
-use crate::cache::update_query::UpdateQuery;
+use crate::cache::update_query::{UpdateQueries, UpdateQuery, UpdateQueryKey};
 use crate::cache::writer::core::WriterCore;
 use crate::cache::{CacheError, CacheResult};
 use crate::catalog::TableMetadata;
@@ -122,6 +122,17 @@ fn pg_eval_template_render(
     false
 }
 
+/// The update queries `keys` name on `update_queries`, in order. The SQL
+/// builder and the result reader both walk this, so a key the relation no
+/// longer holds drops out of both and the result columns stay aligned.
+fn update_queries_by_key<'a>(
+    update_queries: &'a UpdateQueries,
+    keys: &'a [UpdateQueryKey],
+) -> impl Iterator<Item = &'a UpdateQuery> + 'a {
+    keys.iter()
+        .filter_map(|key| update_queries.queries_of(key.fingerprint).get(key.ordinal))
+}
+
 impl WriterCdc {
     /// Build `TRUNCATE <cache table>, ...` for the relations' cache tables,
     /// or `None` if none of the oids map to a known cache table. Shared by
@@ -137,7 +148,8 @@ impl WriterCdc {
     /// predicates joined by `sep`.
     fn pg_eval_chunk_sql(
         &mut self,
-        chunk: &[&UpdateQuery],
+        update_queries: &UpdateQueries,
+        chunk: &[UpdateQueryKey],
         sep: &str,
         table_metadata: &TableMetadata,
         row_data: &[Option<ByteString>],
@@ -145,7 +157,7 @@ impl WriterCdc {
         let buf = &mut self.pg_eval_buf;
         buf.clear();
         buf.push_str("SELECT ");
-        for (i, update_query) in chunk.iter().enumerate() {
+        for (i, update_query) in update_queries_by_key(update_queries, chunk).enumerate() {
             if i > 0 {
                 buf.push_str(sep);
             }
@@ -165,30 +177,32 @@ impl WriterCdc {
     /// use this. Use `pg_eval_any` when only "did anything match" is needed.
     pub(super) async fn pg_eval_matches(
         &mut self,
-        queries: &[&UpdateQuery],
+        update_queries: &UpdateQueries,
+        keys: &[UpdateQueryKey],
         table_metadata: &TableMetadata,
         row_data: &[Option<ByteString>],
-    ) -> CacheResult<Vec<Fingerprint>> {
-        let mut hits = Vec::new();
-        for chunk in queries.chunks(PG_EVAL_CHUNK) {
-            self.pg_eval_chunk_sql(chunk, ", ", table_metadata, row_data)?;
+        mut on_hit: impl FnMut(Fingerprint),
+    ) -> CacheResult<bool> {
+        let mut hit = false;
+        for chunk in keys.chunks(PG_EVAL_CHUNK) {
+            self.pg_eval_chunk_sql(update_queries, chunk, ", ", table_metadata, row_data)?;
             let Some(row) =
                 Self::pg_eval_chunk_row(&self.cache_eval_conn, &self.pg_eval_buf).await?
             else {
                 continue;
             };
-            // One boolean column per query; column `i` ↔ `chunk[i]`.
-            let matched = chunk
-                .iter()
+            // One boolean column per query, in the order the SQL was built.
+            let matched = update_queries_by_key(update_queries, chunk)
                 .enumerate()
                 .filter(|(i, _)| row.get(*i) == Some("t"))
                 .map(|(_, update_query)| update_query.fingerprint);
             for fingerprint in matched {
                 trace!("update_queries pg-eval matched fingerprint {fingerprint}");
-                hits.push(fingerprint);
+                on_hit(fingerprint);
+                hit = true;
             }
         }
-        Ok(hits)
+        Ok(hit)
     }
 
     /// Whether the CDC row matches *any* of `queries` — for the membership-only
@@ -198,12 +212,13 @@ impl WriterCdc {
     /// chain server-side, and evaluation stops at the first chunk that hits.
     pub(super) async fn pg_eval_any(
         &mut self,
-        queries: &[&UpdateQuery],
+        update_queries: &UpdateQueries,
+        keys: &[UpdateQueryKey],
         table_metadata: &TableMetadata,
         row_data: &[Option<ByteString>],
     ) -> CacheResult<bool> {
-        for chunk in queries.chunks(PG_EVAL_CHUNK) {
-            self.pg_eval_chunk_sql(chunk, " OR ", table_metadata, row_data)?;
+        for chunk in keys.chunks(PG_EVAL_CHUNK) {
+            self.pg_eval_chunk_sql(update_queries, chunk, " OR ", table_metadata, row_data)?;
             let row = Self::pg_eval_chunk_row(&self.cache_eval_conn, &self.pg_eval_buf).await?;
             if row.is_some_and(|row| row.get(0) == Some("t")) {
                 return Ok(true);
