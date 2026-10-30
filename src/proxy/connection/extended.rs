@@ -84,7 +84,7 @@ impl ConnectionState {
             }
         }
         if let Some(bytes) = self.extended.buffer_flush() {
-            self.origin_write_buf.push_back(bytes);
+            self.origin_write_buf.push_back(bytes.freeze());
         }
     }
 
@@ -161,10 +161,7 @@ impl ConnectionState {
         let Ok(parsed) = parse_parse_message(&data) else {
             // Parse failed: forward raw. No views of `data` exist on this path,
             // so try_into_mut reclaims the buffer without copying.
-            self.origin_write_buf.push_back(
-                data.try_into_mut()
-                    .unwrap_or_else(|b| BytesMut::from(&b[..])),
-            );
+            self.origin_write_buf.push_back(data);
             return;
         };
         let analysis = self.statement_analyze(&parsed.sql);
@@ -228,7 +225,7 @@ impl ConnectionState {
             trace!("net: Bind buffered");
             return;
         }
-        self.origin_write_buf.push_back(msg.data);
+        self.origin_write_buf.push_back(msg.data.freeze());
     }
 
     /// Handle Execute message — record metrics, parse portal name, buffer bytes.
@@ -355,7 +352,7 @@ impl ConnectionState {
             trace!("net: Describe buffered");
             return;
         }
-        self.origin_write_buf.push_back(msg.data);
+        self.origin_write_buf.push_back(msg.data.freeze());
     }
 
     /// Emit any deferred `CloseComplete`s (PGC-234: locally-handled Closes of
@@ -400,7 +397,7 @@ impl ConnectionState {
             _ => {}
         }
         self.extended.group_origin_forwarded = true;
-        self.origin_write_buf.push_back(msg.data);
+        self.origin_write_buf.push_back(msg.data.freeze());
     }
 
     /// Whether a Close can be answered locally (PGC-234): a statement the
@@ -443,7 +440,7 @@ impl ConnectionState {
             } else {
                 trace!("net: proxy→origin Sync (no buffer)");
                 self.egress.origin_open();
-                self.origin_write_buf.push_back(msg.data);
+                self.origin_write_buf.push_back(msg.data.freeze());
             }
             return;
         };
@@ -468,7 +465,7 @@ impl ConnectionState {
         self.deferred_close_completes_flush();
         self.extended.group_origin_forwarded = true;
         let Some(buffer) = self.extended.buffer_take() else {
-            self.origin_write_buf.push_back(msg.data);
+            self.origin_write_buf.push_back(msg.data.freeze());
             return;
         };
 

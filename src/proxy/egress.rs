@@ -48,6 +48,7 @@
 //! on-wire slot — before the first `Cache` slot, else at the back — so a cache
 //! fallback that forwards to origin lands behind it in both orders.
 
+use smallvec::SmallVec;
 use std::collections::VecDeque;
 use std::mem::discriminant;
 
@@ -70,7 +71,7 @@ pub(super) enum ProbeKind {
 }
 
 /// The columns of a probe's one `DataRow`; `None` is SQL NULL.
-pub(super) type ProbeRow = Vec<Option<EcoString>>;
+pub(super) type ProbeRow = SmallVec<[Option<EcoString>; 8]>;
 
 impl ProbeKind {
     fn same_kind(self, other: Self) -> bool {
@@ -112,12 +113,32 @@ enum EgressSlot<C> {
 /// the cache payload `C` so the abstraction is decoupled from `CacheMessage`.
 pub(super) struct EgressQueue<C> {
     slots: VecDeque<EgressSlot<C>>,
+    /// Buffers of removed `Origin` slots, kept for the next one opened so a
+    /// forward in steady state allocates no queue.
+    spare_buffers: Vec<VecDeque<Bytes>>,
 }
+
+/// Spare origin buffers kept; a connection rarely has more open at once.
+const SPARE_BUFFERS: usize = 2;
 
 impl<C> EgressQueue<C> {
     pub(super) fn new() -> Self {
         Self {
             slots: VecDeque::new(),
+            spare_buffers: Vec::new(),
+        }
+    }
+
+    /// Remove the slot at `idx`, keeping an `Origin` slot's buffer as a spare.
+    fn slot_remove(&mut self, idx: usize) {
+        match self.slots.remove(idx) {
+            Some(EgressSlot::Origin { mut buf, .. })
+                if self.spare_buffers.len() < SPARE_BUFFERS =>
+            {
+                buf.clear();
+                self.spare_buffers.push(buf);
+            }
+            _ => {}
         }
     }
 
@@ -194,7 +215,7 @@ impl<C> EgressQueue<C> {
     /// [`Self::probe_push`] instead.
     pub(super) fn origin_open(&mut self) {
         self.slots.push_back(EgressSlot::Origin {
-            buf: VecDeque::new(),
+            buf: self.spare_buffers.pop().unwrap_or_default(),
             sealed: false,
         });
     }
@@ -247,7 +268,7 @@ impl<C> EgressQueue<C> {
                 Some(EgressSlot::Origin { buf, sealed: true }) if buf.is_empty()
             )
         {
-            self.slots.remove(idx);
+            self.slot_remove(idx);
         }
     }
 
@@ -323,7 +344,7 @@ impl<C> EgressQueue<C> {
             }
         };
         if done {
-            self.slots.remove(idx);
+            self.slot_remove(idx);
         }
     }
 
@@ -363,11 +384,12 @@ impl<C> EgressQueue<C> {
     /// holds the query message (taken by `cache_dispatch`), so it is not
     /// returned. No-op if the head is not a cache slot.
     pub(super) fn cache_to_origin(&mut self) {
-        if let Some(slot @ EgressSlot::Cache { .. }) = self.client_head_mut() {
-            *slot = EgressSlot::Origin {
-                buf: VecDeque::new(),
-                sealed: false,
-            };
+        let buf = self.spare_buffers.pop().unwrap_or_default();
+        match self.client_head_mut() {
+            Some(slot @ EgressSlot::Cache { .. }) => {
+                *slot = EgressSlot::Origin { buf, sealed: false };
+            }
+            _ => self.spare_buffers.push(buf),
         }
     }
 
@@ -419,6 +441,7 @@ impl<C> EgressQueue<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use smallvec::smallvec;
 
     // The Cache slot payload is opaque to the queue, so tests use a trivial
     // stand-in instead of constructing a real `CacheMessage`.
@@ -546,10 +569,10 @@ mod tests {
         q.origin_append(Bytes::from_static(b"r1"));
         q.origin_seal();
         assert!(q.origin_reply_is_probe());
-        q.probe_row(vec![Some("public".into()), None]);
+        q.probe_row(smallvec![Some("public".into()), None]);
         let done = q.probe_complete().expect("probe at origin head");
         assert_eq!(done.kind, ProbeKind::SessionSettings { seq: 0 });
-        assert_eq!(done.row, Some(vec![Some("public".into()), None]));
+        assert_eq!(done.row, Some(smallvec![Some("public".into()), None]));
         assert!(!q.probe_pending(ProbeKind::SessionSettings { seq: 0 }));
         // R1's bytes are still owed to the client.
         assert_eq!(q.write_chunk(), b"r1");
@@ -573,7 +596,7 @@ mod tests {
         q.cache_to_origin();
         // Probe reply first (it was written to origin first).
         assert!(q.origin_reply_is_probe());
-        q.probe_row(vec![Some("0/1".into())]);
+        q.probe_row(smallvec![Some("0/1".into())]);
         let done = q.probe_complete().expect("probe at origin head");
         assert_eq!(done.kind, ProbeKind::CommitLsn { stamp_seq: 7 });
         // Then the forwarded query's reply.
@@ -593,7 +616,7 @@ mod tests {
         q.probe_push(ProbeKind::SessionSettings { seq: 0 });
         q.cache_push("q1");
         assert!(q.cache_dispatch().is_none());
-        q.probe_row(vec![Some("public".into())]);
+        q.probe_row(smallvec![Some("public".into())]);
         assert!(q.probe_complete().is_some());
         assert_eq!(q.cache_dispatch(), Some("q1"));
         q.cache_done();

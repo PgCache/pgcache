@@ -108,7 +108,7 @@ impl Drop for ActiveConnectionGuard {
 pub(super) fn forward_lazy_parse_install(
     stmt_name: &str,
     prepared_statements: &HashMap<EcoString, PreparedStatement>,
-    origin_write_buf: &mut VecDeque<BytesMut>,
+    origin_write_buf: &mut VecDeque<Bytes>,
     origin_intercept: &mut OriginIntercept,
 ) {
     if stmt_name.is_empty() {
@@ -128,7 +128,7 @@ pub(super) fn forward_lazy_parse_install(
     };
     // Cold lazy-Parse forward: materialize the refcounted slice into the
     // origin write queue (BytesMut).
-    origin_write_buf.push_back(slices_concat(std::slice::from_ref(&parse_bytes)));
+    origin_write_buf.push_back(slices_concat(std::slice::from_ref(&parse_bytes)).freeze());
     // The prepended Parse's ParseComplete is swallowed by the LazyParseInline
     // intercept (which marks origin_prepared) — it is NOT a client-awaited
     // response, so it must not be queued in pending_parse_statements.
@@ -706,7 +706,7 @@ impl ConnectionState {
     pub(super) fn origin_dispatch(&mut self, bytes: BytesMut, timing: Option<QueryTiming>) {
         self.telemetry.origin_forward(timing);
         self.egress.origin_open();
-        self.origin_write_buf.push_back(bytes);
+        self.origin_write_buf.push_back(bytes.freeze());
     }
 
     /// Handle a message from the client (frontend).
@@ -760,20 +760,20 @@ impl ConnectionState {
                 // Note: Channel binding cannot be modified in transit because SCRAM includes
                 // the gs2-header in the cryptographic proof. Clients connecting via TLS must
                 // use channel_binding=disable in their connection string.
-                self.origin_write_buf.push_back(msg.data);
+                self.origin_write_buf.push_back(msg.data.freeze());
             }
             PgFrontendMessageType::FunctionCall => {
                 // Legacy fast-path function call: executes a function that may
                 // write, and it carries no SQL to classify — record
                 // conservatively so a subsequent read isn't served stale.
                 self.forwarded_effects_apply(&StatementEffects::unknown());
-                self.origin_write_buf.push_back(msg.data);
+                self.origin_write_buf.push_back(msg.data.freeze());
             }
             _ => {
                 // All other message types (CopyData/CopyDone payload, etc.) —
                 // forward to origin. Not writes in their own right (the COPY
                 // statement itself was already classified when forwarded).
-                self.origin_write_buf.push_back(msg.data);
+                self.origin_write_buf.push_back(msg.data.freeze());
             }
         }
     }
@@ -877,7 +877,7 @@ impl ConnectionState {
         // the client pipelines behind the startup ordered after it — and lets
         // a probe injected at the startup ReadyForQuery see it in flight.
         self.egress.origin_open();
-        self.origin_write_buf.push_back(msg.data);
+        self.origin_write_buf.push_back(msg.data.freeze());
     }
 
     /// Handle a message from the origin database (backend).
@@ -1060,7 +1060,7 @@ impl ConnectionState {
                 &mut self.origin_intercept,
             );
         }
-        self.origin_write_buf.push_back(current_bytes);
+        self.origin_write_buf.push_back(current_bytes.freeze());
         self.batch_remaining_forward();
         self.proxy_mode = ProxyMode::Read;
     }

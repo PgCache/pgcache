@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use tokio_util::bytes::Bytes;
 
 use phf::phf_map;
 use tokio_util::{
@@ -122,6 +123,12 @@ impl ProbeQuery {
 
     pub(crate) fn message(&self) -> BytesMut {
         simple_query_message_encode(self.sql.as_bytes(), self.message_len)
+    }
+
+    /// The encoded message as shared bytes: encode a constant probe once and
+    /// send clones.
+    pub(crate) fn message_bytes(&self) -> Bytes {
+        self.message().freeze()
     }
 }
 

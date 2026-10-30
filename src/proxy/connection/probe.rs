@@ -15,7 +15,10 @@
 //! must not run inside a block and is skipped while one is open or a
 //! forwarded `BEGIN` is unacknowledged; its status is the final check.
 
+use std::sync::LazyLock;
+
 use postgres_types::PgLsn;
+use tokio_util::bytes::Bytes;
 use tracing::debug;
 
 use super::ConnectionState;
@@ -29,6 +32,10 @@ use crate::proxy::session_settings::SETTINGS_PROBE_SQL;
 
 const SETTINGS_PROBE: ProbeQuery = ProbeQuery::new(SETTINGS_PROBE_SQL);
 const WAL_INSERT_LSN_PROBE: ProbeQuery = ProbeQuery::new("SELECT pg_current_wal_insert_lsn()");
+
+/// The commit-LSN probe, encoded once: it follows every forwarded write.
+static WAL_INSERT_LSN_PROBE_MESSAGE: LazyLock<Bytes> =
+    LazyLock::new(|| WAL_INSERT_LSN_PROBE.message_bytes());
 
 impl ConnectionState {
     /// Inject every probe the connection's state calls for. Run after each
@@ -50,8 +57,13 @@ impl ConnectionState {
                 .probe_sql()
                 .and_then(ProbeQuery::dynamic)
             {
-                Some(probe) => self.probe_send(ProbeKind::SessionSettings { seq }, &probe),
-                None => self.probe_send(ProbeKind::SessionSettings { seq }, &SETTINGS_PROBE),
+                Some(probe) => {
+                    self.probe_send(ProbeKind::SessionSettings { seq }, probe.message_bytes());
+                }
+                None => self.probe_send(
+                    ProbeKind::SessionSettings { seq },
+                    SETTINGS_PROBE.message_bytes(),
+                ),
             }
             crate::metrics::handles().conn.settings_probes.increment(1);
         }
@@ -99,14 +111,17 @@ impl ConnectionState {
             return;
         }
         if let Some(stamp_seq) = self.write_log.stamp_seq() {
-            self.probe_send(ProbeKind::CommitLsn { stamp_seq }, &WAL_INSERT_LSN_PROBE);
+            self.probe_send(
+                ProbeKind::CommitLsn { stamp_seq },
+                WAL_INSERT_LSN_PROBE_MESSAGE.clone(),
+            );
             crate::metrics::handles().raw.probes.increment(1);
         }
     }
 
-    fn probe_send(&mut self, kind: ProbeKind, query: &ProbeQuery) {
+    fn probe_send(&mut self, kind: ProbeKind, message: Bytes) {
         self.egress.probe_push(kind);
-        self.origin_write_buf.push_back(query.message());
+        self.origin_write_buf.push_back(message);
     }
 
     /// Consume one origin message that belongs to the probe at the head of
@@ -118,7 +133,7 @@ impl ConnectionState {
             PgBackendMessageType::DataRows => {
                 if let Some(columns) = data_row_columns(&msg.data) {
                     self.egress
-                        .probe_row(columns.into_iter().map(|c| c.map(Into::into)).collect());
+                        .probe_row(columns.iter().map(|c| c.map(Into::into)).collect());
                 }
             }
             PgBackendMessageType::ReadyForQuery => {

@@ -235,8 +235,12 @@ impl InsertAggregate {
 /// sorted column list.
 type EqualityTuple = SmallVec<[LiteralValue; 2]>;
 
+/// A merged shape's WHERE column list, inline for the one- or two-column
+/// keys most writes name, so looking a shape up allocates nothing.
+pub(super) type EqualityColumns = SmallVec<[EcoString; 2]>;
+
 /// Merged all-equality predicates, grouped by shape (the sorted column list).
-type MergedTuples = HashMap<Box<[EcoString]>, Vec<EqualityTuple>>;
+type MergedTuples = HashMap<EqualityColumns, Vec<EqualityTuple>>;
 
 /// The sorted, distinct-column equality tuple of a WHERE predicate, or `None`
 /// when the shape doesn't merge: a non-equality comparison, or a column
@@ -244,7 +248,7 @@ type MergedTuples = HashMap<Box<[EcoString]>, Vec<EqualityTuple>>;
 /// contradictory `c = 1 AND c = 2` case it folds to `Empty`).
 pub(super) fn equality_tuple_build(
     comparisons: &[TableConstraint],
-) -> Option<(Box<[EcoString]>, EqualityTuple)> {
+) -> Option<(EqualityColumns, EqualityTuple)> {
     let mut pairs: SmallVec<[(&EcoString, &LiteralValue); 2]> = SmallVec::new();
     for constraint in comparisons {
         let ColumnConstraintKind::Comparison {
@@ -299,9 +303,12 @@ pub(super) fn merged_tuples_disjoint(merged: &MergedTuples, read_ranges: &Refere
 /// `None` = non-literal RHS, post-update value unknown.
 type SetTuple = SmallVec<[Option<LiteralValue>; 4]>;
 
+/// A merged shape's SET column list, inline like the tuple it names.
+type SetColumns = SmallVec<[EcoString; 4]>;
+
 /// A merged UPDATE's shape: the sorted WHERE column list and the SET column
 /// list (statement order).
-type UpdateShape = (Box<[EcoString]>, Box<[EcoString]>);
+type UpdateShape = (EqualityColumns, SetColumns);
 
 /// Merged all-equality-WHERE UPDATEs, grouped by [`UpdateShape`].
 type MergedUpdates = HashMap<UpdateShape, Vec<(EqualityTuple, SetTuple)>>;

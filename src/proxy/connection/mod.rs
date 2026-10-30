@@ -5,7 +5,7 @@ use std::{
 
 use ecow::EcoString;
 use lru::LruCache;
-use tokio_util::bytes::BytesMut;
+use tokio_util::bytes::Bytes;
 
 use super::cacheability_memo::CacheabilityCache;
 use super::{ProxyMode, ProxyStatus};
@@ -48,7 +48,7 @@ use write_log::{RawDecision, RawForwardCause, RawForwardReason, WriteLog, forwar
 /// Encapsulates transaction state, query fingerprint cache, and protocol state.
 pub(super) struct ConnectionState {
     /// data waiting to be written to origin
-    origin_write_buf: VecDeque<BytesMut>,
+    origin_write_buf: VecDeque<Bytes>,
 
     /// Ordered queue of pending client-bound responses (origin relay, synth,
     /// cache). The single source of truth for client response ordering; see

@@ -1,3 +1,4 @@
+use smallvec::SmallVec;
 use std::hash::Hash;
 
 use phf::phf_map;
@@ -297,14 +298,17 @@ pub(crate) fn authentication_type(data: &BytesMut) -> Option<i32> {
 
 /// Extract the first column value from a DataRow message as a string.
 ///
+/// A row's column texts, inline for the handful of columns a probe reads.
+pub(crate) type DataRowColumns<'a> = SmallVec<[Option<&'a str>; 8]>;
+
 /// Message format: 'D' | int32 len | int16 column_count | (int32 col_len | bytes col_data)*
 ///
 /// Returns `None` if the message is malformed or the column is NULL.
 /// Every column of the first `DataRow` in `data` (a batch may hold several);
 /// `None` for a NULL column. `None` overall if the frame is malformed.
-pub(crate) fn data_row_columns(data: &[u8]) -> Option<Vec<Option<&str>>> {
+pub(crate) fn data_row_columns(data: &[u8]) -> Option<DataRowColumns<'_>> {
     let count = u16::from_be_bytes(data.get(5..7)?.try_into().ok()?);
-    let mut columns = Vec::with_capacity(usize::from(count));
+    let mut columns = DataRowColumns::with_capacity(usize::from(count));
     let mut at = 7usize;
     for _ in 0..count {
         let len = i32::from_be_bytes(data.get(at..at + 4)?.try_into().ok()?);
@@ -502,7 +506,7 @@ mod tests {
         frame.extend_from_slice(&body);
         assert_eq!(
             data_row_columns(&frame),
-            Some(vec![Some("ab"), None, Some("")])
+            Some(SmallVec::from_slice(&[Some("ab"), None, Some("")]))
         );
         assert_eq!(data_row_first_column(&frame), Some("ab"));
         // Truncated frame: no partial answer.

@@ -5,7 +5,7 @@
 use std::collections::VecDeque;
 
 use smallvec::SmallVec;
-use tokio_util::bytes::BytesMut;
+use tokio_util::bytes::Bytes;
 
 use super::ConnectionState;
 use super::extended_buffer::{DispatchContext, ExecuteEntry, ExtendedBuffer};
@@ -129,14 +129,14 @@ impl ConnectionState {
                 .pending_describe_statements
                 .extend(next.describe_statement);
             self.origin_write_buf
-                .push_back(slices_concat(&next.pipeline.buffered_bytes));
+                .push_back(slices_concat(&next.pipeline.buffered_bytes).freeze());
         }
         // A simple `Query` is self-terminating (origin emits its own RFQ);
         // only extended-pipeline entries need a synthesized Sync to close the
         // implicit transaction and produce the single trailing RFQ.
         if self.extended.dispatch_is_extended {
             self.origin_write_buf
-                .push_back(BytesMut::from(SYNC_MESSAGE.as_slice()));
+                .push_back(Bytes::from_static(SYNC_MESSAGE.as_slice()));
         }
     }
 }
