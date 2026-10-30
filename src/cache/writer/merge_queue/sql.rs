@@ -1,6 +1,8 @@
 //! The SQL a drain runs: the per-relation merge plan, the chunk and discard
 //! statements, and reading their row counts back.
 
+use std::fmt::Write as _;
+
 use ecow::EcoString;
 use postgres_protocol::escape;
 use rootcause::Report;
@@ -9,6 +11,7 @@ use tokio_postgres::SimpleQueryMessage;
 use super::ChunkStatement;
 use crate::cache::{CacheError, CacheResult, ReportExt};
 use crate::catalog::TableMetadata;
+use crate::pg::identifier_quote_into;
 
 /// A relation's primary-key columns as the merge's key predicates render
 /// them: the recorded-delete filter on a chunk and the toast-stale probe.
@@ -127,45 +130,84 @@ impl MergeKey {
 }
 
 /// Pre-rendered, owned SQL fragments for merging one relation's staging table
-/// into its shared cache table. Built while borrowing `TableMetadata`, so the
-/// borrow doesn't span the async DB calls.
+/// into its shared cache table: everything of the chunk statement that does
+/// not change between chunks, built once when a drain enters the relation.
+/// Built while borrowing `TableMetadata`, so the borrow doesn't span the
+/// async DB calls.
 pub(super) struct MergePlan {
-    schema: EcoString,
-    name: EcoString,
-    /// `"c1","c2",...` — all columns, position order.
-    columns_csv: String,
     pub(super) key_columns: MergeKey,
+    /// From the drain's `RETURNING` through the upsert's `FROM d`: the
+    /// column list, the cache table and the DISTINCT ON key.
+    drain_tail: String,
     /// `ON CONFLICT ("p1") DO UPDATE SET "p1" = EXCLUDED."p1"` — re-stamps the
-    /// generation of pre-existing rows without overwriting data (CDC owns it).
-    conflict: String,
+    /// generation of pre-existing rows without overwriting data (CDC owns it)
+    /// — closing the statement with the drained row count.
+    upsert_tail: String,
 }
 
 impl MergePlan {
     pub(super) fn build(table: &TableMetadata) -> Self {
-        let columns_csv = table
-            .columns
-            .iter()
-            .map(|c| escape::escape_identifier(&c.name))
-            .collect::<Vec<_>>()
-            .join(",");
-        let key_columns = MergeKey::build(table);
-        let conflict_assign = key_columns
-            .columns
-            .iter()
-            .map(|(c, _)| format!("{c} = EXCLUDED.{c}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let conflict = format!(
-            "ON CONFLICT {} DO UPDATE SET {conflict_assign}",
-            key_columns.paren()
-        );
-        Self {
-            schema: table.schema.clone(),
-            name: table.name.clone(),
-            columns_csv,
-            key_columns,
-            conflict,
+        Self::render(
+            &table.schema,
+            &table.name,
+            table.columns.iter().map(|c| c.name.as_str()),
+            MergeKey::build(table),
+        )
+    }
+
+    fn render<'a>(
+        schema: &str,
+        name: &str,
+        columns: impl Iterator<Item = &'a str> + Clone,
+        key_columns: MergeKey,
+    ) -> Self {
+        let mut cols = String::new();
+        for (i, column) in columns.enumerate() {
+            if i > 0 {
+                cols.push(',');
+            }
+            identifier_quote_into(column, &mut cols);
         }
+        let mut drain_tail = String::with_capacity(cols.len() * 3 + 96);
+        drain_tail.push_str(" RETURNING ");
+        drain_tail.push_str(&cols);
+        drain_tail.push_str("), i AS (INSERT INTO ");
+        identifier_quote_into(schema, &mut drain_tail);
+        drain_tail.push('.');
+        identifier_quote_into(name, &mut drain_tail);
+        drain_tail.push_str(" (");
+        drain_tail.push_str(&cols);
+        drain_tail.push_str(") SELECT DISTINCT ON ");
+        drain_tail.push_str(key_columns.paren());
+        drain_tail.push(' ');
+        drain_tail.push_str(&cols);
+        drain_tail.push_str(" FROM d");
+        let mut upsert_tail = String::with_capacity(64);
+        upsert_tail.push_str(" ON CONFLICT ");
+        upsert_tail.push_str(key_columns.paren());
+        upsert_tail.push_str(" DO UPDATE SET ");
+        for (i, (column, _)) in key_columns.columns.iter().enumerate() {
+            if i > 0 {
+                upsert_tail.push_str(", ");
+            }
+            let _ = write!(upsert_tail, "{column} = EXCLUDED.{column}");
+        }
+        upsert_tail.push_str(") SELECT count(*) FROM d");
+        Self {
+            key_columns,
+            drain_tail,
+            upsert_tail,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test(
+        schema: &str,
+        name: &str,
+        columns: &[&str],
+        key_columns: MergeKey,
+    ) -> Self {
+        Self::render(schema, name, columns.iter().copied(), key_columns)
     }
 
     /// One merge chunk: drain every staging row in heap blocks `[lo, hi)` into
@@ -188,29 +230,40 @@ impl MergePlan {
     /// filter over the window, slower but never skipping. `SET LOCAL` scopes
     /// the generation stamp to the implicit transaction of this
     /// multi-statement string, which also rolls back as a unit on error and
-    /// leaves the connection outside any transaction.
-    pub(super) fn chunk_sql(&self, statement: ChunkStatement<'_>, filter: Option<&str>) -> String {
+    /// leaves the connection outside any transaction. Rendered into `buf`
+    /// (cleared first), the writer's reused merge scratch.
+    pub(super) fn chunk_sql_into(
+        &self,
+        buf: &mut String,
+        statement: ChunkStatement<'_>,
+        filter: Option<&str>,
+    ) {
         let ChunkStatement {
             staging,
             generation,
             lo_block,
             hi_block,
         } = statement;
-        let where_clause = filter.map_or_else(String::new, |f| format!(" WHERE {f}"));
-        format!(
+        buf.clear();
+        let _ = write!(
+            buf,
             "SET LOCAL mem.query_generation = {generation}; \
              WITH d AS (DELETE FROM pgcache_stage.{staging} \
-                 WHERE ctid >= '({lo_block},0)'::tid AND ctid < '({hi_block},0)'::tid \
-                 RETURNING {cols}), \
-             i AS (INSERT INTO {schema}.{name} ({cols}) \
-                 SELECT DISTINCT ON {pk} {cols} FROM d{where_clause} {conflict}) \
-             SELECT count(*) FROM d",
-            schema = escape::escape_identifier(&self.schema),
-            name = escape::escape_identifier(&self.name),
-            cols = self.columns_csv,
-            pk = self.key_columns.paren(),
-            conflict = self.conflict,
-        )
+                 WHERE ctid >= '({lo_block},0)'::tid AND ctid < '({hi_block},0)'::tid"
+        );
+        buf.push_str(&self.drain_tail);
+        if let Some(filter) = filter {
+            buf.push_str(" WHERE ");
+            buf.push_str(filter);
+        }
+        buf.push_str(&self.upsert_tail);
+    }
+
+    #[cfg(test)]
+    fn chunk_sql(&self, statement: ChunkStatement<'_>, filter: Option<&str>) -> String {
+        let mut buf = String::new();
+        self.chunk_sql_into(&mut buf, statement, filter);
+        buf
     }
 }
 
@@ -251,13 +304,12 @@ mod tests {
     }
 
     fn plan() -> MergePlan {
-        MergePlan {
-            schema: "public".into(),
-            name: "t".into(),
-            columns_csv: "\"id\",\"v\"".to_owned(),
-            key_columns: MergeKey::for_test(&[("id", "integer")]),
-            conflict: "ON CONFLICT (\"id\") DO UPDATE SET \"id\" = EXCLUDED.\"id\"".to_owned(),
-        }
+        MergePlan::for_test(
+            "public",
+            "t",
+            &["id", "v"],
+            MergeKey::for_test(&[("id", "integer")]),
+        )
     }
 
     #[test]

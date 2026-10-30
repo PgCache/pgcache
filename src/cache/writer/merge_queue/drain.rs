@@ -3,12 +3,15 @@
 
 use std::time::{Duration, Instant};
 
+use ecow::EcoString;
+
 use super::{
     ChunkBoundary, ChunkWindow, DrainCursor, FilterCache, KeyScope, MergeInProgress,
     StaleProbeCache,
 };
 use crate::cache::messages::PopulationMerge;
 use crate::cache::writer::staging::PopulationKey;
+use crate::oid::Oid;
 
 /// Heap blocks drained per merge chunk on a merge's first chunk; adapted
 /// afterwards so each chunk lands near `MERGE_CHUNK_TARGET`. Chunks are page
@@ -55,6 +58,7 @@ impl MergeInProgress {
             cursor,
             chunk_blocks: fault_merge_chunk_blocks().unwrap_or(MERGE_CHUNK_BLOCKS_INITIAL),
             boundary,
+            plan: None,
             filter: None,
             stale_probe: None,
             drained_rows: 0,
@@ -115,6 +119,11 @@ impl MergeInProgress {
             version,
         });
         Some(predicate)
+    }
+
+    /// The relation and staging table at `index` of the drain's list.
+    pub(super) fn staged_at(&self, index: usize) -> Option<(Oid, EcoString)> {
+        self.staged.get(index).cloned()
     }
 
     /// Account a drained window and move the cursor past it (into the next

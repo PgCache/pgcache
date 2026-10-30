@@ -1,8 +1,8 @@
 //! Advancing the active drain one chunk at a time on the writer (PGC-418).
 
+use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
-use ecow::EcoString;
 use rootcause::Report;
 use tokio_postgres::SimpleQueryMessage;
 use tracing::{debug, error};
@@ -16,7 +16,6 @@ use crate::cache::Generation;
 use crate::cache::messages::PopulationMerge;
 use crate::cache::writer::core::WriterCore;
 use crate::cache::{CacheError, CacheResult, MapIntoReport, ReportExt};
-use crate::oid::Oid;
 use crate::query::Fingerprint;
 
 /// What one merge step reads from the active drain up front.
@@ -24,7 +23,6 @@ struct MergeStepInputs {
     cursor: DrainCursor,
     chunk_blocks: u32,
     generation: Generation,
-    staged: Vec<(Oid, EcoString)>,
     population: (Fingerprint, Generation),
 }
 
@@ -156,7 +154,12 @@ impl WriterCore {
                 blocks,
             },
         };
-        let Some((relation_oid, staging)) = step.staged.get(window.index).cloned() else {
+        let Some((relation_oid, staging)) = self
+            .merges
+            .active
+            .as_ref()
+            .and_then(|in_progress| in_progress.staged_at(window.index))
+        else {
             return Ok(MergeStep::Done);
         };
         let target = ChunkTarget {
@@ -167,25 +170,38 @@ impl WriterCore {
         if self.merge_keys_lost() || self.merge_fallback_missed() {
             return Ok(MergeStep::Aborted);
         }
-        // A relation evicted mid-population has no cache table to merge into.
+        // The plan was rendered on entering the relation; none means the
+        // relation was evicted mid-population and has no cache table to
+        // merge into. Taken out for the DB calls, put back after.
         let Some(plan) = self
-            .cache
-            .tables
-            .get1(&relation_oid)
-            .map(|t| MergePlan::build(t))
+            .merges
+            .active
+            .as_mut()
+            .and_then(|in_progress| in_progress.plan.take())
         else {
             return Ok(MergeStep::Aborted);
         };
+        let outcome = self.merge_chunk(&plan, &target, &step).await;
+        if let Some(in_progress) = self.merges.active.as_mut() {
+            in_progress.plan = Some(plan);
+        }
+        outcome
+    }
+
+    /// The toast-stale probe and the chunk itself, under the relation's plan.
+    async fn merge_chunk(
+        &mut self,
+        plan: &MergePlan,
+        target: &ChunkTarget,
+        step: &MergeStepInputs,
+    ) -> CacheResult<MergeStep> {
         if self
-            .merge_toast_stale_hit(&target, &plan, step.population)
+            .merge_toast_stale_hit(target, plan, step.population)
             .await?
         {
             return Ok(MergeStep::Aborted);
         }
-
-        let (count, elapsed) = self
-            .merge_chunk_run(&plan, &target, step.generation)
-            .await?;
+        let (count, elapsed) = self.merge_chunk_run(plan, target, step.generation).await?;
         if let Some(in_progress) = self.merges.active.as_mut() {
             in_progress.chunk_finish(&target.window, count, elapsed);
         }
@@ -200,22 +216,26 @@ impl WriterCore {
             cursor: in_progress.cursor,
             chunk_blocks: in_progress.chunk_blocks,
             generation: in_progress.generation,
-            staged: in_progress.staged.clone(),
             population: (in_progress.fingerprint, in_progress.generation),
         })
     }
 
-    /// Enter `staged[index]`: size its staging table and point the cursor at
-    /// its first window (or past it, if it is empty).
+    /// Enter `staged[index]`: render the relation's merge plan, size its
+    /// staging table and point the cursor at its first window (or past it,
+    /// if it is empty).
     async fn merge_relation_enter(&mut self, index: usize) -> CacheResult<()> {
         let Some(in_progress) = self.merges.active.as_ref() else {
             return Ok(());
         };
         let staged_len = in_progress.staged.len();
-        let Some((_, staging)) = in_progress.staged.get(index) else {
+        let Some((relation_oid, staging)) = in_progress.staged_at(index) else {
             return Ok(());
         };
-        let staging = staging.clone();
+        let plan = self
+            .cache
+            .tables
+            .get1(&relation_oid)
+            .map(|table| MergePlan::build(table));
         let blocks = self.staging_blocks(&staging).await?;
         let cursor = if blocks == 0 {
             DrainCursor::after_relation(index + 1, staged_len)
@@ -228,6 +248,7 @@ impl WriterCore {
         };
         if let Some(in_progress) = self.merges.active.as_mut() {
             in_progress.cursor = cursor;
+            in_progress.plan = plan;
         }
         Ok(())
     }
@@ -287,13 +308,15 @@ impl WriterCore {
         }) else {
             return Ok(false);
         };
-        let probe = format!(
+        self.merge_buf.clear();
+        let _ = write!(
+            self.merge_buf,
             "SELECT 1 FROM pgcache_stage.{} AS d WHERE {predicate} LIMIT 1",
             target.staging
         );
         let hit = self
             .db_cache
-            .simple_query(&probe)
+            .simple_query(&self.merge_buf)
             .await
             .map_into_report::<CacheError>()
             .attach_loc("population merge toast-stale probe")?
@@ -330,12 +353,12 @@ impl WriterCore {
                 key_columns: &plan.key_columns,
             })
         });
-        let sql = plan.chunk_sql(statement, filter);
+        plan.chunk_sql_into(&mut self.merge_buf, statement, filter);
 
         let started = Instant::now();
         let messages = self
             .db_cache
-            .simple_query(&sql)
+            .simple_query(&self.merge_buf)
             .await
             .map_into_report::<CacheError>()
             .attach_loc("population merge chunk")?;
@@ -350,22 +373,25 @@ impl WriterCore {
     }
 
     /// Heap blocks in a staging table's main fork, from the file size.
-    async fn staging_blocks(&self, staging: &str) -> CacheResult<u32> {
-        let row = self
+    async fn staging_blocks(&mut self, staging: &str) -> CacheResult<u32> {
+        self.merge_buf.clear();
+        let _ = write!(
+            self.merge_buf,
+            "SELECT (pg_relation_size('pgcache_stage.{staging}') \
+             / current_setting('block_size')::bigint)::bigint"
+        );
+        // A simple query: the extended protocol would prepare and close a
+        // statement around one integer, two round trips per relation.
+        let messages = self
             .db_cache
-            .query_one(
-                &format!(
-                    "SELECT (pg_relation_size('pgcache_stage.{staging}') \
-                     / current_setting('block_size')::bigint)::bigint"
-                ),
-                &[],
-            )
+            .simple_query(&self.merge_buf)
             .await
             .map_into_report::<CacheError>()
             .attach_loc("reading staging table size")?;
-        let blocks: i64 = row.get(0);
-        u32::try_from(blocks)
-            .map_err(|_| Report::from(CacheError::Other))
-            .attach_loc("staging table block count out of range")
+        chunk_result_parse(&messages).and_then(|blocks| {
+            u32::try_from(blocks)
+                .map_err(|_| Report::from(CacheError::Other))
+                .attach_loc("staging table block count out of range")
+        })
     }
 }

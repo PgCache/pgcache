@@ -12,7 +12,7 @@ use tokio_postgres::Client;
 use tracing::debug;
 
 use super::frame::{FRAME_BUF_CAPACITY, FrameRowEvent, FrameState, OverlayEntry};
-use super::merge_queue::{MergeQueue, StagingDiscard};
+use super::merge_queue::{MERGE_BUF_CAPACITY, MergeQueue, StagingDiscard};
 use super::mv_build::MvBuildPool;
 use super::privileges::roles_digest_read;
 use super::rls::RlsCatalog;
@@ -234,6 +234,10 @@ pub(super) struct WriterCore {
     /// `cdc_write_conn` writes — invalidations/purges run out-of-band on
     /// `db_cache`. Reused across frames; never reallocates in steady state.
     pub(super) frame_buf: String,
+    /// Reused scratch for the merge statements the writer runs on `db_cache`:
+    /// a chunk, a staging-size read, a toast-stale probe. Never reallocates
+    /// in steady state.
+    pub(super) merge_buf: String,
     /// The in-progress frame's row events, collected at arrival and replayed in
     /// arrival order at the `CommitMark` flush (PGC-241: collect → evaluate →
     /// emit at the flush boundary; partial replay at `FRAME_ROWS_CAPACITY`).
@@ -548,6 +552,7 @@ impl WriterCore {
             frame_relation_oids: HashSet::new(),
             purge_pending: false,
             frame_buf: String::with_capacity(FRAME_BUF_CAPACITY),
+            merge_buf: String::with_capacity(MERGE_BUF_CAPACITY),
             frame_rows: Vec::new(),
             frame_chunk_flushed: false,
             frame_buf_relations: HashSet::new(),

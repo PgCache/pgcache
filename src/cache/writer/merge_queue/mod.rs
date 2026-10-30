@@ -30,7 +30,12 @@ mod drain;
 mod sql;
 
 pub(crate) use sql::MergeKey;
+use sql::MergePlan;
 mod step;
+
+/// Initial capacity of the writer's merge SQL scratch: a chunk statement
+/// with a few columns and no filter.
+pub(super) const MERGE_BUF_CAPACITY: usize = 1024;
 
 /// How long a population merge may stay gated on the apply watermark before the
 /// writer forces an origin WAL flush (`origin_flush_force`) to make its snapshot
@@ -186,6 +191,9 @@ pub(super) struct MergeInProgress {
     cursor: DrainCursor,
     chunk_blocks: u32,
     boundary: ChunkBoundary,
+    /// The relation the cursor is in, rendered once on entering it; taken
+    /// out for the span of a chunk's DB calls and put back after.
+    plan: Option<MergePlan>,
     filter: Option<FilterCache>,
     stale_probe: Option<StaleProbeCache>,
     /// Rows drained from staging so far (before the deleted-key filter).
