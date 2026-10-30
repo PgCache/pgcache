@@ -110,6 +110,7 @@ impl WriterRegistration {
     /// LIMIT-free cached join of its shape, or every table reference of it
     /// by the regions of such queries on its relation, and how. `join` is
     /// `bound`'s join region.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) fn subsumption_check(
         &self,
         core: &WriterCore,
@@ -132,6 +133,7 @@ impl WriterRegistration {
 
     /// The populating parent whose Ready would cover `bound`, the query
     /// `fingerprint`, when no Ready cover exists (PGC-496).
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) fn subsumption_pending_parent(
         &self,
         core: &WriterCore,
@@ -153,6 +155,7 @@ impl WriterRegistration {
     /// Handle a subsumed new query: insert its entry, then stamp its rows and
     /// mark it Ready. `NotSubsumed` when the cache DB failed and the caller
     /// must populate the entry instead.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) async fn query_subsume(
         &self,
         core: &mut WriterCore,

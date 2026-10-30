@@ -128,6 +128,7 @@ impl WriterCore {
     /// so a removal that lands between chunks is honored. Returns `Continue`
     /// while staging rows remain; on `Done` / `Aborted` the caller takes the
     /// active drain and finalizes.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(crate) async fn population_merge_step(&mut self) -> CacheResult<MergeStep> {
         let Some(step) = self.merge_step_inputs() else {
             return Ok(MergeStep::Done);

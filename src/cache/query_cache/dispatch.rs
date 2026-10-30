@@ -420,6 +420,7 @@ impl CacheDispatch {
     /// forwards: a table outside the allowlist, a brand-new pair under
     /// throttle (before resolving, as a brand-new entry would), or a query
     /// that does not resolve.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     async fn identity_resolve(
         &self,
         msg: &QueryRequest,

@@ -35,6 +35,7 @@ pub struct SubsumptionReference {
 /// A set operation is covered when every arm is: each UNION row comes from
 /// one arm, and INTERSECT/EXCEPT read both sides in full, so a missing row
 /// on either would change the result (PGC-495).
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn subsumption_references(bound: &ResolvedQuery) -> Option<Vec<SubsumptionReference>> {
     let base = query_base_references(bound);
     if !base.uncovered.is_empty() {

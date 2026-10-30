@@ -201,6 +201,7 @@ impl WriterRegistration {
     /// The query bound to its cache tables: the Resolve command's binding
     /// when its alias still holds it, else bound here (a pinned query, a
     /// re-registration, or a schema change since).
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) async fn query_bind(
         &self,
         core: &mut WriterCore,
@@ -254,6 +255,7 @@ impl WriterRegistration {
     /// Complete a bound query's resolution for its entry: render the serve
     /// shape, classify shape and limits, register the update queries and
     /// build the read facts.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) fn query_resolve(
         &self,
         core: &mut WriterCore,

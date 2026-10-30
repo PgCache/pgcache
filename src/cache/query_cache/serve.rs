@@ -128,6 +128,7 @@ impl CacheDispatch {
     /// per-client envelope (ParseComplete / BindComplete / ReadyForQuery) around
     /// the cached core, slicing off the leading RowDescription when the client
     /// doesn't expect one, write it to the client, and return the socket.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     async fn memo_serve(
         &self,
         mut msg: QueryRequest,
