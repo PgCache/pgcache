@@ -63,7 +63,7 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 
 fn main() -> Result<(), Report> {
     #[cfg(feature = "dhat-heap")]
-    let _dhat = dhat::Profiler::new_heap();
+    let _dhat = dhat::Profiler::builder().trim_backtraces(None).build();
 
     // Install rustls crypto provider for TLS support
     rustls::crypto::aws_lc_rs::default_provider()
