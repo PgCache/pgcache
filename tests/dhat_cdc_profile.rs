@@ -1,6 +1,6 @@
 //! dhat allocation-profiling driver for the CDC apply path — NOT a correctness test.
 //!
-//! Registers single-table cached queries, then issues a fixed mix of
+//! Registers cached queries over `cdc_bench`, then issues a fixed mix of
 //! INSERT/UPDATE/DELETE directly against the ORIGIN (bypassing the proxy) so
 //! the profiled binary's heap traffic is dominated by per-CDC-event decode and
 //! in-place cache apply rather than the client serve path. Each statement is
@@ -8,12 +8,20 @@
 //! included in the per-event cost. Single-table queries are maintained
 //! in-place (never invalidated), so every event takes the apply path.
 //!
+//! `DHAT_CDC_QUERIES` (default 0) also registers that many point queries of
+//! a join between `cdc_bench` and a partner table, each keyed on the
+//! partner's id. A join's membership is evaluated on the cache DB, and a
+//! point on the partner says nothing about a `cdc_bench` row, so every one
+//! of them is a candidate on every event: the per-event apply cost then
+//! scales with the count, as it does under a workload with many cached
+//! joins on a relation.
+//!
 //! Build with the `dhat-heap` feature so the spawned pgcache binary uses
 //! `dhat::Alloc` and writes `dhat-heap.json` on a clean (SIGINT) exit.
 //!
 //! Run:
-//!   DHAT_CDC_EVENTS=30000 cargo test --features dhat-heap --test dhat_cdc_profile \
-//!     -- --ignored --nocapture --test-threads=1
+//!   DHAT_CDC_EVENTS=30000 DHAT_CDC_QUERIES=100 cargo test --features dhat-heap \
+//!     --test dhat_cdc_profile -- --ignored --nocapture --test-threads=1
 //! then collect pgcache/dhat-heap.json. The event count is rounded down to a
 //! multiple of 3 (each round = one INSERT + one UPDATE + one DELETE); sites
 //! with ~N or ~N/3 blocks are per-event allocations.
@@ -34,6 +42,10 @@ async fn test_dhat_cdc_apply_workload() -> Result<(), Error> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(30_000);
     let rounds = events / 3;
+    let join_queries: usize = std::env::var("DHAT_CDC_QUERIES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
 
     let mut ctx = TestContext::setup().await?;
 
@@ -54,6 +66,35 @@ async fn test_dhat_cdc_apply_workload() -> Result<(), Error> {
         .query("SELECT id, val FROM cdc_bench WHERE n = 3 ORDER BY id", &[])
         .await?;
     ctx.cache_settle().await?;
+
+    if join_queries > 0 {
+        ctx.query(
+            "CREATE TABLE cdc_partner (id INTEGER PRIMARY KEY, cdc_id INTEGER)",
+            &[],
+        )
+        .await?;
+        // Partners point at the ids the rounds below write, so the joins
+        // match and the hit side of the apply path runs too.
+        ctx.origin_query(
+            "INSERT INTO cdc_partner (id, cdc_id) \
+             SELECT g, 1000000 + (g % 1000) FROM generate_series(1, $1) g",
+            &[&i32::try_from(join_queries).expect("query count fits in i32")],
+        )
+        .await?;
+        // Two passes: the registration-rate gate forwards part of a burst of
+        // brand-new queries, and the second pass registers what it forwarded.
+        for _ in 0..2 {
+            for k in 1..=join_queries {
+                let sql = format!(
+                    "SELECT b.id, b.val, p.id FROM cdc_bench b \
+                     JOIN cdc_partner p ON p.cdc_id = b.id WHERE p.id = {k}"
+                );
+                let _ = ctx.query(&sql, &[]).await?;
+            }
+            ctx.cache_settle_with_timeout(Duration::from_secs(120))
+                .await?;
+        }
+    }
 
     // Steady-state CDC events: each round inserts a fresh row matching the
     // cached predicate, updates it, then deletes it — table size stays
@@ -88,7 +129,9 @@ async fn test_dhat_cdc_apply_workload() -> Result<(), Error> {
     // allocations in the heap profile are scrape cost, not apply-path cost.
     if let Ok((_, body)) = util::http_get(ctx.metrics_port, "/metrics").await {
         for line in body.lines() {
-            if line.starts_with("pgcache_cdc_") && !line.starts_with('#') {
+            if (line.starts_with("pgcache_cdc_") || line.starts_with("pgcache_cache_cdc_"))
+                && !line.starts_with('#')
+            {
                 eprintln!("{line}");
             }
         }
