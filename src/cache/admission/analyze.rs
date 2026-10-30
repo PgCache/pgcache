@@ -13,7 +13,7 @@ use super::update_classify::{
     predicate_columns_collect, update_eval_strategy_classify,
 };
 use super::{AdmissionAnalysis, TableAdmission};
-use crate::cache::mv_shape::select_computes;
+use crate::cache::mv_shape::select_reshapes;
 #[cfg(feature = "proxy")]
 use crate::cache::mv_shape::{ShapeGate, shape_classify};
 use crate::cache::query::{limit_clause_of, limit_rows_needed};
@@ -22,7 +22,8 @@ use crate::cache::{CacheError, CacheResult};
 use crate::catalog::{Catalog, ColumnMask};
 use crate::oid::Oid;
 use crate::query::Fingerprint;
-use crate::query::ast::rope::{Body, NodeKind, QueryTree, TreeBuilder, View};
+use crate::query::ast::JoinType;
+use crate::query::ast::rope::{Body, NodeKind, QueryTree, Select, Source, TreeBuilder, View};
 use crate::query::compiled_predicate::CompiledPredicate;
 use crate::query::decorrelate::query_decorrelate;
 use crate::query::join_region::JoinRegion;
@@ -57,10 +58,10 @@ pub fn base_query_prepare(query: &QueryTree) -> (QueryTree, Option<u64>) {
 }
 
 /// The population cap: the root's LIMIT plus OFFSET when the population form
-/// (`decorrelated` when there is one) is a plain projection whose ORDER BY
-/// the capped read can render. A shape that computes its result gets none,
-/// whether or not its ORDER BY can be served: its rows map to no bounded set
-/// of source rows (ADR-060).
+/// (`decorrelated` when there is one) is a plain projection over base tables,
+/// alone or joined inner, whose ORDER BY the capped read can render. A shape
+/// that computes its result gets none, whether or not its ORDER BY can be
+/// served: its rows map to no bounded set of source rows (ADR-060).
 pub fn population_max_limit(
     bound: &ResolvedQuery,
     decorrelated: Option<&ResolvedQuery>,
@@ -71,7 +72,7 @@ pub fn population_max_limit(
     population
         .select()
         .filter(|select| {
-            !select_computes(*select, aggregate_functions)
+            select_cappable(*select, aggregate_functions)
                 && population
                     .tree()
                     .root()
@@ -79,6 +80,27 @@ pub fn population_max_limit(
                     .all(|clause| population.order_by_source(*select, clause).is_some())
         })
         .and(user_max_limit)
+}
+
+/// Whether a branch's top N maps to a bounded set of each table's rows: a
+/// plain projection over base tables joined inner (ADR-060, PGC-570). A
+/// reshaping select computes its rows, and an outer join's NULL-filled side
+/// is read widened (PGC-556), which a window does not compose with; both
+/// populate whole.
+fn select_cappable(select: Select<'_>, aggregate_functions: &HashSet<EcoString>) -> bool {
+    !select_reshapes(select, aggregate_functions) && select.from().all(source_is_inner_base_tables)
+}
+
+fn source_is_inner_base_tables(source: Source<'_>) -> bool {
+    match source {
+        Source::Table(_) => true,
+        Source::Join(join) => {
+            join.join_type() == JoinType::Inner
+                && source_is_inner_base_tables(join.left())
+                && source_is_inner_base_tables(join.right())
+        }
+        Source::Subquery(_) | Source::CteRef(_) => false,
+    }
 }
 
 /// `query` with its root LIMIT/OFFSET dropped: the root re-emitted without
@@ -552,10 +574,39 @@ mod tests {
                 "SELECT x, count(*) FROM a GROUP BY x ORDER BY x LIMIT 3",
                 false,
             ),
+            // A plain projection over an inner join is capped: each table's
+            // read projects its rows from the join's top N (PGC-570).
             (
                 "SELECT a.id FROM a JOIN b ON b.id = a.x ORDER BY b.y LIMIT 3",
+                true,
+            ),
+            (
+                "SELECT a.id FROM a JOIN b ON b.id = a.x JOIN a c ON c.id = b.id ORDER BY b.y, c.x LIMIT 3",
+                true,
+            ),
+            (
+                "SELECT a.id FROM a, b WHERE b.id = a.x ORDER BY b.y LIMIT 3",
+                true,
+            ),
+            (
+                "SELECT a.id FROM a JOIN b ON b.id = a.x ORDER BY 2 LIMIT 3",
                 false,
             ),
+            (
+                "SELECT DISTINCT a.id FROM a JOIN b ON b.id = a.x ORDER BY a.id LIMIT 3",
+                false,
+            ),
+            // Outer joins stay uncapped: a NULL-filled side is read widened
+            // (PGC-556), which a window does not compose with.
+            (
+                "SELECT a.id FROM a LEFT JOIN b ON b.id = a.x ORDER BY a.id LIMIT 3",
+                false,
+            ),
+            (
+                "SELECT a.id FROM a JOIN (SELECT id FROM b) d ON d.id = a.x ORDER BY a.id LIMIT 3",
+                false,
+            ),
+            // Decorrelated to a join with DISTINCT, which computes.
             (
                 "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.id = a.x) ORDER BY id LIMIT 3",
                 false,

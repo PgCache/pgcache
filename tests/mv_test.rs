@@ -735,15 +735,14 @@ async fn test_mv_duplicate_derived_column_names() -> Result<(), Error> {
     Ok(())
 }
 
-/// PGC-188: the demo's tag-page shape — `post_tags ⋈ posts` filtered to one
-/// tag, `ORDER BY score DESC LIMIT N`. With a popular tag, the unlimited join
-/// is large but the MV is LIMIT-capped, so `result_rows × mv_size_ratio (10)
-/// ≤ source_rows` becomes `min(full_count, 10) × 10 ≤ source` → trivially
-/// satisfied for a realistic tag page. Pre-fix the gate counted the full
-/// unlimited join (limit was nulled for all reducer shapes), so the gate
-/// failed and no MV was ever built.
+/// PGC-188's tag-page shape — `post_tags ⋈ posts` filtered to one tag,
+/// `ORDER BY score DESC LIMIT N` — once built an MV of its top N over a
+/// whole-tag population. The population is now capped at the top N itself
+/// (ADR-060, PGC-570): at most one row per table per result row, so the size
+/// gate refuses the MV at the default ratio and every LIMIT within the cap
+/// is served from the source rows.
 #[tokio::test]
-async fn test_mv_join_lifecycle() -> Result<(), Error> {
+async fn test_mv_capped_join_fails_the_size_gate_and_serves_source_rows() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
 
     ctx.query(
@@ -758,9 +757,7 @@ async fn test_mv_join_lifecycle() -> Result<(), Error> {
     .await?;
 
     // 300 posts; 300 post_tags. 'rust' is the popular tag — 200 posts (ids
-    // 100..299, score = id). With LIMIT 10 the MV stores top-10 rows; the
-    // gate sees min(200, 10) × 10 = 100 ≤ source-row cache (≈400) → passes.
-    // Pre-fix it saw 200 × 10 = 2000 ≤ 400 → failed.
+    // 100..299, score = id); the capped population loads ten of them.
     for id in 0..300 {
         ctx.query(
             "INSERT INTO posts VALUES ($1, $2, $3)",
@@ -792,42 +789,30 @@ async fn test_mv_join_lifecycle() -> Result<(), Error> {
             .collect()
     }
 
-    // First query — cache miss, forwarded to origin; source-row population runs.
+    // First query — cache miss, forwarded to origin; the capped population runs.
     let res = ctx.simple_query(sql).await?;
     assert_eq!(ids(&res), expected_top10, "origin: top-10 by score DESC");
-
     ctx.cache_settle().await?;
+
+    // Hits serve the top-10 from the source rows; no MV is scheduled or built.
+    let m1 = ctx.metrics().await?;
+    let res = ctx.simple_query(sql).await?;
+    assert_eq!(ids(&res), expected_top10, "source rows hold the top-10");
+    ctx.cache_settle().await?;
+    let res = ctx.simple_query(sql).await?;
+    assert_eq!(ids(&res), expected_top10);
+    let m2 = ctx.metrics().await?;
+    let d = metrics_delta(&m1, &m2);
+    assert_eq!(d.queries_cache_hit, 2, "both reads hit");
+    assert_eq!(d.cache_mv_hits, 0, "a capped join has no MV to hit");
     assert_eq!(
         mv_table_count(&ctx.dbs).await?,
         0,
-        "MV not built until first cache hit triggers MvFirstPop"
+        "a capped join's population is at most one row per table per result row: the size gate refuses"
     );
 
-    // Second query — cache hit on Pending → schedules first-pop, falls through.
-    let res = ctx.simple_query(sql).await?;
-    assert_eq!(ids(&res), expected_top10);
-
-    ctx.cache_settle().await?;
-    assert_eq!(
-        mv_table_count(&ctx.dbs).await?,
-        1,
-        "LIMIT-capped join must produce an MV table after MvFirstPop"
-    );
-
-    // Third query — MV fast-path hit.
-    let m1 = ctx.metrics().await?;
-    let res = ctx.simple_query(sql).await?;
-    assert_eq!(
-        ids(&res),
-        expected_top10,
-        "MV fast path must return the same top-10"
-    );
-    let m2 = ctx.metrics().await?;
-    let d = metrics_delta(&m1, &m2);
-    assert_eq!(d.cache_mv_hits, 1, "expected join MV fast-path hit");
-    assert_eq!(d.cache_mv_fallthrough, 0);
-
-    // A smaller user LIMIT (3) over the same MV — top-3 subset, served from MV.
+    // A smaller user LIMIT (3) within the cap — the top-3 subset, from the
+    // same source rows.
     let sql_small = "SELECT p.id, p.title, p.score FROM post_tags pt \
                      JOIN posts p ON pt.post_id = p.id \
                      WHERE pt.tag = 'rust' ORDER BY p.score DESC LIMIT 3";
@@ -835,11 +820,12 @@ async fn test_mv_join_lifecycle() -> Result<(), Error> {
     let res = ctx.simple_query(sql_small).await?;
     assert_eq!(ids(&res), vec![299, 298, 297]);
     let m4 = ctx.metrics().await?;
+    let d = metrics_delta(&m3, &m4);
     assert_eq!(
-        metrics_delta(&m3, &m4).cache_mv_hits,
-        1,
-        "smaller LIMIT must be served from the same MV"
+        d.queries_cache_hit, 1,
+        "the smaller LIMIT is a hit on the same entry"
     );
+    assert_eq!(d.cache_mv_hits, 0);
 
     Ok(())
 }

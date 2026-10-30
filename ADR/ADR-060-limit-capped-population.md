@@ -21,15 +21,17 @@ Nothing said what a capped population must load. Two wrong-result bugs followed:
 
 **Which queries are capped.**
 * The cap is the root's LIMIT plus OFFSET.
-* Only a plain-projection SELECT gets one, judged on the population form (decorrelated when it has one). These populate in full:
-  * shapes that compute their result: aggregates, GROUP BY, HAVING, DISTINCT, window functions and joins. This holds even when their ORDER BY can't be served, which demotes their MV gate to `Skip` (PGC-527);
+* Only a plain-projection SELECT gets one, judged on the population form (decorrelated when it has one). Its FROM is base tables, alone or joined inner (amended 2026-10-30, PGC-570). These populate in full:
+  * shapes that compute their result: aggregates, GROUP BY, HAVING, DISTINCT and window functions. This holds even when their ORDER BY can't be served, which demotes their MV gate to `Skip` (PGC-527);
+  * outer joins, and a FROM with a derived table or CTE reference;
   * set operations;
   * an OFFSET with no LIMIT count.
 * The LIMIT is not part of the query's identity or serve shape (ADR-040), so one entry serves every LIMIT its cap covers.
 
 **What a capped read loads.**
-* Only the root SELECT's own table is capped. Subquery, derived-table and CTE reads load whole.
+* Only the root SELECT's own tables are capped. Subquery, derived-table and CTE reads load whole.
 * The capped read is the root's FROM and WHERE, sorted by the query's ORDER BY, with `LIMIT N` and no DISTINCT.
+* A join's table is read as `SELECT DISTINCT * FROM (<that table's columns over the root's FROM and WHERE, sorted, LIMIT N>)`: the rows of the table that take part in the join's top N result rows. The sort may name another table's column, so it sits inside the subquery, and DISTINCT folds the join's fan-out outside it.
   * Each ORDER BY item is rendered as an expression over the table: an output name or a position becomes its select-list expression, with stars expanded. CDC's window columns and sort keys resolve items the same way, through one resolver.
   * If an item can't be resolved, the read is uncapped.
 
@@ -51,7 +53,8 @@ Nothing said what a capped population must load. Two wrong-result bugs followed:
 * **The fix follows from the invariant.**
   * A read without the ORDER BY loads arbitrary rows.
   * A capped subquery read loses rows its predicate is evaluated over.
-  * One table means no join fan-out to fold, and dropping DISTINCT avoids Postgres's rule that ORDER BY expressions must appear in a DISTINCT select list.
+  * One table means no join fan-out to fold, and dropping DISTINCT avoids Postgres's rule that ORDER BY expressions must appear in a DISTINCT select list. A join folds its fan-out with DISTINCT over a sorted, limited subquery, where that rule does not reach.
+* **A join's top N is bounded too.** Projecting a table from the join's top N rows gives every row of that table those result rows need, which is the superset the invariant asks for; serving re-runs the join with its ORDER BY and LIMIT over the shared cache tables, and an extra cached row either fails the WHERE or is a true result row that sorts below the window. Joins were first excluded with the computed shapes. On the bench stack a `LIMIT 50` tag page (`post_tags JOIN posts … WHERE tag = ?`) then loaded every post of the tag, up to 34k rows with bodies, on each of ~2,800 invalidations in 16 minutes: 37M rows staged against 300k cached, the merge queue 14 minutes behind, CDC apply 3 s late and a third of cacheable reads forwarded by the read-after-write gate. Outer joins stay excluded: the NULL-filled side's widened read (PGC-556) does not compose with a window.
 * **ORDER BY items are resolved to expressions** rather than embedding the query's select list and renaming every column of a wrapper, which keeps the read a plain one-table SELECT.
 * **Falling back to an uncapped read is always correct.** It costs rows, never correctness.
 * **Computed shapes populate in full** because their result's top N maps to no bounded set of input rows.
@@ -67,7 +70,9 @@ Nothing said what a capped population must load. Two wrong-result bugs followed:
 ### Negative
 * Demotions, predicate-column changes and deletes invalidate the query.
 * Ties at the window boundary may resolve to different rows in origin and cache, which SQL permits.
-* Subquery reads, and a root whose FROM is a derived table or CTE, load whole even under a cap.
+* Subquery reads, a root whose FROM is a derived table or CTE, and outer joins load whole even under a cap.
+* A capped join issues the join once per table it reads.
+* A capped join invalidates on any sort-key change to a cached row, promotions included: the window can cut a row's fan-out, so a promoted row may need partners the population never loaded. The promotion check (PGC-334) stays single-table.
 * A test can't tell a correct capped read from an unordered one unless its rows sit in a different physical order from the sort. `assert_limit_order_decides` checks this.
 
 ## Implementation Notes

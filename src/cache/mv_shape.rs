@@ -124,12 +124,21 @@ pub(crate) fn select_computes(
     select: Select<'_>,
     aggregate_functions: &HashSet<EcoString>,
 ) -> bool {
+    select_reshapes(select, aggregate_functions) || select_has_join(select)
+}
+
+/// Whether a branch reshapes its rows: a window function, DISTINCT, GROUP
+/// BY, HAVING or an aggregate. A join alone does not; its result's top N
+/// still maps to a bounded set of each table's rows (PGC-570).
+pub(crate) fn select_reshapes(
+    select: Select<'_>,
+    aggregate_functions: &HashSet<EcoString>,
+) -> bool {
     items_any(select, &|e| e.has_window())
         || select.distinct()
         || select.group_by().len() > 0
         || select.having().is_some()
         || items_any(select, &|e| e.has_aggregate(aggregate_functions))
-        || select_has_join(select)
 }
 
 fn select_has_join(select: Select<'_>) -> bool {

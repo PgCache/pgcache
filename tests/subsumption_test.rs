@@ -484,10 +484,11 @@ async fn test_subsumption_same_shape_left_join_nullable_where() -> Result<(), Er
     Ok(())
 }
 
-/// A LIMIT on a join caps no population (ADR-060): the join loads every
-/// FROM row of its shape and parents like an unlimited one.
+/// A LIMIT caps a plain join's population (ADR-060, PGC-570): the join
+/// holds only the rows of its top N, so like any capped query it parents
+/// nothing, and a same-shape child populates itself.
 #[tokio::test]
-async fn test_subsumption_join_limit_parent_still_parents() -> Result<(), Error> {
+async fn test_subsumption_join_limit_parent_does_not_parent() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
     setup_join_shape_tables(&mut ctx).await?;
 
@@ -501,7 +502,7 @@ async fn test_subsumption_join_limit_parent_still_parents() -> Result<(), Error>
     let (proxied, origin) = ctx.proxy_and_origin_rows(&child).await?;
     assert_eq!(origin.len(), 2, "{child}");
     assert_eq!(proxied, origin, "{child}");
-    let _m = assert_join_subsume_hit(&mut ctx, m).await?;
+    let _m = assert_not_subsumed(&mut ctx, m).await?;
 
     Ok(())
 }

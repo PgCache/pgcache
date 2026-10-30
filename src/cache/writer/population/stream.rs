@@ -303,10 +303,12 @@ async fn staging_table_create(
 /// `dropped`. DISTINCT folds join fan-out; GROUP BY and HAVING are dropped
 /// because the cache holds raw rows and aggregates at retrieval.
 ///
-/// `limit` is the root's cap, which only a query reading one table with an
-/// ORDER BY it can render has (`population_max_limit`): the read is sorted as
-/// the query is, so it loads the query's top rows, and one table has no
-/// fan-out to fold.
+/// `limit` is the root's cap, which a plain projection with an ORDER BY it
+/// can render has (`population_max_limit`): the read is sorted as the query
+/// is, so it loads the rows of the query's top N. One table needs no
+/// DISTINCT. A join's table is projected from the join's top N rows inside a
+/// subquery, since the sort may name another table's column, and DISTINCT
+/// folds the fan-out outside it (PGC-570).
 fn population_select_build(
     population: &ResolvedQuery,
     table_node: Table<'_>,
@@ -315,21 +317,18 @@ fn population_select_build(
     dropped: &[NodeId],
 ) -> String {
     let single_table = branch.from().len() == 1 && branch.direct_tables().len() == 1;
-    debug_assert!(
-        limit.is_none() || single_table,
-        "a capped population reads one table"
-    );
-    let window = limit.filter(|_| single_table).and_then(|limit| {
+    let window = limit.and_then(|limit| {
         let order_by = population_order_by(population, branch);
         debug_assert!(order_by.is_some(), "a capped population renders its sort");
         Some((order_by?, limit))
     });
     let mut buf = String::with_capacity(1024);
     let mut cx = population.deparse_context_dropping(dropped);
-    buf.push_str(if window.is_some() {
-        "SELECT"
-    } else {
-        "SELECT DISTINCT"
+    let capped_join = window.is_some() && !single_table;
+    buf.push_str(match (window.is_some(), capped_join) {
+        (true, true) => "SELECT DISTINCT * FROM (SELECT",
+        (true, false) => "SELECT",
+        (false, _) => "SELECT DISTINCT",
     });
     population.source_columns_into(table_node.id(), &mut buf);
     from_deparse_with(branch.from(), &mut cx, &mut buf);
@@ -343,6 +342,9 @@ fn population_select_build(
     if let Some((order_by, limit)) = window {
         buf.push_str(&order_by);
         write!(buf, " LIMIT {limit}").ok();
+    }
+    if capped_join {
+        buf.push_str(") top");
     }
     buf
 }
@@ -543,7 +545,7 @@ mod tests {
     #[test]
     fn test_population_select_cases() {
         #[rustfmt::skip]
-        let cases: [(&str, &str, Option<u64>, &[&str]); 16] = [
+        let cases: [(&str, &str, Option<u64>, &[&str]); 19] = [
             ("single table", "SELECT name FROM users WHERE id = 1 ORDER BY name", Some(5), &[
                 "SELECT public.users.id, public.users.name FROM public.users WHERE public.users.id = 1 ORDER BY public.users.name ASC LIMIT 5",
             ]),
@@ -597,6 +599,22 @@ mod tests {
             ]),
             ("derived-table root uncapped", "SELECT id FROM (SELECT id, name FROM users WHERE id > 1) d ORDER BY id", Some(2), &[
                 "SELECT DISTINCT public.users.id, public.users.name FROM public.users WHERE public.users.id > 1",
+            ]),
+            // A capped join projects each table from the join's top N rows
+            // (PGC-570): the ORDER BY may name another table's column, so it
+            // sorts inside a subquery and DISTINCT applies outside.
+            ("capped join", "SELECT u.name, o.total FROM users u JOIN orders o ON o.user_id = u.id WHERE o.total > 2 ORDER BY o.total DESC", Some(3), &[
+                "SELECT DISTINCT * FROM (SELECT u.id, u.name FROM public.users u JOIN public.orders o ON o.user_id = u.id WHERE o.total > 2 ORDER BY o.total DESC LIMIT 3) top",
+                "SELECT DISTINCT * FROM (SELECT o.id, o.user_id, o.total FROM public.users u JOIN public.orders o ON o.user_id = u.id WHERE o.total > 2 ORDER BY o.total DESC LIMIT 3) top",
+            ]),
+            ("capped three-table join by position", "SELECT i.id, o.total FROM users u JOIN orders o ON o.user_id = u.id JOIN items i ON i.order_id = o.id ORDER BY 2 DESC, 1", Some(2), &[
+                "SELECT DISTINCT * FROM (SELECT u.id, u.name FROM public.users u JOIN public.orders o ON o.user_id = u.id JOIN public.items i ON i.order_id = o.id ORDER BY o.total DESC, i.id ASC LIMIT 2) top",
+                "SELECT DISTINCT * FROM (SELECT o.id, o.user_id, o.total FROM public.users u JOIN public.orders o ON o.user_id = u.id JOIN public.items i ON i.order_id = o.id ORDER BY o.total DESC, i.id ASC LIMIT 2) top",
+                "SELECT DISTINCT * FROM (SELECT i.id, i.order_id FROM public.users u JOIN public.orders o ON o.user_id = u.id JOIN public.items i ON i.order_id = o.id ORDER BY o.total DESC, i.id ASC LIMIT 2) top",
+            ]),
+            ("capped join without order", "SELECT u.name FROM users u JOIN orders o ON o.user_id = u.id", Some(2), &[
+                "SELECT DISTINCT * FROM (SELECT u.id, u.name FROM public.users u JOIN public.orders o ON o.user_id = u.id LIMIT 2) top",
+                "SELECT DISTINCT * FROM (SELECT o.id, o.user_id, o.total FROM public.users u JOIN public.orders o ON o.user_id = u.id LIMIT 2) top",
             ]),
         ];
         for (label, sql, max_limit, expected) in cases {
