@@ -13,7 +13,7 @@ use crate::query::ast::rope::{
 };
 use crate::query::ast::{SubLinkType, UnaryOp};
 #[cfg(feature = "proxy")]
-use crate::query::constraints::ColumnRange;
+use crate::query::constraints::TableRanges;
 use crate::query::predicates::{OuterJoinRole, RelationPredicates, query_branch_predicates_build};
 use crate::query::resolve::{QueryBranch, ResolvedQuery, TableSlot};
 
@@ -66,9 +66,10 @@ pub fn query_base_references(bound: &ResolvedQuery) -> BaseReferences<'_> {
     }
 }
 
-/// One table reference's per-column ranges.
+/// One table reference's ranges, shared with its update query; the gate
+/// reads the bare ones.
 #[cfg(feature = "proxy")]
-pub(crate) type ReferenceRanges = HashMap<EcoString, ColumnRange>;
+pub(crate) type ReferenceRanges = TableRanges;
 
 /// One base relation of a read as the read-after-write gate sees it.
 #[cfg(feature = "proxy")]
@@ -129,7 +130,7 @@ impl ReadRelations {
             };
             match (reference.predicates, &mut relation.ranges) {
                 (Some(predicates), Some(references)) => {
-                    references.push(predicates.ranges.bare_columns());
+                    references.push(predicates.ranges.clone());
                 }
                 (Some(_), None) => {}
                 (None, ranges) => *ranges = None,
@@ -150,7 +151,7 @@ impl ReadRelations {
             .into_iter()
             .map(|(oid, mut relation)| {
                 let unusable = relation.ranges.as_ref().is_some_and(|references| {
-                    references.is_empty() || references.iter().any(HashMap::is_empty)
+                    references.is_empty() || references.iter().any(TableRanges::is_empty)
                 });
                 if unusable {
                     relation.ranges = None;
@@ -466,6 +467,8 @@ mod tests {
     #[cfg(feature = "proxy")]
     use crate::query::ast::LiteralValue;
     use crate::query::ast::query_tree_parse;
+    #[cfg(feature = "proxy")]
+    use crate::query::constraints::ColumnRange;
 
     /// One reference's sorted (column, range) pairs.
     #[cfg(feature = "proxy")]
@@ -504,7 +507,7 @@ mod tests {
                     .iter()
                     .map(|ranges| {
                         let mut ranges: ReferenceLines = ranges
-                            .iter()
+                            .bare_ranges()
                             .map(|(column, range)| (column.to_string(), format!("{range:?}")))
                             .collect();
                         ranges.sort();
@@ -650,7 +653,7 @@ mod tests {
             .expect("the filtered side keeps its ranges");
         assert_eq!(ranges.len(), 1);
         assert!(matches!(
-            ranges[0].get("id"),
+            ranges[0].bare_range("id"),
             Some(ColumnRange::Equal(LiteralValue::Integer(5)))
         ));
         let s1_columns = s1.columns.as_ref().expect("s1.orders columns known");

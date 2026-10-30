@@ -211,7 +211,11 @@ impl InsertAggregate {
             .columns
             .iter()
             .enumerate()
-            .filter_map(|(position, column)| read_ranges.get(column).map(|range| (position, range)))
+            .filter_map(|(position, column)| {
+                read_ranges
+                    .bare_range(column)
+                    .map(|range| (position, range))
+            })
             .collect();
         if constrained.is_empty() {
             return self.rows.is_empty();
@@ -271,7 +275,11 @@ pub(super) fn merged_tuples_disjoint(merged: &MergedTuples, read_ranges: &Refere
         let constrained: SmallVec<[(usize, &ColumnRange); 2]> = columns
             .iter()
             .enumerate()
-            .filter_map(|(position, column)| read_ranges.get(column).map(|range| (position, range)))
+            .filter_map(|(position, column)| {
+                read_ranges
+                    .bare_range(column)
+                    .map(|range| (position, range))
+            })
             .collect();
         if constrained.is_empty() {
             return tuples.is_empty();
@@ -346,8 +354,8 @@ pub(super) fn references_disjoint(
     read_ranges.is_some_and(|references| {
         references.iter().all(|ranges| {
             ranges
-                .values()
-                .any(|range| matches!(range, ColumnRange::Empty))
+                .bare_ranges()
+                .any(|(_, range)| matches!(range, ColumnRange::Empty))
                 || disjoint(ranges)
         })
     })
@@ -391,7 +399,11 @@ fn merged_update_shape_disjoint(
     let where_constrained: SmallVec<[(usize, &ColumnRange); 2]> = where_columns
         .iter()
         .enumerate()
-        .filter_map(|(position, column)| read_ranges.get(column).map(|range| (position, range)))
+        .filter_map(|(position, column)| {
+            read_ranges
+                .bare_range(column)
+                .map(|range| (position, range))
+        })
         .collect();
     // Image side: WHERE columns keep their value unless a SET overrides
     // them; SET columns carry their new value.
@@ -407,7 +419,11 @@ fn merged_update_shape_disjoint(
     let set_constrained: SmallVec<[(usize, &ColumnRange); 4]> = set_columns
         .iter()
         .enumerate()
-        .filter_map(|(position, column)| read_ranges.get(column).map(|range| (position, range)))
+        .filter_map(|(position, column)| {
+            read_ranges
+                .bare_range(column)
+                .map(|range| (position, range))
+        })
         .collect();
     tuples.iter().all(|(where_values, set_values)| {
         let where_excluded = where_constrained.iter().any(|(position, range)| {

@@ -29,7 +29,10 @@ use crate::query::ast::LiteralValue;
 /// inserted value. A column absent from the result is unconstrained (and so
 /// can't exclude any row).
 pub(crate) fn table_column_ranges(filters: &[TableConstraint]) -> HashMap<EcoString, ColumnRange> {
-    TableRanges::build(filters).bare_columns()
+    TableRanges::build(filters)
+        .bare_ranges()
+        .map(|(column, range)| (column.clone(), range.clone()))
+        .collect()
 }
 
 /// Exact three-way comparison between an integer and a float value, without the
@@ -198,23 +201,30 @@ fn bound_below(upper: &Option<RangeBound>, lower: &Option<RangeBound>) -> bool {
     }
 }
 
-/// Whether two per-column predicate range maps are provably disjoint — no row
-/// can satisfy both (PGC-379). `true` if either predicate is itself
-/// unsatisfiable (an `Empty` column range), or some column constrained by *both*
-/// has disjoint ranges. A column present in only one map is unconstrained in the
-/// other, so it can't establish disjointness. Sound in one direction: only
-/// returns `true` when disjoint is provable.
+/// Whether a read reference's ranges and a write's per-column ranges are
+/// provably disjoint — no row can satisfy both (PGC-379). `true` if either
+/// predicate is itself unsatisfiable (an `Empty` column range), or some column
+/// constrained by *both* has disjoint ranges. A column present on only one
+/// side is unconstrained on the other, so it can't establish disjointness.
+/// Sound in one direction: only returns `true` when disjoint is provable.
 pub(crate) fn column_ranges_disjoint(
-    a: &HashMap<EcoString, ColumnRange>,
-    b: &HashMap<EcoString, ColumnRange>,
+    read: &TableRanges,
+    write: &HashMap<EcoString, ColumnRange>,
 ) -> bool {
-    if a.values().any(|r| matches!(r, ColumnRange::Empty))
-        || b.values().any(|r| matches!(r, ColumnRange::Empty))
+    if read
+        .bare_ranges()
+        .any(|(_, range)| matches!(range, ColumnRange::Empty))
+        || write
+            .values()
+            .any(|range| matches!(range, ColumnRange::Empty))
     {
         return true;
     }
-    a.iter()
-        .any(|(col, ra)| b.get(col).is_some_and(|rb| column_range_disjoint(ra, rb)))
+    read.bare_ranges().any(|(column, read_range)| {
+        write
+            .get(column)
+            .is_some_and(|write_range| column_range_disjoint(read_range, write_range))
+    })
 }
 
 /// Whether two literal values are provably equal (`Some(true)`), provably
@@ -480,26 +490,31 @@ mod tests {
             .collect()
     }
 
+    /// The read side of a disjointness check: `pairs` as a reference's ranges.
+    fn read_ranges(pairs: &[(&str, ColumnRange)]) -> TableRanges {
+        TableRanges::from_bare(pairs.iter().map(|(c, r)| ((*c).into(), r.clone())))
+    }
+
     #[test]
     fn test_ranges_disjoint_map() {
         // A column constrained by both, disjointly → whole predicates disjoint.
         assert!(column_ranges_disjoint(
-            &ranges(&[("id", ColumnRange::Equal(int(5)))]),
+            &read_ranges(&[("id", ColumnRange::Equal(int(5)))]),
             &ranges(&[("id", ColumnRange::Equal(int(1)))]),
         ));
         // Same column, overlapping → not disjoint.
         assert!(!column_ranges_disjoint(
-            &ranges(&[("id", ColumnRange::Equal(int(5)))]),
+            &read_ranges(&[("id", ColumnRange::Equal(int(5)))]),
             &ranges(&[("id", ColumnRange::Equal(int(5)))]),
         ));
         // No shared column → can't establish disjointness.
         assert!(!column_ranges_disjoint(
-            &ranges(&[("id", ColumnRange::Equal(int(5)))]),
+            &read_ranges(&[("id", ColumnRange::Equal(int(5)))]),
             &ranges(&[("other", ColumnRange::Equal(int(1)))]),
         ));
         // One disjoint shared column is enough, even if another overlaps.
         assert!(column_ranges_disjoint(
-            &ranges(&[
+            &read_ranges(&[
                 ("id", ColumnRange::Equal(int(5))),
                 ("x", ColumnRange::Equal(int(9)))
             ]),
@@ -510,12 +525,12 @@ mod tests {
         ));
         // An empty map (no predicate) overlaps everything.
         assert!(!column_ranges_disjoint(
-            &HashMap::new(),
+            &TableRanges::default(),
             &ranges(&[("id", ColumnRange::Equal(int(5)))]),
         ));
         // An unsatisfiable (Empty) column range → disjoint from anything.
         assert!(column_ranges_disjoint(
-            &ranges(&[("id", ColumnRange::Empty)]),
+            &read_ranges(&[("id", ColumnRange::Empty)]),
             &ranges(&[("other", ColumnRange::Equal(int(5)))]),
         ));
     }

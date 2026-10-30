@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use ecow::EcoString;
@@ -160,7 +159,10 @@ fn insert_int(table: &str, col: &str, values: &[i64]) -> WriteClass {
 
 /// The read's ranges: one reference of `orders` constraining `col`.
 fn ranges(col: &str, range: ColumnRange) -> ReadRelations {
-    relation_ranges("orders", vec![HashMap::from([(col.into(), range)])])
+    relation_ranges(
+        "orders",
+        vec![ReferenceRanges::from_bare([(col.into(), range)])],
+    )
 }
 
 /// Every column the tests' reads may reference (`SELECT *` expands to the
@@ -216,8 +218,8 @@ fn relation_ranges(table: &str, references: Vec<ReferenceRanges>) -> ReadRelatio
     ReadRelations::from_relations([read_relation(table, Some(references), STAR_COLUMNS)])
 }
 
-fn id_equal(value: i64) -> HashMap<EcoString, ColumnRange> {
-    HashMap::from([(
+fn id_equal(value: i64) -> ReferenceRanges {
+    ReferenceRanges::from_bare([(
         EcoString::from("id"),
         ColumnRange::Equal(LiteralValue::Integer(value)),
     )])
@@ -448,7 +450,7 @@ fn test_insert_diverging_column_lists() {
     // Read constraining both columns: each row excluded via its own column.
     let rab = relation_ranges(
         "orders",
-        vec![HashMap::from([
+        vec![ReferenceRanges::from_bare([
             (
                 EcoString::from("a"),
                 ColumnRange::Equal(LiteralValue::Integer(5)),
@@ -662,7 +664,7 @@ fn test_delete_multi_column_equality_tuples() {
     // a = 2 excludes the first tuple, b = 10 excludes the second.
     let r = relation_ranges(
         "orders",
-        vec![HashMap::from([
+        vec![ReferenceRanges::from_bare([
             (
                 EcoString::from("a"),
                 ColumnRange::Equal(LiteralValue::Integer(2)),
@@ -683,7 +685,7 @@ fn test_delete_multi_column_equality_tuples() {
     // a = 2, b = 20 matches the second tuple exactly → forward.
     let r_hit = relation_ranges(
         "orders",
-        vec![HashMap::from([
+        vec![ReferenceRanges::from_bare([
             (
                 EcoString::from("a"),
                 ColumnRange::Equal(LiteralValue::Integer(2)),
@@ -1632,7 +1634,7 @@ fn test_intersects_every_table_reference() {
         log.decide(&q, Some(&hit)),
         RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
     );
-    let unfiltered = relation_ranges("orders", vec![id_equal(5), HashMap::new()]);
+    let unfiltered = relation_ranges("orders", vec![id_equal(5), ReferenceRanges::default()]);
     assert_eq!(
         log.decide(&q, Some(&unfiltered)),
         RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
