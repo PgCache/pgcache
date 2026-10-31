@@ -58,19 +58,6 @@ pub(super) fn cache_database_reset(settings: &Settings) -> CacheResult<()> {
             .map_into_report::<CacheError>()
             .attach_loc("creating cache database")?;
 
-        // Disable IndexOnlyScan on the cache db (PGC-100). pgcache_pgrx's
-        // tracker handles IOS correctly via a TID-based heap fetch, but that
-        // path defeats IOS's heap-skipping benefit; on the cache db's mostly-
-        // all-visible local heap, IOS isn't worth the slot-shape complexity.
-        admin_client
-            .execute(
-                &format!("ALTER DATABASE {db_name} SET enable_indexonlyscan = off"),
-                &[],
-            )
-            .await
-            .map_into_report::<CacheError>()
-            .attach_loc("disabling enable_indexonlyscan on cache database")?;
-
         // Connect to fresh cache database and create extension
         let (cache_client, cache_conn) = Config::new()
             .host(&settings.cache.host)

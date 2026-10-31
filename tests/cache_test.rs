@@ -520,6 +520,159 @@ async fn test_cache_partial_index_creation() -> Result<(), Error> {
     Ok(())
 }
 
+/// A replicated secondary index carries the table's primary key as INCLUDE
+/// columns, so an index-only scan has the row's PK to stamp (ADR-044); an
+/// index whose key already holds the PK, and a hash index, are left as they are.
+#[tokio::test]
+async fn test_cache_index_carries_primary_key_include() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE covered (id INTEGER PRIMARY KEY, email TEXT, name TEXT)",
+        &[],
+    )
+    .await?;
+    ctx.query("CREATE INDEX covered_email_idx ON covered (email)", &[])
+        .await?;
+    ctx.query(
+        "CREATE INDEX covered_id_name_idx ON covered (id, name)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "CREATE INDEX covered_email_hash ON covered USING hash (email)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO covered (id, email, name) VALUES (1, 'a@example.com', 'a'), (2, 'b@example.com', 'b')",
+        &[],
+    )
+    .await?;
+
+    let _ = ctx
+        .simple_query("SELECT * FROM covered WHERE id = 1")
+        .await?;
+    ctx.cache_settle().await?;
+
+    let cache_db = connect_cache_db(&ctx.dbs).await?;
+    let rows = cache_db
+        .query(
+            r"
+            SELECT pg_get_indexdef(ix.indexrelid) AS definition
+            FROM pg_index ix
+            JOIN pg_class t ON t.oid = ix.indrelid
+            WHERE t.relname = 'covered' AND NOT ix.indisprimary
+            ",
+            &[],
+        )
+        .await
+        .map_err(Error::other)?;
+    let defs: Vec<String> = rows.iter().map(|r| r.get("definition")).collect();
+    assert_eq!(
+        defs.len(),
+        3,
+        "three secondary indexes replicated: {defs:?}"
+    );
+
+    let find = |needle: &str| {
+        defs.iter()
+            .find(|d| d.contains(needle))
+            .unwrap_or_else(|| panic!("index with {needle} present in cache: {defs:?}"))
+    };
+    assert!(
+        find("USING btree (email)").contains("INCLUDE (id)"),
+        "secondary btree index carries the primary key: {defs:?}"
+    );
+    assert!(
+        !find("USING btree (id, name)").contains("INCLUDE"),
+        "index keyed on the primary key gets no INCLUDE: {defs:?}"
+    );
+    assert!(
+        !find("USING hash (email)").contains("INCLUDE"),
+        "hash index gets no INCLUDE: {defs:?}"
+    );
+
+    Ok(())
+}
+
+/// With the primary key carried on the index, a covered count over a cache
+/// table plans as an index-only scan on the cache database.
+#[tokio::test]
+async fn test_cache_covered_count_plans_index_only_scan() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE scanned (id INTEGER PRIMARY KEY, postid INTEGER, body TEXT)",
+        &[],
+    )
+    .await?;
+    ctx.query("CREATE INDEX scanned_postid_idx ON scanned (postid)", &[])
+        .await?;
+    ctx.query(
+        "INSERT INTO scanned (id, postid, body) SELECT i, i % 50, 'body' FROM generate_series(1, 5000) i",
+        &[],
+    )
+    .await?;
+
+    let _ = ctx
+        .simple_query("SELECT * FROM scanned WHERE id = 1")
+        .await?;
+    ctx.cache_settle().await?;
+
+    let cache_db = connect_cache_db(&ctx.dbs).await?;
+    // VACUUM refuses a transaction block, which a multi-statement simple
+    // query is; run it on its own.
+    cache_db
+        .batch_execute("VACUUM (ANALYZE) public.scanned")
+        .await
+        .map_err(Error::other)?;
+    cache_db
+        .batch_execute("SET enable_seqscan = off; SET enable_bitmapscan = off")
+        .await
+        .map_err(Error::other)?;
+    let plan: Vec<String> = cache_db
+        .query(
+            "EXPLAIN SELECT count(*) FROM public.scanned WHERE postid = 7",
+            &[],
+        )
+        .await
+        .map_err(Error::other)?
+        .iter()
+        .map(|r| r.get::<_, String>(0))
+        .collect();
+    assert!(
+        plan.iter().any(|line| line.contains("Index Only Scan")),
+        "covered count plans as an index-only scan: {plan:#?}"
+    );
+
+    // Under a live generation the tracker stamps every row; with the PK on
+    // the index tuple it does so without fetching the heap.
+    cache_db
+        .batch_execute("SET mem.query_generation = 1")
+        .await
+        .map_err(Error::other)?;
+    let analyzed: Vec<String> = cache_db
+        .query(
+            "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) \
+             SELECT count(*) FROM public.scanned WHERE postid = 7",
+            &[],
+        )
+        .await
+        .map_err(Error::other)?
+        .iter()
+        .map(|r| r.get::<_, String>(0))
+        .collect();
+    assert!(
+        analyzed
+            .iter()
+            .any(|line| line.contains("Tracker Heap Fetches: 0")),
+        "tracker stamps from the index tuple: {analyzed:#?}"
+    );
+
+    Ok(())
+}
+
 /// Test that client TLS connections work correctly with caching
 #[tokio::test]
 async fn test_client_tls() -> Result<(), Error> {
