@@ -136,12 +136,15 @@ impl MergeKey {
 /// async DB calls.
 pub(super) struct MergePlan {
     pub(super) key_columns: MergeKey,
+    /// The range stamp up to the staging table's name: the function call
+    /// with the cache table's regclass.
+    stamp_head: String,
     /// From the drain's `RETURNING` through the upsert's `FROM d`: the
     /// column list, the cache table and the DISTINCT ON key.
     drain_tail: String,
-    /// `ON CONFLICT ("p1") DO UPDATE SET "p1" = EXCLUDED."p1"` — re-stamps the
-    /// generation of pre-existing rows without overwriting data (CDC owns it)
-    /// — closing the statement with the drained row count.
+    /// `ON CONFLICT ("p1") DO NOTHING` closing the statement with the drained
+    /// row count: a pre-existing row keeps its data (CDC owns it) and its heap
+    /// tuple, since the range stamp has already lifted its generation.
     upsert_tail: String,
 }
 
@@ -168,6 +171,14 @@ impl MergePlan {
             }
             identifier_quote_into(column, &mut cols);
         }
+        let mut qualified = String::new();
+        identifier_quote_into(schema, &mut qualified);
+        qualified.push('.');
+        identifier_quote_into(name, &mut qualified);
+        let stamp_head = format!(
+            "SELECT pgcache_generation_stamp_range({}::regclass::oid, 'pgcache_stage.",
+            escape::escape_literal(&qualified)
+        );
         let mut drain_tail = String::with_capacity(cols.len() * 3 + 96);
         drain_tail.push_str(" RETURNING ");
         drain_tail.push_str(&cols);
@@ -185,16 +196,10 @@ impl MergePlan {
         let mut upsert_tail = String::with_capacity(64);
         upsert_tail.push_str(" ON CONFLICT ");
         upsert_tail.push_str(key_columns.paren());
-        upsert_tail.push_str(" DO UPDATE SET ");
-        for (i, (column, _)) in key_columns.columns.iter().enumerate() {
-            if i > 0 {
-                upsert_tail.push_str(", ");
-            }
-            let _ = write!(upsert_tail, "{column} = EXCLUDED.{column}");
-        }
-        upsert_tail.push_str(") SELECT count(*) FROM d");
+        upsert_tail.push_str(" DO NOTHING) SELECT count(*) FROM d");
         Self {
             key_columns,
+            stamp_head,
             drain_tail,
             upsert_tail,
         }
@@ -210,8 +215,19 @@ impl MergePlan {
         Self::render(schema, name, columns.iter().copied(), key_columns)
     }
 
-    /// One merge chunk: drain every staging row in heap blocks `[lo, hi)` into
-    /// the cache table and report the row count.
+    /// One merge chunk: stamp the generation on the key of every staging row
+    /// in heap blocks `[lo, hi)`, then drain them into the cache table and
+    /// report the row count.
+    ///
+    /// The stamp is a range scan of the window in the extension
+    /// (`pgcache_generation_stamp_range`, PGC-427), covering new and
+    /// pre-existing keys alike, so the upsert is `DO NOTHING`: a row the cache
+    /// table already holds is never rewritten to get the trigger to stamp it,
+    /// which kept dirtying hot pages and clearing their all-visible bits. It
+    /// runs before the drain because both statements share the string's
+    /// implicit transaction, and a scan after the `DELETE` would see its own
+    /// deletion. With no session generation set, the insert trigger returns
+    /// at once.
     ///
     /// Drains with `DELETE … RETURNING` rather than `SELECT` + a later
     /// `DROP TABLE` (PGC-293): the rows feed the upsert and the table is left
@@ -227,11 +243,10 @@ impl MergePlan {
     ///
     /// A page window is complete under any plan: the planner picks a TID range
     /// scan for it even with stale stats, and a sequential-scan fallback is a
-    /// filter over the window, slower but never skipping. `SET LOCAL` scopes
-    /// the generation stamp to the implicit transaction of this
-    /// multi-statement string, which also rolls back as a unit on error and
-    /// leaves the connection outside any transaction. Rendered into `buf`
-    /// (cleared first), the writer's reused merge scratch.
+    /// filter over the window, slower but never skipping. The multi-statement
+    /// string runs as one implicit transaction, which rolls back as a unit on
+    /// error and leaves the connection outside any transaction. Rendered into
+    /// `buf` (cleared first), the writer's reused merge scratch.
     pub(super) fn chunk_sql_into(
         &self,
         buf: &mut String,
@@ -245,9 +260,10 @@ impl MergePlan {
             hi_block,
         } = statement;
         buf.clear();
+        buf.push_str(&self.stamp_head);
         let _ = write!(
             buf,
-            "SET LOCAL mem.query_generation = {generation}; \
+            "{staging}'::regclass::oid, {generation}, {lo_block}, {hi_block}); \
              WITH d AS (DELETE FROM pgcache_stage.{staging} \
                  WHERE ctid >= '({lo_block},0)'::tid AND ctid < '({hi_block},0)'::tid"
         );
@@ -267,10 +283,12 @@ impl MergePlan {
     }
 }
 
-/// Read a chunk statement's row count.
+/// Read a chunk statement's row count: the last row of the result, since the
+/// range stamp ahead of the drain returns a row of its own.
 pub(super) fn chunk_result_parse(messages: &[SimpleQueryMessage]) -> CacheResult<u64> {
     messages
         .iter()
+        .rev()
         .find_map(|m| match m {
             SimpleQueryMessage::Row(row) => Some(row),
             SimpleQueryMessage::CommandComplete(_) | SimpleQueryMessage::RowDescription(_) | _ => {
@@ -313,11 +331,19 @@ mod tests {
     }
 
     #[test]
-    fn test_chunk_sql_drains_a_page_window_and_stamps_generation_locally() {
+    fn test_chunk_sql_stamps_the_window_before_draining_it() {
         let sql = plan().chunk_sql(statement("stage_1_0", Generation::from_raw(9), 3, 67), None);
         assert!(
-            sql.starts_with("SET LOCAL mem.query_generation = 9;"),
+            sql.starts_with(
+                "SELECT pgcache_generation_stamp_range('\"public\".\"t\"'::regclass::oid, \
+                 'pgcache_stage.stage_1_0'::regclass::oid, 9, 3, 67); \
+                 WITH d AS (DELETE FROM pgcache_stage.stage_1_0"
+            ),
             "{sql}"
+        );
+        assert!(
+            !sql.contains("mem.query_generation"),
+            "the range stamp replaces the trigger's generation: {sql}"
         );
         assert!(
             sql.contains("WHERE ctid >= '(3,0)'::tid AND ctid < '(67,0)'::tid"),
@@ -327,11 +353,10 @@ mod tests {
             !sql.contains("LIMIT"),
             "a row limit is plan-dependent: {sql}"
         );
-        assert!(sql.contains("DELETE FROM pgcache_stage.stage_1_0"), "{sql}");
         assert!(sql.contains("RETURNING \"id\",\"v\""), "{sql}");
         assert!(
-            sql.contains("INSERT INTO \"public\".\"t\" (\"id\",\"v\") SELECT DISTINCT ON (\"id\") \"id\",\"v\" FROM d ON CONFLICT"),
-            "{sql}"
+            sql.contains("INSERT INTO \"public\".\"t\" (\"id\",\"v\") SELECT DISTINCT ON (\"id\") \"id\",\"v\" FROM d ON CONFLICT (\"id\") DO NOTHING)"),
+            "a pre-existing row is stamped by the range scan, never rewritten: {sql}"
         );
         assert!(sql.ends_with("SELECT count(*) FROM d"), "{sql}");
         assert!(

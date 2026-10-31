@@ -1,10 +1,15 @@
+use rootcause::Report;
 use tokio::runtime::Builder;
-use tokio_postgres::{Config, NoTls};
+use tokio_postgres::{Client, Config, NoTls};
 use tracing::{debug, error};
 
-use crate::cache::{CacheError, CacheResult, MapIntoReport, ReportExt};
+use crate::cache::{CacheError, CacheResult, MapIntoReport, ReportExt, SetupError};
 use crate::result::error_chain_format;
 use crate::settings::Settings;
+
+/// The merge chunk's range stamp (PGC-427); a merge fails without it.
+const STAMP_RANGE_SIGNATURE: &str =
+    "pgcache_generation_stamp_range(oid, oid, bigint, integer, integer)";
 
 /// Reset the cache database by dropping and recreating it
 pub(super) fn cache_database_reset(settings: &Settings) -> CacheResult<()> {
@@ -84,6 +89,7 @@ pub(super) fn cache_database_reset(settings: &Settings) -> CacheResult<()> {
             .await
             .map_into_report::<CacheError>()
             .attach_loc("creating pgcache_pgrx extension")?;
+        extension_function_require(&cache_client, STAMP_RANGE_SIGNATURE).await?;
 
         // Dedicated schema for materialized query results. Tables here are named
         // pgcache_mv.q_<fingerprint> and are managed by the MV subsystem (population,
@@ -108,4 +114,23 @@ pub(super) fn cache_database_reset(settings: &Settings) -> CacheResult<()> {
 
         Ok(())
     })
+}
+
+/// Fail startup when the installed extension lacks a function pgcache calls.
+async fn extension_function_require(client: &Client, signature: &'static str) -> CacheResult<()> {
+    let present: bool = client
+        .query_one("SELECT to_regprocedure($1) IS NOT NULL", &[&signature])
+        .await
+        .map_into_report::<CacheError>()
+        .attach_loc("probing pgcache_pgrx for a required function")?
+        .get(0);
+    if present {
+        Ok(())
+    } else {
+        Err(Report::from(CacheError::from(
+            SetupError::ExtensionOutdated {
+                function: signature,
+            },
+        )))
+    }
 }

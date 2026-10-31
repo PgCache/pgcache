@@ -582,3 +582,83 @@ async fn test_generation_tracking_join() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// A population whose rows the cache table already holds lifts them to its
+/// generation by stamping the staging window (PGC-427), not by rewriting them:
+/// every row of the second query carries its generation and the shared table
+/// sees no updates.
+#[tokio::test]
+async fn test_merge_stamps_overlapping_rows_without_rewriting_them() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "create table overlap (id integer primary key, grp integer not null)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "insert into overlap (id, grp) \
+         select i, case when i <= 100 then 1 else 2 end from generate_series(1, 200) i",
+        &[],
+    )
+    .await?;
+    ctx.cdc_decode_settle().await?;
+
+    // Generation 1 caches rows 1..100.
+    ctx.simple_query("select id, grp from overlap where grp = 1")
+        .await?;
+    ctx.cache_settle().await?;
+    // Generation 2 caches rows 1..150: 100 of them already in the cache table.
+    ctx.simple_query("select id, grp from overlap where id <= 150")
+        .await?;
+    ctx.cache_settle().await?;
+
+    let cache_db = connect_cache_db(&ctx.dbs).await?;
+    let lifted: i64 = cache_db
+        .query_one(
+            "SELECT count(*) FROM overlap t \
+             JOIN pgcache_generation_dump() d \
+               ON d.table_oid = 'overlap'::regclass \
+              AND d.pk_hash = pgcache_pk_hash(d.table_oid, t.ctid) \
+              AND d.generation = 2 \
+             WHERE t.id <= 150",
+            &[],
+        )
+        .await
+        .map_err(Error::other)?
+        .get(0);
+    assert_eq!(
+        lifted, 150,
+        "the overlapping rows and the new rows all carry generation 2"
+    );
+
+    // Table stats flush lazily (up to the idle-stats timeout), so wait for the
+    // two merges' inserts to show before reading the update count.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let row = cache_db
+            .query_one(
+                "SELECT n_tup_ins, n_tup_upd FROM pg_stat_user_tables \
+                 WHERE relname = 'overlap' AND schemaname = 'public'",
+                &[],
+            )
+            .await
+            .map_err(Error::other)?;
+        let inserted: i64 = row.get(0);
+        let updated: i64 = row.get(1);
+        if inserted >= 150 {
+            assert_eq!(
+                updated, 0,
+                "a merge over rows the cache table already holds must not rewrite them"
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cache table stats never showed the merged inserts ({inserted})"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    Ok(())
+}

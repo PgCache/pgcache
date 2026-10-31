@@ -4,8 +4,9 @@
 //! population silently failed with the cache entry stuck at `Loading`.
 //!
 //! Covers three code paths that generate upsert SQL:
-//!   1. `insert_statement_build` in writer/population.rs (initial population) —
-//!      emits `DO UPDATE SET <pk> = <pk>` to fire the tracking trigger.
+//!   1. the merge chunk in writer/merge_queue/sql.rs (initial population) —
+//!      emits `DO NOTHING`; the generation is stamped by the range scan of
+//!      the staging window ahead of the drain (PGC-427).
 //!   2. `handle_pg_eval_cdc_sql` in writer/cdc.rs (CDC PG-eval upsert) —
 //!      emits `DO NOTHING` (no non-PK values to apply).
 //!   3. `cache_upsert_unconditional_sql` in writer/cdc.rs (CDC LocalEval fast
@@ -70,10 +71,11 @@ async fn test_pk_only_table_caching() -> Result<(), Error> {
 
 /// Generation-tracker regression: population must link pre-existing cache rows
 /// (inserted via CDC before the query was cached) to the new query's
-/// generation. Before the `DO UPDATE SET <pk> = <pk>` change, population's
-/// `DO NOTHING` on conflict skipped the tracking trigger for PK-only tables,
-/// leaving those rows unlinked from any generation and subject to premature
-/// purge.
+/// generation. Originally population's `DO NOTHING` on conflict skipped the
+/// tracking trigger for PK-only tables, leaving those rows unlinked from any
+/// generation and subject to premature purge; the merge now stamps every key
+/// in the staging window before the drain, so the conflict arm no longer
+/// carries the stamp at all.
 #[tokio::test]
 async fn test_pk_only_population_stamps_generation() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;

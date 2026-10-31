@@ -156,6 +156,12 @@ error_set! {
     SetupError := {
         #[display("Cache-hit latency histogram could not be created")]
         LatencyHistogram,
+        /// The installed `pgcache_pgrx` predates a function the writer calls
+        /// on every merge chunk; refusing at startup beats failing every merge.
+        #[display("installed pgcache_pgrx extension lacks {function}; rebuild and install the extension")]
+        ExtensionOutdated {
+            function: &'static str,
+        },
     }
 
 
