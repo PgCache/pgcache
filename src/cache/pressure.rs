@@ -42,6 +42,7 @@ impl CpuPressure {
 /// Parse a PSI file's `some` line — `some avg10=1.23 avg60=0.45 avg300=…
 /// total=…`, percentages — into fractions. `None` without a complete `some`
 /// line.
+#[cfg(any(target_os = "linux", feature = "fault-injection", test))]
 pub(crate) fn psi_cpu_parse(text: &str) -> Option<CpuPressure> {
     let line = text.lines().find_map(|l| l.strip_prefix("some "))?;
     let field = |key: &str| -> Option<f64> {
