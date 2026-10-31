@@ -3,7 +3,8 @@
 use std::io::Error;
 
 use crate::util::{
-    TestContext, assert_limit_order_decides, http_get, origin_change_invalidates, query_warm,
+    TestContext, assert_cache_hit, assert_limit_order_decides, http_get, origin_change_invalidates,
+    query_warm,
 };
 
 mod util;
@@ -40,8 +41,13 @@ const QUERY: &str = "SELECT b.id, b.v, a.k FROM jb b JOIN ja a ON a.id = b.a_id 
 
 /// The `jb` ids of `QUERY`'s result, best first, from the setup's formulas.
 fn top_ids() -> Vec<i32> {
+    top_ids_where(|id| (id % 50 + 1) % 5 == 1)
+}
+
+/// The `jb` ids of a top-3 by `v DESC` over the rows `keep` admits.
+fn top_ids_where(keep: impl Fn(i32) -> bool) -> Vec<i32> {
     let mut rows: Vec<(i32, i32)> = (1..=ROWS_B)
-        .filter(|id| (id % 50 + 1) % 5 == 1)
+        .filter(|id| keep(*id))
         .map(|id| (id * 37 % 400, id))
         .collect();
     rows.sort_by(|a, b| b.cmp(a));
@@ -165,5 +171,35 @@ async fn test_outer_join_populates_whole() -> Result<(), Error> {
         rows > 6,
         "an outer join's population loaded only {rows} rows"
     );
+    Ok(())
+}
+
+/// Two capped joins filter the same table on different partners. A DELETE
+/// of a row the second holds invalidates the second alone: the recovered
+/// image fails the first's filter, so the row never sat in its window.
+#[tokio::test]
+async fn test_capped_join_delete_spares_other_predicate() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup(&mut ctx).await?;
+
+    let query_7 = "SELECT b.id, b.v, a.k FROM jb b JOIN ja a ON a.id = b.a_id \
+                   WHERE b.a_id = 7 ORDER BY b.v DESC LIMIT 3";
+    let query_8 = "SELECT b.id, b.v, a.k FROM jb b JOIN ja a ON a.id = b.a_id \
+                   WHERE b.a_id = 8 ORDER BY b.v DESC LIMIT 3";
+    query_warm(&mut ctx, query_7).await?;
+    let m = query_warm(&mut ctx, query_8).await?;
+
+    let top_8 = top_ids_where(|id| id % 50 + 1 == 8)[0];
+    origin_change_invalidates(
+        &mut ctx,
+        m,
+        &format!("DELETE FROM jb WHERE id = {top_8}"),
+        query_8,
+    )
+    .await?;
+
+    let m = ctx.metrics().await?;
+    ctx.simple_query(query_7).await?;
+    assert_cache_hit(&mut ctx, m).await?;
     Ok(())
 }

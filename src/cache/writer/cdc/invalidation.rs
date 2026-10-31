@@ -211,9 +211,14 @@ fn from_clause_uncached_invalidates(
     // (the only join type that gets FromClause source), removing a row can
     // only shrink the result set — except that a limited query's cached result
     // may now have fewer rows than the LIMIT window, so invalidate to
-    // repopulate.
+    // repopulate. The window holds only rows meeting the query's filters, so a
+    // recovered image that fails them, or a row no cache table held, leaves
+    // the window whole (ADR-060).
     if event.operation == CdcOperation::Delete {
-        return update_query.has_limit;
+        return update_query.has_limit
+            && event.delete_image.is_none_or(|image| {
+                delete_filters_match(&update_query.predicates.filters, table_metadata, image)
+            });
     }
     // Single-table queries don't need invalidation for uncached rows.
     !update_query.is_single_table && row_relevant(update_query, table_metadata, event)

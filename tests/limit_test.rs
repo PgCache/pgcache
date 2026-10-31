@@ -2,7 +2,8 @@ use std::io::Error;
 
 use crate::util::{
     TestContext, assert_cache_hit, assert_cache_miss, assert_limit_order_decides,
-    assert_proxy_rows_match_origin, assert_row_at, origin_change_invalidates, query_warm,
+    assert_proxy_rows_match_origin, assert_row_at, origin_change_applied_in_place,
+    origin_change_invalidates, query_warm,
 };
 
 mod util;
@@ -1179,4 +1180,71 @@ async fn test_limit_filtered_subquery_delete_invalidates() -> Result<(), Error> 
                  ORDER BY id LIMIT 2";
     let m = query_warm(&mut ctx, query).await?;
     origin_change_invalidates(&mut ctx, m, "DELETE FROM pf WHERE id = 1", query).await
+}
+
+/// Two owners' capped pages share a table. A DELETE of an owner-20 row
+/// that owner 20's page holds invalidates that page alone: the recovered
+/// image fails owner 10's filter, so the row never sat in owner 10's window.
+#[tokio::test]
+async fn test_limit_cdc_delete_spares_other_predicate() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE posts (id INTEGER PRIMARY KEY, owner INTEGER, score INTEGER)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO posts (id, owner, score) VALUES \
+         (3, 10, 30), (2, 10, 40), (1, 10, 50), \
+         (6, 20, 30), (5, 20, 40), (4, 20, 50)",
+        &[],
+    )
+    .await?;
+
+    let query_a = "SELECT id, score FROM posts WHERE owner = 10 ORDER BY score DESC LIMIT 2";
+    let query_b = "SELECT id, score FROM posts WHERE owner = 20 ORDER BY score DESC LIMIT 2";
+    assert_limit_order_decides(&ctx, query_a).await?;
+    assert_limit_order_decides(&ctx, query_b).await?;
+
+    query_warm(&mut ctx, query_a).await?;
+    let m = query_warm(&mut ctx, query_b).await?;
+
+    origin_change_invalidates(&mut ctx, m, "DELETE FROM posts WHERE id = 4", query_b).await?;
+
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(query_a).await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("score", "50")])?;
+    assert_row_at(&res, 2, &[("id", "2"), ("score", "40")])?;
+    assert_cache_hit(&mut ctx, m).await?;
+    Ok(())
+}
+
+/// A DELETE of a row no cache table holds can't have taken a row out of any
+/// window: the capped population loaded the top two only, so the third row
+/// of the owner leaves without a repopulation.
+#[tokio::test]
+async fn test_limit_cdc_delete_of_uncached_row_keeps_cache() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE posts (id INTEGER PRIMARY KEY, owner INTEGER, score INTEGER)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO posts (id, owner, score) VALUES \
+         (3, 10, 30), (2, 10, 40), (1, 10, 50), (4, 20, 50)",
+        &[],
+    )
+    .await?;
+
+    let query = "SELECT id, score FROM posts WHERE owner = 10 ORDER BY score DESC LIMIT 2";
+    assert_limit_order_decides(&ctx, query).await?;
+
+    let m = query_warm(&mut ctx, query).await?;
+    let m = origin_change_applied_in_place(&mut ctx, m, "DELETE FROM posts WHERE id = 3", query)
+        .await?;
+    origin_change_applied_in_place(&mut ctx, m, "DELETE FROM posts WHERE id = 4", query).await?;
+    Ok(())
 }

@@ -43,7 +43,7 @@ Nothing said what a capped population must load. Two wrong-result bugs followed:
   * a WHERE column changed (PGC-94);
   * or the sort key moved in a way that isn't provably a promotion. The check knows sort direction (PGC-334), and an expression sort key stays conservative.
 * A row that fails the query's WHERE can't enter its window, so it never invalidates (PGC-336).
-* A DELETE invalidates every capped query on the relation (ADR-045).
+* A DELETE invalidates a capped query when the deleted row may have met its filters: the image the old-image ladder recovered (ADR-045) is checked against them, a row no cache table held met none, and nothing recovered counts as met. A row that fails the filters never sat in the window.
 * A relevant change to a capped query's subquery table invalidates it, including a shrink. An `IN` set losing a row, or a `NOT IN` set gaining one, can vacate a top-N row whose replacement was never loaded (PGC-527).
 
 **Subsumption.** A capped query is never a subsumption parent (ADR-024): it doesn't hold every row its filters describe.
@@ -68,7 +68,7 @@ Nothing said what a capped population must load. Two wrong-result bugs followed:
 * One cached entry serves every LIMIT and OFFSET within its cap.
 
 ### Negative
-* Demotions, predicate-column changes and deletes invalidate the query.
+* Demotions, predicate-column changes and deletes of rows that may have met the filters invalidate the query, including a delete of a matching row below the window: the image doesn't place the row against the boundary.
 * Ties at the window boundary may resolve to different rows in origin and cache, which SQL permits.
 * Subquery reads, a root whose FROM is a derived table or CTE, and outer joins load whole even under a cap.
 * A capped join issues the join once per table it reads.
