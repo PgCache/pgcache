@@ -22,6 +22,8 @@ error_set! {
         MultipleStatements,
         #[display("Missing statement")]
         MissingStatement,
+        #[display("Parse error: {message}")]
+        ParseError { message: String },
         #[display("Unsupported SELECT feature: {feature}")]
         UnsupportedSelectFeature { feature: String },
         #[display("Unsupported feature: {feature}")]
@@ -63,9 +65,11 @@ error_set! {
 }
 
 // Re-export everything public from submodules
+pub use convert_tree::{
+    RawStatement, index_tree_convert_raw, query_tree_convert_raw, statement_convert_raw,
+};
 #[cfg(any(test, feature = "proxy"))]
-pub(crate) use convert_tree::query_tree_parse;
-pub use convert_tree::{RawStatement, query_tree_convert_raw, statement_convert_raw};
+pub(crate) use convert_tree::{index_tree_parse, query_tree_parse};
 pub(crate) use deparse::separated_deparse;
 pub use deparse::{Clause, Deparse};
 pub use fingerprint::*;

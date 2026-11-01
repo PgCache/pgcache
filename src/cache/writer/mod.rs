@@ -1,3 +1,4 @@
+mod cache_index;
 mod cdc;
 mod core;
 mod deadlock;

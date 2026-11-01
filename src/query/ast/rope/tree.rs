@@ -6,7 +6,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use super::node::{Node, NodeKind};
-use super::view::{NodeRef, Query};
+use super::view::{NodeRef, Query, Statement, View};
 use crate::query::ast::NodeId;
 
 /// Tables up to this many chunks are scanned; longer ones are searched.
@@ -146,8 +146,15 @@ impl QueryTree {
         self.node_in(0, position(id))
     }
 
+    /// The root as a query: every tree the SELECT converter builds. A tree
+    /// of another statement is read through [`QueryTree::statement`].
     pub fn root(&self) -> Query<'_> {
         Query(NodeRef::root(self))
+    }
+
+    /// The root by statement kind.
+    pub fn statement(&self) -> Statement<'_> {
+        Statement::from_ref(NodeRef::root(self))
     }
 
     /// Every node in position order.

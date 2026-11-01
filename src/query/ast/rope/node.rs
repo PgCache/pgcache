@@ -182,6 +182,36 @@ pub enum NodeKind {
     When,
     /// One entry of a name list: an alias column, a USING column.
     Name(EcoString),
+    /// Children: the `Table`, `key_count` × `IndexKey`, `include_count` ×
+    /// `Name`, `option_count` × `IndexOption`, then the `Where` predicate
+    /// when flagged.
+    CreateIndex {
+        name: Option<EcoString>,
+        method: EcoString,
+        unique: bool,
+        only: bool,
+        nulls_not_distinct: bool,
+        key_count: u32,
+        include_count: u32,
+        option_count: u32,
+        has_where: bool,
+    },
+    /// Children: the key as a scalar (a `Column` for a plain column), then
+    /// `collation_count` × `Name`, `opclass_count` × `Name` (qualified names
+    /// as name lists), `opclass_option_count` × `IndexOption`.
+    IndexKey {
+        direction: OrderDirection,
+        null_order: NullOrder,
+        collation_count: u32,
+        opclass_count: u32,
+        opclass_option_count: u32,
+    },
+    /// A `name = value` entry of a WITH or opclass option list. Child: the
+    /// value `Literal` when flagged.
+    IndexOption {
+        name: EcoString,
+        has_value: bool,
+    },
 }
 
 /// A join's qualification, with the USING column count; the columns are
@@ -293,6 +323,20 @@ impl NodeKind {
                 has_default,
             } => flag(*has_arg) + when_count + flag(*has_default),
             NodeKind::When => 2,
+            NodeKind::CreateIndex {
+                key_count,
+                include_count,
+                option_count,
+                has_where,
+                ..
+            } => 1 + key_count + include_count + option_count + flag(*has_where),
+            NodeKind::IndexKey {
+                collation_count,
+                opclass_count,
+                opclass_option_count,
+                ..
+            } => 1 + collation_count + opclass_count + opclass_option_count,
+            NodeKind::IndexOption { has_value, .. } => flag(*has_value),
         }
     }
 

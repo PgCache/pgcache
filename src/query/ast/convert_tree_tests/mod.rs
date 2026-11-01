@@ -6,6 +6,7 @@
 
 mod clauses;
 mod expressions;
+mod index;
 mod render;
 mod subqueries;
 mod tables;

@@ -6,6 +6,7 @@
 #![allow(clippy::wildcard_enum_match_arm)]
 
 mod expr;
+mod index;
 mod query;
 mod source;
 
@@ -14,6 +15,7 @@ use std::marker::PhantomData;
 use ecow::EcoString;
 
 pub use expr::{Conjuncts, FrameBound, ScalarKind, WhereKind};
+pub use index::Statement;
 pub use query::{Body, DirectTables, SelectItem};
 pub use source::{JoinQual, Source};
 
@@ -277,3 +279,6 @@ view!(When);
 view!(Name);
 view!(Where);
 view!(Scalar);
+view!(CreateIndex);
+view!(IndexKey);
+view!(IndexOption);

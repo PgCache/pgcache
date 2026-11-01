@@ -31,6 +31,7 @@ use crate::query::write::{
 };
 
 mod from;
+mod index;
 mod scalar;
 mod select;
 mod where_clause;
@@ -52,6 +53,34 @@ pub unsafe fn query_tree_convert_raw(
         let stmt = root_statement(tree_root)?;
         match node_tag(stmt) {
             pg::NodeTag_T_SelectStmt => select_root_convert(cast::<pg::SelectStmt>(stmt), sql_len),
+            other => Err(AstError::UnsupportedStatement {
+                statement_type: node_tag_name(other).into_owned(),
+            }),
+        }
+    }
+}
+
+/// Convert the root of a raw parse tree holding one `IndexStmt` into a
+/// [`QueryTree`] rooted at `CreateIndex`: the writer's path for an origin
+/// index definition (PGC-575). Every other statement is rejected, so a
+/// SELECT never reaches this entry and an index never reaches
+/// [`query_tree_convert_raw`].
+///
+/// # Safety
+/// `tree_root` must be the live `List *` handed to the `parse_raw_scoped`
+/// callback, valid for the duration of this call.
+pub unsafe fn index_tree_convert_raw(
+    tree_root: *const c_void,
+    sql_len: usize,
+) -> Result<QueryTree, AstError> {
+    unsafe {
+        let stmt = root_statement(tree_root)?;
+        match node_tag(stmt) {
+            pg::NodeTag_T_IndexStmt => {
+                let mut builder = TreeBuilder::with_capacity(sql_len / 4 + 8);
+                index::index_emit(&mut builder, cast::<pg::IndexStmt>(stmt))?;
+                Ok(builder.finish().0)
+            }
             other => Err(AstError::UnsupportedStatement {
                 statement_type: node_tag_name(other).into_owned(),
             }),
@@ -327,6 +356,21 @@ pub(crate) fn query_tree_parse(sql: &str) -> Result<QueryTree, AstError> {
         query_tree_convert_raw(tree, sql.len())
     })
     .expect("parse SQL")
+}
+
+/// Parse a `CREATE INDEX` statement straight to the rope. A statement that
+/// does not parse is an error, not a panic: the writer feeds it origin
+/// catalog text and falls back on failure.
+#[cfg(any(test, feature = "proxy"))]
+pub(crate) fn index_tree_parse(sql: &str) -> Result<QueryTree, AstError> {
+    pg_query::parse_raw_scoped(sql, |tree| unsafe {
+        index_tree_convert_raw(tree, sql.len())
+    })
+    .unwrap_or_else(|e| {
+        Err(AstError::ParseError {
+            message: e.to_string(),
+        })
+    })
 }
 
 #[cfg(test)]

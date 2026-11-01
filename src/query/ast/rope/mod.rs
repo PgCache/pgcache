@@ -18,9 +18,9 @@ pub use deparse::{DeparseContext, Plain};
 pub use node::{FrameBoundKind, JoinQualKind, Node, NodeKind};
 pub use tree::QueryTree;
 pub use view::{
-    Arithmetic, Array, Binary, Body, Case, Children, Column, Conjuncts, Cte, CteRef, DirectTables,
-    Frame, FrameBound, Function, Join, JoinQual, Literal, Multi, Name, NodeRef, OrderBy, Query,
-    Run, Scalar, ScalarKind, ScalarSubquery, Select, SelectExpr, SelectItem, SetOp, Source, Star,
-    Subquery, Subtree, Table, TypeCast, Unary, Values, ValuesRow, View, When, Where, WhereKind,
-    WhereSubquery, Window,
+    Arithmetic, Array, Binary, Body, Case, Children, Column, Conjuncts, CreateIndex, Cte, CteRef,
+    DirectTables, Frame, FrameBound, Function, IndexKey, IndexOption, Join, JoinQual, Literal,
+    Multi, Name, NodeRef, OrderBy, Query, Run, Scalar, ScalarKind, ScalarSubquery, Select,
+    SelectExpr, SelectItem, SetOp, Source, Star, Statement, Subquery, Subtree, Table, TypeCast,
+    Unary, Values, ValuesRow, View, When, Where, WhereKind, WhereSubquery, Window,
 };

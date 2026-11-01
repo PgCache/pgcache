@@ -86,7 +86,10 @@ fn ast_error_forward_reason(ast_error: &AstError) -> ForwardReason {
             debug!(%ast_error, "forwarding query: AST conversion failed");
             ForwardReason::UncacheableSelect
         }
-        AstError::MultipleStatements | AstError::MissingStatement | AstError::InvalidTableRef => {
+        AstError::MultipleStatements
+        | AstError::MissingStatement
+        | AstError::ParseError { .. }
+        | AstError::InvalidTableRef => {
             debug!(%ast_error, "forwarding query: invalid");
             ForwardReason::Invalid
         }

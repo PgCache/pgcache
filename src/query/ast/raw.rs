@@ -50,6 +50,9 @@ pub(crate) fn node_tag_name(tag: NodeTag) -> Cow<'static, str> {
         pg::NodeTag_T_ExecuteStmt => "EXECUTE",
         pg::NodeTag_T_DeclareCursorStmt => "DECLARE CURSOR",
         pg::NodeTag_T_CreateTableAsStmt => "CREATE TABLE AS",
+        pg::NodeTag_T_IndexStmt => "CREATE INDEX",
+        pg::NodeTag_T_IndexElem => "index column",
+        pg::NodeTag_T_DefElem => "option",
         // FROM-side
         pg::NodeTag_T_RangeVar => "table reference",
         pg::NodeTag_T_RangeSubselect => "subquery in FROM",

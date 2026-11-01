@@ -7,8 +7,8 @@ use std::mem::size_of;
 use super::build::{Remap, Replacement, Replacements, TreeBuilder};
 use super::node::{Node, NodeKind};
 use super::tree::QueryTree;
-use super::view::{Body, View};
-use crate::query::ast::{LiteralValue, NodeId, query_tree_parse};
+use super::view::{Body, Statement, View};
+use crate::query::ast::{LiteralValue, NodeId, index_tree_parse, query_tree_parse};
 
 /// One query per node kind and child layout the converter produces.
 pub(crate) const CORPUS: &[&str] = &[
@@ -46,8 +46,44 @@ pub(crate) const CORPUS: &[&str] = &[
     "SELECT a FROM t WHERE a = ANY (ARRAY[1, 2]) AND b <> ALL (ARRAY[3, 4])",
 ];
 
+/// One CREATE INDEX per clause the converter handles, as `pg_get_indexdef`
+/// writes them.
+pub(crate) const INDEX_CORPUS: &[&str] = &[
+    "CREATE INDEX t_a_idx ON public.t USING btree (a)",
+    "CREATE UNIQUE INDEX t_ab_idx ON public.t USING btree (a DESC, b NULLS FIRST, c DESC NULLS LAST)",
+    "CREATE INDEX t_lower_idx ON public.t USING btree (lower((name)::text), (a + b), coalesce(c, 0))",
+    "CREATE INDEX t_coll_idx ON public.t USING btree (name COLLATE \"C\" text_pattern_ops, b pg_catalog.int4_ops)",
+    "CREATE INDEX t_opts_idx ON public.t USING gist (geom gist_geometry_ops_2d (buffering = 'on'))",
+    "CREATE INDEX t_inc_idx ON public.t USING btree (a) INCLUDE (b, c)",
+    "CREATE UNIQUE INDEX t_nnd_idx ON public.t USING btree (a) NULLS NOT DISTINCT WITH (fillfactor = '90', deduplicate_items = 'off')",
+    "CREATE INDEX t_part_idx ON public.t USING btree (a) WHERE (a IS NOT NULL) AND (b > 1)",
+    "CREATE INDEX t_only_idx ON ONLY public.t USING btree (a)",
+    "CREATE INDEX \"Mixed_idx\" ON public.\"Mixed\" USING hash (\"Col\")",
+    "CREATE INDEX t_bare_idx ON t USING brin (a)",
+];
+
+/// The plain rendering of each index corpus statement.
+#[rustfmt::skip]
+const INDEX_PLAIN_EXPECTED: &[&str] = &[
+    "CREATE INDEX t_a_idx ON public.t USING btree (a)",
+    "CREATE UNIQUE INDEX t_ab_idx ON public.t USING btree (a DESC, b NULLS FIRST, c DESC NULLS LAST)",
+    "CREATE INDEX t_lower_idx ON public.t USING btree (LOWER((name)::text), ((a + b)), COALESCE(c, 0))",
+    "CREATE INDEX t_coll_idx ON public.t USING btree (name COLLATE \"C\" text_pattern_ops, b pg_catalog.int4_ops)",
+    "CREATE INDEX t_opts_idx ON public.t USING gist (geom gist_geometry_ops_2d (buffering = 'on'))",
+    "CREATE INDEX t_inc_idx ON public.t USING btree (a) INCLUDE (b, c)",
+    "CREATE UNIQUE INDEX t_nnd_idx ON public.t USING btree (a) NULLS NOT DISTINCT WITH (fillfactor = '90', deduplicate_items = 'off')",
+    "CREATE INDEX t_part_idx ON public.t USING btree (a) WHERE a IS NOT NULL AND b > 1",
+    "CREATE INDEX t_only_idx ON ONLY public.t USING btree (a)",
+    "CREATE INDEX \"Mixed_idx\" ON public.\"Mixed\" USING hash (\"Col\")",
+    "CREATE INDEX t_bare_idx ON t USING brin (a)",
+];
+
 fn tree(sql: &str) -> QueryTree {
     query_tree_parse(sql).expect("parse query")
+}
+
+fn index_tree(sql: &str) -> QueryTree {
+    index_tree_parse(sql).unwrap_or_else(|e| panic!("{sql}: {e}"))
 }
 
 fn session_hash(tree: &QueryTree) -> u64 {
@@ -150,6 +186,48 @@ fn test_plain_rendering_expectations() {
             "{text}: the rendering parses back to the tree"
         );
     }
+}
+
+#[test]
+fn test_index_plain_rendering_expectations() {
+    assert_eq!(INDEX_CORPUS.len(), INDEX_PLAIN_EXPECTED.len());
+    for (text, expected) in INDEX_CORPUS.iter().zip(INDEX_PLAIN_EXPECTED) {
+        let parsed = index_tree(text);
+        assert_eq!(parsed.chunk_count(), 1, "{text}");
+        assert_eq!(
+            lens(&parsed)[0],
+            parsed.len(),
+            "{text}: the root spans the tree"
+        );
+        assert_eq!(parsed.sql(), *expected, "{text}");
+        assert_eq!(
+            index_tree(expected),
+            parsed,
+            "{text}: the rendering parses back to the tree"
+        );
+    }
+}
+
+#[test]
+fn test_index_positions_follow_pre_order_lengths() {
+    let tree = index_tree(
+        "CREATE UNIQUE INDEX posts_slug ON public.posts USING btree \
+         (lower(slug) COLLATE \"C\" text_pattern_ops DESC NULLS LAST) \
+         INCLUDE (id) WITH (fillfactor = '90') WHERE deleted_at IS NULL",
+    );
+    // CreateIndex, Table, IndexKey, Function, Column, Name, Name, Name, IndexOption, Literal, Unary, Column
+    assert_eq!(lens(&tree), vec![12, 1, 5, 2, 1, 1, 1, 1, 2, 1, 2, 1]);
+    let Statement::CreateIndex(index) = tree.statement() else {
+        panic!("a CREATE INDEX root");
+    };
+    assert_eq!(index.table().id().index(), 1);
+    let keys: Vec<_> = index.keys().map(|key| key.id().index()).collect();
+    assert_eq!(keys, vec![2]);
+    let includes: Vec<_> = index.includes().map(|name| name.id().index()).collect();
+    assert_eq!(includes, vec![7]);
+    let options: Vec<_> = index.options().map(|option| option.id().index()).collect();
+    assert_eq!(options, vec![8]);
+    assert_eq!(index.predicate().expect("predicate").id().index(), 10);
 }
 
 #[test]

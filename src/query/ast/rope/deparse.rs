@@ -8,12 +8,13 @@ use ecow::EcoString;
 
 use super::tree::QueryTree;
 use super::view::{
-    Binary, Body, Case, Column, Conjuncts, Cte, CteRef, Frame, FrameBound, Function, Join,
-    JoinQual, Multi, OrderBy, Query, Run, Scalar, ScalarKind, Select, SelectItem, Source, Star,
-    Subquery, Table, Unary, Values, Where, WhereKind, Window,
+    Binary, Body, Case, Column, Conjuncts, CreateIndex, Cte, CteRef, Frame, FrameBound, Function,
+    IndexKey, IndexOption, Join, JoinQual, Multi, OrderBy, Query, Run, Scalar, ScalarKind, Select,
+    SelectItem, Source, Star, Statement, Subquery, Table, Unary, Values, Where, WhereKind, Window,
 };
 use crate::query::ast::{
-    BinaryOp, Clause, CteMaterialization, Deparse, LiteralValue, MultiOp, SubLinkType, UnaryOp,
+    BinaryOp, Clause, CteMaterialization, Deparse, LiteralValue, MultiOp, OrderDirection,
+    SubLinkType, UnaryOp,
 };
 use crate::query::cast::cast_target_deparse;
 
@@ -79,7 +80,10 @@ impl DeparseContext for Plain {}
 impl QueryTree {
     /// The tree as written, appended to `buf`.
     pub fn deparse_into(&self, buf: &mut String) {
-        query_deparse_with(self.root(), &mut Plain, buf);
+        match self.statement() {
+            Statement::Query(query) => query_deparse_with(query, &mut Plain, buf),
+            Statement::CreateIndex(index) => create_index_deparse_with(index, &mut Plain, buf),
+        }
     }
 
     pub fn sql(&self) -> String {
@@ -162,6 +166,121 @@ pub fn function_name_plain_deparse(function: Function<'_>, buf: &mut String) {
         buf.push('.');
     }
     buf.push_str(&function.name().to_uppercase());
+}
+
+// --- CREATE INDEX ----------------------------------------------------------
+
+/// `CREATE [UNIQUE] INDEX [name] ON [ONLY] table USING method (keys)
+/// [INCLUDE (...)] [NULLS NOT DISTINCT] [WITH (...)] [WHERE ...]`.
+pub fn create_index_deparse_with<C: DeparseContext>(
+    index: CreateIndex<'_>,
+    cx: &mut C,
+    buf: &mut String,
+) {
+    buf.push_str("CREATE ");
+    if index.unique() {
+        buf.push_str("UNIQUE ");
+    }
+    buf.push_str("INDEX ");
+    if let Some(name) = index.name() {
+        name.deparse(buf);
+        buf.push(' ');
+    }
+    buf.push_str("ON ");
+    if index.only() {
+        buf.push_str("ONLY ");
+    }
+    let table = index.table();
+    if let Some(schema) = table.schema() {
+        schema.deparse(buf);
+        buf.push('.');
+    }
+    table.name().deparse(buf);
+    buf.push_str(" USING ");
+    buf.push_str(index.method());
+    buf.push_str(" (");
+    let mut sep = "";
+    for key in index.keys() {
+        buf.push_str(sep);
+        index_key_deparse_with(key, cx, buf);
+        sep = ", ";
+    }
+    buf.push(')');
+    let includes = index.includes();
+    if includes.len() > 0 {
+        buf.push_str(" INCLUDE (");
+        names_deparse(includes, ", ", buf);
+        buf.push(')');
+    }
+    if index.nulls_not_distinct() {
+        buf.push_str(" NULLS NOT DISTINCT");
+    }
+    let options = index.options();
+    if options.len() > 0 {
+        buf.push_str(" WITH (");
+        index_options_deparse_with(options, cx, buf);
+        buf.push(')');
+    }
+    if let Some(predicate) = index.predicate() {
+        cx.clause_enter(Clause::Where);
+        buf.push_str(" WHERE ");
+        where_deparse_with(predicate, cx, buf);
+        cx.clause_leave(Clause::Where);
+    }
+}
+
+/// A key: a column or function call bare, any other expression
+/// parenthesised as the grammar requires, then collation, opclass with its
+/// options, `DESC` (ASC is the default and stays implicit) and NULLS order.
+fn index_key_deparse_with<C: DeparseContext>(key: IndexKey<'_>, cx: &mut C, buf: &mut String) {
+    let expr = key.expr();
+    match expr.kind() {
+        ScalarKind::Column(_) | ScalarKind::Function(_) => scalar_deparse_with(expr, cx, buf),
+        _ => {
+            buf.push('(');
+            scalar_deparse_with(expr, cx, buf);
+            buf.push(')');
+        }
+    }
+    let collation = key.collation();
+    if collation.len() > 0 {
+        buf.push_str(" COLLATE ");
+        names_deparse(collation, ".", buf);
+    }
+    let opclass = key.opclass();
+    if opclass.len() > 0 {
+        buf.push(' ');
+        names_deparse(opclass, ".", buf);
+        let options = key.opclass_options();
+        if options.len() > 0 {
+            buf.push_str(" (");
+            index_options_deparse_with(options, cx, buf);
+            buf.push(')');
+        }
+    }
+    match key.direction() {
+        OrderDirection::Asc => {}
+        OrderDirection::Desc => buf.push_str(" DESC"),
+    }
+    key.null_order().deparse(buf);
+}
+
+/// `name = value, ...`; a bare `name` when the option has no value.
+fn index_options_deparse_with<C: DeparseContext>(
+    options: Run<'_, IndexOption<'_>>,
+    cx: &mut C,
+    buf: &mut String,
+) {
+    let mut sep = "";
+    for option in options {
+        buf.push_str(sep);
+        option.name().deparse(buf);
+        if let Some(value) = option.value() {
+            buf.push_str(" = ");
+            cx.literal_deparse(value.value(), buf);
+        }
+        sep = ", ";
+    }
 }
 
 // --- the walk --------------------------------------------------------------

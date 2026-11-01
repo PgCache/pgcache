@@ -2,14 +2,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use ecow::EcoString;
-use pg_query::protobuf::node::Node as NodeEnum;
-use pg_query::protobuf::{IndexElem, Node, RangeVar, SortByDir, SortByNulls};
 use postgres_protocol::escape;
 use rootcause::Report;
 use tokio_postgres::Row;
 use tokio_postgres::types::{ToSql, Type};
 use tracing::{debug, error, info, instrument, warn};
 
+use super::cache_index::index_sql_retarget;
 use super::core::WriterCore;
 use crate::cache::messages::PartitionCreated;
 use crate::cache::types::WriteTargetMap;
@@ -756,111 +755,6 @@ fn table_tree_holds(table: &TableMetadata, relation_oid: Oid) -> bool {
     table.relation_oid == relation_oid || table.partitions.contains(&relation_oid)
 }
 
-/// Rebuild a canonical `pg_get_indexdef` statement against the cache table,
-/// carrying the primary key as INCLUDE columns: the generation stamp is keyed
-/// on the PK (ADR-044), so an index-only scan can stamp from the index tuple
-/// only when the tuple holds it. Falls back to the plain text retarget when
-/// the definition doesn't parse, so the index is still created.
-fn index_sql_retarget(
-    definition: &str,
-    is_unique: bool,
-    schema: &str,
-    table: &str,
-    primary_key: &[EcoString],
-) -> Option<String> {
-    index_sql_rebuild(definition, schema, table, primary_key)
-        .or_else(|| index_sql_retarget_plain(definition, is_unique, schema, table))
-}
-
-/// Access methods that accept INCLUDE columns. The others (hash, gin, brin)
-/// can't return index tuples for an index-only scan either.
-const INCLUDE_ACCESS_METHODS: [&str; 3] = ["btree", "gist", "spgist"];
-
-fn index_sql_rebuild(
-    definition: &str,
-    schema: &str,
-    table: &str,
-    primary_key: &[EcoString],
-) -> Option<String> {
-    let mut parsed = pg_query::parse(definition).ok()?;
-    let [statement] = parsed.protobuf.stmts.as_mut_slice() else {
-        return None;
-    };
-    let Some(NodeEnum::IndexStmt(index)) =
-        statement.stmt.as_mut().and_then(|node| node.node.as_mut())
-    else {
-        return None;
-    };
-    index.idxname.clear();
-    index.relation = Some(RangeVar {
-        schemaname: schema.to_owned(),
-        relname: table.to_owned(),
-        inh: true,
-        relpersistence: "p".to_owned(),
-        ..RangeVar::default()
-    });
-    if INCLUDE_ACCESS_METHODS.contains(&index.access_method.as_str()) {
-        let missing: Vec<&EcoString> = primary_key
-            .iter()
-            .filter(|column| {
-                !index
-                    .index_params
-                    .iter()
-                    .chain(&index.index_including_params)
-                    .filter_map(index_elem_column)
-                    .any(|name| name == column.as_str())
-            })
-            .collect();
-        for column in missing {
-            index
-                .index_including_params
-                .push(index_elem_column_node(column));
-        }
-    }
-    parsed.deparse().ok()
-}
-
-/// The column a plain index element names; `None` for an expression.
-fn index_elem_column(node: &Node) -> Option<&str> {
-    if let Some(NodeEnum::IndexElem(elem)) = node.node.as_ref()
-        && !elem.name.is_empty()
-    {
-        Some(&elem.name)
-    } else {
-        None
-    }
-}
-
-fn index_elem_column_node(column: &str) -> Node {
-    Node {
-        node: Some(NodeEnum::IndexElem(Box::new(IndexElem {
-            name: column.to_owned(),
-            ordering: SortByDir::SortbyDefault as i32,
-            nulls_ordering: SortByNulls::SortbyNullsDefault as i32,
-            ..IndexElem::default()
-        }))),
-    }
-}
-
-/// Retarget by text: `pg_get_indexdef` emits `CREATE [UNIQUE] INDEX name ON
-/// schema.tbl USING ...`, and everything from `USING` onward references only
-/// column names, so an anonymous index against the cache table is the tail
-/// behind the cache's own schema/table. Returns `None` without a `USING`.
-fn index_sql_retarget_plain(
-    definition: &str,
-    is_unique: bool,
-    schema: &str,
-    table: &str,
-) -> Option<String> {
-    let (_, using) = definition.split_once(" USING ")?;
-    let unique = if is_unique { "UNIQUE " } else { "" };
-    Some(format!(
-        "CREATE {unique}INDEX ON {}.{} USING {using}",
-        escape::escape_identifier(schema),
-        escape::escape_identifier(table)
-    ))
-}
-
 impl WriterCore {
     /// Register table metadata from CDC processing.
     #[instrument(skip_all)]
@@ -1100,148 +994,6 @@ fn cache_table_ddl_build(table_metadata: &TableMetadata) -> CacheTableDdl {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn pk(columns: &[&str]) -> Vec<EcoString> {
-        columns.iter().map(|c| EcoString::from(*c)).collect()
-    }
-
-    #[test]
-    fn test_index_sql_retarget_partial() {
-        let def = "CREATE INDEX posts_owneruserid_idx ON public.posts USING btree (owneruserid) WHERE (owneruserid IS NOT NULL)";
-        let sql = index_sql_retarget(def, false, "public", "posts", &pk(&["id"]))
-            .expect("retarget partial index");
-        assert_eq!(
-            sql,
-            "CREATE INDEX ON public.posts USING btree (owneruserid) INCLUDE (id) WHERE owneruserid IS NOT NULL"
-        );
-    }
-
-    #[test]
-    fn test_index_sql_retarget_unique_desc() {
-        let def = "CREATE UNIQUE INDEX foo_idx ON public.foo USING btree (created_at DESC, name)";
-        let sql = index_sql_retarget(def, true, "public", "foo", &pk(&["id"]))
-            .expect("retarget unique index");
-        assert_eq!(
-            sql,
-            "CREATE UNIQUE INDEX ON public.foo USING btree (created_at DESC, name) INCLUDE (id)"
-        );
-    }
-
-    #[test]
-    fn test_index_sql_retarget_partition_child_retargeted() {
-        // Definition read from a child partition names the child; output must
-        // target the parent cache table.
-        let def = "CREATE INDEX posts_2023_parentid_idx ON public.posts_2023 USING btree (parentid) WHERE (parentid IS NOT NULL)";
-        let sql = index_sql_retarget(def, false, "public", "posts", &pk(&["id"]))
-            .expect("retarget child index");
-        assert_eq!(
-            sql,
-            "CREATE INDEX ON public.posts USING btree (parentid) INCLUDE (id) WHERE parentid IS NOT NULL"
-        );
-    }
-
-    #[test]
-    fn test_index_sql_retarget_no_using_returns_none() {
-        assert!(
-            index_sql_retarget("not an index def", false, "public", "posts", &pk(&["id"]))
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn test_index_sql_retarget_key_covering_pk_gets_no_include() {
-        let def = "CREATE INDEX t_id_idx ON public.t USING btree (id)";
-        let sql = index_sql_retarget(def, false, "public", "t", &pk(&["id"])).expect("retarget");
-        assert_eq!(sql, "CREATE INDEX ON public.t USING btree (id)");
-
-        let def = "CREATE INDEX t_ba_idx ON public.t USING btree (b, a)";
-        let sql =
-            index_sql_retarget(def, false, "public", "t", &pk(&["a", "b"])).expect("retarget");
-        assert_eq!(sql, "CREATE INDEX ON public.t USING btree (b, a)");
-    }
-
-    #[test]
-    fn test_index_sql_retarget_includes_only_missing_pk_columns() {
-        let def = "CREATE INDEX t_b_idx ON public.t USING btree (b)";
-        let sql =
-            index_sql_retarget(def, false, "public", "t", &pk(&["a", "b"])).expect("retarget");
-        assert_eq!(sql, "CREATE INDEX ON public.t USING btree (b) INCLUDE (a)");
-    }
-
-    #[test]
-    fn test_index_sql_retarget_extends_existing_include() {
-        let def = "CREATE INDEX t_email_idx ON public.t USING btree (email) INCLUDE (name)";
-        let sql = index_sql_retarget(def, false, "public", "t", &pk(&["id"])).expect("retarget");
-        assert_eq!(
-            sql,
-            "CREATE INDEX ON public.t USING btree (email) INCLUDE (name, id)"
-        );
-
-        let def = "CREATE INDEX t_email_idx ON public.t USING btree (email) INCLUDE (id)";
-        let sql = index_sql_retarget(def, false, "public", "t", &pk(&["id"])).expect("retarget");
-        assert_eq!(
-            sql,
-            "CREATE INDEX ON public.t USING btree (email) INCLUDE (id)"
-        );
-    }
-
-    #[test]
-    fn test_index_sql_retarget_expression_key_gets_include() {
-        let def = "CREATE INDEX t_lower_idx ON public.t USING btree (lower((name)::text))";
-        let sql = index_sql_retarget(def, false, "public", "t", &pk(&["id"])).expect("retarget");
-        assert_eq!(
-            sql,
-            "CREATE INDEX ON public.t USING btree (lower(name::text)) INCLUDE (id)"
-        );
-    }
-
-    #[test]
-    fn test_index_sql_retarget_leaves_hash_index_alone() {
-        let def = "CREATE INDEX t_email_hash ON public.t USING hash (email)";
-        let sql = index_sql_retarget(def, false, "public", "t", &pk(&["id"])).expect("retarget");
-        assert_eq!(sql, "CREATE INDEX ON public.t USING hash (email)");
-    }
-
-    #[test]
-    fn test_index_sql_retarget_gist_gets_include() {
-        let def = "CREATE INDEX t_geom_idx ON public.t USING gist (geom)";
-        let sql = index_sql_retarget(def, false, "public", "t", &pk(&["id"])).expect("retarget");
-        assert_eq!(
-            sql,
-            "CREATE INDEX ON public.t USING gist (geom) INCLUDE (id)"
-        );
-    }
-
-    #[test]
-    fn test_index_sql_retarget_keeps_trailing_clauses_after_include() {
-        let def = "CREATE UNIQUE INDEX t_a_idx ON public.t USING btree (a) NULLS NOT DISTINCT WITH (fillfactor='90')";
-        let sql = index_sql_retarget(def, true, "public", "t", &pk(&["id"])).expect("retarget");
-        assert_eq!(
-            sql,
-            "CREATE UNIQUE INDEX ON public.t USING btree (a) INCLUDE (id) NULLS NOT DISTINCT WITH (fillfactor='90')"
-        );
-    }
-
-    #[test]
-    fn test_index_sql_retarget_quotes_identifiers() {
-        let def = "CREATE INDEX \"Posts_owner_idx\" ON public.\"Posts\" USING btree (\"OwnerId\" DESC NULLS LAST)";
-        let sql =
-            index_sql_retarget(def, false, "public", "Posts", &pk(&["Id"])).expect("retarget");
-        assert_eq!(
-            sql,
-            "CREATE INDEX ON public.\"Posts\" USING btree (\"OwnerId\" DESC NULLS LAST) INCLUDE (\"Id\")"
-        );
-    }
-
-    #[test]
-    fn test_index_sql_retarget_falls_back_to_text_when_unparsable() {
-        let def = "CREATE INDEX t_idx ON public.t USING btree (a) FOO BAR";
-        let sql = index_sql_retarget(def, false, "public", "t", &pk(&["id"])).expect("fallback");
-        assert_eq!(
-            sql,
-            "CREATE INDEX ON \"public\".\"t\" USING btree (a) FOO BAR"
-        );
-    }
 
     #[test]
     fn test_cache_table_ddl_build_quotes_and_keys() {
