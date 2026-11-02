@@ -176,9 +176,10 @@ pub struct MemoEntry {
     /// none was captured). Serve writes the whole buffer for a request that
     /// wants a RowDescription, or `core[rd_len..]` for one that does not.
     pub rd_len: usize,
-    /// Slots stamped at capture; the entry is live while all still match. Holds
-    /// only the [`SlotKey::Memo`] slot (rung 3) — never a `Relation` guard slot.
-    pub stamped: Box<[(SlotKey, u64)]>,
+    /// Version of the key's [`SlotKey::Memo`] slot at capture; the entry is
+    /// live while that slot still reads it (rung 3). A `Relation` guard is a
+    /// capture-time check only and is never stored.
+    pub version: u64,
     /// Wall time of the serve this snapshot was captured from (worker hop, cache
     /// PG execution, relay): what one memo hit saves.
     pub serve_cost: Duration,
@@ -348,12 +349,18 @@ impl ResultMemo {
             .all(|&(slot, version)| self.slot_version(slot) == version)
     }
 
+    /// Whether a stored entry is live: its key's `Memo` slot still reads the
+    /// version it was captured at.
+    fn entry_live(&self, key: &MemoKey, entry: &MemoEntry) -> bool {
+        self.slot_version(SlotKey::Memo(key.fingerprint)) == entry.version
+    }
+
     /// Look up a live memo. Stale entries (a stamped version has advanced) are
     /// dropped lazily and reported as a miss.
     pub fn get(&self, key: &MemoKey) -> Option<MemoHit> {
         {
             let entry = self.entries.get(key)?;
-            if self.slots_valid(&entry.stamped) {
+            if self.entry_live(key, &entry) {
                 entry.hits.fetch_add(1, Ordering::Relaxed);
                 return Some(MemoHit {
                     core: entry.core.clone(),
@@ -365,10 +372,7 @@ impl ResultMemo {
         // Stale: evict — but only if it's *still* stale under the write lock, so
         // a capture that re-inserted a fresh entry for this key in the gap isn't
         // clobbered.
-        if let Some((_, removed)) = self
-            .entries
-            .remove_if(key, |_, v| !self.slots_valid(&v.stamped))
-        {
+        if let Some((_, removed)) = self.entries.remove_if(key, |k, v| !self.entry_live(k, v)) {
             self.bytes_reclaim(removed.size());
         }
         None
@@ -457,9 +461,9 @@ impl ResultMemo {
     /// [`get`](Self::get) it neither evicts stale entries nor records metrics
     /// (used by `pgcache_explain` diagnostics).
     pub fn fingerprint_memoized(&self, fingerprint: Fingerprint) -> bool {
-        self.entries
-            .iter()
-            .any(|entry| entry.key().fingerprint == fingerprint && self.slots_valid(&entry.stamped))
+        self.entries.iter().any(|entry| {
+            entry.key().fingerprint == fingerprint && self.entry_live(entry.key(), entry.value())
+        })
     }
 
     /// Remove an entry, returning its byte accounting to the budget.
@@ -498,7 +502,7 @@ impl ResultMemo {
         let stale: Vec<MemoKey> = self
             .entries
             .iter()
-            .filter(|e| !self.slots_valid(&e.stamped))
+            .filter(|e| !self.entry_live(e.key(), e.value()))
             .map(|e| *e.key())
             .collect();
         for key in stale {
@@ -648,21 +652,22 @@ impl MemoCapture {
             return false;
         }
         let serve_cost = now.saturating_duration_since(self.began);
-        // The entry stamps ONLY its `Memo` slot — serving is per-fingerprint
-        // precise. The `Relation` versions in `self.stamped` were the
-        // capture-window guard (re-checked above), not a serve dependency.
-        let stamped: Box<[(SlotKey, u64)]> = self
+        // The entry keeps ONLY its `Memo` slot's version — serving is
+        // per-fingerprint precise. The `Relation` versions in `self.stamped`
+        // were the capture-window guard (re-checked above), not a serve dependency.
+        let Some(version) = self
             .stamped
             .iter()
-            .copied()
-            .filter(|(slot, _)| matches!(slot, SlotKey::Memo(_)))
-            .collect();
+            .find_map(|&(slot, version)| matches!(slot, SlotKey::Memo(_)).then_some(version))
+        else {
+            return false;
+        };
         memo.insert(
             self.key,
             MemoEntry {
                 core: self.buf.freeze(),
                 rd_len: self.rd_len,
-                stamped,
+                version,
                 serve_cost,
                 hits: AtomicU64::new(1),
             },
@@ -682,23 +687,30 @@ mod tests {
         ResultMemo::new(dynamic)
     }
 
-    fn entry(bytes: &[u8], stamped: &[(SlotKey, u64)]) -> MemoEntry {
-        entry_valued(bytes, Duration::ZERO, 1).with_stamped(stamped)
+    fn entry(bytes: &[u8], version: u64) -> MemoEntry {
+        entry_valued(bytes, Duration::ZERO, 1).with_version(version)
+    }
+
+    /// An entry stamped at the current version of its key's `Memo` slot,
+    /// creating the slot if the test has not yet.
+    fn live_entry(m: &ResultMemo, k: &MemoKey, bytes: &[u8]) -> MemoEntry {
+        m.memo_slot_create(k.fingerprint);
+        entry(bytes, m.slot_version(SlotKey::Memo(k.fingerprint)))
     }
 
     fn entry_valued(bytes: &[u8], serve_cost: Duration, hits: u64) -> MemoEntry {
         MemoEntry {
             core: Bytes::copy_from_slice(bytes),
             rd_len: 0,
-            stamped: Box::new([]),
+            version: 0,
             serve_cost,
             hits: AtomicU64::new(hits),
         }
     }
 
     impl MemoEntry {
-        fn with_stamped(mut self, stamped: &[(SlotKey, u64)]) -> Self {
-            self.stamped = stamped.into();
+        fn with_version(mut self, version: u64) -> Self {
+            self.version = version;
             self
         }
     }
@@ -737,8 +749,10 @@ mod tests {
         // Stored entry depends only on its per-fingerprint Memo slot — never a
         // Relation guard slot.
         let stored = m.entries.get(&k).expect("entry stored");
-        assert_eq!(stored.stamped.len(), 1);
-        assert_eq!(stored.stamped[0].0, SlotKey::Memo(Fingerprint::from_raw(7)));
+        assert_eq!(
+            stored.version,
+            m.slot_version(SlotKey::Memo(Fingerprint::from_raw(7)))
+        );
     }
 
     /// PGC-350: a capture that begins and finishes while a frame is replaying
@@ -774,12 +788,12 @@ mod tests {
         m.memo_slot_create(Fingerprint::from_raw(7));
         let k = key(7);
         let slot = SlotKey::Memo(k.fingerprint);
-        let stamped = stamp(&m, &[slot]);
+        let version = m.slot_version(slot);
 
         m.slot_dirty_begin(slot);
         m.slot_dirty_end(slot);
         assert!(
-            m.insert(k, entry(b"stale", &stamped)),
+            m.insert(k, entry(b"stale", version)),
             "insert itself succeeds"
         );
         assert!(m.get(&k).is_none(), "the entry predates the bump");
@@ -912,11 +926,8 @@ mod tests {
         // instant the writer enters the pending phase, before COMMIT visibility.
         let m = memo(1 << 20);
         let k = key(1);
-        m.insert(
-            k,
-            entry(b"snapshot", &[(SlotKey::Relation(Oid::from_raw(10)), 0)]),
-        );
-        m.slot_dirty_begin(SlotKey::Relation(Oid::from_raw(10))); // pre-commit, not yet ended
+        m.insert(k, live_entry(&m, &k, b"snapshot"));
+        m.slot_dirty_begin(SlotKey::Memo(k.fingerprint)); // pre-commit, not yet ended
         assert!(m.get(&k).is_none(), "pending (odd) version busts the memo");
     }
 
@@ -924,10 +935,7 @@ mod tests {
     fn test_insert_get_roundtrip() {
         let m = memo(1 << 20);
         let k = key(1);
-        assert!(m.insert(
-            k,
-            entry(b"core-bytes", &[(SlotKey::Relation(Oid::from_raw(10)), 0)])
-        ));
+        assert!(m.insert(k, live_entry(&m, &k, b"core-bytes")));
         let hit = m.get(&k).expect("present and live");
         assert_eq!(&hit.core[..], b"core-bytes");
         assert_eq!(m.total_bytes(), b"core-bytes".len());
@@ -937,12 +945,9 @@ mod tests {
     fn test_get_evicts_after_dirty_cycle() {
         let m = memo(1 << 20);
         let k = key(1);
-        m.insert(
-            k,
-            entry(b"snapshot", &[(SlotKey::Relation(Oid::from_raw(10)), 0)]),
-        );
-        m.slot_dirty_begin(SlotKey::Relation(Oid::from_raw(10)));
-        m.slot_dirty_end(SlotKey::Relation(Oid::from_raw(10)));
+        m.insert(k, live_entry(&m, &k, b"snapshot"));
+        m.slot_dirty_begin(SlotKey::Memo(k.fingerprint));
+        m.slot_dirty_end(SlotKey::Memo(k.fingerprint));
         assert!(m.get(&k).is_none(), "stale entry not served");
         assert_eq!(m.total_bytes(), 0, "stale entry reclaimed lazily on get");
         assert!(m.is_empty());
@@ -952,16 +957,16 @@ mod tests {
     fn test_large_entry_within_budget_is_stored() {
         let m = memo(1 << 30);
         let big = vec![0u8; 1 << 20];
-        assert!(m.insert(key(1), entry(&big, &[])), "no per-entry cap");
+        assert!(m.insert(key(1), entry(&big, 0)), "no per-entry cap");
         assert_eq!(m.total_bytes(), 1 << 20);
     }
 
     #[test]
     fn test_over_budget_insert_with_equal_values_refuses() {
         let m = memo(16);
-        assert!(m.insert(key(1), entry(b"0123456789", &[])), "fits");
+        assert!(m.insert(key(1), entry(b"0123456789", 0)), "fits");
         assert!(
-            !m.insert(key(2), entry(b"0123456789", &[])),
+            !m.insert(key(2), entry(b"0123456789", 0)),
             "a newcomer no more valuable than its victim is refused"
         );
         assert_eq!(m.total_bytes(), 10);
@@ -1034,7 +1039,7 @@ mod tests {
     fn test_hit_increments_entry_hits() {
         let m = memo(1 << 20);
         let k = key(1);
-        assert!(m.insert(k, entry(b"x", &[])));
+        assert!(m.insert(k, entry(b"x", 0)));
         assert!(m.get(&k).is_some());
         assert!(m.get(&k).is_some());
         assert_eq!(m.entries.get(&k).expect("stored").hits(), 3);
@@ -1044,29 +1049,26 @@ mod tests {
     fn test_recapture_carries_half_the_hits() {
         let m = memo(1 << 20);
         let k = key(1);
-        assert!(m.insert(k, entry(b"x", &[])));
+        assert!(m.insert(k, entry(b"x", 0)));
         for _ in 0..9 {
             assert!(m.get(&k).is_some());
         }
         assert_eq!(m.entries.get(&k).expect("stored").hits(), 10);
-        assert!(
-            m.insert(k, entry(b"xy", &[])),
-            "re-capture replaces the key"
-        );
+        assert!(m.insert(k, entry(b"xy", 0)), "re-capture replaces the key");
         assert_eq!(
             m.entries.get(&k).expect("stored").hits(),
             5,
             "half the lineage"
         );
-        assert!(m.insert(k, entry(b"xyz", &[])));
+        assert!(m.insert(k, entry(b"xyz", 0)));
         assert_eq!(m.entries.get(&k).expect("stored").hits(), 2);
-        assert!(m.insert(k, entry(b"w", &[])));
+        assert!(m.insert(k, entry(b"w", 0)));
         assert_eq!(
             m.entries.get(&k).expect("stored").hits(),
             1,
             "floored at one"
         );
-        assert!(m.insert(k, entry(b"v", &[])));
+        assert!(m.insert(k, entry(b"v", 0)));
         assert_eq!(m.entries.get(&k).expect("stored").hits(), 1);
     }
 
@@ -1074,18 +1076,15 @@ mod tests {
     fn test_disabled_when_budget_zero() {
         let m = memo(0);
         assert!(!m.enabled());
-        assert!(
-            !m.insert(key(1), entry(b"x", &[])),
-            "disabled rejects insert"
-        );
+        assert!(!m.insert(key(1), entry(b"x", 0)), "disabled rejects insert");
     }
 
     #[test]
     fn test_insert_replace_reuses_accounting() {
         let m = memo(32);
-        m.insert(key(1), entry(b"0123456789", &[]));
+        m.insert(key(1), entry(b"0123456789", 0));
         assert!(
-            m.insert(key(1), entry(b"abcde", &[])),
+            m.insert(key(1), entry(b"abcde", 0)),
             "replacing the same key nets the size delta, not a fresh add"
         );
         assert_eq!(m.total_bytes(), 5);
@@ -1096,18 +1095,12 @@ mod tests {
     fn test_get_serves_fresh_reinsert_over_stale() {
         let m = memo(1 << 20);
         let k = key(1);
-        // Entry stamped at version 0, then the slot advances → stale.
-        m.insert(
-            k,
-            entry(b"old", &[(SlotKey::Relation(Oid::from_raw(10)), 0)]),
-        );
-        m.slot_dirty_begin(SlotKey::Relation(Oid::from_raw(10)));
-        m.slot_dirty_end(SlotKey::Relation(Oid::from_raw(10))); // slot now 2
+        // Entry stamped at the current version, then the slot advances → stale.
+        m.insert(k, live_entry(&m, &k, b"old"));
+        m.slot_dirty_begin(SlotKey::Memo(k.fingerprint));
+        m.slot_dirty_end(SlotKey::Memo(k.fingerprint));
         // A capture re-inserts a fresh entry for the same key at the new version.
-        m.insert(
-            k,
-            entry(b"new", &[(SlotKey::Relation(Oid::from_raw(10)), 2)]),
-        );
+        m.insert(k, live_entry(&m, &k, b"new"));
         // get serves the fresh entry and does not evict it.
         assert_eq!(&m.get(&k).expect("fresh served").core[..], b"new");
         assert!(m.get(&k).is_some(), "fresh entry not clobbered by get");
@@ -1116,16 +1109,13 @@ mod tests {
     #[test]
     fn test_gc_skips_when_unarmed() {
         let m = memo(1 << 20);
-        m.insert(
-            key(1),
-            entry(b"x", &[(SlotKey::Relation(Oid::from_raw(10)), 0)]),
-        );
+        m.insert(key(1), live_entry(&m, &key(1), b"x"));
         // No slot bumped since insert → gc is a no-op, entry survives.
         m.gc();
         assert!(m.get(&key(1)).is_some(), "entry survives an unarmed gc");
         // A bump arms gc; the now-stale entry is swept.
-        m.slot_dirty_begin(SlotKey::Relation(Oid::from_raw(10)));
-        m.slot_dirty_end(SlotKey::Relation(Oid::from_raw(10)));
+        m.slot_dirty_begin(SlotKey::Memo(key(1).fingerprint));
+        m.slot_dirty_end(SlotKey::Memo(key(1).fingerprint));
         m.gc();
         assert!(m.is_empty(), "stale entry swept once gc is armed");
     }
@@ -1144,9 +1134,10 @@ mod tests {
         m.memo_slot_create(fingerprint);
         let stamped = stamp(&m, &[SlotKey::Memo(fingerprint)]);
         assert!(m.slots_valid(&stamped), "capture validated before removal");
+        let version = stamped[0].1;
 
         m.memo_slot_remove(fingerprint);
-        m.insert(key(1), entry(b"orphan", &stamped));
+        m.insert(key(1), entry(b"orphan", version));
 
         assert!(m.get(&key(1)).is_none(), "orphan not served");
     }
@@ -1186,7 +1177,7 @@ mod tests {
         m.memo_slot_create(fingerprint);
         slot_bump(&m, SlotKey::Memo(fingerprint));
         let old = stamp(&m, &[SlotKey::Memo(fingerprint)]);
-        m.insert(key(1), entry(b"old", &old));
+        m.insert(key(1), entry(b"old", old[0].1));
         m.memo_slot_remove(fingerprint);
 
         m.memo_slot_create(fingerprint);
@@ -1226,8 +1217,8 @@ mod tests {
         m.memo_slot_create(kept);
         m.memo_slot_create(removed);
         slot_bump(&m, SlotKey::Memo(kept));
-        m.insert(key(1), entry(b"one", &stamp(&m, &[SlotKey::Memo(kept)])));
-        m.insert(key(2), entry(b"two", &stamp(&m, &[SlotKey::Memo(removed)])));
+        m.insert(key(1), live_entry(&m, &key(1), b"one"));
+        m.insert(key(2), live_entry(&m, &key(2), b"two"));
         let mut capture = MemoCapture::begin(
             &m,
             MemoKey {
@@ -1290,16 +1281,10 @@ mod tests {
     #[test]
     fn test_gc_sweeps_stale() {
         let m = memo(1 << 20);
-        m.insert(
-            key(1),
-            entry(b"aaa", &[(SlotKey::Relation(Oid::from_raw(10)), 0)]),
-        );
-        m.insert(
-            key(2),
-            entry(b"bbb", &[(SlotKey::Relation(Oid::from_raw(20)), 0)]),
-        );
-        m.slot_dirty_begin(SlotKey::Relation(Oid::from_raw(10)));
-        m.slot_dirty_end(SlotKey::Relation(Oid::from_raw(10)));
+        m.insert(key(1), live_entry(&m, &key(1), b"aaa"));
+        m.insert(key(2), live_entry(&m, &key(2), b"bbb"));
+        m.slot_dirty_begin(SlotKey::Memo(key(1).fingerprint));
+        m.slot_dirty_end(SlotKey::Memo(key(1).fingerprint));
         m.gc();
         assert!(m.get(&key(2)).is_some(), "live entry survives gc");
         assert_eq!(m.len(), 1);
