@@ -88,8 +88,8 @@ pub(crate) struct MetricsSnapshot {
     pub cache_memo_evictions_skipped: u64,
     /// Memo entries displaced to make room for a more valuable capture (PGC-576).
     pub cache_memo_replacements: u64,
-    /// Captures refused because they were worth less than the entries they
-    /// would have displaced (PGC-576).
+    /// Captures refused over budget: the entries worth less than the newcomer
+    /// could not free enough room (PGC-576).
     pub cache_memo_refused: u64,
     /// Gauge: memo version slots currently held.
     pub cache_memo_slots: u64,

@@ -386,8 +386,11 @@ impl Relay {
         // change touched a read relation across the capture (re-checked in
         // `finish`). Error paths returned earlier, so reaching here means a
         // clean response.
+        // The serve's cost ends at CommandComplete: the client flush above is
+        // paid by a memo hit too, so it is not time the entry saves.
         if let Some(cap) = memo_capture {
-            cap.finish(&state_view.memo);
+            let done = timing.query_done_at.unwrap_or_else(Instant::now);
+            cap.finish_at(&state_view.memo, done);
         }
 
         debug!("cache hit");

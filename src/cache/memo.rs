@@ -78,15 +78,16 @@ use crate::query::Fingerprint;
 use crate::query::ast::{LimitClause, LiteralValue};
 use crate::settings::DynamicConfigHandle;
 
-/// Time a memo saves per byte it holds: `serve_cost × hits / bytes`. Ranks
-/// entries when an insert needs room; the newcomer must beat every victim it
-/// displaces. No per-entry size cap: a large result is simply a large price
-/// against the time its hits save (PGC-576).
+/// Time a memo saves per KiB it holds: `serve_cost × hits / bytes`, in
+/// nanoseconds per KiB so a fast serve of a large result keeps a nonzero
+/// rank. Ranks entries when an insert needs room; the newcomer must beat
+/// every victim it displaces. No per-entry size cap: a large result is
+/// simply a large price against the time its hits save (PGC-576).
 fn entry_value(serve_cost: Duration, hits: u64, bytes: usize) -> u128 {
     if bytes == 0 {
         return 0;
     }
-    serve_cost.as_nanos() * u128::from(hits) / bytes as u128
+    serve_cost.as_nanos() * u128::from(hits) * 1024 / bytes as u128
 }
 
 /// A fingerprint is memoized from its first eligible serve. Capture only happens
@@ -183,8 +184,9 @@ pub struct MemoEntry {
     /// Wall time of the serve this snapshot was captured from (worker hop, cache
     /// PG execution, relay): what one memo hit saves.
     pub serve_cost: Duration,
-    /// Serves this entry has satisfied, counting the capturing serve as the
-    /// first. A re-capture of the same key inherits half its predecessor's.
+    /// Demand: the fingerprint's cache hit count at capture, plus every serve
+    /// from this entry since. A newcomer therefore competes on the same
+    /// footing as the residents it would displace.
     pub hits: AtomicU64,
 }
 
@@ -355,12 +357,17 @@ impl ResultMemo {
         self.slot_version(SlotKey::Memo(key.fingerprint)) == entry.version
     }
 
-    /// Look up a live memo. Stale entries (a stamped version has advanced) are
-    /// dropped lazily and reported as a miss.
-    pub fn get(&self, key: &MemoKey) -> Option<MemoHit> {
+    /// Look up a live memo that can serve this request: a client wanting a
+    /// RowDescription needs an entry that captured one. Stale entries (the
+    /// slot version has advanced) are dropped lazily and reported as a miss;
+    /// only a served hit counts toward the entry's demand.
+    pub fn get(&self, key: &MemoKey, wants_row_description: bool) -> Option<MemoHit> {
         {
             let entry = self.entries.get(key)?;
             if self.entry_live(key, &entry) {
+                if wants_row_description && entry.rd_len == 0 {
+                    return None;
+                }
                 entry.hits.fetch_add(1, Ordering::Relaxed);
                 return Some(MemoHit {
                     core: entry.core.clone(),
@@ -379,9 +386,9 @@ impl ResultMemo {
     }
 
     /// Insert a captured snapshot. Rejected (returns `false`) when memoization is
-    /// disabled, or when it would exceed the total budget and is worth less than
-    /// the entries it would have to displace. Replacing an existing key reuses
-    /// its byte accounting and inherits half its hits.
+    /// disabled, or when it would exceed the total budget and the entries worth
+    /// less than it cannot make room. Replacing an existing key reuses its byte
+    /// accounting.
     pub fn insert(&self, key: MemoKey, entry: MemoEntry) -> bool {
         let size = entry.size();
         let budget = self.budget();
@@ -395,14 +402,11 @@ impl ResultMemo {
         // plain subtraction underflow (panic under overflow-checks). Saturate;
         // the budget is a soft cap and the authoritative accounting below is the
         // per-op atomic add/sub keyed on the actual map mutation.
-        let prev = self.entries.get(&key).map(|e| (e.size(), e.hits()));
-        if let Some((_, prev_hits)) = prev {
-            entry.hits.store((prev_hits / 2).max(1), Ordering::Relaxed);
-        }
+        let prev_size = self.entries.get(&key).map(|e| e.size());
         let projected = self
             .total_bytes
             .load(Ordering::Relaxed)
-            .saturating_sub(prev.map_or(0, |(size, _)| size))
+            .saturating_sub(prev_size.unwrap_or(0))
             + size;
         if projected > budget && !self.room_make(&key, entry.worth(), projected - budget) {
             crate::metrics::handles().cache.memo_refused.increment(1);
@@ -417,42 +421,50 @@ impl ResultMemo {
         true
     }
 
-    /// Displace the lowest-value entries until `needed` bytes are free, unless
-    /// the newcomer is worth no more than the most valuable victim that takes:
-    /// then nothing is displaced and the newcomer is refused. A key being
-    /// replaced is never its own victim; its bytes are already discounted.
+    /// Displace entries worth less than the newcomer, cheapest first, until
+    /// `needed` bytes are free. A stale entry is worth nothing and goes first.
+    /// Refused without displacing anything when those entries cannot free
+    /// enough. A key being replaced is never its own victim; its bytes are
+    /// already discounted.
     fn room_make(&self, newcomer: &MemoKey, newcomer_value: u128, needed: usize) -> bool {
         let mut candidates: Vec<(MemoKey, u128, usize)> = self
             .entries
             .iter()
             .filter(|e| e.key() != newcomer)
-            .map(|e| (*e.key(), e.worth(), e.size()))
+            .filter_map(|e| {
+                let value = if self.entry_live(e.key(), e.value()) {
+                    e.worth()
+                } else {
+                    0
+                };
+                (value < newcomer_value).then(|| (*e.key(), value, e.size()))
+            })
             .collect();
+        if candidates.iter().map(|&(_, _, size)| size).sum::<usize>() < needed {
+            return false;
+        }
         candidates.sort_unstable_by_key(|&(_, value, _)| value);
 
+        // Count only what this thread removed: a concurrent displacement may
+        // have taken the same victim, and its bytes must not be freed twice.
         let mut freed = 0;
-        let mut victims = Vec::new();
-        for (key, value, size) in candidates {
+        let mut displaced = 0;
+        for (key, _, _) in candidates {
             if freed >= needed {
                 break;
             }
-            if value >= newcomer_value {
-                return false;
+            if let Some((_, removed)) = self.entries.remove(&key) {
+                self.total_bytes
+                    .fetch_sub(removed.size(), Ordering::Relaxed);
+                freed += removed.size();
+                displaced += 1;
             }
-            freed += size;
-            victims.push(key);
-        }
-        if freed < needed {
-            return false;
-        }
-        for key in &victims {
-            self.remove(key);
         }
         crate::metrics::handles()
             .cache
             .memo_replacements
-            .increment(victims.len() as u64);
-        true
+            .increment(displaced);
+        freed >= needed
     }
 
     /// True if any *live* memo entry exists for `fingerprint` (across result
@@ -576,13 +588,21 @@ pub(crate) struct MemoCapture {
     /// Taken before the serve query is issued; `finish` measures the serve from
     /// here, which is the time a hit on the stored entry saves.
     began: Instant,
+    /// The fingerprint's cache hit count at `begin`: the entry's starting demand.
+    demand: u64,
 }
 
 impl MemoCapture {
-    /// Begin a capture for `key` over `relation_oids`. Returns `None` when
-    /// memoization is disabled or any read relation is mid-write (odd slot) —
-    /// the caller skips capturing and serves normally.
-    pub(crate) fn begin(memo: &ResultMemo, key: MemoKey, relation_oids: &[Oid]) -> Option<Self> {
+    /// Begin a capture for `key` over `relation_oids`, with `demand` the
+    /// fingerprint's cache hit count so far. Returns `None` when memoization is
+    /// disabled or any read relation is mid-write (odd slot) — the caller skips
+    /// capturing and serves normally.
+    pub(crate) fn begin(
+        memo: &ResultMemo,
+        key: MemoKey,
+        relation_oids: &[Oid],
+        demand: u64,
+    ) -> Option<Self> {
         let budget = memo.budget();
         if budget == 0 {
             return None;
@@ -605,6 +625,7 @@ impl MemoCapture {
             aborted: false,
             budget,
             began: Instant::now(),
+            demand,
         })
     }
 
@@ -640,13 +661,10 @@ impl MemoCapture {
     }
 
     /// Finalize: insert the captured snapshot iff it wasn't aborted and no read
-    /// relation changed since `begin`. Returns whether an entry was stored.
-    pub(crate) fn finish(self, memo: &ResultMemo) -> bool {
-        self.finish_at(memo, Instant::now())
-    }
-
-    /// [`finish`](Self::finish) with the completion instant supplied; the
-    /// serve's cost is `now - began`.
+    /// relation changed since `begin`. Returns whether an entry was stored. The
+    /// serve's cost is `now - began`; callers pass the instant the cache PG
+    /// finished (CommandComplete), not the client flush: a hit skips the
+    /// former and still pays the latter.
     pub(crate) fn finish_at(self, memo: &ResultMemo, now: Instant) -> bool {
         if self.aborted || !memo.slots_valid(&self.stamped) {
             return false;
@@ -669,7 +687,7 @@ impl MemoCapture {
                 rd_len: self.rd_len,
                 version,
                 serve_cost,
-                hits: AtomicU64::new(1),
+                hits: AtomicU64::new(self.demand.max(1)),
             },
         )
     }
@@ -741,10 +759,10 @@ mod tests {
         let oid = Oid::from_raw(10);
         let k = key(7);
 
-        let mut cap = MemoCapture::begin(&m, k, &[oid]).expect("capture begins");
+        let mut cap = MemoCapture::begin(&m, k, &[oid], 1).expect("capture begins");
         cap.row_description_push(b"rd");
         cap.command_complete_push(b"cc");
-        assert!(cap.finish(&m), "capture finishes");
+        assert!(cap.finish_at(&m, Instant::now()), "capture finishes");
 
         // Stored entry depends only on its per-fingerprint Memo slot — never a
         // Relation guard slot.
@@ -767,15 +785,18 @@ mod tests {
         let k = key(7);
         let slot = SlotKey::Memo(k.fingerprint);
 
-        let mut cap = MemoCapture::begin(&m, k, &[oid]).expect("capture begins");
+        let mut cap = MemoCapture::begin(&m, k, &[oid], 1).expect("capture begins");
         cap.row_description_push(b"rd");
         cap.command_complete_push(b"cc");
-        assert!(cap.finish(&m), "no slot moved yet, so the capture stores");
+        assert!(
+            cap.finish_at(&m, Instant::now()),
+            "no slot moved yet, so the capture stores"
+        );
 
         m.slot_dirty_begin(slot);
         m.slot_dirty_end(slot);
         assert!(
-            m.get(&k).is_none(),
+            m.get(&k, false).is_none(),
             "the pre-commit snapshot is never served"
         );
     }
@@ -796,7 +817,7 @@ mod tests {
             m.insert(k, entry(b"stale", version)),
             "insert itself succeeds"
         );
-        assert!(m.get(&k).is_none(), "the entry predates the bump");
+        assert!(m.get(&k, false).is_none(), "the entry predates the bump");
     }
 
     /// A frame that commits while the first capture is in flight has no
@@ -812,14 +833,17 @@ mod tests {
             m.bracket_wanted(),
             "an enabled memo may have a capture in flight"
         );
-        let mut cap = MemoCapture::begin(&m, key(7), &[oid]).expect("capture begins");
+        let mut cap = MemoCapture::begin(&m, key(7), &[oid], 1).expect("capture begins");
         cap.row_description_push(b"rd");
         cap.command_complete_push(b"cc");
         if m.bracket_wanted() {
             m.slot_dirty_begin(SlotKey::Relation(oid));
             m.slot_dirty_end(SlotKey::Relation(oid));
         }
-        assert!(!cap.finish(&m), "the capture predates the commit");
+        assert!(
+            !cap.finish_at(&m, Instant::now()),
+            "the capture predates the commit"
+        );
         assert!(m.is_empty());
 
         let disabled = memo(0);
@@ -827,7 +851,7 @@ mod tests {
             !disabled.bracket_wanted(),
             "nothing can capture while disabled"
         );
-        assert!(MemoCapture::begin(&disabled, key(7), &[oid]).is_none());
+        assert!(MemoCapture::begin(&disabled, key(7), &[oid], 1).is_none());
     }
 
     /// The create-memo vs. frame-update race: a frame that commits on a relation
@@ -845,7 +869,7 @@ mod tests {
         let oid = Oid::from_raw(10);
         let k = key(7);
 
-        let mut cap = MemoCapture::begin(&m, k, &[oid]).expect("capture begins");
+        let mut cap = MemoCapture::begin(&m, k, &[oid], 1).expect("capture begins");
         cap.row_description_push(b"rd");
         cap.command_complete_push(b"cc");
 
@@ -862,7 +886,7 @@ mod tests {
 
         // The capture must drop rather than store a snapshot predating the commit.
         assert!(
-            !cap.finish(&m),
+            !cap.finish_at(&m, Instant::now()),
             "a capture over a relation written mid-window must drop"
         );
         assert!(m.entries.get(&k).is_none(), "nothing stored");
@@ -928,7 +952,10 @@ mod tests {
         let k = key(1);
         m.insert(k, live_entry(&m, &k, b"snapshot"));
         m.slot_dirty_begin(SlotKey::Memo(k.fingerprint)); // pre-commit, not yet ended
-        assert!(m.get(&k).is_none(), "pending (odd) version busts the memo");
+        assert!(
+            m.get(&k, false).is_none(),
+            "pending (odd) version busts the memo"
+        );
     }
 
     #[test]
@@ -936,7 +963,7 @@ mod tests {
         let m = memo(1 << 20);
         let k = key(1);
         assert!(m.insert(k, live_entry(&m, &k, b"core-bytes")));
-        let hit = m.get(&k).expect("present and live");
+        let hit = m.get(&k, false).expect("present and live");
         assert_eq!(&hit.core[..], b"core-bytes");
         assert_eq!(m.total_bytes(), b"core-bytes".len());
     }
@@ -948,7 +975,7 @@ mod tests {
         m.insert(k, live_entry(&m, &k, b"snapshot"));
         m.slot_dirty_begin(SlotKey::Memo(k.fingerprint));
         m.slot_dirty_end(SlotKey::Memo(k.fingerprint));
-        assert!(m.get(&k).is_none(), "stale entry not served");
+        assert!(m.get(&k, false).is_none(), "stale entry not served");
         assert_eq!(m.total_bytes(), 0, "stale entry reclaimed lazily on get");
         assert!(m.is_empty());
     }
@@ -970,7 +997,10 @@ mod tests {
             "a newcomer no more valuable than its victim is refused"
         );
         assert_eq!(m.total_bytes(), 10);
-        assert!(m.get(&key(1)).is_some(), "the resident entry is untouched");
+        assert!(
+            m.get(&key(1), false).is_some(),
+            "the resident entry is untouched"
+        );
     }
 
     #[test]
@@ -987,6 +1017,13 @@ mod tests {
             "a thousand cheap hits beat a hundred costly ones"
         );
         assert_eq!(entry_value(MS, 1, 0), 0, "an empty core has no value");
+        let big = entry_value(MS, 1, 1_200_000);
+        let mid = entry_value(Duration::from_micros(250), 1, 300 * 1024);
+        assert!(
+            big > 0 && mid > 0,
+            "sub-nanosecond-per-byte ratios do not collapse to zero"
+        );
+        assert!(big > mid);
     }
 
     #[test]
@@ -998,9 +1035,9 @@ mod tests {
             m.insert(key(3), entry_valued(&[0u8; 8], MS, 1)),
             "C is worth more than B and takes its place"
         );
-        assert!(m.get(&key(1)).is_some(), "A kept");
-        assert!(m.get(&key(2)).is_none(), "B displaced");
-        assert!(m.get(&key(3)).is_some(), "C stored");
+        assert!(m.get(&key(1), false).is_some(), "A kept");
+        assert!(m.get(&key(2), false).is_none(), "B displaced");
+        assert!(m.get(&key(3), false).is_some(), "C stored");
         assert_eq!(m.total_bytes(), 16);
     }
 
@@ -1013,8 +1050,8 @@ mod tests {
             !m.insert(key(3), entry_valued(&[0u8; 8], US, 1)),
             "C is worth less than any resident"
         );
-        assert!(m.get(&key(1)).is_some());
-        assert!(m.get(&key(2)).is_some());
+        assert!(m.get(&key(1), false).is_some());
+        assert!(m.get(&key(2), false).is_some());
         assert_eq!(m.total_bytes(), 16, "nothing displaced");
     }
 
@@ -1028,10 +1065,10 @@ mod tests {
             m.insert(key(4), entry_valued(&[0u8; 16], MS, 1)),
             "D needs both low-value entries gone"
         );
-        assert!(m.get(&key(1)).is_some(), "A kept");
-        assert!(m.get(&key(2)).is_none(), "B displaced");
-        assert!(m.get(&key(3)).is_none(), "C displaced");
-        assert!(m.get(&key(4)).is_some(), "D stored");
+        assert!(m.get(&key(1), false).is_some(), "A kept");
+        assert!(m.get(&key(2), false).is_none(), "B displaced");
+        assert!(m.get(&key(3), false).is_none(), "C displaced");
+        assert!(m.get(&key(4), false).is_some(), "D stored");
         assert_eq!(m.total_bytes(), 24);
     }
 
@@ -1040,36 +1077,99 @@ mod tests {
         let m = memo(1 << 20);
         let k = key(1);
         assert!(m.insert(k, entry(b"x", 0)));
-        assert!(m.get(&k).is_some());
-        assert!(m.get(&k).is_some());
+        assert!(m.get(&k, false).is_some());
+        assert!(m.get(&k, false).is_some());
         assert_eq!(m.entries.get(&k).expect("stored").hits(), 3);
     }
 
     #[test]
-    fn test_recapture_carries_half_the_hits() {
+    fn test_recapture_takes_the_newcomers_demand() {
         let m = memo(1 << 20);
         let k = key(1);
-        assert!(m.insert(k, entry(b"x", 0)));
-        for _ in 0..9 {
-            assert!(m.get(&k).is_some());
-        }
-        assert_eq!(m.entries.get(&k).expect("stored").hits(), 10);
-        assert!(m.insert(k, entry(b"xy", 0)), "re-capture replaces the key");
+        assert!(m.insert(k, entry_valued(b"x", MS, 10)));
+        assert!(
+            m.insert(k, entry_valued(b"xy", MS, 3)),
+            "re-capture replaces the key"
+        );
+        assert_eq!(m.entries.get(&k).expect("stored").hits(), 3);
+    }
+
+    #[test]
+    fn test_capture_seeds_hits_from_the_fingerprint_demand() {
+        let m = memo(1 << 20);
+        m.memo_slot_create(Fingerprint::from_raw(1));
+        let k = key(1);
+        let cap = MemoCapture::begin(&m, k, &[Oid::from_raw(10)], 7).expect("enabled");
+        assert!(cap.finish_at(&m, Instant::now()));
         assert_eq!(
             m.entries.get(&k).expect("stored").hits(),
-            5,
-            "half the lineage"
+            7,
+            "demand is the fingerprint's hit count"
         );
-        assert!(m.insert(k, entry(b"xyz", 0)));
-        assert_eq!(m.entries.get(&k).expect("stored").hits(), 2);
-        assert!(m.insert(k, entry(b"w", 0)));
+        let cap = MemoCapture::begin(&m, k, &[Oid::from_raw(10)], 0).expect("enabled");
+        assert!(cap.finish_at(&m, Instant::now()));
         assert_eq!(
             m.entries.get(&k).expect("stored").hits(),
             1,
-            "floored at one"
+            "never below the capturing serve"
         );
-        assert!(m.insert(k, entry(b"v", 0)));
-        assert_eq!(m.entries.get(&k).expect("stored").hits(), 1);
+    }
+
+    #[test]
+    fn test_get_wanting_a_row_description_skips_a_headless_entry() {
+        let m = memo(1 << 20);
+        let k = key(1);
+        assert!(m.insert(k, entry(b"rows", 0)));
+        assert!(m.get(&k, true).is_none(), "no RowDescription to serve");
+        assert_eq!(
+            m.entries.get(&k).expect("stored").hits(),
+            1,
+            "a rejected lookup is not a hit"
+        );
+        assert!(m.get(&k, false).is_some());
+        assert_eq!(m.entries.get(&k).expect("stored").hits(), 2);
+    }
+
+    #[test]
+    fn test_stale_entries_are_displaced_first() {
+        let m = memo(16);
+        let hot = key(1);
+        let mut stale = live_entry(&m, &hot, &[0u8; 8]);
+        stale.serve_cost = MS;
+        stale.hits = AtomicU64::new(1000);
+        assert!(m.insert(hot, stale));
+        m.slot_dirty_begin(SlotKey::Memo(hot.fingerprint));
+        m.slot_dirty_end(SlotKey::Memo(hot.fingerprint));
+        let mut cheap = live_entry(&m, &key(2), &[0u8; 8]);
+        cheap.serve_cost = US;
+        assert!(m.insert(key(2), cheap), "cheap live entry");
+        let mut newcomer = live_entry(&m, &key(3), &[0u8; 8]);
+        newcomer.serve_cost = US;
+        newcomer.hits = AtomicU64::new(2);
+        assert!(
+            m.insert(key(3), newcomer),
+            "the newcomer displaces the dead hot entry, not the live cheap one"
+        );
+        assert!(m.entries.get(&hot).is_none(), "stale entry gone");
+        assert!(m.get(&key(2), false).is_some(), "live cheap entry kept");
+        assert!(m.get(&key(3), false).is_some());
+    }
+
+    #[test]
+    fn test_replacement_refused_when_cheaper_entries_cannot_free_enough() {
+        let m = memo(16);
+        assert!(m.insert(key(1), entry_valued(&[0u8; 8], MS, 100)));
+        assert!(m.insert(key(2), entry_valued(&[0u8; 8], US, 1)));
+        assert!(
+            !m.insert(key(3), entry_valued(&[0u8; 16], MS, 1)),
+            "only the cheap entry may go, and it frees half of what is needed"
+        );
+        assert!(m.get(&key(1), false).is_some());
+        assert!(
+            m.get(&key(2), false).is_some(),
+            "nothing displaced on a refusal"
+        );
+        assert_eq!(m.total_bytes(), 16);
     }
 
     #[test]
@@ -1102,8 +1202,11 @@ mod tests {
         // A capture re-inserts a fresh entry for the same key at the new version.
         m.insert(k, live_entry(&m, &k, b"new"));
         // get serves the fresh entry and does not evict it.
-        assert_eq!(&m.get(&k).expect("fresh served").core[..], b"new");
-        assert!(m.get(&k).is_some(), "fresh entry not clobbered by get");
+        assert_eq!(&m.get(&k, false).expect("fresh served").core[..], b"new");
+        assert!(
+            m.get(&k, false).is_some(),
+            "fresh entry not clobbered by get"
+        );
     }
 
     #[test]
@@ -1112,7 +1215,10 @@ mod tests {
         m.insert(key(1), live_entry(&m, &key(1), b"x"));
         // No slot bumped since insert → gc is a no-op, entry survives.
         m.gc();
-        assert!(m.get(&key(1)).is_some(), "entry survives an unarmed gc");
+        assert!(
+            m.get(&key(1), false).is_some(),
+            "entry survives an unarmed gc"
+        );
         // A bump arms gc; the now-stale entry is swept.
         m.slot_dirty_begin(SlotKey::Memo(key(1).fingerprint));
         m.slot_dirty_end(SlotKey::Memo(key(1).fingerprint));
@@ -1139,7 +1245,7 @@ mod tests {
         m.memo_slot_remove(fingerprint);
         m.insert(key(1), entry(b"orphan", version));
 
-        assert!(m.get(&key(1)).is_none(), "orphan not served");
+        assert!(m.get(&key(1), false).is_none(), "orphan not served");
     }
 
     #[test]
@@ -1148,12 +1254,15 @@ mod tests {
         let fingerprint = Fingerprint::from_raw(1);
         m.memo_slot_create(fingerprint);
         let mut capture =
-            MemoCapture::begin(&m, key(1), &[Oid::from_raw(10)]).expect("capture begins");
+            MemoCapture::begin(&m, key(1), &[Oid::from_raw(10)], 1).expect("capture begins");
         capture.command_complete_push(b"C");
 
         m.memo_slot_remove(fingerprint);
 
-        assert!(!capture.finish(&m), "capture across removal dropped");
+        assert!(
+            !capture.finish_at(&m, Instant::now()),
+            "capture across removal dropped"
+        );
         assert!(m.is_empty());
     }
 
@@ -1167,7 +1276,7 @@ mod tests {
         m.memo_slot_create(fingerprint);
         m.memo_slot_remove(fingerprint);
 
-        assert!(MemoCapture::begin(&m, key(1), &[Oid::from_raw(10)]).is_none());
+        assert!(MemoCapture::begin(&m, key(1), &[Oid::from_raw(10)], 1).is_none());
     }
 
     #[test]
@@ -1184,7 +1293,7 @@ mod tests {
 
         assert!(m.slot_version(SlotKey::Memo(fingerprint)) > old[0].1);
         assert!(
-            m.get(&key(1)).is_none(),
+            m.get(&key(1), false).is_none(),
             "old entry not served after re-create"
         );
     }
@@ -1226,16 +1335,17 @@ mod tests {
                 ..key(1)
             },
             &[Oid::from_raw(10)],
+            1,
         )
         .expect("capture begins");
         capture.command_complete_push(b"C");
 
         m.memo_slot_remove(removed);
 
-        assert!(m.get(&key(1)).is_some(), "other entry still served");
-        assert!(m.get(&key(2)).is_none(), "removed entry stale");
+        assert!(m.get(&key(1), false).is_some(), "other entry still served");
+        assert!(m.get(&key(2), false).is_none(), "removed entry stale");
         assert!(
-            capture.finish(&m),
+            capture.finish_at(&m, Instant::now()),
             "capture over an unwritten relation kept"
         );
         assert_eq!(m.slot_epochs.len(), 1, "only the kept slot remains");
@@ -1286,7 +1396,7 @@ mod tests {
         m.slot_dirty_begin(SlotKey::Memo(key(1).fingerprint));
         m.slot_dirty_end(SlotKey::Memo(key(1).fingerprint));
         m.gc();
-        assert!(m.get(&key(2)).is_some(), "live entry survives gc");
+        assert!(m.get(&key(2), false).is_some(), "live entry survives gc");
         assert_eq!(m.len(), 1);
         assert_eq!(m.total_bytes(), 3);
     }
@@ -1326,15 +1436,15 @@ mod tests {
     fn test_capture_roundtrip_and_rd_len() {
         let m = memo(1 << 20);
         m.memo_slot_create(Fingerprint::from_raw(1));
-        let mut cap = MemoCapture::begin(&m, key(1), &[Oid::from_raw(10), Oid::from_raw(20)])
+        let mut cap = MemoCapture::begin(&m, key(1), &[Oid::from_raw(10), Oid::from_raw(20)], 1)
             .expect("relations stable, memo enabled");
         cap.row_description_push(b"RD");
         cap.data_push(b"row1");
         cap.data_push(b"row2");
         cap.command_complete_push(b"CC");
-        assert!(cap.finish(&m), "clean capture inserts");
+        assert!(cap.finish_at(&m, Instant::now()), "clean capture inserts");
 
-        let hit = m.get(&key(1)).expect("memoized");
+        let hit = m.get(&key(1), false).expect("memoized");
         assert_eq!(&hit.core[..], b"RDrow1row2CC");
         assert_eq!(hit.rd_len, 2, "RowDescription length recorded");
     }
@@ -1344,7 +1454,7 @@ mod tests {
         let m = memo(1 << 20);
         m.memo_slot_create(Fingerprint::from_raw(1));
         let mut cap =
-            MemoCapture::begin(&m, key(1), &[Oid::from_raw(10)]).expect("stable at begin");
+            MemoCapture::begin(&m, key(1), &[Oid::from_raw(10)], 1).expect("stable at begin");
         cap.row_description_push(b"RD");
         cap.data_push(b"row");
         cap.command_complete_push(b"CC");
@@ -1352,10 +1462,10 @@ mod tests {
         m.slot_dirty_begin(SlotKey::Relation(Oid::from_raw(10)));
         m.slot_dirty_end(SlotKey::Relation(Oid::from_raw(10)));
         assert!(
-            !cap.finish(&m),
+            !cap.finish_at(&m, Instant::now()),
             "stamp advanced → capture dropped, not stored"
         );
-        assert!(m.get(&key(1)).is_none());
+        assert!(m.get(&key(1), false).is_none());
     }
 
     #[test]
@@ -1363,7 +1473,7 @@ mod tests {
         let m = memo(1 << 20);
         m.slot_dirty_begin(SlotKey::Relation(Oid::from_raw(10))); // odd: write in progress
         assert!(
-            MemoCapture::begin(&m, key(1), &[Oid::from_raw(10)]).is_none(),
+            MemoCapture::begin(&m, key(1), &[Oid::from_raw(10)], 1).is_none(),
             "no capture started while a read relation is mid-write"
         );
     }
@@ -1372,11 +1482,11 @@ mod tests {
     fn test_capture_aborts_over_budget() {
         let m = memo(1 << 10);
         m.memo_slot_create(Fingerprint::from_raw(1));
-        let mut cap = MemoCapture::begin(&m, key(1), &[Oid::from_raw(10)]).expect("enabled");
+        let mut cap = MemoCapture::begin(&m, key(1), &[Oid::from_raw(10)], 1).expect("enabled");
         cap.row_description_push(b"RD");
         cap.data_push(&vec![0u8; 1 << 11]);
         assert!(
-            !cap.finish(&m),
+            !cap.finish_at(&m, Instant::now()),
             "a capture larger than the whole budget is dropped"
         );
         assert!(m.is_empty());
@@ -1387,7 +1497,7 @@ mod tests {
         let m = memo(1 << 20);
         m.memo_slot_create(Fingerprint::from_raw(1));
         let k = key(1);
-        let cap = MemoCapture::begin(&m, k, &[Oid::from_raw(10)]).expect("enabled");
+        let cap = MemoCapture::begin(&m, k, &[Oid::from_raw(10)], 1).expect("enabled");
         let began = cap.began;
         assert!(cap.finish_at(&m, began + 5 * MS), "capture stored");
         let stored = m.entries.get(&k).expect("stored");
@@ -1406,6 +1516,6 @@ mod tests {
     #[test]
     fn test_capture_disabled_returns_none() {
         let m = memo(0);
-        assert!(MemoCapture::begin(&m, key(1), &[Oid::from_raw(10)]).is_none());
+        assert!(MemoCapture::begin(&m, key(1), &[Oid::from_raw(10)], 1).is_none());
     }
 }

@@ -221,14 +221,16 @@ pub mod names {
     /// Serves that applied the client's rendering settings on the cache
     /// connection (not skipped as already applied) (PGC-287).
     pub const CACHE_SERVE_SETTINGS_APPLIED: &str = "pgcache.cache.serve_settings_applied";
-    /// Memo entries dropped (CDC-evicted via stale seqlock, or budget-reclaimed).
+    /// Memo entries dropped as stale (CDC-evicted via the seqlock). Entries
+    /// displaced for room are `memo_replacements`, not counted here.
     pub const CACHE_MEMO_EVICTIONS: &str = "pgcache.cache.memo_evictions";
     /// Memo-eligible candidates not evicted because the UPDATE changed no
     /// column their query reads (PGC-247), per row and candidate.
     pub const CACHE_MEMO_EVICTIONS_SKIPPED: &str = "pgcache.cache.memo_evictions_skipped";
     /// Memo entries displaced to make room for a more valuable capture (PGC-576).
     pub const CACHE_MEMO_REPLACEMENTS: &str = "pgcache.cache.memo_replacements";
-    /// Captures refused as worth less than the entries they would displace (PGC-576).
+    /// Captures refused over budget: the entries worth less than the newcomer
+    /// could not free enough room, or there were none (PGC-576).
     pub const CACHE_MEMO_REFUSED: &str = "pgcache.cache.memo_refused";
     /// Current number of live memo entries.
     pub const CACHE_MEMO_ENTRIES: &str = "pgcache.cache.memo_entries";

@@ -109,12 +109,7 @@ impl CacheDispatch {
             shape,
             profile: msg.output_settings.profile(),
         };
-        let hit = self.state_view.memo.get(&key)?;
-        // A captured snapshot always carries a RowDescription; guard anyway so a
-        // RowDescription-wanting client never gets a body with none.
-        if wants_row_description && hit.rd_len == 0 {
-            return None;
-        }
+        let hit = self.state_view.memo.get(&key, wants_row_description)?;
         Some(MemoServe {
             hit,
             has_parse,

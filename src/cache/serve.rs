@@ -99,7 +99,7 @@ fn memo_capture_begin(
         shape,
         profile: msg.output_settings.profile(),
     };
-    MemoCapture::begin(&state_view.memo, key, &oids)
+    MemoCapture::begin(&state_view.memo, key, &oids, hits)
 }
 
 /// Deterministic fault injection for serve-pool replenishment (PGC-238): poison
