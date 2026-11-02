@@ -86,6 +86,11 @@ pub(crate) struct MetricsSnapshot {
     /// Memo evictions skipped because the UPDATE changed no column the
     /// query reads (PGC-247).
     pub cache_memo_evictions_skipped: u64,
+    /// Memo entries displaced to make room for a more valuable capture (PGC-576).
+    pub cache_memo_replacements: u64,
+    /// Captures refused because they were worth less than the entries they
+    /// would have displaced (PGC-576).
+    pub cache_memo_refused: u64,
     /// Gauge: memo version slots currently held.
     pub cache_memo_slots: u64,
     /// Gauge: entries Pending below the admission threshold.
@@ -231,6 +236,8 @@ const SAMPLES: &[Sample] = samples! {
     "pgcache_cache_reference_only_forward_total" => cache_reference_only_forwards,
     "pgcache_cache_memo_evictions" => cache_memo_evictions,
     "pgcache_cache_memo_evictions_skipped" => cache_memo_evictions_skipped,
+    "pgcache_cache_memo_replacements" => cache_memo_replacements,
+    "pgcache_cache_memo_refused" => cache_memo_refused,
     "pgcache_cache_memo_slots" => cache_memo_slots,
     "pgcache_cache_queries_pending" => cache_queries_pending,
     "pgcache_cache_cdc_local_eval_hits" => cache_cdc_local_eval_hits,

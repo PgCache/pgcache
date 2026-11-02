@@ -67,6 +67,7 @@
 //! removed, so they start at 0 and a floor raise leaves them alone.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
@@ -77,9 +78,16 @@ use crate::query::Fingerprint;
 use crate::query::ast::{LimitClause, LiteralValue};
 use crate::settings::DynamicConfigHandle;
 
-/// Per-entry size cap. Results above this are never memoized — the in-memory
-/// backend targets the small/stable results that dominate source-row traffic.
-const MAX_MEMO_ENTRY_BYTES: usize = 128 * 1024;
+/// Time a memo saves per byte it holds: `serve_cost × hits / bytes`. Ranks
+/// entries when an insert needs room; the newcomer must beat every victim it
+/// displaces. No per-entry size cap: a large result is simply a large price
+/// against the time its hits save (PGC-576).
+fn entry_value(serve_cost: Duration, hits: u64, bytes: usize) -> u128 {
+    if bytes == 0 {
+        return 0;
+    }
+    serve_cost.as_nanos() * u128::from(hits) / bytes as u128
+}
 
 /// A fingerprint is memoized from its first eligible serve. Capture only happens
 /// for already-cacheable source-row serves and the store is byte-bounded, so a
@@ -158,7 +166,7 @@ pub struct MemoKey {
 
 /// A captured result snapshot: client-ready core wire bytes plus the slot epochs
 /// it was valid against.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct MemoEntry {
     /// `RowDescription` + `DataRow*` + `CommandComplete`, as a single contiguous
     /// buffer. The per-client envelope (Parse/Bind/RFQ) is regenerated per serve
@@ -171,11 +179,25 @@ pub struct MemoEntry {
     /// Slots stamped at capture; the entry is live while all still match. Holds
     /// only the [`SlotKey::Memo`] slot (rung 3) — never a `Relation` guard slot.
     pub stamped: Box<[(SlotKey, u64)]>,
+    /// Wall time of the serve this snapshot was captured from (worker hop, cache
+    /// PG execution, relay): what one memo hit saves.
+    pub serve_cost: Duration,
+    /// Serves this entry has satisfied, counting the capturing serve as the
+    /// first. A re-capture of the same key inherits half its predecessor's.
+    pub hits: AtomicU64,
 }
 
 impl MemoEntry {
     fn size(&self) -> usize {
         self.core.len()
+    }
+
+    fn hits(&self) -> u64 {
+        self.hits.load(Ordering::Relaxed)
+    }
+
+    fn worth(&self) -> u128 {
+        entry_value(self.serve_cost, self.hits(), self.size())
     }
 }
 
@@ -332,6 +354,7 @@ impl ResultMemo {
         {
             let entry = self.entries.get(key)?;
             if self.slots_valid(&entry.stamped) {
+                entry.hits.fetch_add(1, Ordering::Relaxed);
                 return Some(MemoHit {
                     core: entry.core.clone(),
                     rd_len: entry.rd_len,
@@ -352,12 +375,13 @@ impl ResultMemo {
     }
 
     /// Insert a captured snapshot. Rejected (returns `false`) when memoization is
-    /// disabled, the entry exceeds the per-entry cap, or it would exceed the
-    /// total budget. Replacing an existing key reuses its byte accounting.
+    /// disabled, or when it would exceed the total budget and is worth less than
+    /// the entries it would have to displace. Replacing an existing key reuses
+    /// its byte accounting and inherits half its hits.
     pub fn insert(&self, key: MemoKey, entry: MemoEntry) -> bool {
         let size = entry.size();
         let budget = self.budget();
-        if budget == 0 || size > MAX_MEMO_ENTRY_BYTES {
+        if budget == 0 {
             return false;
         }
 
@@ -367,13 +391,17 @@ impl ResultMemo {
         // plain subtraction underflow (panic under overflow-checks). Saturate;
         // the budget is a soft cap and the authoritative accounting below is the
         // per-op atomic add/sub keyed on the actual map mutation.
-        let prev_size = self.entries.get(&key).map(|e| e.size());
+        let prev = self.entries.get(&key).map(|e| (e.size(), e.hits()));
+        if let Some((_, prev_hits)) = prev {
+            entry.hits.store((prev_hits / 2).max(1), Ordering::Relaxed);
+        }
         let projected = self
             .total_bytes
             .load(Ordering::Relaxed)
-            .saturating_sub(prev_size.unwrap_or(0))
+            .saturating_sub(prev.map_or(0, |(size, _)| size))
             + size;
-        if projected > budget {
+        if projected > budget && !self.room_make(&key, entry.worth(), projected - budget) {
+            crate::metrics::handles().cache.memo_refused.increment(1);
             return false;
         }
 
@@ -382,6 +410,44 @@ impl ResultMemo {
         }
         self.total_bytes.fetch_add(size, Ordering::Relaxed);
         crate::metrics::handles().cache.memo_captures.increment(1);
+        true
+    }
+
+    /// Displace the lowest-value entries until `needed` bytes are free, unless
+    /// the newcomer is worth no more than the most valuable victim that takes:
+    /// then nothing is displaced and the newcomer is refused. A key being
+    /// replaced is never its own victim; its bytes are already discounted.
+    fn room_make(&self, newcomer: &MemoKey, newcomer_value: u128, needed: usize) -> bool {
+        let mut candidates: Vec<(MemoKey, u128, usize)> = self
+            .entries
+            .iter()
+            .filter(|e| e.key() != newcomer)
+            .map(|e| (*e.key(), e.worth(), e.size()))
+            .collect();
+        candidates.sort_unstable_by_key(|&(_, value, _)| value);
+
+        let mut freed = 0;
+        let mut victims = Vec::new();
+        for (key, value, size) in candidates {
+            if freed >= needed {
+                break;
+            }
+            if value >= newcomer_value {
+                return false;
+            }
+            freed += size;
+            victims.push(key);
+        }
+        if freed < needed {
+            return false;
+        }
+        for key in &victims {
+            self.remove(key);
+        }
+        crate::metrics::handles()
+            .cache
+            .memo_replacements
+            .increment(victims.len() as u64);
         true
     }
 
@@ -498,9 +564,14 @@ pub(crate) struct MemoCapture {
     stamped: Box<[(SlotKey, u64)]>,
     buf: BytesMut,
     rd_len: usize,
-    /// Set once the accumulated bytes exceed the per-entry cap; the capture is
-    /// then a no-op through `finish`.
+    /// Set once the accumulated bytes exceed the whole memo budget; the capture
+    /// is then a no-op through `finish`.
     aborted: bool,
+    /// Budget at `begin`, so the per-frame bound needs no dynamic-config load.
+    budget: usize,
+    /// Taken before the serve query is issued; `finish` measures the serve from
+    /// here, which is the time a hit on the stored entry saves.
+    began: Instant,
 }
 
 impl MemoCapture {
@@ -508,7 +579,8 @@ impl MemoCapture {
     /// memoization is disabled or any read relation is mid-write (odd slot) —
     /// the caller skips capturing and serves normally.
     pub(crate) fn begin(memo: &ResultMemo, key: MemoKey, relation_oids: &[Oid]) -> Option<Self> {
-        if !memo.enabled() {
+        let budget = memo.budget();
+        if budget == 0 {
             return None;
         }
         // Stamp the per-fingerprint `Memo` slot (the serve-time dependency) plus
@@ -527,6 +599,8 @@ impl MemoCapture {
             buf: BytesMut::new(),
             rd_len: 0,
             aborted: false,
+            budget,
+            began: Instant::now(),
         })
     }
 
@@ -534,7 +608,7 @@ impl MemoCapture {
         if self.aborted {
             return;
         }
-        if self.buf.len() + data.len() > MAX_MEMO_ENTRY_BYTES {
+        if self.buf.len() + data.len() > self.budget {
             // Too large to memoize — drop what we have and stop accumulating.
             self.aborted = true;
             self.buf = BytesMut::new();
@@ -564,9 +638,16 @@ impl MemoCapture {
     /// Finalize: insert the captured snapshot iff it wasn't aborted and no read
     /// relation changed since `begin`. Returns whether an entry was stored.
     pub(crate) fn finish(self, memo: &ResultMemo) -> bool {
+        self.finish_at(memo, Instant::now())
+    }
+
+    /// [`finish`](Self::finish) with the completion instant supplied; the
+    /// serve's cost is `now - began`.
+    pub(crate) fn finish_at(self, memo: &ResultMemo, now: Instant) -> bool {
         if self.aborted || !memo.slots_valid(&self.stamped) {
             return false;
         }
+        let serve_cost = now.saturating_duration_since(self.began);
         // The entry stamps ONLY its `Memo` slot — serving is per-fingerprint
         // precise. The `Relation` versions in `self.stamped` were the
         // capture-window guard (re-checked above), not a serve dependency.
@@ -582,6 +663,8 @@ impl MemoCapture {
                 core: self.buf.freeze(),
                 rd_len: self.rd_len,
                 stamped,
+                serve_cost,
+                hits: AtomicU64::new(1),
             },
         )
     }
@@ -600,12 +683,28 @@ mod tests {
     }
 
     fn entry(bytes: &[u8], stamped: &[(SlotKey, u64)]) -> MemoEntry {
+        entry_valued(bytes, Duration::ZERO, 1).with_stamped(stamped)
+    }
+
+    fn entry_valued(bytes: &[u8], serve_cost: Duration, hits: u64) -> MemoEntry {
         MemoEntry {
             core: Bytes::copy_from_slice(bytes),
             rd_len: 0,
-            stamped: stamped.into(),
+            stamped: Box::new([]),
+            serve_cost,
+            hits: AtomicU64::new(hits),
         }
     }
+
+    impl MemoEntry {
+        fn with_stamped(mut self, stamped: &[(SlotKey, u64)]) -> Self {
+            self.stamped = stamped.into();
+            self
+        }
+    }
+
+    const MS: Duration = Duration::from_millis(1);
+    const US: Duration = Duration::from_micros(1);
 
     fn key(fp: u64) -> MemoKey {
         MemoKey {
@@ -850,25 +949,125 @@ mod tests {
     }
 
     #[test]
-    fn test_per_entry_cap_rejects() {
+    fn test_large_entry_within_budget_is_stored() {
         let m = memo(1 << 30);
-        let big = vec![0u8; MAX_MEMO_ENTRY_BYTES + 1];
-        assert!(
-            !m.insert(key(1), entry(&big, &[])),
-            "over per-entry cap rejected"
-        );
-        assert!(m.is_empty());
+        let big = vec![0u8; 1 << 20];
+        assert!(m.insert(key(1), entry(&big, &[])), "no per-entry cap");
+        assert_eq!(m.total_bytes(), 1 << 20);
     }
 
     #[test]
-    fn test_total_budget_rejects() {
+    fn test_over_budget_insert_with_equal_values_refuses() {
         let m = memo(16);
         assert!(m.insert(key(1), entry(b"0123456789", &[])), "fits");
         assert!(
             !m.insert(key(2), entry(b"0123456789", &[])),
-            "would exceed budget"
+            "a newcomer no more valuable than its victim is refused"
         );
         assert_eq!(m.total_bytes(), 10);
+        assert!(m.get(&key(1)).is_some(), "the resident entry is untouched");
+    }
+
+    #[test]
+    fn test_entry_value_is_time_saved_per_byte() {
+        let list = entry_value(Duration::from_micros(2700), 100, 94 * 1024);
+        let row = entry_value(Duration::from_micros(300), 1, 1024);
+        let hot_row = entry_value(Duration::from_micros(300), 1000, 1024);
+        assert!(
+            list > row,
+            "a costly list hit a hundred times beats a cheap row hit once"
+        );
+        assert!(
+            hot_row > list,
+            "a thousand cheap hits beat a hundred costly ones"
+        );
+        assert_eq!(entry_value(MS, 1, 0), 0, "an empty core has no value");
+    }
+
+    #[test]
+    fn test_over_budget_insert_displaces_lowest_value() {
+        let m = memo(20);
+        assert!(m.insert(key(1), entry_valued(&[0u8; 8], MS, 100)), "A fits");
+        assert!(m.insert(key(2), entry_valued(&[0u8; 8], US, 1)), "B fits");
+        assert!(
+            m.insert(key(3), entry_valued(&[0u8; 8], MS, 1)),
+            "C is worth more than B and takes its place"
+        );
+        assert!(m.get(&key(1)).is_some(), "A kept");
+        assert!(m.get(&key(2)).is_none(), "B displaced");
+        assert!(m.get(&key(3)).is_some(), "C stored");
+        assert_eq!(m.total_bytes(), 16);
+    }
+
+    #[test]
+    fn test_over_budget_insert_refuses_newcomer_below_victims() {
+        let m = memo(20);
+        assert!(m.insert(key(1), entry_valued(&[0u8; 8], MS, 100)));
+        assert!(m.insert(key(2), entry_valued(&[0u8; 8], MS, 10)));
+        assert!(
+            !m.insert(key(3), entry_valued(&[0u8; 8], US, 1)),
+            "C is worth less than any resident"
+        );
+        assert!(m.get(&key(1)).is_some());
+        assert!(m.get(&key(2)).is_some());
+        assert_eq!(m.total_bytes(), 16, "nothing displaced");
+    }
+
+    #[test]
+    fn test_displacement_takes_as_many_victims_as_the_newcomer_needs() {
+        let m = memo(24);
+        assert!(m.insert(key(1), entry_valued(&[0u8; 8], MS, 100)));
+        assert!(m.insert(key(2), entry_valued(&[0u8; 8], US, 1)));
+        assert!(m.insert(key(3), entry_valued(&[0u8; 8], US, 2)));
+        assert!(
+            m.insert(key(4), entry_valued(&[0u8; 16], MS, 1)),
+            "D needs both low-value entries gone"
+        );
+        assert!(m.get(&key(1)).is_some(), "A kept");
+        assert!(m.get(&key(2)).is_none(), "B displaced");
+        assert!(m.get(&key(3)).is_none(), "C displaced");
+        assert!(m.get(&key(4)).is_some(), "D stored");
+        assert_eq!(m.total_bytes(), 24);
+    }
+
+    #[test]
+    fn test_hit_increments_entry_hits() {
+        let m = memo(1 << 20);
+        let k = key(1);
+        assert!(m.insert(k, entry(b"x", &[])));
+        assert!(m.get(&k).is_some());
+        assert!(m.get(&k).is_some());
+        assert_eq!(m.entries.get(&k).expect("stored").hits(), 3);
+    }
+
+    #[test]
+    fn test_recapture_carries_half_the_hits() {
+        let m = memo(1 << 20);
+        let k = key(1);
+        assert!(m.insert(k, entry(b"x", &[])));
+        for _ in 0..9 {
+            assert!(m.get(&k).is_some());
+        }
+        assert_eq!(m.entries.get(&k).expect("stored").hits(), 10);
+        assert!(
+            m.insert(k, entry(b"xy", &[])),
+            "re-capture replaces the key"
+        );
+        assert_eq!(
+            m.entries.get(&k).expect("stored").hits(),
+            5,
+            "half the lineage"
+        );
+        assert!(m.insert(k, entry(b"xyz", &[])));
+        assert_eq!(m.entries.get(&k).expect("stored").hits(), 2);
+        assert!(m.insert(k, entry(b"w", &[])));
+        assert_eq!(
+            m.entries.get(&k).expect("stored").hits(),
+            1,
+            "floored at one"
+        );
+        assert!(m.insert(k, entry(b"v", &[])));
+        assert_eq!(m.entries.get(&k).expect("stored").hits(), 1);
     }
 
     #[test]
@@ -1185,14 +1384,38 @@ mod tests {
     }
 
     #[test]
-    fn test_capture_aborts_over_cap() {
-        let m = memo(1 << 30);
+    fn test_capture_aborts_over_budget() {
+        let m = memo(1 << 10);
         m.memo_slot_create(Fingerprint::from_raw(1));
         let mut cap = MemoCapture::begin(&m, key(1), &[Oid::from_raw(10)]).expect("enabled");
         cap.row_description_push(b"RD");
-        cap.data_push(&vec![0u8; MAX_MEMO_ENTRY_BYTES + 1]);
-        assert!(!cap.finish(&m), "oversized capture is dropped");
+        cap.data_push(&vec![0u8; 1 << 11]);
+        assert!(
+            !cap.finish(&m),
+            "a capture larger than the whole budget is dropped"
+        );
         assert!(m.is_empty());
+    }
+
+    #[test]
+    fn test_capture_records_serve_cost() {
+        let m = memo(1 << 20);
+        m.memo_slot_create(Fingerprint::from_raw(1));
+        let k = key(1);
+        let cap = MemoCapture::begin(&m, k, &[Oid::from_raw(10)]).expect("enabled");
+        let began = cap.began;
+        assert!(cap.finish_at(&m, began + 5 * MS), "capture stored");
+        let stored = m.entries.get(&k).expect("stored");
+        assert_eq!(
+            stored.serve_cost,
+            5 * MS,
+            "the capture bracket is the time a hit saves"
+        );
+        assert_eq!(
+            stored.hits(),
+            1,
+            "the capturing serve counts as the first hit"
+        );
     }
 
     #[test]

@@ -226,6 +226,10 @@ pub mod names {
     /// Memo-eligible candidates not evicted because the UPDATE changed no
     /// column their query reads (PGC-247), per row and candidate.
     pub const CACHE_MEMO_EVICTIONS_SKIPPED: &str = "pgcache.cache.memo_evictions_skipped";
+    /// Memo entries displaced to make room for a more valuable capture (PGC-576).
+    pub const CACHE_MEMO_REPLACEMENTS: &str = "pgcache.cache.memo_replacements";
+    /// Captures refused as worth less than the entries they would displace (PGC-576).
+    pub const CACHE_MEMO_REFUSED: &str = "pgcache.cache.memo_refused";
     /// Current number of live memo entries.
     pub const CACHE_MEMO_ENTRIES: &str = "pgcache.cache.memo_entries";
     /// Current total bytes held by the memo.
@@ -754,6 +758,8 @@ pub struct CacheHandles {
     pub memo_hits: Counter,
     pub memo_captures: Counter,
     pub memo_evictions: Counter,
+    pub memo_replacements: Counter,
+    pub memo_refused: Counter,
     /// Rendering-settings applications on serve connections (PGC-287).
     pub serve_settings_applied: Counter,
     pub memo_entries: Gauge,
@@ -806,16 +812,17 @@ impl CacheHandles {
             CACHE_CPU_PRESSURE_AVG10, CACHE_CPU_PRESSURE_AVG60, CACHE_CPU_WAITING_TASKS,
             CACHE_LOOKUP_LATENCY_SECONDS, CACHE_MARGINAL_BYTES_PER_QUERY, CACHE_MEMO_BYTES,
             CACHE_MEMO_CAPTURES, CACHE_MEMO_ENTRIES, CACHE_MEMO_EVICTIONS, CACHE_MEMO_HITS,
-            CACHE_MEMO_SLOTS, CACHE_MEMORY_BUDGET_BYTES, CACHE_MEMORY_USED_BYTES,
-            CACHE_MV_BUILDS_SUPPRESSED, CACHE_MV_FALLTHROUGH, CACHE_MV_HITS, CACHE_POOL_AVAILABLE,
-            CACHE_POOL_RECYCLED, CACHE_POOL_REPLENISHED, CACHE_QUERY_COUNT_CAP,
-            CACHE_REFERENCE_ONLY_FORWARD_TOTAL, CACHE_REG_GATE_BTLBW, CACHE_REG_GATE_DRAIN_RATE,
-            CACHE_REG_GATE_LOADING, CACHE_REG_GATE_QUEUE_MIN, CACHE_REG_GATE_RATE,
-            CACHE_REGISTRATION_THROTTLED, CACHE_REGISTRATION_THROTTLED_TOTAL, CACHE_RESTARTS_TOTAL,
-            CACHE_ROLE_CHANGES, CACHE_RSS_BYTES, CACHE_SERVE_DESYNC_TOTAL,
-            CACHE_SERVE_DIRTY_RETURN_TOTAL, CACHE_SERVE_POOL_BACKSTOP_GROWS,
-            CACHE_SERVE_POOL_SCALE_DOWN, CACHE_SERVE_POOL_SCALE_UP, CACHE_SERVE_POOL_SIZE,
-            CACHE_SERVE_SETTINGS_APPLIED, CACHE_SERVE_STALL_TOTAL, CACHE_SERVES_IN_FLIGHT,
+            CACHE_MEMO_REFUSED, CACHE_MEMO_REPLACEMENTS, CACHE_MEMO_SLOTS,
+            CACHE_MEMORY_BUDGET_BYTES, CACHE_MEMORY_USED_BYTES, CACHE_MV_BUILDS_SUPPRESSED,
+            CACHE_MV_FALLTHROUGH, CACHE_MV_HITS, CACHE_POOL_AVAILABLE, CACHE_POOL_RECYCLED,
+            CACHE_POOL_REPLENISHED, CACHE_QUERY_COUNT_CAP, CACHE_REFERENCE_ONLY_FORWARD_TOTAL,
+            CACHE_REG_GATE_BTLBW, CACHE_REG_GATE_DRAIN_RATE, CACHE_REG_GATE_LOADING,
+            CACHE_REG_GATE_QUEUE_MIN, CACHE_REG_GATE_RATE, CACHE_REGISTRATION_THROTTLED,
+            CACHE_REGISTRATION_THROTTLED_TOTAL, CACHE_RESTARTS_TOTAL, CACHE_ROLE_CHANGES,
+            CACHE_RSS_BYTES, CACHE_SERVE_DESYNC_TOTAL, CACHE_SERVE_DIRTY_RETURN_TOTAL,
+            CACHE_SERVE_POOL_BACKSTOP_GROWS, CACHE_SERVE_POOL_SCALE_DOWN,
+            CACHE_SERVE_POOL_SCALE_UP, CACHE_SERVE_POOL_SIZE, CACHE_SERVE_SETTINGS_APPLIED,
+            CACHE_SERVE_STALL_TOTAL, CACHE_SERVES_IN_FLIGHT,
         };
         Self {
             lookup_latency: metrics::histogram!(CACHE_LOOKUP_LATENCY_SECONDS),
@@ -829,6 +836,8 @@ impl CacheHandles {
             memo_captures: metrics::counter!(CACHE_MEMO_CAPTURES),
             serve_settings_applied: metrics::counter!(CACHE_SERVE_SETTINGS_APPLIED),
             memo_evictions: metrics::counter!(CACHE_MEMO_EVICTIONS),
+            memo_replacements: metrics::counter!(CACHE_MEMO_REPLACEMENTS),
+            memo_refused: metrics::counter!(CACHE_MEMO_REFUSED),
             memo_entries: metrics::gauge!(CACHE_MEMO_ENTRIES),
             memo_bytes: metrics::gauge!(CACHE_MEMO_BYTES),
             memo_slots: metrics::gauge!(CACHE_MEMO_SLOTS),

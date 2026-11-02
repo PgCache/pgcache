@@ -11,7 +11,7 @@
 use std::io::Error;
 use std::time::Duration;
 
-use crate::util::{TestContext, assert_row_at, http_put};
+use crate::util::{TestContext, assert_row_at, http_put, rows_of};
 
 mod util;
 
@@ -615,6 +615,42 @@ async fn test_memo_not_served_after_toast_fallback_invalidation() -> Result<(), 
     assert!(
         served_from_cache,
         "the readmitted query was never served from cache"
+    );
+    Ok(())
+}
+
+/// A result far larger than the old fixed per-entry cap is captured and served
+/// from the memo: the only size bound is the whole memo budget (PGC-576).
+#[tokio::test]
+async fn test_memo_serves_a_result_larger_than_the_old_cap() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    ctx.query(
+        "create table memo_big (id integer primary key, kind text, val text)",
+        &[],
+    )
+    .await?;
+    // ~3,000 rows of 100 bytes: roughly 300 KiB on the wire, above 128 KiB.
+    ctx.query(
+        "insert into memo_big select g, 'x', repeat('v', 100) from generate_series(1, 3000) g",
+        &[],
+    )
+    .await?;
+
+    warm_until_memoized(&mut ctx, "select id, val from memo_big where kind = 'x'").await?;
+
+    let before = ctx.metrics().await?;
+    let res = ctx
+        .simple_query("select id, val from memo_big where kind = 'x'")
+        .await?;
+    assert_eq!(
+        rows_of(&res).len(),
+        3000,
+        "the memo serves the whole result"
+    );
+    let after = ctx.metrics().await?;
+    assert!(
+        after.cache_memo_hits > before.cache_memo_hits,
+        "a 300 KiB result should serve from the memo"
     );
     Ok(())
 }
