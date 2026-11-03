@@ -18,22 +18,22 @@ your platform:
 
 | Platform | Asset |
 |---|---|
-| macOS (Apple Silicon) | `pgcache-fit-0.0.3-aarch64-apple-darwin` |
-| Linux x86_64 | `pgcache-fit-0.0.3-x86_64-unknown-linux-musl` |
-| Linux arm64 | `pgcache-fit-0.0.3-aarch64-unknown-linux-musl` |
+| macOS (Apple Silicon) | `pgcache-fit-0.0.4-aarch64-apple-darwin` |
+| Linux x86_64 | `pgcache-fit-0.0.4-x86_64-unknown-linux-musl` |
+| Linux arm64 | `pgcache-fit-0.0.4-aarch64-unknown-linux-musl` |
 
 Download it, make it executable, and run:
 
 ```sh
 # with the gh CLI (macOS arm64 shown)
-gh release download fit-v0.0.3 --repo PgCache/pgcache \
-  --pattern 'pgcache-fit-0.0.3-aarch64-apple-darwin'
+gh release download fit-v0.0.4 --repo PgCache/pgcache \
+  --pattern 'pgcache-fit-0.0.4-aarch64-apple-darwin'
 
 # or with curl
-curl -LO https://github.com/PgCache/pgcache/releases/download/fit-v0.0.3/pgcache-fit-0.0.3-aarch64-apple-darwin
+curl -LO https://github.com/PgCache/pgcache/releases/download/fit-v0.0.4/pgcache-fit-0.0.4-aarch64-apple-darwin
 
-chmod +x pgcache-fit-0.0.3-*
-./pgcache-fit-0.0.3-aarch64-apple-darwin check queries.sql
+chmod +x pgcache-fit-0.0.4-*
+./pgcache-fit-0.0.4-aarch64-apple-darwin check queries.sql
 ```
 
 The Linux binaries are static (musl) and run on any distro with no
