@@ -215,6 +215,4 @@ name = "ast_pipeline"
 harness = false
 
 [patch.crates-io]
-# Local path while pg_query changes accumulate (bindgen allowlist); push the
-# fork and restore the git patch when the churn settles.
-pg_query = { path = "../pg_query.rs" }
+pg_query = { git = "https://github.com/PgCache/pg_query.rs", branch = "pgcache" }
