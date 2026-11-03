@@ -186,6 +186,7 @@ fn ast_error_detail(error: &AstError) -> String {
             format!("subquery type {sublink_type}")
         }
         AstError::WhereParseError(error) => where_error_detail(error),
+        AstError::ParseError { message } => message.clone(),
         AstError::MultipleStatements | AstError::MissingStatement => error.to_string(),
     }
 }
