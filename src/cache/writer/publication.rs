@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use postgres_protocol::escape;
+use tokio_postgres::error::SqlState;
 use tracing::debug;
 
 use super::core::WriterCore;
@@ -94,11 +95,26 @@ impl WriterCore {
             self.oids_to_table_list(&added)
         );
         debug!("publication add: {sql}");
-        self.db_origin
-            .batch_execute(&sql)
-            .await
-            .map_into_report::<CacheError>()
-            .attach_loc("adding relations to the publication")?;
+        match self.db_origin.batch_execute(&sql).await {
+            Ok(()) => {}
+            // Postgres already considers every named relation a publication
+            // member (e.g. a previous attempt added it before failing on a
+            // different relation in the same statement, or some other
+            // out-of-band `ALTER PUBLICATION`). `publication_oids` is only
+            // our local mirror of that server-side state, so trust Postgres
+            // and sync instead of erroring: treating this as a hard failure
+            // left `publication_oids` permanently out of sync, so every later
+            // registration recomputed the identical `added` set and retried
+            // the identical failing statement with no backoff.
+            Err(e) if e.code() == Some(&SqlState::DUPLICATE_OBJECT) => {
+                debug!("publication add: {added:?} already published, syncing local state");
+            }
+            Err(e) => {
+                return Err(e)
+                    .map_into_report::<CacheError>()
+                    .attach_loc("adding relations to the publication");
+            }
+        }
         self.publication_oids.extend(added);
         Ok(())
     }
