@@ -16,7 +16,7 @@ use crate::cache::QueryParameters;
 use crate::query::ast::rope::{
     NodeKind, NodeRef, QueryTree, Replacement, Replacements, Scalar, ScalarKind, TreeBuilder, View,
 };
-use crate::query::ast::{LiteralValue, NodeId};
+use crate::query::ast::{LiteralValue, NodeId, ScalarOp};
 
 /// `tree` with its placeholders bound to `parameters` and the arithmetic
 /// that exposes folded.
@@ -66,7 +66,10 @@ impl Pass<'_> {
         let kind = position.kind();
         let folded = if let NodeKind::Literal(LiteralValue::Parameter(_)) = kind {
             self.bound(Scalar::from_ref(position))?
-        } else if let NodeKind::Arithmetic { .. } = kind {
+        } else if let NodeKind::Operator {
+            op: ScalarOp::Arithmetic(_),
+        } = kind
+        {
             self.fold(Scalar::from_ref(position))?
         } else {
             None
@@ -85,14 +88,16 @@ impl Pass<'_> {
                     Some(literal.value().clone())
                 }
             }
-            ScalarKind::Arithmetic(arithmetic) => {
-                let (Some(left), Some(right)) = (
-                    self.fold(arithmetic.left())?,
-                    self.fold(arithmetic.right())?,
-                ) else {
+            ScalarKind::Operator(operator) => {
+                let ScalarOp::Arithmetic(op) = operator.op() else {
                     return Ok(None);
                 };
-                literal_arithmetic_fold(&left, arithmetic.op(), &right)
+                let (Some(left), Some(right)) =
+                    (self.fold(operator.left())?, self.fold(operator.right())?)
+                else {
+                    return Ok(None);
+                };
+                literal_arithmetic_fold(&left, op, &right)
             }
             ScalarKind::Column(_)
             | ScalarKind::Function(_)

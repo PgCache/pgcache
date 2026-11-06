@@ -84,8 +84,8 @@ mod tests {
     use super::*;
     use crate::cache::QueryParameters;
     use crate::oid::TypeOid;
-    use crate::query::ast::query_tree_parse;
     use crate::query::ast::rope::{Body, QueryTree, ScalarKind, WhereKind};
+    use crate::query::ast::{ScalarOp, query_tree_parse};
     use crate::query::transform::query_tree_parameters_replace;
 
     /// Conversion folds literal arithmetic as it finishes.
@@ -115,7 +115,10 @@ mod tests {
     }
 
     fn where_rhs_is_arithmetic(tree: &QueryTree) -> bool {
-        matches!(where_rhs(tree).kind(), ScalarKind::Arithmetic(_))
+        matches!(
+            where_rhs(tree).kind(),
+            ScalarKind::Operator(operator) if matches!(operator.op(), ScalarOp::Arithmetic(_))
+        )
     }
 
     #[test]

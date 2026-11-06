@@ -11,10 +11,11 @@
 //! sessions on the reference settings it will be populated under.
 
 use crate::query::ast::rope::{
-    Body, Case, Function, JoinQual, NodeKind, Query, QueryTree, Replacement, Replacements, Scalar,
-    ScalarKind, Select, SelectItem, Source, TreeBuilder, Values, View, Where, WhereKind,
+    Body, Case, Function, JoinQual, NodeKind, Operator, Query, QueryTree, Replacement,
+    Replacements, Scalar, ScalarKind, Select, SelectItem, Source, TreeBuilder, Values, View, Where,
+    WhereKind,
 };
-use crate::query::ast::{LiteralValue, NodeId};
+use crate::query::ast::{LiteralValue, NodeId, ScalarOp};
 use crate::query::cast::{CastTarget, cast_target_from_canonical};
 use crate::query::literal_settings::LiteralSettings;
 use crate::query::resolve::{Bindings, BindingsBuilder, BoundView};
@@ -186,13 +187,41 @@ impl TreePass<'_> {
             }
             ScalarKind::Function(function) => self.function(function),
             ScalarKind::Case(case) => self.case(case),
-            ScalarKind::Arithmetic(arithmetic) => {
-                self.scalar(arithmetic.left(), None);
-                self.scalar(arithmetic.right(), None);
-            }
+            ScalarKind::Operator(operator) => self.operator(operator),
             ScalarKind::Subquery(subquery) => self.query(subquery.query()),
             ScalarKind::Column(_) => {}
         }
+    }
+
+    /// Arithmetic operands are blind positions. A json operator fixes its
+    /// operand types to settings-insensitive ones, so its literals are never
+    /// date-time literals. `@>`, `<@` and `||` also take arrays, ranges and
+    /// scalars: beside a json column a literal is json, but beside any other
+    /// column it is an element, a range or (`timestamp || 'x'`) plain text,
+    /// never the column's own kind, so it stays blind.
+    fn operator(&mut self, operator: Operator<'_>) {
+        let (left, right) = (operator.left(), operator.right());
+        match operator.op() {
+            ScalarOp::Arithmetic(_) => {
+                self.scalar(left, None);
+                self.scalar(right, None);
+            }
+            ScalarOp::Json(op) if op.operands_settings_insensitive() => {
+                self.scalar(left, Some(ValueKind::Text));
+                self.scalar(right, Some(ValueKind::Text));
+            }
+            ScalarOp::Json(_) => {
+                self.scalar(left, self.json_column_kind(right));
+                self.scalar(right, self.json_column_kind(left));
+            }
+        }
+    }
+
+    /// `Text` when `scalar` is a column of a settings-insensitive type such
+    /// as jsonb, otherwise `None`.
+    fn json_column_kind(&self, scalar: Scalar<'_>) -> Option<ValueKind> {
+        self.scalar_column_kind(scalar)
+            .filter(|kind| *kind == ValueKind::Text)
     }
 
     fn function(&mut self, function: Function<'_>) {
@@ -232,7 +261,9 @@ impl TreePass<'_> {
     }
 
     /// The kind of the column a comparison side names, looking through a
-    /// cast; an inner join's merged column has its left column's kind.
+    /// cast; an inner join's merged column has its left column's kind. A
+    /// column of a type whose text input no tracked setting changes reads
+    /// as `Text`, as a cast to it does.
     fn column_kind(&self, side: Where<'_>) -> Option<ValueKind> {
         let WhereKind::Scalar(scalar) = side.kind() else {
             return None;
@@ -242,17 +273,21 @@ impl TreePass<'_> {
 
     fn scalar_column_kind(&self, scalar: Scalar<'_>) -> Option<ValueKind> {
         match scalar.kind() {
-            ScalarKind::Column(column) => self
-                .bound
-                .column_type_at(column.id())
-                .map(ValueKind::of_type),
+            ScalarKind::Column(column) => self.bound.column_type_at(column.id()).map(|ty| {
+                let kind = ValueKind::of_type(ty);
+                if kind == ValueKind::Unsupported && type_input_settings_insensitive(ty.name()) {
+                    ValueKind::Text
+                } else {
+                    kind
+                }
+            }),
             ScalarKind::TypeCast(cast) => {
                 cast_kind(cast.target()).or_else(|| self.scalar_column_kind(cast.expr()))
             }
             ScalarKind::Literal(_)
             | ScalarKind::Function(_)
             | ScalarKind::Case(_)
-            | ScalarKind::Arithmetic(_)
+            | ScalarKind::Operator(_)
             | ScalarKind::Subquery(_)
             | ScalarKind::Array(_) => None,
         }
@@ -429,6 +464,8 @@ mod tests {
                     column("local_at", 4, Type::TIMESTAMP),
                     column("label", 5, Type::TEXT),
                     column("span", 6, Type::INTERVAL),
+                    column("data", 7, Type::JSONB),
+                    column("days", 8, Type::DATE_ARRAY),
                 ],
             )
             .into(),
@@ -536,5 +573,45 @@ mod tests {
             &settings,
         );
         assert!(!json.residual);
+    }
+
+    /// A json operator's literal operands are json, text or a path: never a
+    /// date-time literal, however many digits they carry (PGC-577). A
+    /// containment or concatenation literal is json only beside a json
+    /// column; beside a date array or a timestamp it is blind.
+    #[test]
+    fn test_json_operator_operands_are_not_residual() {
+        let settings = tokyo_dmy();
+        for sql in [
+            "SELECT id FROM events WHERE data ->> '2024' = 'yes'",
+            "SELECT id FROM events WHERE data -> 'n' ->> '01/02/2024' IS NULL",
+            "SELECT id FROM events WHERE data #>> '{2024,1}' = 'x' AND data ? '2024-01-02'",
+            "SELECT id FROM events WHERE data ?| ARRAY['2024', '01/02/2024']",
+            "SELECT id FROM events WHERE data @? '$.when == \"2024-01-02\"'",
+            "SELECT id FROM events WHERE data @> '{\"n\": 2024}'",
+            "SELECT id FROM events WHERE '{\"n\": 2024}' <@ data",
+            "SELECT id FROM events WHERE data = '{\"n\": 2024}'",
+            "SELECT id, data || '{\"n\": 2024}' FROM events",
+            "SELECT id, data #- '{2024}' FROM events",
+        ] {
+            let (_, outcome) = canon(sql, &settings);
+            assert!(!outcome.residual, "{sql}");
+        }
+        let (_, date_array) = canon(
+            "SELECT id FROM events WHERE days @> ARRAY['01/02/2024']",
+            &settings,
+        );
+        assert!(date_array.residual);
+        // `timestamp || text` takes the text overload: the literal is text
+        // origin renders as written, never a timestamp to canonicalise.
+        let (sql, concat) = canon("SELECT id, local_at || '01/02/2024' FROM events", &settings);
+        assert!(concat.residual, "{sql}");
+        assert!(sql.contains("'01/02/2024'"), "{sql}");
+        let (sql, day_in_array) = canon(
+            "SELECT id FROM events WHERE ARRAY[day] <@ ARRAY['01/02/2024'::date]",
+            &settings,
+        );
+        assert!(!day_in_array.residual, "{sql}");
+        assert!(sql.contains("'2024-02-01'"), "{sql}");
     }
 }

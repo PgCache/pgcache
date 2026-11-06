@@ -1011,6 +1011,31 @@ mod tests {
         assert!(!unrecognized("b"));
     }
 
+    /// A json operator is never a constraint (PGC-577): standing alone as
+    /// a predicate or under a comparison, it leaves its reference
+    /// unrecognized with empty filters, so CDC evaluates every change to
+    /// the table on the cache PG.
+    #[test]
+    fn test_json_operator_conjunct_is_opaque() {
+        for sql in [
+            "SELECT * FROM a JOIN b ON b.id = a.id WHERE a.x @> '{\"k\": 1}'",
+            "SELECT * FROM a JOIN b ON b.id = a.id WHERE a.x ->> 'k' = 'v'",
+            "SELECT * FROM a JOIN b ON b.id = a.id WHERE (a.x ->> 'k')::int IN (1, 2)",
+        ] {
+            let bound = resolve(sql);
+            let branch = root_predicates(&bound);
+            let predicates = |name: &str| {
+                branch
+                    .relation_predicates(slot_of(&bound, &branch, name))
+                    .expect("relation predicates")
+            };
+            assert!(predicates("a").unrecognized, "{sql}");
+            assert!(predicates("a").filters.is_empty(), "{sql}");
+            assert!(!predicates("a").exact, "{sql}");
+            assert!(!predicates("b").unrecognized, "{sql}");
+        }
+    }
+
     /// A null test over a bare column is read as a constraint; over any
     /// other expression it is kept opaque for its columns (PGC-533).
     #[test]

@@ -42,6 +42,7 @@ Conventions: files are `ADR-XXX-brief-title.md` with the next sequential number;
 - [ADR-030](ADR-030-subsumption-two-sided-range-index.md) — Subsumption two-sided (BETWEEN-style) range index
 - [ADR-037](ADR-037-constraint-containment-index.md) — Generalized constraint-containment index *(generalizes ADR-024/029/030; shared with the CDC matcher; amended by ADR-059)*
 - [ADR-057](ADR-057-query-tree-with-side-table-bindings.md) — One immutable query tree with resolution as a side table keyed by pre-order `NodeId`; structural results of resolution as annotations; arena as the named second round *(supersedes ADR-002's parallel hierarchy)*
+- [ADR-064](ADR-064-opaque-scalar-operators.md) — Opaque scalar operators: one two-child `Operator` kind over arithmetic and the json operator family, never a constraint, volatility per operator under the stable-function rule *(extends ADR-057, ADR-059; amends ADR-056 part C)*
 
 ## Caching tiers & serving
 - [ADR-010](ADR-010-population-worker-pool.md) — Persistent population worker pool *(amended by ADR-050)*

@@ -128,9 +128,9 @@ pub(super) fn scalar_has_correlation(planner: &Planner<'_>, expr: Scalar<'_>) ->
                     .default()
                     .is_some_and(|default| scalar_has_correlation(planner, default))
         }
-        ScalarKind::Arithmetic(arithmetic) => {
-            scalar_has_correlation(planner, arithmetic.left())
-                || scalar_has_correlation(planner, arithmetic.right())
+        ScalarKind::Operator(operator) => {
+            scalar_has_correlation(planner, operator.left())
+                || scalar_has_correlation(planner, operator.right())
         }
         ScalarKind::Array(array) => array
             .elements()
@@ -161,9 +161,9 @@ fn scalar_columns<'t>(expr: Scalar<'t>, out: &mut Vec<Column<'t>>) {
         ScalarKind::Function(function) => {
             function.args().for_each(|arg| scalar_columns(arg, out));
         }
-        ScalarKind::Arithmetic(arithmetic) => {
-            scalar_columns(arithmetic.left(), out);
-            scalar_columns(arithmetic.right(), out);
+        ScalarKind::Operator(operator) => {
+            scalar_columns(operator.left(), out);
+            scalar_columns(operator.right(), out);
         }
         ScalarKind::Case(case) => {
             if let Some(arg) = case.arg() {

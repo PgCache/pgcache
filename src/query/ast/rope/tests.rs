@@ -44,6 +44,9 @@ pub(crate) const CORPUS: &[&str] = &[
      AND g = NULL::int4 AND h = '{1,2}'::int4[] AND i = 'x'::date",
     "SELECT a FROM t WHERE a = 1 AND (b = 2 OR c = 3) AND d <> 4 AND e <= 5 AND f >= 6",
     "SELECT a FROM t WHERE a = ANY (ARRAY[1, 2]) AND b <> ALL (ARRAY[3, 4])",
+    "SELECT a -> 'k', a ->> 'k', a #> '{p}', a #>> '{p}', a || '{}', a #- '{p}' FROM t \
+     WHERE a @> '{}' AND a <@ '{}' AND a ? 'k' AND a ?| ARRAY['k'] AND a ?& ARRAY['k'] \
+     AND a @? '$.k' AND a @@ '$.k == 1'",
 ];
 
 /// One CREATE INDEX per clause the converter handles, as `pg_get_indexdef`
@@ -166,6 +169,7 @@ const PLAIN_EXPECTED: &[&str] = &[
     "SELECT a FROM t WHERE b = $1 AND c = 'x' AND d = 1.5 AND e = true AND f IS NULL AND g = (NULL)::int4 AND h = ('{1,2}')::int4[] AND i = ('x')::date",
     "SELECT a FROM t WHERE a = 1 AND (b = 2 OR c = 3) AND d != 4 AND e <= 5 AND f >= 6",
     "SELECT a FROM t WHERE a = ANY (ARRAY[1, 2]) AND b != ALL (ARRAY[3, 4])",
+    "SELECT (a -> 'k'), (a ->> 'k'), (a #> '{p}'), (a #>> '{p}'), (a || '{}'), (a #- '{p}') FROM t WHERE (a @> '{}') AND (a <@ '{}') AND (a ? 'k') AND (a ?| ARRAY['k']) AND (a ?& ARRAY['k']) AND (a @? '$.k') AND (a @@ '$.k == 1')",
 ];
 
 #[test]

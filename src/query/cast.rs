@@ -239,7 +239,7 @@ pub fn comparison_canonicalize<'t>(
             ScalarKind::Function(_)
             | ScalarKind::Literal(_)
             | ScalarKind::Case(_)
-            | ScalarKind::Arithmetic(_)
+            | ScalarKind::Operator(_)
             | ScalarKind::Subquery(_)
             | ScalarKind::Array(_)
             | ScalarKind::TypeCast(_) => None,
@@ -247,7 +247,7 @@ pub fn comparison_canonicalize<'t>(
         ScalarKind::Function(_)
         | ScalarKind::Literal(_)
         | ScalarKind::Case(_)
-        | ScalarKind::Arithmetic(_)
+        | ScalarKind::Operator(_)
         | ScalarKind::Subquery(_)
         | ScalarKind::Array(_) => None,
     };
@@ -256,7 +256,7 @@ pub fn comparison_canonicalize<'t>(
         ScalarKind::Column(_)
         | ScalarKind::Function(_)
         | ScalarKind::Case(_)
-        | ScalarKind::Arithmetic(_)
+        | ScalarKind::Operator(_)
         | ScalarKind::Subquery(_)
         | ScalarKind::Array(_)
         | ScalarKind::TypeCast(_) => None,

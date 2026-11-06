@@ -311,13 +311,13 @@ fn test_arithmetic_cases() {
     ];
     for (label, sql, op) in cases {
         let tree = parse(sql);
-        let ScalarKind::Arithmetic(arithmetic) = expr_of(items(select_of(&tree))[0]).kind() else {
+        let ScalarKind::Operator(arithmetic) = expr_of(items(select_of(&tree))[0]).kind() else {
             panic!("{label}: expected arithmetic");
         };
-        assert_eq!(arithmetic.op(), op, "{label}");
+        assert_eq!(arithmetic.op(), ScalarOp::Arithmetic(op), "{label}");
     }
     let tree = parse("SELECT amount * -1 FROM t");
-    let ScalarKind::Arithmetic(arithmetic) = expr_of(items(select_of(&tree))[0]).kind() else {
+    let ScalarKind::Operator(arithmetic) = expr_of(items(select_of(&tree))[0]).kind() else {
         panic!("expected arithmetic");
     };
     assert!(matches!(
@@ -327,14 +327,66 @@ fn test_arithmetic_cases() {
     assert_eq!(tree.sql(), "SELECT (amount * -1) FROM t");
 
     let tree = parse("SELECT (a + b) * c FROM t");
-    let ScalarKind::Arithmetic(outer) = expr_of(items(select_of(&tree))[0]).kind() else {
+    let ScalarKind::Operator(outer) = expr_of(items(select_of(&tree))[0]).kind() else {
         panic!("expected arithmetic");
     };
-    assert_eq!(outer.op(), Multiply);
-    let ScalarKind::Arithmetic(inner) = outer.left().kind() else {
+    assert_eq!(outer.op(), ScalarOp::Arithmetic(Multiply));
+    let ScalarKind::Operator(inner) = outer.left().kind() else {
         panic!("expected nested arithmetic");
     };
-    assert_eq!(inner.op(), Add);
+    assert_eq!(inner.op(), ScalarOp::Arithmetic(Add));
+}
+
+/// Every json operator converts to an `Operator` node and deparses as
+/// origin spells it; its operands are ordinary scalars.
+#[test]
+fn test_json_operator_cases() {
+    #[rustfmt::skip]
+    let cases = [
+        ("->",  "SELECT data -> 'k' FROM t",              JsonOp::Field,       "SELECT (data -> 'k') FROM t"),
+        ("->>", "SELECT data ->> 'k' FROM t",             JsonOp::FieldText,   "SELECT (data ->> 'k') FROM t"),
+        ("#>",  "SELECT data #> '{a,b}' FROM t",          JsonOp::Path,        "SELECT (data #> '{a,b}') FROM t"),
+        ("#>>", "SELECT data #>> '{a,b}' FROM t",         JsonOp::PathText,    "SELECT (data #>> '{a,b}') FROM t"),
+        ("@>",  "SELECT data @> '{\"a\": 1}' FROM t",     JsonOp::Contains,    "SELECT (data @> '{\"a\": 1}') FROM t"),
+        ("<@",  "SELECT data <@ '{\"a\": 1}' FROM t",     JsonOp::ContainedBy, "SELECT (data <@ '{\"a\": 1}') FROM t"),
+        ("?",   "SELECT data ? 'k' FROM t",               JsonOp::HasKey,      "SELECT (data ? 'k') FROM t"),
+        ("?|",  "SELECT data ?| array['a', 'b'] FROM t",  JsonOp::HasAnyKey,   "SELECT (data ?| ARRAY['a', 'b']) FROM t"),
+        ("?&",  "SELECT data ?& array['a', 'b'] FROM t",  JsonOp::HasAllKeys,  "SELECT (data ?& ARRAY['a', 'b']) FROM t"),
+        ("@?",  "SELECT data @? '$.a' FROM t",            JsonOp::PathExists,  "SELECT (data @? '$.a') FROM t"),
+        ("@@",  "SELECT data @@ '$.a == 1' FROM t",       JsonOp::PathMatch,   "SELECT (data @@ '$.a == 1') FROM t"),
+        ("||",  "SELECT data || '{\"a\": 1}' FROM t",     JsonOp::Concat,      "SELECT (data || '{\"a\": 1}') FROM t"),
+        ("#-",  "SELECT data #- '{a,b}' FROM t",          JsonOp::DeletePath,  "SELECT (data #- '{a,b}') FROM t"),
+        ("int index", "SELECT data -> 0 FROM t",          JsonOp::Field,       "SELECT (data -> 0) FROM t"),
+        ("nested", "SELECT data -> 'a' ->> 'b' FROM t",   JsonOp::FieldText,   "SELECT ((data -> 'a') ->> 'b') FROM t"),
+        ("cast", "SELECT (data ->> 'n')::int FROM t",     JsonOp::FieldText,   "SELECT ((data ->> 'n'))::int4 FROM t"),
+    ];
+    for (label, sql, op, rendered) in cases {
+        let tree = parse(sql);
+        let mut expr = expr_of(items(select_of(&tree))[0]);
+        if let ScalarKind::TypeCast(cast) = expr.kind() {
+            expr = cast.expr();
+        }
+        let ScalarKind::Operator(operator) = expr.kind() else {
+            panic!("{label}: expected an operator node");
+        };
+        assert_eq!(operator.op(), ScalarOp::Json(op), "{label}");
+        assert!(
+            matches!(
+                operator.left().kind(),
+                ScalarKind::Column(_) | ScalarKind::Operator(_)
+            ),
+            "{label}: left operand"
+        );
+        assert_eq!(tree.sql(), rendered, "{label}");
+    }
+    // Two json literals do not fold: the fold is arithmetic's alone.
+    let tree = parse("SELECT '{\"a\": 1}'::jsonb ->> 'a' FROM t");
+    assert!(matches!(
+        expr_of(items(select_of(&tree))[0]).kind(),
+        ScalarKind::Operator(_)
+    ));
+    // An operator outside every family is still unsupported.
+    assert!(query_tree_parse("SELECT a <-> b FROM t").is_err());
 }
 
 /// The first select item as a `(inner, canonical target)` cast.
@@ -360,7 +412,7 @@ fn test_type_cast_cases() {
     let tree = parse("SELECT (a + b)::numeric(10,2) FROM t");
     let (expr, target) = first_typecast(&tree);
     assert_eq!(target, "numeric(10,2)");
-    assert!(matches!(expr.kind(), ScalarKind::Arithmetic(_)));
+    assert!(matches!(expr.kind(), ScalarKind::Operator(_)));
 
     let tree = parse("SELECT t.col::int FROM t");
     let (expr, target) = first_typecast(&tree);

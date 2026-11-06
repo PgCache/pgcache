@@ -676,7 +676,7 @@ impl ResolvedQuery {
             ScalarKind::Column(_)
             | ScalarKind::Function(_)
             | ScalarKind::Case(_)
-            | ScalarKind::Arithmetic(_)
+            | ScalarKind::Operator(_)
             | ScalarKind::Subquery(_)
             | ScalarKind::Array(_)
             | ScalarKind::TypeCast(_) => OrderByTarget::Own,

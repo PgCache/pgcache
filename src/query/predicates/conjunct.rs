@@ -74,7 +74,7 @@ fn operand(expr: Where<'_>) -> Operand<'_> {
             ScalarKind::Literal(literal) => Operand::Literal(literal),
             ScalarKind::Function(_)
             | ScalarKind::Case(_)
-            | ScalarKind::Arithmetic(_)
+            | ScalarKind::Operator(_)
             | ScalarKind::Subquery(_)
             | ScalarKind::Array(_)
             | ScalarKind::TypeCast(_) => Operand::Other,
@@ -358,7 +358,7 @@ fn array_literal_values(rhs: Scalar<'_>) -> Option<Vec<LiteralValue>> {
         ScalarKind::Column(_)
         | ScalarKind::Function(_)
         | ScalarKind::Case(_)
-        | ScalarKind::Arithmetic(_)
+        | ScalarKind::Operator(_)
         | ScalarKind::Subquery(_)
         | ScalarKind::TypeCast(_) => None,
     }

@@ -438,9 +438,9 @@ fn scalar_branches_collect<'t>(
                 scalar_branches_collect(default, branches);
             }
         }
-        ScalarKind::Arithmetic(arithmetic) => {
-            scalar_branches_collect(arithmetic.left(), branches);
-            scalar_branches_collect(arithmetic.right(), branches);
+        ScalarKind::Operator(operator) => {
+            scalar_branches_collect(operator.left(), branches);
+            scalar_branches_collect(operator.right(), branches);
         }
         ScalarKind::Subquery(subquery) => {
             let source = UpdateQuerySource::Subquery(SubqueryKind::Scalar);

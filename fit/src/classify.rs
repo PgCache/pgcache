@@ -108,6 +108,7 @@ pub enum PassthroughReason {
     UnsupportedFrom,
     UnsupportedSubquery,
     NonImmutableFunction,
+    NonImmutableOperator,
     SchemaQualifiedFunction,
     HasLimit,
     SystemCatalogReference,
@@ -126,6 +127,7 @@ impl PassthroughReason {
             PassthroughReason::UnsupportedFrom => "unsupported FROM clause",
             PassthroughReason::UnsupportedSubquery => "unsupported subquery",
             PassthroughReason::NonImmutableFunction => "non-immutable function",
+            PassthroughReason::NonImmutableOperator => "non-immutable operator",
             PassthroughReason::SchemaQualifiedFunction => "schema-qualified function",
             PassthroughReason::HasLimit => "LIMIT not cacheable here",
             PassthroughReason::SystemCatalogReference => "system catalog reference",
@@ -156,6 +158,10 @@ fn cacheability_reason(error: &CacheabilityError) -> (PassthroughReason, Option<
         CacheabilityError::NonImmutableFunction { function } => (
             PassthroughReason::NonImmutableFunction,
             Some(function.to_string()),
+        ),
+        CacheabilityError::NonImmutableOperator { operator } => (
+            PassthroughReason::NonImmutableOperator,
+            Some(operator.to_string()),
         ),
         CacheabilityError::SchemaQualifiedFunction { function } => (
             PassthroughReason::SchemaQualifiedFunction,
@@ -465,6 +471,17 @@ mod tests {
                 PassthroughReason::NonImmutableFunction | PassthroughReason::ConversionUnsupported
             )
         ));
+    }
+
+    #[test]
+    fn test_json_operator_cacheable_and_stable_one_passthrough() {
+        let verdict = classify("SELECT id FROM docs WHERE data ->> 'kind' = 'invoice'");
+        assert!(matches!(verdict, Verdict::Cacheable(_)));
+        let verdict = classify("SELECT id FROM docs WHERE data @@ '$.a == 1'");
+        assert_eq!(
+            passthrough_reason(&verdict),
+            Some(PassthroughReason::NonImmutableOperator)
+        );
     }
 
     #[test]

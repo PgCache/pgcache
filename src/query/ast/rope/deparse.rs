@@ -789,13 +789,13 @@ pub fn scalar_deparse_with<C: DeparseContext>(expr: Scalar<'_>, cx: &mut C, buf:
         ScalarKind::Function(function) => function_deparse_with(function, cx, buf),
         ScalarKind::Literal(literal) => cx.literal_deparse(literal.value(), buf),
         ScalarKind::Case(case) => case_deparse_with(case, cx, buf),
-        ScalarKind::Arithmetic(arithmetic) => {
+        ScalarKind::Operator(operator) => {
             buf.push('(');
-            scalar_deparse_with(arithmetic.left(), cx, buf);
+            scalar_deparse_with(operator.left(), cx, buf);
             buf.push(' ');
-            buf.push_str(arithmetic.op().as_ref());
+            buf.push_str(operator.op().symbol());
             buf.push(' ');
-            scalar_deparse_with(arithmetic.right(), cx, buf);
+            scalar_deparse_with(operator.right(), cx, buf);
             buf.push(')');
         }
         ScalarKind::Subquery(subquery) => {

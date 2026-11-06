@@ -4,7 +4,7 @@
 use ecow::EcoString;
 use ordered_float::NotNan;
 use postgres_protocol::escape;
-use strum_macros::AsRefStr;
+use strum_macros::{AsRefStr, EnumString};
 
 use super::Deparse;
 
@@ -400,7 +400,7 @@ impl Deparse for MultiOp {
 }
 
 /// Arithmetic operators for expressions like `amount * 2`
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, AsRefStr)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, AsRefStr, EnumString)]
 pub enum ArithmeticOp {
     #[strum(to_string = "+")]
     Add,
@@ -412,6 +412,101 @@ pub enum ArithmeticOp {
     Divide,
     #[strum(to_string = "%")]
     Modulo,
+}
+
+impl ArithmeticOp {
+    pub fn from_symbol(symbol: &str) -> Option<Self> {
+        symbol.parse().ok()
+    }
+}
+
+/// The json/jsonb operator family (PGC-577). Opaque to the predicate model:
+/// a predicate over one is evaluated on the cache PG, never modelled as a
+/// constraint. Deparsed as origin spells it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, AsRefStr, EnumString)]
+pub enum JsonOp {
+    #[strum(to_string = "->")]
+    Field,
+    #[strum(to_string = "->>")]
+    FieldText,
+    #[strum(to_string = "#>")]
+    Path,
+    #[strum(to_string = "#>>")]
+    PathText,
+    #[strum(to_string = "@>")]
+    Contains,
+    #[strum(to_string = "<@")]
+    ContainedBy,
+    #[strum(to_string = "?")]
+    HasKey,
+    #[strum(to_string = "?|")]
+    HasAnyKey,
+    #[strum(to_string = "?&")]
+    HasAllKeys,
+    #[strum(to_string = "@?")]
+    PathExists,
+    #[strum(to_string = "@@")]
+    PathMatch,
+    #[strum(to_string = "||")]
+    Concat,
+    #[strum(to_string = "#-")]
+    DeletePath,
+}
+
+impl JsonOp {
+    pub fn from_symbol(symbol: &str) -> Option<Self> {
+        symbol.parse().ok()
+    }
+
+    /// Whether every `pg_catalog` overload of the operator is immutable.
+    /// `text @@ text` reads `default_text_search_config` and
+    /// `text || anynonarray` renders its operand under DateStyle/TimeZone,
+    /// so those two are STABLE and follow the rule for stable functions.
+    pub fn is_immutable(self) -> bool {
+        !matches!(self, JsonOp::PathMatch | JsonOp::Concat)
+    }
+
+    /// Whether the operator fixes both operand types to ones whose text
+    /// input no session setting changes (json, jsonb, text, text[],
+    /// jsonpath, int), so a literal operand is never a date-time literal.
+    /// `@>`, `<@` and `||` also take arrays, ranges and (`||`) any scalar,
+    /// so a literal of theirs is typed only beside a json column.
+    pub fn operands_settings_insensitive(self) -> bool {
+        !matches!(
+            self,
+            JsonOp::Contains | JsonOp::ContainedBy | JsonOp::Concat
+        )
+    }
+}
+
+/// A scalar operator with two operands: arithmetic, or one of the json
+/// operator family. Every family is deparsed `(left op right)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScalarOp {
+    Arithmetic(ArithmeticOp),
+    Json(JsonOp),
+}
+
+impl ScalarOp {
+    pub fn from_symbol(symbol: &str) -> Option<Self> {
+        ArithmeticOp::from_symbol(symbol)
+            .map(ScalarOp::Arithmetic)
+            .or_else(|| JsonOp::from_symbol(symbol).map(ScalarOp::Json))
+    }
+
+    pub fn symbol(&self) -> &str {
+        match self {
+            ScalarOp::Arithmetic(op) => op.as_ref(),
+            ScalarOp::Json(op) => op.as_ref(),
+        }
+    }
+}
+
+impl Deparse for ScalarOp {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        buf.push_str(self.symbol());
+        buf
+    }
 }
 
 /// SubLink type for subqueries in WHERE clauses

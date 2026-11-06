@@ -39,6 +39,12 @@ error_set! {
         NonImmutableFunction {
             function: EcoString,
         },
+        /// An operator with a STABLE overload (`@@`, `||`) outside the
+        /// SELECT list, under the rule for stable functions.
+        #[display("Non-immutable operator: {operator}")]
+        NonImmutableOperator {
+            operator: EcoString,
+        },
         /// A value the session supplies, left unsubstituted: `current_user`
         /// or `current_setting(…)` in the client's own query (PGC-113).
         #[display("Session term: {term}")]

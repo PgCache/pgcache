@@ -8,13 +8,14 @@ use ecow::EcoString;
 use smallvec::SmallVec;
 
 use super::{
-    Arithmetic, Array, Binary, Case, Column, EMPTY_NAME, Frame, Function, Literal, Multi, NULL,
-    Name, OrderBy, Query, Run, Scalar, ScalarSubquery, TypeCast, Unary, When, Where, WhereSubquery,
+    Array, Binary, Case, Column, EMPTY_NAME, Frame, Function, Literal, Multi, NULL, Name, Operator,
+    OrderBy, Query, Run, Scalar, ScalarSubquery, TypeCast, Unary, When, Where, WhereSubquery,
     Window, mismatch,
 };
 use crate::query::ast::rope::node::{FrameBoundKind, NodeKind};
 use crate::query::ast::{
-    ArithmeticOp, BinaryOp, FrameExclusion, FrameMode, LiteralValue, MultiOp, SubLinkType, UnaryOp,
+    ArithmeticOp, BinaryOp, FrameExclusion, FrameMode, LiteralValue, MultiOp, ScalarOp,
+    SubLinkType, UnaryOp,
 };
 use crate::query::cast::CastTarget;
 
@@ -277,7 +278,7 @@ pub enum ScalarKind<'t> {
     Function(Function<'t>),
     Literal(Literal<'t>),
     Case(Case<'t>),
-    Arithmetic(Arithmetic<'t>),
+    Operator(Operator<'t>),
     Subquery(ScalarSubquery<'t>),
     Array(Array<'t>),
     TypeCast(TypeCast<'t>),
@@ -289,7 +290,7 @@ impl<'t> Scalar<'t> {
             NodeKind::Column { .. } => ScalarKind::Column(Column(self.0)),
             NodeKind::Function { .. } => ScalarKind::Function(Function(self.0)),
             NodeKind::Case { .. } => ScalarKind::Case(Case(self.0)),
-            NodeKind::Arithmetic { .. } => ScalarKind::Arithmetic(Arithmetic(self.0)),
+            NodeKind::Operator { .. } => ScalarKind::Operator(Operator(self.0)),
             NodeKind::ScalarSubquery => ScalarKind::Subquery(ScalarSubquery(self.0)),
             NodeKind::Array { .. } => ScalarKind::Array(Array(self.0)),
             NodeKind::TypeCast { .. } => ScalarKind::TypeCast(TypeCast(self.0)),
@@ -324,8 +325,8 @@ impl<'t> Scalar<'t> {
                     || case.whens().any(|when| when.result().has_window())
                     || case.default().is_some_and(|default| default.has_window())
             }
-            ScalarKind::Arithmetic(arithmetic) => {
-                arithmetic.left().has_window() || arithmetic.right().has_window()
+            ScalarKind::Operator(operator) => {
+                operator.left().has_window() || operator.right().has_window()
             }
             ScalarKind::Array(array) => array.elements().any(|element| element.has_window()),
             ScalarKind::TypeCast(cast) => cast.expr().has_window(),
@@ -350,9 +351,9 @@ impl<'t> Scalar<'t> {
                         .default()
                         .is_some_and(|default| default.has_aggregate(aggregates))
             }
-            ScalarKind::Arithmetic(arithmetic) => {
-                arithmetic.left().has_aggregate(aggregates)
-                    || arithmetic.right().has_aggregate(aggregates)
+            ScalarKind::Operator(operator) => {
+                operator.left().has_aggregate(aggregates)
+                    || operator.right().has_aggregate(aggregates)
             }
             ScalarKind::Array(array) => array
                 .elements()
@@ -465,11 +466,12 @@ impl<'t> WhereSubquery<'t> {
     }
 }
 
-impl<'t> Arithmetic<'t> {
-    pub fn op(&self) -> ArithmeticOp {
+impl<'t> Operator<'t> {
+    pub fn op(&self) -> ScalarOp {
         match *self.0.kind() {
-            NodeKind::Arithmetic { op } => op,
-            _ => mismatch::<Option<ArithmeticOp>>("arithmetic").unwrap_or(ArithmeticOp::Add),
+            NodeKind::Operator { op } => op,
+            _ => mismatch::<Option<ScalarOp>>("operator")
+                .unwrap_or(ScalarOp::Arithmetic(ArithmeticOp::Add)),
         }
     }
 

@@ -175,7 +175,7 @@ fn inner_output_column(inner: Select<'_>) -> DecorrelateResult<Column<'_>> {
             ScalarKind::Function(_)
             | ScalarKind::Literal(_)
             | ScalarKind::Case(_)
-            | ScalarKind::Arithmetic(_)
+            | ScalarKind::Operator(_)
             | ScalarKind::Subquery(_)
             | ScalarKind::Array(_)
             | ScalarKind::TypeCast(_) => Err(rejected(

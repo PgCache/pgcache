@@ -23,8 +23,8 @@ pub(super) use crate::query::ast::rope::{
     Source, Table, View, Where, WhereKind,
 };
 pub(super) use crate::query::ast::{
-    ArithmeticOp, BinaryOp, CteMaterialization, Deparse, JoinType, LiteralValue, MultiOp,
-    OrderDirection, SetOpType, SubLinkType, UnaryOp, query_tree_parse,
+    ArithmeticOp, BinaryOp, CteMaterialization, Deparse, JoinType, JsonOp, LiteralValue, MultiOp,
+    OrderDirection, ScalarOp, SetOpType, SubLinkType, UnaryOp, query_tree_parse,
 };
 pub(super) use crate::query::cast::cast_target_deparse;
 pub(super) use crate::query::update::select_branches_with_source;

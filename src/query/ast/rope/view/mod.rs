@@ -270,7 +270,7 @@ view!(Unary);
 view!(Binary);
 view!(Multi);
 view!(WhereSubquery);
-view!(Arithmetic);
+view!(Operator);
 view!(ScalarSubquery);
 view!(Array);
 view!(TypeCast);

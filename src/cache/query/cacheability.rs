@@ -6,10 +6,10 @@ use ecow::EcoString;
 use super::{CacheabilityError, FunctionVolatilityMap};
 use crate::catalog::FunctionVolatility;
 use crate::query::ast::rope::{
-    Body, Case, Function, Join, JoinQual, NodeKind, Query, QueryTree, Scalar, ScalarKind, Select,
-    SelectItem, Source, Where, WhereKind,
+    Body, Case, Function, Join, JoinQual, NodeKind, Operator, Query, QueryTree, Scalar, ScalarKind,
+    Select, SelectItem, Source, Where, WhereKind,
 };
-use crate::query::ast::{Deparse, JoinType, LiteralValue};
+use crate::query::ast::{Deparse, JoinType, LiteralValue, ScalarOp};
 
 /// Reject queries that reference a PostgreSQL system catalog: a `pg_`
 /// prefix on the schema or the table name, anywhere in the tree.
@@ -213,9 +213,10 @@ fn scalar_cacheable(
         }
         ScalarKind::Function(function) => function_cacheable(function, ctx, fv),
         ScalarKind::Case(case) => case_cacheable(case, ctx, fv),
-        ScalarKind::Arithmetic(arithmetic) => {
-            scalar_cacheable(arithmetic.left(), ctx, fv)?;
-            scalar_cacheable(arithmetic.right(), ctx, fv)
+        ScalarKind::Operator(operator) => {
+            operator_volatility_check(operator, ctx)?;
+            scalar_cacheable(operator.left(), ctx, fv)?;
+            scalar_cacheable(operator.right(), ctx, fv)
         }
         ScalarKind::Subquery(subquery) => subquery_inner_cacheable(subquery.query(), ctx, fv),
         ScalarKind::Array(array) => array
@@ -224,6 +225,24 @@ fn scalar_cacheable(
         // A cast is pure coercion: the wrapped expression decides.
         ScalarKind::TypeCast(cast) => scalar_cacheable(cast.expr(), ctx, fv),
     }
+}
+
+/// An operator whose every overload is immutable passes anywhere; one with a
+/// STABLE overload (`@@`, `||`) only in the SELECT list, as a stable
+/// function does.
+fn operator_volatility_check(
+    operator: Operator<'_>,
+    ctx: ExprContext,
+) -> Result<(), CacheabilityError> {
+    if let ScalarOp::Json(op) = operator.op()
+        && !op.is_immutable()
+        && !matches!(ctx, ExprContext::SelectList)
+    {
+        return Err(CacheabilityError::NonImmutableOperator {
+            operator: op.as_ref().into(),
+        });
+    }
+    Ok(())
 }
 
 /// A function call: immutable everywhere, any volatility in the SELECT list
@@ -942,6 +961,47 @@ mod tests {
         assert!(
             matches!(result, Err(CacheabilityError::NonImmutableFunction { .. })),
             "Unknown function in WHERE should not be cacheable: {result:?}"
+        );
+    }
+
+    /// The json operators whose every overload is immutable pass anywhere
+    /// (PGC-577); `@@` and `||`, which have STABLE overloads, follow the
+    /// stable-function rule: SELECT list only.
+    #[test]
+    fn test_json_operators_follow_the_function_volatility_rule() {
+        for sql in [
+            "SELECT id FROM docs WHERE data ->> 'kind' = 'invoice'",
+            "SELECT id FROM docs WHERE data @> '{\"a\": 1}' AND data ? 'k'",
+            "SELECT id FROM docs WHERE data #>> '{a,b}' IS NULL OR data @? '$.a'",
+            "SELECT id FROM docs JOIN other ON other.data <@ docs.data",
+            "SELECT data -> 'a', data #- '{a}', data || '{}', data @@ '$.a == 1' FROM docs",
+            "SELECT count(*) FILTER (WHERE data ?| ARRAY['a']) FROM docs",
+        ] {
+            assert!(check_cacheable(sql).is_ok(), "{sql}");
+        }
+        for (sql, operator) in [
+            ("SELECT id FROM docs WHERE data || '{}' = '{}'", "||"),
+            ("SELECT id FROM docs WHERE data @@ '$.a == 1'", "@@"),
+            (
+                "SELECT id FROM docs JOIN other ON other.data @@ docs.data",
+                "@@",
+            ),
+            (
+                "SELECT count(*) FILTER (WHERE data @@ '$.a') FROM docs",
+                "@@",
+            ),
+        ] {
+            let error = check_cacheable(sql).expect_err(sql);
+            assert!(
+                matches!(&error, CacheabilityError::NonImmutableOperator { operator: found } if found == operator),
+                "{sql}: {error}"
+            );
+        }
+        assert_eq!(
+            check_cacheable("SELECT id FROM docs WHERE data @@ '$.a'")
+                .expect_err("stable operator")
+                .to_string(),
+            "Non-immutable operator: @@"
         );
     }
 

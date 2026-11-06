@@ -196,9 +196,9 @@ fn scalar_bind_outputs(expr: Scalar<'_>, bindings: &mut BindingsBuilder) {
                 scalar_bind_outputs(arg, bindings);
             }
         }
-        ScalarKind::Arithmetic(arithmetic) => {
-            scalar_bind_outputs(arithmetic.left(), bindings);
-            scalar_bind_outputs(arithmetic.right(), bindings);
+        ScalarKind::Operator(operator) => {
+            scalar_bind_outputs(operator.left(), bindings);
+            scalar_bind_outputs(operator.right(), bindings);
         }
         ScalarKind::Array(array) => {
             for element in array.elements() {

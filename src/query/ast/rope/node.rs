@@ -6,8 +6,8 @@ use ecow::EcoString;
 
 use crate::cache::SubqueryKind;
 use crate::query::ast::{
-    ArithmeticOp, BinaryOp, CteMaterialization, FrameExclusion, FrameMode, JoinType, LiteralValue,
-    MultiOp, NullOrder, OrderDirection, SetOpType, SubLinkType, UnaryOp,
+    BinaryOp, CteMaterialization, FrameExclusion, FrameMode, JoinType, LiteralValue, MultiOp,
+    NullOrder, OrderDirection, ScalarOp, SetOpType, SubLinkType, UnaryOp,
 };
 use crate::query::cast::CastTarget;
 
@@ -157,9 +157,10 @@ pub enum NodeKind {
         sublink_type: SubLinkType,
         has_test_expr: bool,
     },
+    /// A scalar operator of any family: arithmetic, the json operators.
     /// Children: the left operand, the right operand.
-    Arithmetic {
-        op: ArithmeticOp,
+    Operator {
+        op: ScalarOp,
     },
     /// Children: the query.
     ScalarSubquery,
@@ -273,7 +274,7 @@ impl NodeKind {
             }
             NodeKind::Values { row_count } => *row_count,
             NodeKind::ValuesRow { width } => *width,
-            NodeKind::SetOp { .. } | NodeKind::Binary { .. } | NodeKind::Arithmetic { .. } => 2,
+            NodeKind::SetOp { .. } | NodeKind::Binary { .. } | NodeKind::Operator { .. } => 2,
             NodeKind::OrderBy { .. }
             | NodeKind::SelectExpr { .. }
             | NodeKind::Unary { .. }

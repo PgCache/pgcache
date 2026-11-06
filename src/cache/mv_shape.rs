@@ -69,7 +69,7 @@ fn set_op_order_by_viable<'t>(
         | ScalarKind::Function(_)
         | ScalarKind::Literal(_)
         | ScalarKind::Case(_)
-        | ScalarKind::Arithmetic(_)
+        | ScalarKind::Operator(_)
         | ScalarKind::Subquery(_)
         | ScalarKind::Array(_)
         | ScalarKind::TypeCast(_) => false,

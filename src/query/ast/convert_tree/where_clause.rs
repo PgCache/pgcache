@@ -8,7 +8,7 @@ use ecow::EcoString;
 use ordered_float::NotNan;
 use pg_query::pg_nodes as pg;
 
-use super::scalar::{arithmetic_emit, arithmetic_op_from_str, operator_name_single, scalar_emit};
+use super::scalar::{array_emit, operator_emit, operator_name_single, scalar_emit};
 use super::select::query_emit;
 use super::sublink_type_map;
 use super::{ExpressionScope, ParseContext};
@@ -18,7 +18,7 @@ use crate::query::ast::raw::{
 };
 use crate::query::ast::rope::{NodeKind, TreeBuilder};
 use crate::query::ast::{
-    AstError, BinaryOp, LiteralValue, MultiOp, SubLinkType, UnaryOp, WhereParseError,
+    AstError, BinaryOp, LiteralValue, MultiOp, ScalarOp, SubLinkType, UnaryOp, WhereParseError,
 };
 
 // ---------- Literal / column / param extraction ----------
@@ -356,7 +356,8 @@ unsafe fn binary_emit(
     }
 }
 
-/// A plain operator: arithmetic yields a scalar, anything else a comparison.
+/// A plain operator: a `ScalarOp` family yields a scalar, a comparison a
+/// `Binary`; anything else is unsupported.
 unsafe fn a_expr_operator_emit(
     builder: &mut TreeBuilder<'_>,
     expr: *const pg::A_Expr,
@@ -366,8 +367,8 @@ unsafe fn a_expr_operator_emit(
         let op_name = operator_name_single((*expr).name).ok_or_else(|| WhereParseError::Other {
             error: "Multi-part operator names not supported".to_owned(),
         })?;
-        if arithmetic_op_from_str(op_name).is_some() {
-            return arithmetic_emit(builder, expr, scope).map_err(WhereParseError::from);
+        if let Some(op) = ScalarOp::from_symbol(op_name) {
+            return operator_emit(builder, expr, op, scope).map_err(WhereParseError::from);
         }
         let op =
             binary_op_from_str(op_name).ok_or_else(|| WhereParseError::UnsupportedOperator {
@@ -452,14 +453,7 @@ unsafe fn a_expr_any_all_emit(
         let open = builder.open(NodeKind::Multi { op, count: 2 });
         where_expr_emit(builder, lexpr, scope)?;
         if node_tag(rexpr) == pg::NodeTag_T_A_ArrayExpr {
-            let elements = (*cast::<pg::A_ArrayExpr>(rexpr)).elements;
-            let array = builder.open(NodeKind::Array {
-                count: list_len(elements),
-            });
-            for element in list_nodes(elements) {
-                scalar_emit(builder, element, scope)?;
-            }
-            builder.close(array);
+            array_emit(builder, cast::<pg::A_ArrayExpr>(rexpr), scope)?;
         } else {
             where_expr_emit(builder, rexpr, scope)?;
         }

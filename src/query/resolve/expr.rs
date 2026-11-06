@@ -90,9 +90,9 @@ pub(super) fn scalar_resolve<'a>(
             }
             Ok(None)
         }
-        ScalarKind::Arithmetic(arithmetic) => {
-            scalar_resolve(arithmetic.left(), scope)?;
-            scalar_resolve(arithmetic.right(), scope)?;
+        ScalarKind::Operator(operator) => {
+            scalar_resolve(operator.left(), scope)?;
+            scalar_resolve(operator.right(), scope)?;
             Ok(None)
         }
         ScalarKind::Subquery(subquery) => {

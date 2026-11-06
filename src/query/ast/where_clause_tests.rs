@@ -12,7 +12,8 @@ use crate::query::ast::rope::{
     Body, Node, NodeKind, QueryTree, ScalarKind, SelectItem, View, Where, WhereKind,
 };
 use crate::query::ast::{
-    ArithmeticOp, AstError, BinaryOp, LiteralValue, MultiOp, NodeId, UnaryOp, query_tree_parse,
+    ArithmeticOp, AstError, BinaryOp, JsonOp, LiteralValue, MultiOp, NodeId, ScalarOp, UnaryOp,
+    WhereParseError, query_tree_parse,
 };
 use crate::query::cast::CastTarget;
 
@@ -132,7 +133,21 @@ fn array(elements: Vec<Vec<Node>>) -> Vec<Node> {
 }
 
 fn arith(op: ArithmeticOp, left: Vec<Node>, right: Vec<Node>) -> Vec<Node> {
-    node(NodeKind::Arithmetic { op }, &[left, right])
+    node(
+        NodeKind::Operator {
+            op: ScalarOp::Arithmetic(op),
+        },
+        &[left, right],
+    )
+}
+
+fn json(op: JsonOp, left: Vec<Node>, right: Vec<Node>) -> Vec<Node> {
+    node(
+        NodeKind::Operator {
+            op: ScalarOp::Json(op),
+        },
+        &[left, right],
+    )
 }
 
 /// Each case's WHERE clause must parse to exactly the expected fragment.
@@ -408,4 +423,36 @@ fn test_where_arithmetic_rhs_cases() {
     for (label, sql, expected) in cases {
         assert_eq!(where_clause_rhs(sql), expected, "{label}: {sql}");
     }
+}
+
+/// A json operator in WHERE: a boolean-valued one stands alone as a scalar
+/// predicate, a value-valued one sits under a comparison or a null test.
+#[test]
+fn test_where_json_operator_cases() {
+    #[rustfmt::skip]
+    let cases: Vec<(&str, &str, Option<Vec<Node>>)> = vec![
+        ("@> alone",   "SELECT * FROM t WHERE data @> '{\"a\": 1}'",
+                       Some(json(JsonOp::Contains, col("data"), text("{\"a\": 1}")))),
+        ("? alone",    "SELECT * FROM t WHERE data ? 'k'",
+                       Some(json(JsonOp::HasKey, col("data"), text("k")))),
+        ("->> under =", "SELECT * FROM t WHERE data ->> 'k' = 'v'",
+                       Some(cmp(BinaryOp::Equal, json(JsonOp::FieldText, col("data"), text("k")), text("v")))),
+        ("#>> IS NULL", "SELECT * FROM t WHERE data #>> '{a,b}' IS NULL",
+                       Some(unary(UnaryOp::IsNull, json(JsonOp::PathText, col("data"), text("{a,b}"))))),
+        ("NOT ?|",     "SELECT * FROM t WHERE NOT data ?| array['a']",
+                       Some(not(json(JsonOp::HasAnyKey, col("data"), array(vec![text("a")]))))),
+        ("under AND",  "SELECT * FROM t WHERE id = 1 AND data @? '$.a'",
+                       Some(and(cmp(BinaryOp::Equal, col("id"), int(1)), json(JsonOp::PathExists, col("data"), text("$.a"))))),
+        ("-> with int", "SELECT * FROM t WHERE data -> 0 IS NOT NULL",
+                       Some(unary(UnaryOp::IsNotNull, json(JsonOp::Field, col("data"), int(0))))),
+    ];
+    where_cases_check(cases);
+    assert_eq!(
+        parse("SELECT * FROM t WHERE data -> 'a' ->> 'b' = $1 AND data @> '{}'").sql(),
+        "SELECT * FROM t WHERE ((data -> 'a') ->> 'b') = $1 AND (data @> '{}')"
+    );
+    assert!(matches!(
+        query_tree_parse("SELECT * FROM t WHERE a <-> b"),
+        Err(AstError::WhereParseError(WhereParseError::UnsupportedOperator { operator })) if operator == "<->"
+    ));
 }

@@ -1,5 +1,5 @@
 //! Scalar expressions: columns, literals, subqueries, function calls, casts,
-//! CASE and arithmetic.
+//! CASE and the two-operand operators (arithmetic, the json family).
 
 use ecow::EcoString;
 use pg_query::pg_nodes as pg;
@@ -13,7 +13,7 @@ use crate::query::ast::raw::{
     string_node_value,
 };
 use crate::query::ast::rope::{NodeKind, TreeBuilder};
-use crate::query::ast::{ArithmeticOp, AstError, Deparse, LiteralValue, SessionTerm};
+use crate::query::ast::{ArithmeticOp, AstError, Deparse, LiteralValue, ScalarOp, SessionTerm};
 use crate::query::cast::cast_target_from_canonical;
 use crate::query::transform::literal_arithmetic_fold;
 
@@ -57,18 +57,41 @@ pub(super) unsafe fn scalar_emit(
                 let aexpr = cast::<pg::A_Expr>(node);
                 match (*aexpr).kind {
                     pg::A_Expr_Kind_AEXPR_NULLIF => nullif_emit(builder, aexpr, scope),
-                    pg::A_Expr_Kind_AEXPR_OP => arithmetic_emit(builder, aexpr, scope),
+                    pg::A_Expr_Kind_AEXPR_OP => {
+                        let op = scalar_op_extract((*aexpr).name)?;
+                        operator_emit(builder, aexpr, op, scope)
+                    }
                     other => Err(AstError::UnsupportedFeature {
                         feature: format!("{} in a column expression", aexpr_kind_name(other)),
                     }),
                 }
             }
+            pg::NodeTag_T_A_ArrayExpr => array_emit(builder, cast::<pg::A_ArrayExpr>(node), scope),
             pg::NodeTag_T_CaseExpr => case_emit(builder, cast::<pg::CaseExpr>(node), scope),
             pg::NodeTag_T_TypeCast => type_cast_emit(builder, cast::<pg::TypeCast>(node), scope),
             other => Err(AstError::UnsupportedFeature {
                 feature: format!("{} in a column expression", node_tag_name(other)),
             }),
         }
+    }
+}
+
+/// `ARRAY[e1, e2, ...]`: one `Array` node over its element scalars.
+pub(super) unsafe fn array_emit(
+    builder: &mut TreeBuilder<'_>,
+    array: *const pg::A_ArrayExpr,
+    scope: ExpressionScope<'_>,
+) -> Result<(), AstError> {
+    unsafe {
+        let elements = (*array).elements;
+        let open = builder.open(NodeKind::Array {
+            count: list_len(elements),
+        });
+        for element in list_nodes(elements) {
+            scalar_emit(builder, element, scope)?;
+        }
+        builder.close(open);
+        Ok(())
     }
 }
 
@@ -378,31 +401,34 @@ unsafe fn nullif_emit(
     }
 }
 
-pub(super) unsafe fn arithmetic_emit(
+/// `lexpr op rexpr` for an operator of a known family (`ScalarOp`).
+pub(super) unsafe fn operator_emit(
     builder: &mut TreeBuilder<'_>,
     aexpr: *const pg::A_Expr,
+    op: ScalarOp,
     scope: ExpressionScope<'_>,
 ) -> Result<(), AstError> {
     unsafe {
-        let op = arithmetic_op_extract((*aexpr).name)?;
         if (*aexpr).lexpr.is_null() {
             return Err(AstError::UnsupportedFeature {
-                feature: "arithmetic expression without left operand".to_owned(),
+                feature: format!("operator {} without left operand", op.symbol()),
             });
         }
         if (*aexpr).rexpr.is_null() {
             return Err(AstError::UnsupportedFeature {
-                feature: "arithmetic expression without right operand".to_owned(),
+                feature: format!("operator {} without right operand", op.symbol()),
             });
         }
         // Arithmetic over literals alone is one literal in the tree, so two
         // spellings of a value are one query; what does not fold (a
         // placeholder, a column, division by zero) is emitted as written.
-        if let Some(folded) = literal_fold(aexpr as NodePtr)? {
+        if let ScalarOp::Arithmetic(_) = op
+            && let Some(folded) = literal_fold(aexpr as NodePtr)?
+        {
             builder.leaf(NodeKind::Literal(folded));
             return Ok(());
         }
-        let open = builder.open(NodeKind::Arithmetic { op });
+        let open = builder.open(NodeKind::Operator { op });
         scalar_emit(builder, (*aexpr).lexpr, scope)?;
         scalar_emit(builder, (*aexpr).rexpr, scope)?;
         builder.close(open);
@@ -424,7 +450,8 @@ unsafe fn literal_fold(node: NodePtr) -> Result<Option<LiteralValue>, AstError> 
                 {
                     return Ok(None);
                 }
-                let Some(op) = operator_name_single((*aexpr).name).and_then(arithmetic_op_from_str)
+                let Some(op) =
+                    operator_name_single((*aexpr).name).and_then(ArithmeticOp::from_symbol)
                 else {
                     return Ok(None);
                 };
@@ -441,17 +468,6 @@ unsafe fn literal_fold(node: NodePtr) -> Result<Option<LiteralValue>, AstError> 
     }
 }
 
-pub(super) fn arithmetic_op_from_str(op: &str) -> Option<ArithmeticOp> {
-    match op {
-        "+" => Some(ArithmeticOp::Add),
-        "-" => Some(ArithmeticOp::Subtract),
-        "*" => Some(ArithmeticOp::Multiply),
-        "/" => Some(ArithmeticOp::Divide),
-        "%" => Some(ArithmeticOp::Modulo),
-        _ => None,
-    }
-}
-
 /// The single operator name from a (possibly multi-part) operator `List`, with
 /// no intermediate allocation. `None` for multi-part or unparseable names.
 pub(super) unsafe fn operator_name_single<'a>(name: *const pg::List) -> Option<&'a str> {
@@ -464,13 +480,13 @@ pub(super) unsafe fn operator_name_single<'a>(name: *const pg::List) -> Option<&
     }
 }
 
-unsafe fn arithmetic_op_extract(name: *const pg::List) -> Result<ArithmeticOp, AstError> {
+unsafe fn scalar_op_extract(name: *const pg::List) -> Result<ScalarOp, AstError> {
     unsafe {
         let op = operator_name_single(name).ok_or_else(|| AstError::UnsupportedFeature {
-            feature: "multi-part operator names in arithmetic".to_owned(),
+            feature: "multi-part operator names".to_owned(),
         })?;
-        arithmetic_op_from_str(op).ok_or_else(|| AstError::UnsupportedFeature {
-            feature: format!("arithmetic operator: {op}"),
+        ScalarOp::from_symbol(op).ok_or_else(|| AstError::UnsupportedFeature {
+            feature: format!("operator {op}"),
         })
     }
 }

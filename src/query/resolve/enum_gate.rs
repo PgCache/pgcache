@@ -304,9 +304,9 @@ impl Gate<'_> {
             ScalarKind::Column(_) | ScalarKind::Literal(_) => Ok(()),
             ScalarKind::Function(function) => self.function_check(function),
             ScalarKind::Case(case) => self.case_check(case),
-            ScalarKind::Arithmetic(arithmetic) => {
-                self.scalar_check(arithmetic.left())?;
-                self.scalar_check(arithmetic.right())
+            ScalarKind::Operator(operator) => {
+                self.scalar_check(operator.left())?;
+                self.scalar_check(operator.right())
             }
             ScalarKind::Subquery(subquery) => self.query_check(subquery.query()),
             ScalarKind::Array(array) => {
