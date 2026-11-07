@@ -10,7 +10,7 @@
 use std::collections::HashSet;
 
 use ecow::EcoString;
-use pgcache_lib::catalog::{FunctionCatalog, FunctionRow, FunctionVolatility};
+use pgcache_lib::catalog::{FunctionCatalog, FunctionKind, FunctionRow, FunctionVolatility};
 use pgcache_lib::oid::{FunctionOid, TypeOid};
 
 static FUNCTIONS_TSV: &str = include_str!("../data/functions.tsv");
@@ -56,6 +56,7 @@ fn function_row_parse(line: &str) -> Option<FunctionRow> {
     let security_definer = fields.next()? == "t";
     let returns_set = fields.next()? == "t";
     let return_type = fields.next()?.parse().ok()?;
+    let kind = FunctionKind::from_prokind(fields.next()?)?;
     Some(FunctionRow {
         oid: FunctionOid::from_raw(oid),
         schema: EcoString::from(schema),
@@ -68,6 +69,7 @@ fn function_row_parse(line: &str) -> Option<FunctionRow> {
         security_definer,
         returns_set,
         return_type: TypeOid::from_raw(return_type),
+        kind,
     })
 }
 
@@ -78,7 +80,7 @@ mod tests {
     #[test]
     fn test_builtin_functions_snapshot_sane() {
         let b = builtin_functions_load();
-        let worst = |name, arg_count| b.catalog.worst_volatility(None, name, arg_count);
+        let worst = |name, arg_count| b.catalog.builtin_worst_volatility(None, name, arg_count);
         assert_eq!(worst("abs", 1), Some(FunctionVolatility::Immutable));
         assert_eq!(worst("now", 0), Some(FunctionVolatility::Stable));
         assert_eq!(worst("random", 0), Some(FunctionVolatility::Volatile));
@@ -90,12 +92,17 @@ mod tests {
         );
         assert_eq!(worst("concat", 3), Some(FunctionVolatility::Stable));
         assert_eq!(worst("substring", 2), Some(FunctionVolatility::Immutable));
-        // Aggregate-only names are not in the catalog.
-        assert_eq!(b.catalog.name_worst_volatility("max"), None);
+        // An aggregate is in the catalog but never judged by volatility.
+        assert_eq!(worst("max", 1), None);
+        assert!(
+            b.catalog
+                .named("max")
+                .any(|row| row.kind == FunctionKind::Aggregate)
+        );
         assert!(b.aggregates.contains("max"));
         assert!(b.aggregates.contains("count"));
         assert!(b.aggregates.contains("sum"));
         assert!(!b.aggregates.contains("lower"));
-        assert!(b.catalog.len() > 2500, "{}", b.catalog.len());
+        assert!(b.catalog.len() > 3000, "{}", b.catalog.len());
     }
 }

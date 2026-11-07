@@ -105,7 +105,7 @@ pub use update_query::{
 };
 
 error_set! {
-    CacheError := WriteError || ReadError || DbError || ParseError || TableError || SendError || QueryResolutionError || SetupError || PrivilegeError || RlsError
+    CacheError := WriteError || ReadError || DbError || ParseError || TableError || SendError || QueryResolutionError || SetupError || PrivilegeError || RlsError || FunctionError
 
     ReadError := {
         IoError(io::Error),
@@ -228,6 +228,22 @@ error_set! {
         #[display("Unparseable pg_current_snapshot() text '{text}'")]
         PrivilegeSnapshot {
             text: String,
+        },
+    }
+
+    /// Why a function call keeps a query from registering (PGC-578); each
+    /// forwards the read.
+    FunctionError := {
+        #[display("function {function} with {arg_count} arguments is not on the search_path")]
+        FunctionUnknown {
+            function: EcoString,
+            arg_count: u32,
+        },
+        /// The cache PG has only PostgreSQL's own functions, so a user or
+        /// extension function cannot be served or evaluated there (PGC-474).
+        #[display("function {function} is not a PostgreSQL builtin")]
+        FunctionNotBuiltin {
+            function: EcoString,
         },
     }
 

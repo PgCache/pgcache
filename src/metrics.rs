@@ -51,6 +51,10 @@ pub mod names {
     /// (PGC-113), by reason: `setting_unknown`, `default_deny`,
     /// `row_security_off`, `unsupported`.
     pub const QUERIES_RLS_FORWARDS: &str = "pgcache.queries.rls_forwards";
+    /// Registrations refused on a function call (PGC-578), by reason:
+    /// `unknown` (no function of the name and arity on the search_path) or
+    /// `not_builtin` (a user or extension function the cache PG lacks).
+    pub const QUERIES_FUNCTION_FORWARDS: &str = "pgcache.queries.function_forwards";
 
     // Read-after-write tracking (PGC-124)
     /// Writes folded into a connection's read-after-write log.
@@ -669,6 +673,8 @@ pub struct QueryHandles {
     pub rls_forward_default_deny: Counter,
     pub rls_forward_row_security_off: Counter,
     pub rls_forward_unsupported: Counter,
+    pub function_forward_unknown: Counter,
+    pub function_forward_not_builtin: Counter,
     pub cache_latency: Histogram,
     pub origin_latency: Histogram,
     pub origin_execution: Histogram,
@@ -679,8 +685,9 @@ impl QueryHandles {
         use names::{
             CACHE_QUERY_LATENCY_SECONDS, ORIGIN_EXECUTION_SECONDS, ORIGIN_QUERY_LATENCY_SECONDS,
             QUERIES_ALLOWLIST_SKIPPED, QUERIES_CACHE_ERROR, QUERIES_CACHE_HIT, QUERIES_CACHE_MISS,
-            QUERIES_CACHEABLE, QUERIES_INVALID, QUERIES_PRIVILEGE_FORWARDS, QUERIES_RLS_FORWARDS,
-            QUERIES_RLS_SKIPPED, QUERIES_TOTAL, QUERIES_UNCACHEABLE, QUERIES_UNSUPPORTED,
+            QUERIES_CACHEABLE, QUERIES_FUNCTION_FORWARDS, QUERIES_INVALID,
+            QUERIES_PRIVILEGE_FORWARDS, QUERIES_RLS_FORWARDS, QUERIES_RLS_SKIPPED, QUERIES_TOTAL,
+            QUERIES_UNCACHEABLE, QUERIES_UNSUPPORTED,
         };
         Self {
             total: metrics::counter!(QUERIES_TOTAL),
@@ -699,6 +706,8 @@ impl QueryHandles {
             rls_forward_default_deny: metrics::counter!(QUERIES_RLS_FORWARDS, "reason" => "default_deny"),
             rls_forward_row_security_off: metrics::counter!(QUERIES_RLS_FORWARDS, "reason" => "row_security_off"),
             rls_forward_unsupported: metrics::counter!(QUERIES_RLS_FORWARDS, "reason" => "unsupported"),
+            function_forward_unknown: metrics::counter!(QUERIES_FUNCTION_FORWARDS, "reason" => "unknown"),
+            function_forward_not_builtin: metrics::counter!(QUERIES_FUNCTION_FORWARDS, "reason" => "not_builtin"),
             cache_latency: metrics::histogram!(CACHE_QUERY_LATENCY_SECONDS),
             origin_latency: metrics::histogram!(ORIGIN_QUERY_LATENCY_SECONDS),
             origin_execution: metrics::histogram!(ORIGIN_EXECUTION_SECONDS),

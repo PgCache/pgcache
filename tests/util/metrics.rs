@@ -29,6 +29,9 @@ pub(crate) struct MetricsSnapshot {
     pub queries_rls_forward_setting_unknown: u64,
     pub queries_rls_forward_default_deny: u64,
     pub queries_rls_forward_row_security_off: u64,
+    /// Registrations refused on a function call (PGC-578).
+    pub queries_function_forward_unknown: u64,
+    pub queries_function_forward_not_builtin: u64,
     pub cache_subsumptions: u64,
     /// Subsumptions that needed an in-set column split to cover (PGC-494).
     pub cache_subsumptions_split: u64,
@@ -178,6 +181,8 @@ const SAMPLES: &[Sample] = samples! {
     "pgcache_queries_rls_forwards{reason=\"setting_unknown\"}" => queries_rls_forward_setting_unknown,
     "pgcache_queries_rls_forwards{reason=\"default_deny\"}" => queries_rls_forward_default_deny,
     "pgcache_queries_rls_forwards{reason=\"row_security_off\"}" => queries_rls_forward_row_security_off,
+    "pgcache_queries_function_forwards{reason=\"unknown\"}" => queries_function_forward_unknown,
+    "pgcache_queries_function_forwards{reason=\"not_builtin\"}" => queries_function_forward_not_builtin,
     "pgcache_raw_writes_recorded" => raw_writes_recorded,
     "pgcache_raw_probes" => raw_probes,
     "pgcache_raw_forwards{scope=\"table\"}" => raw_forwards_table,

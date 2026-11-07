@@ -22,7 +22,10 @@ use crate::oid::{Oid, TypeOid};
 
 mod function;
 
-pub use function::{FUNCTION_CATALOG_SQL, FunctionCatalog, FunctionRow, FunctionVolatility};
+pub use function::{
+    FUNCTION_CATALOG_SQL, FunctionCatalog, FunctionKind, FunctionRow, FunctionVolatility,
+    is_sql_form,
+};
 
 /// Column storage: sorted by position with O(1) name lookups.
 ///

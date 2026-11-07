@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use ecow::EcoString;
+use rootcause::Report;
 
 use super::{QueryResolution, WriterRegistration};
 use crate::cache::admission::{
@@ -21,9 +22,10 @@ use crate::cache::types::{AliasResolution, ReadFacts, SharedQueryShape, SharedRe
 use crate::cache::update_query::{UpdateQueries, UpdateQuery};
 use crate::cache::writer::core::WriterCore;
 use crate::cache::{CacheError, CacheResult, ReportExt};
-use crate::oid::Oid;
+use crate::catalog::is_sql_form;
+use crate::oid::{FunctionOid, Oid};
 use crate::query::Fingerprint;
-use crate::query::ast::rope::QueryTree;
+use crate::query::ast::rope::{NodeKind, QueryTree};
 use crate::query::keying_settings::KeyingSettings;
 use crate::query::resolve::{ResolvedQuery, TableSlot};
 
@@ -67,6 +69,76 @@ async fn cache_tables_ensure(
     Ok(())
 }
 
+/// A query in its canonical form with what the binding learned beside it.
+struct CanonicalBinding {
+    resolution: CanonicalResolution,
+    /// The user's LIMIT split off before binding.
+    user_max_limit: Option<u64>,
+    /// The functions the query calls, resolved on the session's search_path.
+    function_oids: Vec<FunctionOid>,
+}
+
+/// Resolve every function the tree calls on `search_path`: the oids the
+/// entry depends on (PGC-578). A call no function fits, or one a user or
+/// extension function could answer, refuses the query: the cache PG has
+/// only PostgreSQL's own functions to serve and evaluate with. The parser's
+/// own forms (`coalesce`, ...) have no row and need none.
+fn functions_resolve(
+    core: &WriterCore,
+    tree: &QueryTree,
+    search_path: &[&str],
+) -> CacheResult<Vec<FunctionOid>> {
+    let mut oids = Vec::new();
+    for node in tree.nodes() {
+        let NodeKind::Function {
+            schema,
+            name,
+            arg_count,
+            ..
+        } = &node.kind
+        else {
+            continue;
+        };
+        if schema.is_none() && is_sql_form(name) {
+            continue;
+        }
+        let mut found = false;
+        for row in core
+            .function_catalog
+            .on_path(schema.as_deref(), name, *arg_count, search_path)
+        {
+            found = true;
+            if !row.oid.is_builtin() {
+                return Err(function_refusal(CacheError::FunctionNotBuiltin {
+                    function: EcoString::from(format!("{}.{}", row.schema, row.name)),
+                }));
+            }
+            oids.push(row.oid);
+        }
+        if !found {
+            return Err(function_refusal(CacheError::FunctionUnknown {
+                function: name.clone(),
+                arg_count: *arg_count,
+            }));
+        }
+    }
+    oids.sort_unstable();
+    oids.dedup();
+    Ok(oids)
+}
+
+/// Count a function refusal by reason and wrap it as the registration's error.
+fn function_refusal(error: CacheError) -> Report<CacheError> {
+    let m = crate::metrics::handles();
+    let counter = if matches!(error, CacheError::FunctionNotBuiltin { .. }) {
+        &m.query.function_forward_not_builtin
+    } else {
+        &m.query.function_forward_unknown
+    };
+    counter.increment(1);
+    Report::from(error)
+}
+
 /// Ensure the query's tables exist in the cache and bind it to them under
 /// the session's keying settings, with the user's LIMIT split off. The one
 /// path to a query's canonical form: the fingerprint dispatch resolves and
@@ -75,7 +147,7 @@ async fn query_bind_canonical(
     core: &mut WriterCore,
     query: &QueryTree,
     keying: &KeyingSettings,
-) -> CacheResult<(CanonicalResolution, Option<u64>)> {
+) -> CacheResult<CanonicalBinding> {
     let (base_query, user_max_limit) = base_query_prepare(query);
     cache_tables_ensure(core, &base_query, &keying.search_path).await?;
     let path = search_path(keying);
@@ -93,7 +165,12 @@ async fn query_bind_canonical(
             .map_err(|e| e.context_transform(CacheError::from))
             .attach_loc("resolving the query with its policies inlined")?;
     }
-    Ok((resolution, user_max_limit))
+    let function_oids = functions_resolve(core, resolution.bound.tree(), &search_path(keying))?;
+    Ok(CanonicalBinding {
+        resolution,
+        user_max_limit,
+        function_oids,
+    })
 }
 
 /// The fingerprint of a query under the session's keying settings, the hash
@@ -104,15 +181,19 @@ pub(super) async fn query_fingerprint_resolve(
     query: &QueryTree,
     keying: &KeyingSettings,
 ) -> CacheResult<(Fingerprint, AliasResolution)> {
-    let (CanonicalResolution { bound, literals }, user_max_limit) =
-        query_bind_canonical(core, query, keying)
-            .await
-            .attach_loc("resolving query expression for its fingerprint")?;
+    let CanonicalBinding {
+        resolution: CanonicalResolution { bound, literals },
+        user_max_limit,
+        function_oids,
+    } = query_bind_canonical(core, query, keying)
+        .await
+        .attach_loc("resolving query expression for its fingerprint")?;
     let fingerprint = bound.fingerprint();
     Ok((
         fingerprint,
         AliasResolution {
             bound,
+            function_oids,
             reference_only: literals.residual,
             user_max_limit,
         },
@@ -190,6 +271,7 @@ fn resolution_limits(
 /// resolution is never built for it.
 pub(super) struct BoundQuery {
     pub(super) bound: SharedResolvedQuery,
+    function_oids: Vec<FunctionOid>,
     user_max_limit: Option<u64>,
     reference_only: bool,
 }
@@ -206,21 +288,26 @@ impl WriterRegistration {
     ) -> CacheResult<BoundQuery> {
         let AliasResolution {
             bound,
+            function_oids,
             reference_only,
             user_max_limit,
         } = match alias_resolution_take(core, request) {
             Some(resolution) => resolution,
             None => {
                 let bind_start = Instant::now();
-                let (CanonicalResolution { bound, literals }, user_max_limit) =
-                    query_bind_canonical(core, request.cacheable_query.tree(), &request.keying)
-                        .await?;
+                let CanonicalBinding {
+                    resolution: CanonicalResolution { bound, literals },
+                    user_max_limit,
+                    function_oids,
+                } = query_bind_canonical(core, request.cacheable_query.tree(), &request.keying)
+                    .await?;
                 crate::metrics::handles()
                     .reg
                     .register_bind
                     .record(bind_start.elapsed().as_secs_f64());
                 AliasResolution {
                     bound,
+                    function_oids,
                     reference_only: literals.residual,
                     user_max_limit,
                 }
@@ -242,6 +329,7 @@ impl WriterRegistration {
 
         Ok(BoundQuery {
             bound,
+            function_oids,
             user_max_limit,
             reference_only,
         })
@@ -259,6 +347,7 @@ impl WriterRegistration {
     ) -> CacheResult<QueryResolution> {
         let BoundQuery {
             bound,
+            function_oids,
             user_max_limit,
             reference_only,
         } = query;
@@ -296,6 +385,7 @@ impl WriterRegistration {
         Ok(QueryResolution {
             serve_shape,
             relation_oids,
+            function_oids,
             bound,
             read_facts,
             population,

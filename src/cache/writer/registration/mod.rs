@@ -31,7 +31,7 @@ use crate::cache::types::{
 };
 use crate::cache::{CacheError, CacheResult, MapIntoReport, ReportExt};
 use crate::catalog::{TableMetadata, aggregate_functions_load};
-use crate::oid::Oid;
+use crate::oid::{FunctionOid, Oid};
 use crate::query::Fingerprint;
 use crate::result::error_chain_format;
 use crate::settings::Settings;
@@ -71,6 +71,8 @@ pub(super) struct QueryResolution {
     /// `CachedQuery.serve_shape`.
     pub(super) serve_shape: SharedQueryShape,
     pub(super) relation_oids: Vec<Oid>,
+    /// See `CachedQuery.function_oids`.
+    pub(super) function_oids: Vec<FunctionOid>,
     /// The canonical plain tree with its bindings (ADR-057).
     pub(super) bound: SharedResolvedQuery,
     /// See `CachedQuery.read_facts`.
@@ -127,6 +129,7 @@ pub(super) fn cached_query_insert(
         fingerprint: identity.fingerprint,
         generation,
         relation_oids: resolution.relation_oids,
+        function_oids: resolution.function_oids,
         bound: resolution.bound,
         read_facts: resolution.read_facts,
         population: resolution.population,
@@ -189,7 +192,8 @@ fn command_histogram(cmd: &QueryCommand) -> &'static Histogram {
 /// (ambiguous self-join columns, USING/NATURAL qualifiers, etc.) as a
 /// `ResolveError`; a correlated subquery that can't be decorrelated as a
 /// `DecorrelateError`; a table with row-level security enabled as
-/// an RLS refusal (PGC-113). A forwarded query still returns the correct result; a
+/// an RLS refusal (PGC-113); a call of a function the cache PG lacks as a
+/// function refusal (PGC-578). A forwarded query still returns the correct result; a
 /// wrong cached result is caught by the result-diff path, and "should have
 /// cached" by routing assertions — neither relies on this error log.
 fn register_failure_log(key: impl std::fmt::Display, error: &CacheError) {
@@ -206,6 +210,8 @@ fn register_failure_log(key: impl std::fmt::Display, error: &CacheError) {
             | CacheError::RlsUninlinable { .. }
             | CacheError::RlsUnsupported { .. }
             | CacheError::RlsRoleCannotBypass
+            | CacheError::FunctionUnknown { .. }
+            | CacheError::FunctionNotBuiltin { .. }
     ) {
         debug!(
             "query {key} forwarded (not cacheable): {}",

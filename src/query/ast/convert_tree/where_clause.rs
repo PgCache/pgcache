@@ -133,7 +133,11 @@ pub(super) unsafe fn where_expr_emit(
                 ))));
                 Ok(())
             }
-            pg::NodeTag_T_FuncCall | pg::NodeTag_T_TypeCast | pg::NodeTag_T_SQLValueFunction => {
+            pg::NodeTag_T_FuncCall
+            | pg::NodeTag_T_TypeCast
+            | pg::NodeTag_T_SQLValueFunction
+            | pg::NodeTag_T_CoalesceExpr
+            | pg::NodeTag_T_MinMaxExpr => {
                 scalar_emit(builder, node, scope).map_err(WhereParseError::from)
             }
             _ => Err(WhereParseError::UnsupportedPattern),
@@ -319,6 +323,9 @@ unsafe fn a_expr_emit(
             pg::A_Expr_Kind_AEXPR_OP_ALL => {
                 let comparison = operator_extract((*expr).name)?;
                 a_expr_any_all_emit(builder, expr, MultiOp::All { comparison }, scope)
+            }
+            pg::A_Expr_Kind_AEXPR_NULLIF => {
+                scalar_emit(builder, expr as NodePtr, scope).map_err(WhereParseError::from)
             }
             other => Err(WhereParseError::UnsupportedAExpr {
                 expr: format!("{} in WHERE", aexpr_kind_name(other)),

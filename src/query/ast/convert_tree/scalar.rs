@@ -348,6 +348,11 @@ unsafe fn const_literal_peeled(node: NodePtr) -> Result<Option<LiteralValue>, As
     }
 }
 
+/// The functions the parser spells as nodes of their own, emitted as plain
+/// calls by [`function_bare_emit`] and `nullif_emit`. None has a `pg_proc`
+/// row: the executor evaluates them itself, on every PostgreSQL.
+pub const SQL_FORM_FUNCTIONS: [&str; 4] = ["coalesce", "greatest", "least", "nullif"];
+
 /// A function the parser spells as its own node (`coalesce`, `greatest`,
 /// `least`): a plain call of `name` over `args`.
 unsafe fn function_bare_emit(

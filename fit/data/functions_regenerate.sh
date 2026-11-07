@@ -12,12 +12,11 @@ version=$(psql "$@" -Atc "SHOW server_version")
   echo "# Regenerate with functions_regenerate.sh."
   psql "$@" -At -F "$(printf '\t')" -c "SELECT p.oid, n.nspname, p.proname, \
         p.pronargs, p.pronargdefaults, p.provariadic <> 0, p.provolatile::text, \
-        l.lanname, p.prosecdef, p.proretset, p.prorettype \
+        l.lanname, p.prosecdef, p.proretset, p.prorettype, p.prokind::text \
  FROM pg_proc p \
  JOIN pg_namespace n ON p.pronamespace = n.oid \
  JOIN pg_language l ON l.oid = p.prolang \
- WHERE p.prokind NOT IN ('a', 'w') \
-   AND n.nspname IN ('pg_catalog', 'information_schema') \
+ WHERE n.nspname IN ('pg_catalog', 'information_schema') \
  ORDER BY n.nspname, p.proname, p.oid"
 } > functions.tsv
 {

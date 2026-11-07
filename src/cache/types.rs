@@ -19,7 +19,7 @@ use super::privileges::PrivilegeVerdicts;
 use super::reg_gate::RegGate;
 use super::serve_pool_state::ServePool;
 use super::update_query::UpdateQueries;
-use crate::oid::Oid;
+use crate::oid::{FunctionOid, Oid};
 use crate::query::update::ReadRelations;
 use crate::{
     cache::{CacheError, CacheResult, memo::ResultMemo, mv::MvMeta, query::CacheableQuery},
@@ -53,6 +53,9 @@ pub struct Alias {
 #[derive(Debug, Clone)]
 pub struct AliasResolution {
     pub(crate) bound: Arc<ResolvedQuery>,
+    /// The functions the query calls, resolved on the session's search_path
+    /// (PGC-578).
+    pub(crate) function_oids: Vec<FunctionOid>,
     /// A date-time literal was left as written (`LiteralCanonOutcome::residual`).
     pub(crate) reference_only: bool,
     /// The user's LIMIT split off before binding.
@@ -110,6 +113,9 @@ pub struct CachedQuery {
     /// Generation number assigned when query was registered (monotonically increasing)
     pub generation: Generation,
     pub relation_oids: Vec<Oid>,
+    /// The functions `bound` calls, by `pg_proc` oid: what a function
+    /// redefinition on origin evicts by (PGC-578).
+    pub function_oids: Vec<FunctionOid>,
     pub bound: SharedResolvedQuery,
     /// What a hit on `bound` must prove, built once with it.
     pub(crate) read_facts: SharedReadFacts,

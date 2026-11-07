@@ -252,8 +252,9 @@ fn operator_volatility_check(
 
 /// A function call: immutable everywhere, any volatility in the SELECT list
 /// (re-evaluated at serve time); its arguments and FILTER must be cacheable.
-/// A bare name is judged by the worst of its overloads in any schema, since
-/// which schema the session's search_path picks is known only to the writer.
+/// Judged by the builtin overloads the call can name, the worst of them: a
+/// user function never counts, since the cache PG cannot run it, and which
+/// overload the session's search_path picks is the writer's to resolve.
 fn function_cacheable(
     function: Function<'_>,
     ctx: ExprContext,
@@ -271,7 +272,7 @@ fn function_cacheable(
     }
     let name = function.name();
     let arg_count = u32::try_from(function.args().len()).unwrap_or(u32::MAX);
-    let worst = functions.worst_volatility(schema, name, arg_count);
+    let worst = functions.builtin_worst_volatility(schema, name, arg_count);
     if worst != Some(FunctionVolatility::Immutable) && !matches!(ctx, ExprContext::SelectList) {
         return Err(CacheabilityError::NonImmutableFunction {
             function: name.to_lowercase(),
@@ -329,6 +330,7 @@ mod tests {
 
     use super::*;
     use crate::cache::query::CacheableQuery;
+    use crate::catalog::FunctionRow;
     use crate::query::ast::query_tree_parse;
 
     /// A test catalog of common builtins.
@@ -349,14 +351,18 @@ mod tests {
         ]
         .into_iter()
         .map(|name| (name, FunctionVolatility::Immutable));
-        let stable = ["now", "current_timestamp"]
-            .into_iter()
-            .map(|name| (name, FunctionVolatility::Stable));
-        FunctionCatalog::test_builtins(
-            immutable
-                .chain(stable)
-                .chain([("random", FunctionVolatility::Volatile)]),
-        )
+        let rows = immutable
+            .chain([
+                ("now", FunctionVolatility::Stable),
+                ("random", FunctionVolatility::Volatile),
+            ])
+            .map(|(name, volatility)| FunctionRow::test_builtin(name, volatility))
+            .chain([
+                FunctionRow::test_user("app", "tenant_of", FunctionVolatility::Immutable),
+                FunctionRow::test_user("app", "lower", FunctionVolatility::Stable),
+            ])
+            .collect();
+        FunctionCatalog::from_rows(rows)
     }
 
     /// Parse SQL and check cacheability against the test catalog.
@@ -892,6 +898,34 @@ mod tests {
     fn test_pg_catalog_qualified_function_cacheable() {
         assert!(check_cacheable("SELECT id FROM users WHERE pg_catalog.lower(name) = 'x'").is_ok());
         assert!(check_cacheable("SELECT pg_catalog.lower(name) FROM users").is_ok());
+    }
+
+    /// A user function is never admitted in WHERE, immutable or not: the
+    /// cache PG cannot run it (PGC-474, PGC-578). A user overload beside a
+    /// builtin does not drag the builtin down either.
+    #[test]
+    fn test_user_functions_do_not_count() {
+        let err = check_cacheable("SELECT id FROM users WHERE tenant_of(id) = 1")
+            .expect_err("user function in WHERE");
+        assert!(
+            matches!(err, CacheabilityError::NonImmutableFunction { .. }),
+            "{err}"
+        );
+        assert!(check_cacheable("SELECT id FROM users WHERE lower(name) = 'x'").is_ok());
+        assert!(check_cacheable("SELECT tenant_of(id) FROM users").is_ok());
+    }
+
+    /// `COALESCE`, `NULLIF`, `GREATEST` and `LEAST` are the parser's own
+    /// forms, immutable wherever they stand.
+    #[test]
+    fn test_sql_forms_cacheable_in_where() {
+        for sql in [
+            "SELECT id FROM users WHERE COALESCE(name, '') = 'x'",
+            "SELECT id FROM users WHERE NULLIF(name, '') = 'x'",
+            "SELECT id FROM users WHERE GREATEST(id, 3) = 3 AND LEAST(id, 3) = 1",
+        ] {
+            assert!(check_cacheable(sql).is_ok(), "{sql}");
+        }
     }
 
     #[test]

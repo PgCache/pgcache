@@ -66,7 +66,8 @@ error_set! {
 
 // Re-export everything public from submodules
 pub use convert_tree::{
-    RawStatement, index_tree_convert_raw, query_tree_convert_raw, statement_convert_raw,
+    RawStatement, SQL_FORM_FUNCTIONS, index_tree_convert_raw, query_tree_convert_raw,
+    statement_convert_raw,
 };
 #[cfg(any(test, feature = "proxy"))]
 pub(crate) use convert_tree::{index_tree_parse, query_tree_parse};

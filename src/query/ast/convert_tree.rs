@@ -33,6 +33,7 @@ use crate::query::write::{
 mod from;
 mod index;
 mod scalar;
+pub use scalar::SQL_FORM_FUNCTIONS;
 mod select;
 mod where_clause;
 mod window;
