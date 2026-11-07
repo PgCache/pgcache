@@ -9,7 +9,7 @@ use tokio_util::bytes::Bytes;
 
 use super::cacheability_memo::CacheabilityCache;
 use super::{ProxyMode, ProxyStatus};
-use crate::catalog::FunctionVolatility;
+use crate::catalog::FunctionCatalog;
 use crate::query::write::IsolationLevel;
 use crate::{
     cache::{CacheDispatchHandle, CacheMessage},
@@ -113,7 +113,7 @@ pub(super) struct ConnectionState {
     telemetry: QueryTelemetry,
 
     /// Function volatility map for cacheability checks
-    func_volatility: Arc<HashMap<EcoString, FunctionVolatility>>,
+    function_catalog: Arc<FunctionCatalog>,
 
     /// Extended query protocol pipeline state
     extended: ExtendedPending,

@@ -26,7 +26,7 @@ use crate::cache::{
     mv_shape::ShapeGate,
     types::{ActiveRelations, Cache, CacheStateView, CachedQueryState, CachedQueryView, ServingAt},
 };
-use crate::catalog::{CatalogTable, FunctionVolatility, function_volatility_map_load};
+use crate::catalog::{CatalogTable, FunctionCatalog};
 use crate::oid::Oid;
 use crate::pg;
 use crate::pg::Lsn;
@@ -394,9 +394,9 @@ pub(super) struct WriterCore {
     pub(super) roles_digest: Option<EcoString>,
     /// The secured relations and their policies (PGC-113).
     pub(super) rls: RlsCatalog,
-    /// Function volatility by name, for the cacheability check of an inlined
+    /// The origin's functions, for the cacheability check of an inlined
     /// policy predicate.
-    pub(super) function_volatility: HashMap<EcoString, FunctionVolatility>,
+    pub(super) function_catalog: FunctionCatalog,
     /// The writer connection's resolved search_path: what `pg_get_expr`
     /// deparses a policy's table names under.
     pub(super) origin_search_path: Arc<[EcoString]>,
@@ -512,10 +512,10 @@ impl WriterCore {
                     .digest,
             )
         };
-        let function_volatility = function_volatility_map_load(&origin_client)
+        let function_catalog = FunctionCatalog::load(&origin_client)
             .await
             .map_into_report::<CacheError>()
-            .attach_loc("loading function volatility for policy inlining")?;
+            .attach_loc("loading the function catalog for policy inlining")?;
         let origin_search_path = origin_search_path_read(&origin_client).await?;
         let WriterShared {
             state_view,
@@ -588,7 +588,7 @@ impl WriterCore {
             disk_drop_backoff: false,
             roles_digest,
             rls: RlsCatalog::default(),
-            function_volatility,
+            function_catalog,
             origin_search_path,
         };
         core.rls_startup_load()

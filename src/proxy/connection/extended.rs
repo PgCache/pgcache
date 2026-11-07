@@ -183,7 +183,7 @@ impl ConnectionState {
     /// The statement's effects, settings changes included, are memoized with
     /// the verdict.
     fn statement_analyze(&mut self, sql: &str) -> StatementAnalysis {
-        let analyzed = analyze(sql, &mut self.cacheability_cache, &self.func_volatility);
+        let analyzed = analyze(sql, &mut self.cacheability_cache, &self.function_catalog);
         let (sql_type, effects) = match analyzed {
             Ok(Action::CacheCheck(ast)) => {
                 (StatementType::Cacheable(ast), StatementEffects::default())

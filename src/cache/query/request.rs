@@ -78,18 +78,19 @@ impl RequestQuery {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use bytes::Bytes;
     use postgres_types::Type as PgType;
 
     use super::*;
+    use crate::catalog::FunctionCatalog;
     use crate::oid::TypeOid;
     use crate::query::ast::{LiteralValue, query_tree_parse};
 
     fn cacheable(sql: &str) -> Arc<CacheableQuery> {
         let tree = query_tree_parse(sql).expect("parse query");
-        Arc::new(CacheableQuery::try_new(tree, &HashMap::new()).expect("cacheable query"))
+        Arc::new(
+            CacheableQuery::try_new(tree, &FunctionCatalog::default()).expect("cacheable query"),
+        )
     }
 
     fn int_params(values: &[&[u8]]) -> QueryParameters {

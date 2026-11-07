@@ -1,6 +1,5 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
-use ecow::EcoString;
 use tokio_util::bytes::BytesMut;
 use tracing::debug;
 
@@ -9,7 +8,7 @@ use super::cacheability_memo::{CacheabilityCache, SqlTextHash};
 use super::explain::{ExplainSpec, explain_spec_extract};
 use crate::{
     cache::query::{CacheableQuery, query_tree_has_volatile_function},
-    catalog::FunctionVolatility,
+    catalog::FunctionCatalog,
     query::ast::rope::{Function, NodeKind, QueryTree, View},
     query::ast::{AstError, LiteralValue, RawStatement, statement_convert_raw},
     query::guc::Guc,
@@ -113,10 +112,10 @@ pub(super) enum Action {
 pub(super) async fn handle_query(
     data: &BytesMut,
     cacheability_cache: &mut CacheabilityCache,
-    func_volatility: &HashMap<EcoString, FunctionVolatility>,
+    function_catalog: &FunctionCatalog,
 ) -> Result<Action, ParseError> {
     let query = query_sql_extract(data).ok_or(ParseError::InvalidUtf8)?;
-    analyze(query, cacheability_cache, func_volatility)
+    analyze(query, cacheability_cache, function_catalog)
 }
 
 /// Whether the statement text contains a `set_config` call (case-insensitive),
@@ -150,7 +149,7 @@ pub(super) fn query_sql_extract(data: &BytesMut) -> Option<&str> {
 pub(super) fn analyze(
     sql: &str,
     cacheability_cache: &mut CacheabilityCache,
-    func_volatility: &HashMap<EcoString, FunctionVolatility>,
+    function_catalog: &FunctionCatalog,
 ) -> Result<Action, ParseError> {
     cacheability_cache.epoch_reconcile();
 
@@ -199,10 +198,10 @@ pub(super) fn analyze(
             if let Some(spec) = explain_spec_extract(&query) {
                 Action::Explain(Arc::new(spec))
             } else {
-                match CacheableQuery::cacheable(&query, func_volatility) {
+                match CacheableQuery::cacheable(&query, function_catalog) {
                     // `cacheable` just passed, so `try_new` (same validation)
                     // cannot fail; forward conservatively if it ever disagrees.
-                    Ok(()) => match CacheableQuery::try_new(query, func_volatility) {
+                    Ok(()) => match CacheableQuery::try_new(query, function_catalog) {
                         Ok(cacheable_query) => Action::CacheCheck(Arc::new(cacheable_query)),
                         Err(_) => Action::Forward(
                             ForwardReason::UncacheableSelect,
@@ -216,7 +215,8 @@ pub(super) fn analyze(
                         // carrying one is a potential write (PGC-124). Scanned
                         // only now that the query is known uncacheable — the
                         // cacheable path never pays for it.
-                        let effects = if query_tree_has_volatile_function(&query, func_volatility) {
+                        let effects = if query_tree_has_volatile_function(&query, function_catalog)
+                        {
                             StatementEffects::write(WriteClass::Connection, isolation)
                         } else {
                             StatementEffects::read_only(isolation, None)
@@ -305,11 +305,12 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::catalog::FunctionVolatility;
     use crate::proxy::cacheability_memo::CACHEABILITY_MEMO_CAPACITY;
     use crate::proxy::cacheability_store::CacheabilityStore;
 
-    fn empty_volatility() -> HashMap<EcoString, FunctionVolatility> {
-        HashMap::new()
+    fn empty_catalog() -> FunctionCatalog {
+        FunctionCatalog::default()
     }
 
     /// Two connections analyzing the same text must share one interned payload.
@@ -318,7 +319,7 @@ mod tests {
     #[test]
     fn test_repeat_text_across_connections_interns_once() {
         let store = Arc::new(CacheabilityStore::new());
-        let fv = empty_volatility();
+        let fv = empty_catalog();
         let sql = "SELECT a FROM t WHERE id = 1";
 
         let mut first = CacheabilityCache::new(Arc::clone(&store));
@@ -342,7 +343,7 @@ mod tests {
     #[test]
     fn test_memo_is_bounded_and_releases_on_eviction() {
         let store = Arc::new(CacheabilityStore::new());
-        let fv = empty_volatility();
+        let fv = empty_catalog();
         let mut memo = CacheabilityCache::new(Arc::clone(&store));
 
         let overshoot = CACHEABILITY_MEMO_CAPACITY.get() * 2;
@@ -368,7 +369,7 @@ mod tests {
     #[test]
     fn test_connection_close_reclaims_its_entries() {
         let store = Arc::new(CacheabilityStore::new());
-        let fv = empty_volatility();
+        let fv = empty_catalog();
 
         let mut memo = CacheabilityCache::new(Arc::clone(&store));
         analyze("SELECT a FROM t WHERE id = 1", &mut memo, &fv).expect("analyze");
@@ -387,7 +388,7 @@ mod tests {
     #[test]
     fn test_shared_entry_survives_one_connection_closing() {
         let store = Arc::new(CacheabilityStore::new());
-        let fv = empty_volatility();
+        let fv = empty_catalog();
         let sql = "SELECT a FROM t WHERE id = 1";
 
         let mut first = CacheabilityCache::new(Arc::clone(&store));
@@ -407,7 +408,7 @@ mod tests {
     #[test]
     fn test_pressure_drop_drains_connection_memos() {
         let store = Arc::new(CacheabilityStore::new());
-        let fv = empty_volatility();
+        let fv = empty_catalog();
         let mut memo = CacheabilityCache::new(Arc::clone(&store));
         analyze("SELECT a FROM t WHERE id = 1", &mut memo, &fv).expect("analyze");
 
@@ -421,14 +422,14 @@ mod tests {
         assert_eq!(store.len(), 1);
     }
 
-    fn analyze_fresh(sql: &str, fv: &HashMap<EcoString, FunctionVolatility>) -> Action {
+    fn analyze_fresh(sql: &str, fv: &FunctionCatalog) -> Action {
         let store = Arc::new(CacheabilityStore::new());
         analyze(sql, &mut CacheabilityCache::new(store), fv).expect("analyze sql")
     }
 
     #[test]
     fn test_analyze_dml_classifies_as_write() {
-        let fv = HashMap::new();
+        let fv = FunctionCatalog::default();
         match analyze_fresh("INSERT INTO t (a) VALUES (1)", &fv) {
             Action::Forward(
                 ForwardReason::UnsupportedStatement,
@@ -482,7 +483,7 @@ mod tests {
     }
 
     fn settings_of(sql: &str) -> SettingsEffect {
-        match analyze_fresh(sql, &HashMap::new()) {
+        match analyze_fresh(sql, &FunctionCatalog::default()) {
             Action::Forward(_, effects) => effects.settings,
             _ => panic!("expected a forward for {sql:?}"),
         }
@@ -512,7 +513,7 @@ mod tests {
     }
 
     fn custom_settings_of(sql: &str) -> Vec<CustomSettingEffect> {
-        match analyze_fresh(sql, &HashMap::new()) {
+        match analyze_fresh(sql, &FunctionCatalog::default()) {
             Action::Forward(_, effects) => effects.custom_settings.into_vec(),
             _ => panic!("expected a forward for {sql:?}"),
         }
@@ -557,7 +558,7 @@ mod tests {
         ];
         for (sql, expected) in cases {
             assert_eq!(
-                action_described(&analyze_fresh(sql, &HashMap::new())),
+                action_described(&analyze_fresh(sql, &FunctionCatalog::default())),
                 expected,
                 "{sql}"
             );
@@ -566,7 +567,7 @@ mod tests {
 
     #[test]
     fn test_analyze_txn_control_is_plain_forward() {
-        let fv = HashMap::new();
+        let fv = FunctionCatalog::default();
         for sql in ["BEGIN", "COMMIT", "SET search_path TO public"] {
             assert!(
                 matches!(
@@ -582,9 +583,10 @@ mod tests {
     fn test_analyze_volatile_where_function_is_a_write() {
         // Unknown and volatile functions in WHERE can modify the database;
         // stable ones cannot (PGC-124).
-        let mut fv = HashMap::new();
-        fv.insert(EcoString::from("f_volatile"), FunctionVolatility::Volatile);
-        fv.insert(EcoString::from("f_stable"), FunctionVolatility::Stable);
+        let fv = FunctionCatalog::test_builtins([
+            ("f_volatile", FunctionVolatility::Volatile),
+            ("f_stable", FunctionVolatility::Stable),
+        ]);
 
         for sql in [
             "SELECT * FROM t WHERE f_volatile(a) = 1",
@@ -618,9 +620,10 @@ mod tests {
         // A volatile nested inside a stable function still executes and can
         // modify the DB. The cacheability check short-circuits on the outer
         // stable, so write detection must walk the whole tree independently.
-        let mut fv = HashMap::new();
-        fv.insert(EcoString::from("f_volatile"), FunctionVolatility::Volatile);
-        fv.insert(EcoString::from("f_stable"), FunctionVolatility::Stable);
+        let fv = FunctionCatalog::test_builtins([
+            ("f_volatile", FunctionVolatility::Volatile),
+            ("f_stable", FunctionVolatility::Stable),
+        ]);
 
         assert!(
             matches!(
@@ -648,7 +651,7 @@ mod tests {
     #[test]
     fn test_analyze_multi_statement_is_a_write() {
         assert!(matches!(
-            analyze_fresh("SELECT 1; SELECT 2", &HashMap::new()),
+            analyze_fresh("SELECT 1; SELECT 2", &FunctionCatalog::default()),
             Action::Forward(
                 ForwardReason::Invalid,
                 StatementEffects {
@@ -661,7 +664,7 @@ mod tests {
 
     #[test]
     fn test_writes_are_not_memoized() {
-        let fv = HashMap::new();
+        let fv = FunctionCatalog::default();
         let mut cache = CacheabilityCache::new(Arc::new(CacheabilityStore::new()));
         // (sql, its action, memo entries afterwards): a write is classified
         // but left out of the memo (DML text is ~unique and its class can

@@ -272,14 +272,12 @@ pub(super) fn predicate_columns_collect(
 #[cfg(test)]
 mod classify_tests {
 
-    use std::collections::HashMap;
-
     use iddqd::BiHashMap;
     use postgres_types::Type;
 
     use super::*;
     use crate::cache::query::CacheableQuery;
-    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
+    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, FunctionCatalog, TableMetadata};
     use crate::oid::{Oid, TypeOid};
     use crate::query::ast::query_tree_parse;
     use crate::query::resolve::ResolvedQuery;
@@ -302,7 +300,8 @@ mod classify_tests {
 
     fn resolve(sql: &str, tables: &Catalog) -> ResolvedQuery {
         let tree = query_tree_parse(sql).expect("convert");
-        let cacheable = CacheableQuery::try_new(tree, &HashMap::new()).expect("cacheable");
+        let cacheable =
+            CacheableQuery::try_new(tree, &FunctionCatalog::default()).expect("cacheable");
         let tree = cacheable.tree().clone();
         ResolvedQuery::resolve(tree, tables, &["public"]).expect("resolve")
     }

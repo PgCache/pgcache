@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::{collections::HashMap, sync::Arc, thread};
+use std::{sync::Arc, thread};
 
 use ecow::EcoString;
 use metrics_exporter_prometheus::PrometheusHandle;
@@ -22,7 +22,7 @@ use crate::{
         CacheDispatchHandle, CacheDispatchUpdater, PinnedQuery, cache_generation_start,
         cache_supervise,
     },
-    catalog::{FunctionVolatility, function_volatility_map_load},
+    catalog::{FunctionCatalog, FunctionVolatility},
     pg::{cdc::replication_cleanup, connect},
     query::ast::query_tree_convert_raw,
     settings::{Settings, SslMode},
@@ -54,51 +54,49 @@ fn tls_config_load(settings: &Settings) -> ConnectionResult<Option<Arc<tls::TlsA
     }
 }
 
-/// Load function volatilities from origin database.
-///
-/// Opens a temporary connection to origin, queries pg_proc for all scalar
-/// function volatilities, and returns an immutable shared map.
-async fn function_volatility_load(
-    settings: &Settings,
-) -> ConnectionResult<Arc<HashMap<EcoString, FunctionVolatility>>> {
-    let client = connect(&settings.origin, "volatility-load")
+/// Load the function catalog from the origin database over a temporary
+/// connection, as an immutable shared value.
+async fn function_catalog_load(settings: &Settings) -> ConnectionResult<Arc<FunctionCatalog>> {
+    let client = connect(&settings.origin, "function-catalog-load")
         .await
         .map_err(|e| {
             Report::from(ConnectionError::IoError(std::io::Error::other(format!(
-                "volatility load connection: {e}"
+                "function catalog load connection: {e}"
             ))))
         })?;
-    let map = function_volatility_map_load(&client).await.map_err(|e| {
+    let catalog = FunctionCatalog::load(&client).await.map_err(|e| {
         Report::from(ConnectionError::IoError(std::io::Error::other(format!(
-            "volatility map load: {e}"
+            "function catalog load: {e}"
         ))))
     })?;
-    let immutable_count = map
-        .iter()
-        .filter(|(_, v)| matches!(v, FunctionVolatility::Immutable))
-        .count();
+    let immutable = || {
+        catalog
+            .rows()
+            .iter()
+            .filter(|row| row.volatility == FunctionVolatility::Immutable)
+    };
     info!(
-        "loaded {} function volatilities ({immutable_count} immutable)",
-        map.len()
+        "loaded {} functions ({} immutable)",
+        catalog.len(),
+        immutable().count()
     );
 
     if tracing::enabled!(tracing::Level::TRACE) {
-        let mut names: Vec<&str> = map
-            .iter()
-            .filter(|(_, v)| matches!(v, FunctionVolatility::Immutable))
-            .map(|(k, _)| k.as_str())
+        let mut names: Vec<String> = immutable()
+            .map(|row| format!("{}.{}", row.schema, row.name))
             .collect();
         names.sort_unstable();
+        names.dedup();
         trace!("immutable functions: {}", names.join(", "));
     }
 
-    Ok(Arc::new(map))
+    Ok(Arc::new(catalog))
 }
 
 /// Parse and validate pinned queries at startup, returning only those that are cacheable.
 fn pinned_queries_validate(
     settings: &Settings,
-    func_volatility: &HashMap<EcoString, FunctionVolatility>,
+    function_catalog: &FunctionCatalog,
 ) -> Vec<PinnedQuery> {
     let Some(queries) = &settings.pinned_queries else {
         return Vec::new();
@@ -120,7 +118,7 @@ fn pinned_queries_validate(
                     return None;
                 }
             };
-            let cacheable_query = match CacheableQuery::try_new(tree, func_volatility) {
+            let cacheable_query = match CacheableQuery::try_new(tree, function_catalog) {
                 Ok(cq) => cq,
                 Err(e) => {
                     tracing::warn!("pinned query not cacheable, skipping: {sql} ({e})");
@@ -154,8 +152,8 @@ pub fn proxy_run(
         .map_into_report::<ConnectionError>()?;
     // Replication provisioning now happens per cache generation in `cache_setup`,
     // so a restart re-establishes a slot the origin lost.
-    let func_volatility = pre_rt.block_on(function_volatility_load(settings))?;
-    let pinned = pinned_queries_validate(settings, &func_volatility);
+    let function_catalog = pre_rt.block_on(function_catalog_load(settings))?;
+    let pinned = pinned_queries_validate(settings, &function_catalog);
     drop(pre_rt);
 
     // One shared multi-thread runtime hosts connection tasks + worker serves
@@ -241,7 +239,7 @@ pub fn proxy_run(
             origin_database: EcoString::from(settings.origin.database.as_str()),
             dispatch_handle,
             tls_acceptor,
-            func_volatility: Arc::clone(&func_volatility),
+            function_catalog: Arc::clone(&function_catalog),
             cacheability_store,
         };
 
@@ -303,7 +301,7 @@ struct ConnectionContext {
     origin_database: EcoString,
     dispatch_handle: CacheDispatchHandle,
     tls_acceptor: Option<Arc<tls::TlsAcceptor>>,
-    func_volatility: Arc<HashMap<EcoString, FunctionVolatility>>,
+    function_catalog: Arc<FunctionCatalog>,
     cacheability_store: Arc<CacheabilityStore>,
 }
 
@@ -320,7 +318,7 @@ impl ConnectionContext {
             self.server_name.clone(),
             self.dispatch_handle.clone(),
             self.tls_acceptor.clone(),
-            Arc::clone(&self.func_volatility),
+            Arc::clone(&self.function_catalog),
             self.origin_database.clone(),
             Arc::clone(&self.cacheability_store),
         ));
@@ -470,11 +468,8 @@ fn taskdump_spawn() {
 
 #[cfg(test)]
 mod tests {
-
-    use std::collections::HashMap;
-
     use super::pinned_queries_validate;
-    use crate::catalog::FunctionVolatility;
+    use crate::catalog::{FunctionCatalog, FunctionVolatility};
     use crate::settings::{
         CdcSettings, DynamicConfigHandle, ListenSettings, PgSettings, Settings, SslMode,
     };
@@ -515,7 +510,7 @@ mod tests {
     #[test]
     fn test_pinned_queries_validate_none_returns_empty() {
         let settings = test_settings(None);
-        let result = pinned_queries_validate(&settings, &HashMap::new());
+        let result = pinned_queries_validate(&settings, &FunctionCatalog::default());
         assert!(result.is_empty());
     }
 
@@ -524,7 +519,7 @@ mod tests {
         let settings = test_settings(Some(vec![
             "SELECT id, name FROM users WHERE active = true".to_owned(),
         ]));
-        let result = pinned_queries_validate(&settings, &HashMap::new());
+        let result = pinned_queries_validate(&settings, &FunctionCatalog::default());
         assert_eq!(result.len(), 1);
     }
 
@@ -534,7 +529,7 @@ mod tests {
             "SELECT * FROM users".to_owned(),
             "SELECT * FROM orders".to_owned(),
         ]));
-        let result = pinned_queries_validate(&settings, &HashMap::new());
+        let result = pinned_queries_validate(&settings, &FunctionCatalog::default());
         assert_eq!(result.len(), 2);
         assert_ne!(
             result[0].cacheable_query.tree(),
@@ -545,7 +540,7 @@ mod tests {
     #[test]
     fn test_pinned_queries_validate_unparseable_skipped() {
         let settings = test_settings(Some(vec!["NOT VALID SQL !!!".to_owned()]));
-        let result = pinned_queries_validate(&settings, &HashMap::new());
+        let result = pinned_queries_validate(&settings, &FunctionCatalog::default());
         assert!(result.is_empty());
     }
 
@@ -553,7 +548,7 @@ mod tests {
     fn test_pinned_queries_validate_non_cacheable_skipped() {
         // INSERT is not cacheable
         let settings = test_settings(Some(vec!["INSERT INTO users (id) VALUES (1)".to_owned()]));
-        let result = pinned_queries_validate(&settings, &HashMap::new());
+        let result = pinned_queries_validate(&settings, &FunctionCatalog::default());
         assert!(result.is_empty());
     }
 
@@ -564,14 +559,13 @@ mod tests {
             "NOT VALID SQL".to_owned(),
             "SELECT * FROM orders".to_owned(),
         ]));
-        let result = pinned_queries_validate(&settings, &HashMap::new());
+        let result = pinned_queries_validate(&settings, &FunctionCatalog::default());
         assert_eq!(result.len(), 2);
     }
 
     #[test]
     fn test_pinned_queries_validate_non_cacheable_function_in_where_rejected() {
-        let mut fv = HashMap::new();
-        fv.insert("random".into(), FunctionVolatility::Volatile);
+        let fv = FunctionCatalog::test_builtins([("random", FunctionVolatility::Volatile)]);
 
         // Volatile function in WHERE clause makes query non-cacheable
         let settings = test_settings(Some(vec![

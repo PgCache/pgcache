@@ -1,4 +1,5 @@
-//! PostgreSQL OID newtypes: relation OIDs (`Oid`) and type OIDs (`TypeOid`).
+//! PostgreSQL OID newtypes: relation OIDs (`Oid`), type OIDs (`TypeOid`) and
+//! function OIDs (`FunctionOid`).
 
 use std::fmt;
 
@@ -137,6 +138,71 @@ impl<'a> FromSql<'a> for TypeOid {
         raw: &'a [u8],
     ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
         <u32 as FromSql>::from_sql(ty, raw).map(TypeOid)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        <u32 as FromSql>::accepts(ty)
+    }
+}
+
+/// A PostgreSQL function OID (`pg_proc.oid`): what a call in a query resolves
+/// to, and the dependency a cached entry records on it (PGC-578). Distinct
+/// from [`Oid`] and [`TypeOid`] for the same reason those two are: all three
+/// are `u32`s, and only the type stops a relation's oid naming a function.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct FunctionOid(u32);
+
+impl FunctionOid {
+    /// Below this, an oid is a builtin's: `FirstNormalObjectId` in PostgreSQL.
+    const FIRST_NORMAL_OBJECT_ID: u32 = 16384;
+
+    /// Wrap a raw `u32` from a catalog row.
+    pub const fn from_raw(value: u32) -> Self {
+        Self(value)
+    }
+
+    /// The underlying `u32`, for SQL parameters and logs.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+
+    /// Whether the function ships with PostgreSQL rather than being created
+    /// in the database (by an extension or a user).
+    pub const fn is_builtin(self) -> bool {
+        self.0 < Self::FIRST_NORMAL_OBJECT_ID
+    }
+}
+
+impl fmt::Display for FunctionOid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl ToSql for FunctionOid {
+    fn to_sql(
+        &self,
+        ty: &Type,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        self.0.to_sql(ty, out)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        <u32 as ToSql>::accepts(ty)
+    }
+
+    to_sql_checked!();
+}
+
+impl<'a> FromSql<'a> for FunctionOid {
+    fn from_sql(
+        ty: &Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        <u32 as FromSql>::from_sql(ty, raw).map(FunctionOid)
     }
 
     fn accepts(ty: &Type) -> bool {

@@ -294,7 +294,7 @@ pub fn statement_classify(
     };
 
     // Stage A: syntactic cacheability against the builtin volatility map.
-    let cacheable = match CacheableQuery::try_new(expr.clone(), &builtins.volatility) {
+    let cacheable = match CacheableQuery::try_new(expr.clone(), &builtins.catalog) {
         Ok(cacheable) => cacheable,
         Err(error) => {
             let (reason, detail) = cacheability_reason(&error);

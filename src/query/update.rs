@@ -469,7 +469,7 @@ mod tests {
     use crate::cache::SubqueryKind;
     use crate::cache::UpdateQuerySource::{FromClause, OuterJoinOptional, OuterJoinTerminal};
     use crate::cache::query::CacheableQuery;
-    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
+    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, FunctionCatalog, TableMetadata};
     use crate::oid::TypeOid;
     #[cfg(feature = "proxy")]
     use crate::query::ast::LiteralValue;
@@ -678,7 +678,7 @@ mod tests {
     /// Helper to parse SQL and return a CacheableQuery
     fn parse_cacheable(sql: &str) -> CacheableQuery {
         let tree = query_tree_parse(sql).expect("parse");
-        CacheableQuery::try_new(tree, &HashMap::new()).expect("query to be cacheable")
+        CacheableQuery::try_new(tree, &FunctionCatalog::default()).expect("query to be cacheable")
     }
 
     /// Create test table metadata with given column names.

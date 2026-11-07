@@ -3,8 +3,8 @@
 
 use ecow::EcoString;
 
-use super::{CacheabilityError, FunctionVolatilityMap};
-use crate::catalog::FunctionVolatility;
+use super::CacheabilityError;
+use crate::catalog::{FunctionCatalog, FunctionVolatility};
 use crate::query::ast::rope::{
     Body, Case, Function, Join, JoinQual, NodeKind, Operator, Query, QueryTree, Scalar, ScalarKind,
     Select, SelectItem, Source, Where, WhereKind,
@@ -55,42 +55,45 @@ enum ExprContext {
 /// A query body: SELECT nodes and set-operation branches recursively.
 pub(super) fn body_cacheable(
     body: Body<'_>,
-    fv: &FunctionVolatilityMap,
+    functions: &FunctionCatalog,
 ) -> Result<(), CacheabilityError> {
     match body {
-        Body::Select(select) => select_cacheable(select, fv),
+        Body::Select(select) => select_cacheable(select, functions),
         Body::Values(_) => Err(CacheabilityError::UnsupportedQueryType { kind: "VALUES" }),
         Body::SetOp(set_op) => {
             // LIMIT/OFFSET on branches makes them non-cacheable
             if set_op.left().has_limit() || set_op.right().has_limit() {
                 return Err(CacheabilityError::HasLimit);
             }
-            body_cacheable(set_op.left().body(), fv)?;
-            body_cacheable(set_op.right().body(), fv)
+            body_cacheable(set_op.left().body(), functions)?;
+            body_cacheable(set_op.right().body(), functions)
         }
     }
 }
 
 fn select_cacheable(
     select: Select<'_>,
-    fv: &FunctionVolatilityMap,
+    functions: &FunctionCatalog,
 ) -> Result<(), CacheabilityError> {
-    from_supported(select, fv)?;
+    from_supported(select, functions)?;
     if let Some(where_clause) = select.where_clause() {
-        where_cacheable(where_clause, ExprContext::WhereClause, fv)?;
+        where_cacheable(where_clause, ExprContext::WhereClause, functions)?;
     }
     for item in select.items().into_iter().flatten() {
         if let SelectItem::Expr(expr) = item {
-            scalar_cacheable(expr.expr(), ExprContext::SelectList, fv)?;
+            scalar_cacheable(expr.expr(), ExprContext::SelectList, functions)?;
         }
     }
     Ok(())
 }
 
-fn from_supported(select: Select<'_>, fv: &FunctionVolatilityMap) -> Result<(), CacheabilityError> {
+fn from_supported(
+    select: Select<'_>,
+    functions: &FunctionCatalog,
+) -> Result<(), CacheabilityError> {
     let mut from = select.from();
     match (from.next(), from.next()) {
-        (Some(Source::Join(join)), None) => join_supported(join, fv),
+        (Some(Source::Join(join)), None) => join_supported(join, functions),
         (Some(Source::Table(_)), None) => Ok(()),
         (Some(Source::Subquery(subquery)), None) => {
             // LATERAL subqueries reference the outer scope.
@@ -103,9 +106,9 @@ fn from_supported(select: Select<'_>, fv: &FunctionVolatilityMap) -> Result<(), 
                 });
             }
             // LIMIT in a derived table is valid SQL, so only the body is checked.
-            body_cacheable(subquery.query().body(), fv)
+            body_cacheable(subquery.query().body(), functions)
         }
-        (Some(Source::CteRef(cte_ref)), None) => body_cacheable(cte_ref.query().body(), fv),
+        (Some(Source::CteRef(cte_ref)), None) => body_cacheable(cte_ref.query().body(), functions),
         (None, _) => Err(CacheabilityError::UnsupportedFrom {
             construct: "no FROM clause",
         }),
@@ -117,10 +120,10 @@ fn from_supported(select: Select<'_>, fv: &FunctionVolatilityMap) -> Result<(), 
 
 fn source_supported(
     source: Source<'_>,
-    fv: &FunctionVolatilityMap,
+    functions: &FunctionCatalog,
 ) -> Result<(), CacheabilityError> {
     match source {
-        Source::Join(nested) => join_supported(nested, fv),
+        Source::Join(nested) => join_supported(nested, functions),
         Source::Table(_) => Ok(()),
         Source::Subquery(subquery) => {
             if subquery.lateral() {
@@ -131,13 +134,13 @@ fn source_supported(
                     kind: "derived table without alias",
                 });
             }
-            body_cacheable(subquery.query().body(), fv)
+            body_cacheable(subquery.query().body(), functions)
         }
-        Source::CteRef(cte_ref) => body_cacheable(cte_ref.query().body(), fv),
+        Source::CteRef(cte_ref) => body_cacheable(cte_ref.query().body(), functions),
     }
 }
 
-fn join_supported(join: Join<'_>, fv: &FunctionVolatilityMap) -> Result<(), CacheabilityError> {
+fn join_supported(join: Join<'_>, functions: &FunctionCatalog) -> Result<(), CacheabilityError> {
     // FULL OUTER JOINs are not cacheable: both sides are optional.
     if join.join_type() == JoinType::Full {
         return Err(CacheabilityError::UnsupportedFrom {
@@ -147,10 +150,10 @@ fn join_supported(join: Join<'_>, fv: &FunctionVolatilityMap) -> Result<(), Cach
     // Any predicate WHERE accepts is accepted in ON: the per-reference
     // predicate model (ADR-059) keeps what it cannot read as opaque.
     if let JoinQual::On(condition) = join.qual() {
-        where_cacheable(condition, ExprContext::JoinOn, fv)?;
+        where_cacheable(condition, ExprContext::JoinOn, functions)?;
     }
-    source_supported(join.left(), fv)?;
-    source_supported(join.right(), fv)
+    source_supported(join.left(), functions)?;
+    source_supported(join.right(), functions)
 }
 
 /// A predicate: comparisons, AND/OR, LIKE, multi-operand forms, unary
@@ -158,22 +161,22 @@ fn join_supported(join: Join<'_>, fv: &FunctionVolatilityMap) -> Result<(), Cach
 fn where_cacheable(
     expr: Where<'_>,
     ctx: ExprContext,
-    fv: &FunctionVolatilityMap,
+    functions: &FunctionCatalog,
 ) -> Result<(), CacheabilityError> {
     match expr.kind() {
         WhereKind::Binary(binary) => {
-            where_cacheable(binary.lexpr(), ctx, fv)?;
-            where_cacheable(binary.rexpr(), ctx, fv)
+            where_cacheable(binary.lexpr(), ctx, functions)?;
+            where_cacheable(binary.rexpr(), ctx, functions)
         }
-        WhereKind::Scalar(scalar) => scalar_cacheable(scalar, ctx, fv),
+        WhereKind::Scalar(scalar) => scalar_cacheable(scalar, ctx, functions),
         WhereKind::Multi(multi) => multi
             .exprs()
-            .try_for_each(|operand| where_cacheable(operand, ctx, fv)),
-        WhereKind::Unary(unary) => where_cacheable(unary.expr(), ctx, fv),
+            .try_for_each(|operand| where_cacheable(operand, ctx, functions)),
+        WhereKind::Unary(unary) => where_cacheable(unary.expr(), ctx, functions),
         WhereKind::Subquery(subquery) => {
-            subquery_inner_cacheable(subquery.query(), ctx, fv)?;
+            subquery_inner_cacheable(subquery.query(), ctx, functions)?;
             if let Some(test) = subquery.test_expr() {
-                scalar_cacheable(test, ctx, fv)?;
+                scalar_cacheable(test, ctx, functions)?;
             }
             Ok(())
         }
@@ -184,20 +187,20 @@ fn where_cacheable(
 fn subquery_inner_cacheable(
     query: Query<'_>,
     ctx: ExprContext,
-    fv: &FunctionVolatilityMap,
+    functions: &FunctionCatalog,
 ) -> Result<(), CacheabilityError> {
     if matches!(ctx, ExprContext::JoinOn) {
         return Err(CacheabilityError::UnsupportedFrom {
             construct: "subquery in join condition",
         });
     }
-    body_cacheable(query.body(), fv)
+    body_cacheable(query.body(), functions)
 }
 
 fn scalar_cacheable(
     expr: Scalar<'_>,
     ctx: ExprContext,
-    fv: &FunctionVolatilityMap,
+    functions: &FunctionCatalog,
 ) -> Result<(), CacheabilityError> {
     match expr.kind() {
         ScalarKind::Column(_) => Ok(()),
@@ -211,19 +214,21 @@ fn scalar_cacheable(
             }
             Ok(())
         }
-        ScalarKind::Function(function) => function_cacheable(function, ctx, fv),
-        ScalarKind::Case(case) => case_cacheable(case, ctx, fv),
+        ScalarKind::Function(function) => function_cacheable(function, ctx, functions),
+        ScalarKind::Case(case) => case_cacheable(case, ctx, functions),
         ScalarKind::Operator(operator) => {
             operator_volatility_check(operator, ctx)?;
-            scalar_cacheable(operator.left(), ctx, fv)?;
-            scalar_cacheable(operator.right(), ctx, fv)
+            scalar_cacheable(operator.left(), ctx, functions)?;
+            scalar_cacheable(operator.right(), ctx, functions)
         }
-        ScalarKind::Subquery(subquery) => subquery_inner_cacheable(subquery.query(), ctx, fv),
+        ScalarKind::Subquery(subquery) => {
+            subquery_inner_cacheable(subquery.query(), ctx, functions)
+        }
         ScalarKind::Array(array) => array
             .elements()
-            .try_for_each(|element| scalar_cacheable(element, ctx, fv)),
+            .try_for_each(|element| scalar_cacheable(element, ctx, functions)),
         // A cast is pure coercion: the wrapped expression decides.
-        ScalarKind::TypeCast(cast) => scalar_cacheable(cast.expr(), ctx, fv),
+        ScalarKind::TypeCast(cast) => scalar_cacheable(cast.expr(), ctx, functions),
     }
 }
 
@@ -247,30 +252,38 @@ fn operator_volatility_check(
 
 /// A function call: immutable everywhere, any volatility in the SELECT list
 /// (re-evaluated at serve time); its arguments and FILTER must be cacheable.
+/// A bare name is judged by the worst of its overloads in any schema, since
+/// which schema the session's search_path picks is known only to the writer.
 fn function_cacheable(
     function: Function<'_>,
     ctx: ExprContext,
-    fv: &FunctionVolatilityMap,
+    functions: &FunctionCatalog,
 ) -> Result<(), CacheabilityError> {
-    if let Some(schema) = function.schema()
+    let schema = function.schema().map(EcoString::as_str);
+    // The cache PG holds only pg_catalog's functions; another schema's
+    // function is admissible once the writer resolves it (PGC-578).
+    if let Some(schema) = schema
         && schema != "pg_catalog"
     {
         return Err(CacheabilityError::SchemaQualifiedFunction {
             function: format!("{schema}.{}", function.name()).into(),
         });
     }
-    let name = function.name().to_lowercase();
-    let is_immutable = matches!(fv.get(name.as_str()), Some(FunctionVolatility::Immutable));
-    if !is_immutable && !matches!(ctx, ExprContext::SelectList) {
-        return Err(CacheabilityError::NonImmutableFunction { function: name });
+    let name = function.name();
+    let arg_count = u32::try_from(function.args().len()).unwrap_or(u32::MAX);
+    let worst = functions.worst_volatility(schema, name, arg_count);
+    if worst != Some(FunctionVolatility::Immutable) && !matches!(ctx, ExprContext::SelectList) {
+        return Err(CacheabilityError::NonImmutableFunction {
+            function: name.to_lowercase(),
+        });
     }
     for arg in function.args() {
-        scalar_cacheable(arg, ctx, fv)?;
+        scalar_cacheable(arg, ctx, functions)?;
     }
     // FILTER predicates run per input row, so a volatile function there is
     // rejected as in a WHERE.
     if let Some(filter) = function.filter() {
-        where_cacheable(filter, ExprContext::WhereClause, fv)?;
+        where_cacheable(filter, ExprContext::WhereClause, functions)?;
     }
     Ok(())
 }
@@ -278,31 +291,32 @@ fn function_cacheable(
 fn case_cacheable(
     case: Case<'_>,
     ctx: ExprContext,
-    fv: &FunctionVolatilityMap,
+    functions: &FunctionCatalog,
 ) -> Result<(), CacheabilityError> {
     if let Some(arg) = case.arg() {
-        scalar_cacheable(arg, ctx, fv)?;
+        scalar_cacheable(arg, ctx, functions)?;
     }
     for when in case.whens() {
-        where_cacheable(when.condition(), ctx, fv)?;
-        scalar_cacheable(when.result(), ctx, fv)?;
+        where_cacheable(when.condition(), ctx, functions)?;
+        scalar_cacheable(when.result(), ctx, functions)?;
     }
     if let Some(default) = case.default() {
-        scalar_cacheable(default, ctx, fv)?;
+        scalar_cacheable(default, ctx, functions)?;
     }
     Ok(())
 }
 
 /// Whether the query contains any function that can modify the database:
-/// a VOLATILE function, or one absent from the volatility map (unknown, so
-/// conservatively volatile). Every function anywhere in the tree counts.
-pub fn query_tree_has_volatile_function(tree: &QueryTree, fv: &FunctionVolatilityMap) -> bool {
+/// a VOLATILE function, or one absent from the catalog (unknown, so
+/// conservatively volatile). Every function anywhere in the tree counts,
+/// under the worst of the name's overloads in any schema.
+pub fn query_tree_has_volatile_function(tree: &QueryTree, functions: &FunctionCatalog) -> bool {
     tree.nodes().any(|node| {
         let NodeKind::Function { name, .. } = &node.kind else {
             return false;
         };
         !matches!(
-            fv.get(name.to_lowercase().as_str()),
+            functions.name_worst_volatility(name),
             Some(FunctionVolatility::Immutable | FunctionVolatility::Stable)
         )
     })
@@ -313,16 +327,13 @@ mod tests {
 
     #![allow(clippy::wildcard_enum_match_arm)]
 
-    use std::collections::HashMap;
-
     use super::*;
     use crate::cache::query::CacheableQuery;
     use crate::query::ast::query_tree_parse;
 
-    /// Build a test volatility map with common functions.
-    fn test_func_volatility() -> FunctionVolatilityMap {
-        let mut map = HashMap::new();
-        for name in [
+    /// A test catalog of common builtins.
+    fn test_function_catalog() -> FunctionCatalog {
+        let immutable = [
             "lower",
             "upper",
             "length",
@@ -335,21 +346,24 @@ mod tests {
             "replace",
             "substring",
             "date_trunc",
-        ] {
-            map.insert(name.into(), FunctionVolatility::Immutable);
-        }
-        for name in ["now", "current_timestamp"] {
-            map.insert(name.into(), FunctionVolatility::Stable);
-        }
-        map.insert("random".into(), FunctionVolatility::Volatile);
-        map
+        ]
+        .into_iter()
+        .map(|name| (name, FunctionVolatility::Immutable));
+        let stable = ["now", "current_timestamp"]
+            .into_iter()
+            .map(|name| (name, FunctionVolatility::Stable));
+        FunctionCatalog::test_builtins(
+            immutable
+                .chain(stable)
+                .chain([("random", FunctionVolatility::Volatile)]),
+        )
     }
 
-    /// Parse SQL and check cacheability using the test volatility map.
+    /// Parse SQL and check cacheability against the test catalog.
     fn check_cacheable(sql: &str) -> Result<CacheableQuery, CacheabilityError> {
-        let fv = test_func_volatility();
+        let functions = test_function_catalog();
         let tree = query_tree_parse(sql).expect("convert");
-        CacheableQuery::try_new(tree, &fv)
+        CacheableQuery::try_new(tree, &functions)
     }
 
     #[test]

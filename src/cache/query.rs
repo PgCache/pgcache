@@ -1,10 +1,8 @@
-use std::collections::HashMap;
-
 use bytes::Bytes;
 use ecow::EcoString;
 use error_set::error_set;
 
-use crate::catalog::FunctionVolatility;
+use crate::catalog::FunctionCatalog;
 use crate::oid::TypeOid;
 use crate::query::ast::rope::{Body, QueryTree, Select};
 use crate::query::transform::{AstTransformResult, query_tree_parameters_replace};
@@ -63,9 +61,6 @@ error_set! {
     }
 }
 
-/// Type alias for the function volatility map passed through cacheability checks.
-type FunctionVolatilityMap = HashMap<EcoString, FunctionVolatility>;
-
 /// A query that passed the cacheability check, held as the rope (ADR-057).
 /// The field is private so `try_new` (and the invariant-preserving
 /// `parameters_replace`) are the only ways to construct one — a
@@ -109,20 +104,23 @@ impl CacheableQuery {
     /// clauses are immutable. Functions in SELECT lists are always allowed.
     pub fn cacheable(
         tree: &QueryTree,
-        fv: &FunctionVolatilityMap,
+        functions: &FunctionCatalog,
     ) -> Result<(), CacheabilityError> {
         // System catalogs (pg_catalog, pg_toast, unqualified pg_* relations) can't
         // be logically replicated, so registration against the cache db fails with
         // "unacceptable schema name". Reject up front and forward to origin —
         // e.g. psql's \d, which queries pg_class/pg_namespace.
         references_system_catalog(tree)?;
-        body_cacheable(tree.root().body(), fv)
+        body_cacheable(tree.root().body(), functions)
     }
 
     /// Build a cacheable query, validating it first. Fails with the same
     /// verdict as [`Self::cacheable`].
-    pub fn try_new(tree: QueryTree, fv: &FunctionVolatilityMap) -> Result<Self, CacheabilityError> {
-        Self::cacheable(&tree, fv)?;
+    pub fn try_new(
+        tree: QueryTree,
+        functions: &FunctionCatalog,
+    ) -> Result<Self, CacheabilityError> {
+        Self::cacheable(&tree, functions)?;
         Ok(CacheableQuery { tree })
     }
 }

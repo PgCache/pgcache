@@ -27,7 +27,7 @@ use super::{
     RawForwardReason, TransactionForwardReason, WriteLog, forward_cause, origin_connect,
 };
 use crate::cache::query::CacheableQuery;
-use crate::catalog::FunctionVolatility;
+use crate::catalog::FunctionCatalog;
 #[cfg(feature = "fault-injection")]
 use crate::pg::protocol::encode::notice_response_encode;
 use crate::proxy::CacheabilityStore;
@@ -150,7 +150,7 @@ async fn handle_connection(
     ssl_mode: SslMode,
     server_name: &str,
     dispatch_handle: CacheDispatchHandle,
-    func_volatility: Arc<HashMap<EcoString, FunctionVolatility>>,
+    function_catalog: Arc<FunctionCatalog>,
     origin_database: EcoString,
     cacheability_store: Arc<CacheabilityStore>,
 ) -> ConnectionResult<()> {
@@ -177,7 +177,7 @@ async fn handle_connection(
 
     let mut cacheability_epoch = cacheability_store.epoch_subscribe();
     let mut state = ConnectionState::new(
-        func_volatility,
+        function_catalog,
         origin_database,
         cacheability_store,
         dispatch_handle.clone(),
@@ -487,7 +487,7 @@ pub async fn connection_task(
     server_name: EcoString,
     dispatch_handle: CacheDispatchHandle,
     tls_acceptor: Option<Arc<tls::TlsAcceptor>>,
-    func_volatility: Arc<HashMap<EcoString, FunctionVolatility>>,
+    function_catalog: Arc<FunctionCatalog>,
     origin_database: EcoString,
     cacheability_store: Arc<CacheabilityStore>,
 ) {
@@ -519,7 +519,7 @@ pub async fn connection_task(
         ssl_mode,
         &server_name,
         dispatch_handle,
-        func_volatility,
+        function_catalog,
         origin_database,
         cacheability_store,
     )
@@ -615,7 +615,7 @@ fn forward_reason_metric(reason: ForwardReason) {
 
 impl ConnectionState {
     pub(super) fn new(
-        func_volatility: Arc<HashMap<EcoString, FunctionVolatility>>,
+        function_catalog: Arc<FunctionCatalog>,
         origin_database: EcoString,
         cacheability_store: Arc<CacheabilityStore>,
         dispatch_handle: CacheDispatchHandle,
@@ -637,7 +637,7 @@ impl ConnectionState {
             origin_intercept: OriginIntercept::None,
             session_settings: SessionSettings::new(),
             telemetry: QueryTelemetry::new(),
-            func_volatility,
+            function_catalog,
             extended: ExtendedPending::new(),
             origin_database,
             cache_disabled: false,
@@ -688,7 +688,7 @@ impl ConnectionState {
     /// is being forwarded so origin reports the aborted-block error; it is
     /// never dispatched, so its forward is counted here.
     async fn forwarded_statement_effects_apply(&mut self, data: &BytesMut) {
-        match handle_query(data, &mut self.cacheability_cache, &self.func_volatility).await {
+        match handle_query(data, &mut self.cacheability_cache, &self.function_catalog).await {
             Ok(Action::Forward(_, effects)) => self.forwarded_effects_apply(&effects),
             Ok(Action::CacheCheck(_)) => {
                 if self.transaction_status == TransactionStatus::Failed {
@@ -790,7 +790,7 @@ impl ConnectionState {
             let analyzed = handle_query(
                 &msg.data,
                 &mut self.cacheability_cache,
-                &self.func_volatility,
+                &self.function_catalog,
             )
             .await;
             self.proxy_mode = self.simple_query_route(analyzed, msg);

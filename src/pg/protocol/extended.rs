@@ -368,10 +368,9 @@ pub(crate) fn parse_parameter_description(
 #[cfg(test)]
 mod tests {
 
-    use std::collections::HashMap;
-
     use super::*;
     use crate::cache::query::CacheableQuery;
+    use crate::catalog::FunctionCatalog;
     use crate::query::ast::query_tree_parse;
     use crate::query::ast::rope::NodeKind;
 
@@ -552,7 +551,7 @@ mod tests {
 
         // Test that this SQL would be cacheable
         let query = query_tree_parse(&result.sql).unwrap();
-        let cacheable = CacheableQuery::try_new(query, &HashMap::new());
+        let cacheable = CacheableQuery::try_new(query, &FunctionCatalog::default());
         assert!(
             cacheable.is_ok(),
             "Simple SELECT with equality should be cacheable"
@@ -588,7 +587,7 @@ mod tests {
         );
 
         // Verify cacheability check accepts it (non-correlated subqueries are now cacheable)
-        let cacheable_result = CacheableQuery::try_new(query, &HashMap::new());
+        let cacheable_result = CacheableQuery::try_new(query, &FunctionCatalog::default());
         assert!(
             cacheable_result.is_ok(),
             "SELECT with non-correlated subquery should be cacheable"

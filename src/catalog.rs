@@ -20,6 +20,10 @@ use tokio_postgres::{Client, Error};
 use crate::cache::CacheError;
 use crate::oid::{Oid, TypeOid};
 
+mod function;
+
+pub use function::{FUNCTION_CATALOG_SQL, FunctionCatalog, FunctionRow, FunctionVolatility};
+
 /// Column storage: sorted by position with O(1) name lookups.
 ///
 /// Columns are stored once in position order (table definition order).
@@ -458,65 +462,10 @@ pub struct IndexMetadata {
     pub definition: EcoString,
 }
 
-/// PostgreSQL function volatility classification.
-///
-/// Determines whether a function's result depends only on its inputs (immutable),
-/// on inputs plus database state (stable), or can vary between calls (volatile).
-/// Used to decide whether functions in WHERE/FROM clauses are safe for caching.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FunctionVolatility {
-    Immutable,
-    Stable,
-    Volatile,
-}
-
-/// SQL behind [`function_volatility_map_load`]. Public so pgcache-fit's
-/// embedded snapshot regenerates from the identical query and cannot drift
-/// from the loader.
-pub const FUNCTION_VOLATILITY_SQL: &str = "SELECT p.proname,
-        MAX(CASE p.provolatile
-            WHEN 'v' THEN 2
-            WHEN 's' THEN 1
-            ELSE 0
-        END) AS worst_volatility
- FROM pg_proc p
- JOIN pg_namespace n ON p.pronamespace = n.oid
- WHERE p.prokind NOT IN ('a', 'w')
- GROUP BY p.proname";
-
 /// SQL behind [`aggregate_functions_load`]; public for the same
-/// anti-drift reason as [`FUNCTION_VOLATILITY_SQL`].
+/// anti-drift reason as [`FUNCTION_CATALOG_SQL`].
 pub const AGGREGATE_FUNCTIONS_SQL: &str =
     "SELECT DISTINCT lower(p.proname) FROM pg_proc p WHERE p.prokind = 'a'";
-
-/// Load function volatilities from pg_proc.
-///
-/// Queries the origin database for all scalar functions and builds a map
-/// from unqualified function name to worst-case volatility across all
-/// overloads and schemas. Aggregate and window functions are excluded.
-///
-/// The map is keyed by lowercase function name to match PostgreSQL's
-/// case-insensitive identifier handling.
-#[cfg(feature = "proxy")]
-pub async fn function_volatility_map_load(
-    client: &Client,
-) -> Result<HashMap<EcoString, FunctionVolatility>, Error> {
-    let rows = client.query(FUNCTION_VOLATILITY_SQL, &[]).await?;
-
-    let mut map = HashMap::with_capacity(rows.len());
-    for row in &rows {
-        let name: &str = row.get(0);
-        let worst: i32 = row.get(1);
-        let volatility = match worst {
-            0 => FunctionVolatility::Immutable,
-            1 => FunctionVolatility::Stable,
-            _ => FunctionVolatility::Volatile,
-        };
-        map.insert(name.into(), volatility);
-    }
-
-    Ok(map)
-}
 
 /// Load aggregate function names from pg_proc.
 ///
