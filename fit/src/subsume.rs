@@ -362,8 +362,8 @@ mod tests {
     /// A cached join parents a join of its shape under a WHERE that implies
     /// its own, whatever the join's references load (PGC-417); another
     /// shape, a wider WHERE or a WHERE the model can't read whole is no
-    /// cover. A LIMIT on a join caps no population (ADR-060), so it still
-    /// parents.
+    /// cover. A plain join's LIMIT caps its population (ADR-060, PGC-570),
+    /// so a capped join parents nothing.
     #[test]
     fn test_same_shape_join_parent_subsumes_narrower_where() {
         let analyses = corpus_analyze(&[
@@ -389,10 +389,13 @@ mod tests {
         assert!(!registry.query_subsumed(&analyses[5]), "an OR is no parent");
         let mut registry = SubsumerRegistry::new();
         registry.subsumer_register(&analyses[6]);
-        assert!(!analyses[6].has_limit, "a join's LIMIT caps no population");
-        assert_eq!(
-            registry.query_cover(&analyses[5]),
-            Some(SubsumptionCover::Join)
+        assert!(
+            analyses[6].has_limit,
+            "a plain join's LIMIT caps its population"
+        );
+        assert!(
+            !registry.query_subsumed(&analyses[5]),
+            "a capped join parents nothing"
         );
     }
 
