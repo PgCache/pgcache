@@ -504,7 +504,7 @@ impl WriterCore {
                 })?;
                 let tree = query_tree_session_terms_replace(&parsed.tree, &rls.terms)
                     .map_err(|e| rls_refusal(term_error(e)))?;
-                CacheableQuery::cacheable(&tree, &self.function_catalog).map_err(|e| {
+                CacheableQuery::cacheable(&tree, &**self.function_catalog.load()).map_err(|e| {
                     rls_refusal(CacheError::RlsUninlinable {
                         policy: policy.name.clone(),
                         reason: EcoString::from(e.to_string()),

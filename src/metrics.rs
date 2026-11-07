@@ -52,8 +52,10 @@ pub mod names {
     /// `row_security_off`, `unsupported`.
     pub const QUERIES_RLS_FORWARDS: &str = "pgcache.queries.rls_forwards";
     /// Registrations refused on a function call (PGC-578), by reason:
-    /// `unknown` (no function of the name and arity on the search_path) or
-    /// `not_builtin` (a user or extension function the cache PG lacks).
+    /// `unknown` (no function of the name and arity on the search_path),
+    /// `not_on_cache` (a user or extension function the cache PG lacks) or
+    /// `not_immutable` (the overload the path picks, where only an immutable
+    /// function may stand).
     pub const QUERIES_FUNCTION_FORWARDS: &str = "pgcache.queries.function_forwards";
 
     // Read-after-write tracking (PGC-124)
@@ -674,7 +676,8 @@ pub struct QueryHandles {
     pub rls_forward_row_security_off: Counter,
     pub rls_forward_unsupported: Counter,
     pub function_forward_unknown: Counter,
-    pub function_forward_not_builtin: Counter,
+    pub function_forward_not_on_cache: Counter,
+    pub function_forward_not_immutable: Counter,
     pub cache_latency: Histogram,
     pub origin_latency: Histogram,
     pub origin_execution: Histogram,
@@ -707,7 +710,8 @@ impl QueryHandles {
             rls_forward_row_security_off: metrics::counter!(QUERIES_RLS_FORWARDS, "reason" => "row_security_off"),
             rls_forward_unsupported: metrics::counter!(QUERIES_RLS_FORWARDS, "reason" => "unsupported"),
             function_forward_unknown: metrics::counter!(QUERIES_FUNCTION_FORWARDS, "reason" => "unknown"),
-            function_forward_not_builtin: metrics::counter!(QUERIES_FUNCTION_FORWARDS, "reason" => "not_builtin"),
+            function_forward_not_on_cache: metrics::counter!(QUERIES_FUNCTION_FORWARDS, "reason" => "not_on_cache"),
+            function_forward_not_immutable: metrics::counter!(QUERIES_FUNCTION_FORWARDS, "reason" => "not_immutable"),
             cache_latency: metrics::histogram!(CACHE_QUERY_LATENCY_SECONDS),
             origin_latency: metrics::histogram!(ORIGIN_QUERY_LATENCY_SECONDS),
             origin_execution: metrics::histogram!(ORIGIN_EXECUTION_SECONDS),

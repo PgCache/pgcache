@@ -1,15 +1,18 @@
 //! Function resolution at registration (PGC-578): a call is resolved on the
-//! session's search_path to PostgreSQL's own functions, which the cache PG
-//! can serve and evaluate with; a user function, which it lacks, forwards
-//! the read cleanly instead of erroring on every hit (PGC-474).
+//! session's search_path; PostgreSQL's own functions are served and
+//! evaluated on the cache PG, a user function only when the cache database
+//! holds it with origin's body, and otherwise the read forwards cleanly
+//! instead of erroring on every hit (PGC-474). A function redefined or
+//! dropped on origin evicts the entries calling it.
 
 use std::io::Error;
 
 use tokio_postgres::Client;
+use tokio_postgres::error::SqlState;
 
 use crate::util::{
-    MetricsSnapshot, TestContext, assert_proxy_rows_match_origin, metrics_delta, query_warm,
-    result_rows,
+    MetricsSnapshot, TestContext, assert_proxy_rows_match_origin, connect_cache_db, metrics_delta,
+    query_warm, result_rows,
 };
 
 mod util;
@@ -21,9 +24,12 @@ const ITEMS: &[&str] = &[
 
 const DOUBLE_IT: &str = "CREATE FUNCTION double_it(x INTEGER) RETURNS INTEGER \
      LANGUAGE sql IMMUTABLE AS $$ SELECT x * 2 $$";
+const TRIPLE_IT: &str = "CREATE OR REPLACE FUNCTION double_it(x INTEGER) RETURNS INTEGER \
+     LANGUAGE sql IMMUTABLE AS $$ SELECT x * 3 $$";
+const DOUBLE_READ: &str = "SELECT id FROM items WHERE double_it(n) = 20 ORDER BY id";
 
 /// Origin with the items table and `statements` in place before pgcache
-/// starts, so its function catalog knows them.
+/// starts, so its function catalog knows them from the start.
 async fn setup_with(statements: &'static [&'static str]) -> Result<TestContext, Error> {
     TestContext::setup_before_start(|origin| async move {
         for sql in ITEMS.iter().chain(statements) {
@@ -46,6 +52,17 @@ async fn rows(client: &Client, sql: &str) -> Result<Vec<Vec<Option<String>>>, Er
     Ok(result_rows(
         &client.simple_query(sql).await.map_err(Error::other)?,
     ))
+}
+
+/// Run `sql` on the cache database, where pgcache's own role installs
+/// nothing: what an operator does to make a user function servable.
+async fn cache_db_run(ctx: &TestContext, sql: &str) -> Result<(), Error> {
+    connect_cache_db(&ctx.dbs)
+        .await?
+        .simple_query(sql)
+        .await
+        .map_err(Error::other)?;
+    Ok(())
 }
 
 /// One read of `sql` through `client` forwards for the function `reason`,
@@ -85,53 +102,117 @@ async fn forward_assert(
     Ok(())
 }
 
-/// A user function in the SELECT list is refused at registration, so the
-/// read forwards with origin's rows instead of erroring on the cache PG.
+/// A user function the cache database lacks is refused at registration, in
+/// the SELECT list as in WHERE, so the read forwards with origin's rows
+/// instead of erroring on the cache PG.
 #[tokio::test]
-async fn test_user_function_in_select_list_forwards_cleanly() -> Result<(), Error> {
+async fn test_user_function_absent_from_the_cache_database_forwards() -> Result<(), Error> {
     let mut ctx = setup_with(&[DOUBLE_IT]).await?;
     let client = ctx.proxy_client_connect().await?;
     let origin = ctx.origin_connect_as("postgres").await?;
-    forward_assert(
-        &mut ctx,
-        &client,
-        &origin,
+    for sql in [
         "SELECT id, double_it(n) AS twice FROM items WHERE id = 1",
-        |d| d.queries_function_forward_not_builtin,
-    )
-    .await
+        DOUBLE_READ,
+    ] {
+        forward_assert(&mut ctx, &client, &origin, sql, |d| {
+            d.queries_function_forward_not_on_cache
+        })
+        .await?;
+    }
+    Ok(())
 }
 
-/// A function created after pgcache started forwards too: as unknown when
-/// the writer's catalog was read before the CREATE, as a non-builtin when
-/// after (the two race under load). The function-change signal will bring
-/// the catalog up to date; until then either verdict forwards the read.
+/// A user function with no immutable overload is refused before dispatch.
 #[tokio::test]
-async fn test_function_created_after_start_forwards() -> Result<(), Error> {
-    let mut ctx = setup_with(&[]).await?;
-    ctx.origin_query(DOUBLE_IT, &[]).await?;
-    let client = ctx.proxy_client_connect().await?;
-    let origin = ctx.origin_connect_as("postgres").await?;
-    forward_assert(
-        &mut ctx,
-        &client,
-        &origin,
-        "SELECT id, double_it(n) AS twice FROM items WHERE id = 1",
-        |d| d.queries_function_forward_unknown + d.queries_function_forward_not_builtin,
-    )
-    .await
-}
-
-/// A user function in WHERE is refused before dispatch: it is not a builtin
-/// the cache PG could evaluate, immutable or not.
-#[tokio::test]
-async fn test_user_function_in_where_is_uncacheable() -> Result<(), Error> {
-    let mut ctx = setup_with(&[DOUBLE_IT]).await?;
-    let sql = "SELECT id FROM items WHERE double_it(n) = 20";
+async fn test_stable_user_function_in_where_is_uncacheable() -> Result<(), Error> {
+    let mut ctx = setup_with(&["CREATE FUNCTION clock_n(x INTEGER) RETURNS INTEGER \
+         LANGUAGE sql STABLE AS $$ SELECT x $$"])
+    .await?;
+    let sql = "SELECT id FROM items WHERE clock_n(n) = 20";
     let before = ctx.metrics().await?;
     assert_proxy_rows_match_origin(&mut ctx, sql).await?;
     let delta = metrics_delta(&before, &ctx.metrics().await?);
     assert_eq!(delta.queries_uncacheable, 1, "refused at the proxy");
+    assert_eq!(delta.queries_cache_error, 0);
+    Ok(())
+}
+
+/// A function created after pgcache started reaches the catalog through
+/// the function-change signal, so the read is judged by it rather than
+/// forwarded as unknown.
+#[tokio::test]
+async fn test_function_created_after_start_is_known() -> Result<(), Error> {
+    let mut ctx = setup_with(&[]).await?;
+    ctx.origin_query(DOUBLE_IT, &[]).await?;
+    ctx.cache_settle().await?;
+    let client = ctx.proxy_client_connect().await?;
+    let origin = ctx.origin_connect_as("postgres").await?;
+    forward_assert(
+        &mut ctx,
+        &client,
+        &origin,
+        "SELECT id, double_it(n) AS twice FROM items WHERE id = 1",
+        |d| d.queries_function_forward_not_on_cache,
+    )
+    .await
+}
+
+/// A user function the cache database holds with origin's body is cached;
+/// a new body on origin evicts the entry and, until the cache database has
+/// the same body, the read forwards with origin's rows.
+#[tokio::test]
+async fn test_function_on_both_databases_caches_until_redefined() -> Result<(), Error> {
+    let mut ctx = setup_with(&[DOUBLE_IT]).await?;
+    cache_db_run(&ctx, DOUBLE_IT).await?;
+    query_warm(&mut ctx, DOUBLE_READ).await?;
+    query_warm(
+        &mut ctx,
+        "SELECT id, double_it(n) AS twice FROM items ORDER BY id",
+    )
+    .await?;
+
+    ctx.origin_query(TRIPLE_IT, &[]).await?;
+    ctx.cache_settle().await?;
+    let client = ctx.proxy_client_connect().await?;
+    let origin = ctx.origin_connect_as("postgres").await?;
+    assert!(
+        rows(&origin, DOUBLE_READ).await?.is_empty(),
+        "origin now triples"
+    );
+    forward_assert(&mut ctx, &client, &origin, DOUBLE_READ, |d| {
+        d.queries_function_forward_not_on_cache
+    })
+    .await?;
+
+    cache_db_run(&ctx, TRIPLE_IT).await?;
+    query_warm(&mut ctx, DOUBLE_READ).await?;
+    Ok(())
+}
+
+/// Dropping a function on origin evicts the entries calling it; the next
+/// read forwards and gets origin's own error.
+#[tokio::test]
+async fn test_dropping_a_function_evicts_its_queries() -> Result<(), Error> {
+    let mut ctx = setup_with(&[DOUBLE_IT]).await?;
+    cache_db_run(&ctx, DOUBLE_IT).await?;
+    query_warm(&mut ctx, DOUBLE_READ).await?;
+
+    ctx.origin_query("DROP FUNCTION double_it(INTEGER)", &[])
+        .await?;
+    ctx.cache_settle().await?;
+    let client = ctx.proxy_client_connect().await?;
+    let before = ctx.metrics().await?;
+    let error = client
+        .simple_query(DOUBLE_READ)
+        .await
+        .expect_err("origin has no such function");
+    assert_eq!(
+        error.code(),
+        Some(&SqlState::UNDEFINED_FUNCTION),
+        "origin's own error: {error}"
+    );
+    let delta = metrics_delta(&before, &ctx.metrics().await?);
+    assert_eq!(delta.queries_cache_hit, 0, "never served the evicted entry");
     assert_eq!(delta.queries_cache_error, 0);
     Ok(())
 }
@@ -157,7 +238,7 @@ async fn test_user_overload_on_the_search_path_forwards() -> Result<(), Error> {
         set_search_path(client, "app, public").await?;
     }
     forward_assert(&mut ctx, &shadowed, &origin, sql, |d| {
-        d.queries_function_forward_not_builtin
+        d.queries_function_forward_not_on_cache
     })
     .await
 }

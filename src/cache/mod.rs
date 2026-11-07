@@ -239,10 +239,16 @@ error_set! {
             function: EcoString,
             arg_count: u32,
         },
-        /// The cache PG has only PostgreSQL's own functions, so a user or
-        /// extension function cannot be served or evaluated there (PGC-474).
-        #[display("function {function} is not a PostgreSQL builtin")]
-        FunctionNotBuiltin {
+        /// Neither PostgreSQL's own nor installed on the cache database with
+        /// the same body, so it cannot be served or evaluated there (PGC-474).
+        #[display("function {function} is not available on the cache database")]
+        FunctionNotOnCache {
+            function: EcoString,
+        },
+        /// Resolved on the search_path to an overload that is not immutable,
+        /// in a position only an immutable function may hold.
+        #[display("function {function} is not immutable on the search_path")]
+        FunctionNotImmutable {
             function: EcoString,
         },
     }

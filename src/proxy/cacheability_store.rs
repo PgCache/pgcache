@@ -113,12 +113,20 @@ impl CacheabilityStore {
         {
             return;
         }
+        self.verdicts_drop("memory pressure");
+    }
+
+    /// Drop every interned verdict and bump the epoch so connections drain
+    /// their own LRUs: the verdicts are a pure cache, so the cost is bounded
+    /// re-analysis. Also the response to a function catalog change, after
+    /// which a verdict may be wrong rather than merely stale.
+    pub(super) fn verdicts_drop(&self, why: &str) {
         self.entries.clear();
         let epoch = self.epoch.fetch_add(1, Ordering::Relaxed) + 1;
         // Wake every connection, including idle ones. Clearing the map above
         // frees nothing on its own while connections still hold handles.
         self.epoch_tx.send_replace(epoch);
-        tracing::info!("memory pressure: dropped interned cacheability verdicts");
+        tracing::info!("{why}: dropped interned cacheability verdicts");
     }
 
     /// Number of interned verdicts.

@@ -515,6 +515,17 @@ impl WriterCdc {
                 .await
                 .attach_loc("reloading a secured relation's policies")?;
         }
+        // A function's body or definition changed (PGC-578): the entries
+        // computed by the old one go, then the catalog is read afresh so
+        // the next registration and the proxy judge by the new one.
+        if !change.functions_changed.is_empty() {
+            for oid in &change.functions_changed {
+                core.cache_function_invalidate(*oid)
+                    .await
+                    .attach_loc("a function changed on origin")?;
+            }
+            core.function_catalog_reload().await?;
+        }
         Ok(())
     }
 

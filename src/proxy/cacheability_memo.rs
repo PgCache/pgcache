@@ -10,6 +10,7 @@ use tracing::trace;
 
 use super::cacheability_store::CacheabilityStore;
 use super::query::Action;
+use crate::catalog::FunctionCatalog;
 use crate::id_hash::{BuildIdHasher, impl_id_hashable};
 
 /// A hash of a SQL query's *text* (not its AST). Keys the proxy's cacheability
@@ -52,6 +53,8 @@ pub(super) struct CacheabilityCache {
     store: Arc<CacheabilityStore>,
     /// Drain epoch this memo was last reconciled against.
     epoch: u64,
+    /// The function catalog the memoized verdicts were analyzed against.
+    catalog: Option<Arc<FunctionCatalog>>,
 }
 
 impl CacheabilityCache {
@@ -60,6 +63,22 @@ impl CacheabilityCache {
             entries: LruCache::with_hasher(CACHEABILITY_MEMO_CAPACITY, BuildIdHasher::default()),
             epoch: store.epoch(),
             store,
+            catalog: None,
+        }
+    }
+
+    /// Note the catalog the next analysis runs against. A verdict judged a
+    /// function by the old catalog may be wrong under the new one, so the
+    /// first connection to see a new catalog drops every interned verdict;
+    /// the epoch move then drains every memo, this one included.
+    pub(super) fn catalog_reconcile(&mut self, current: &Arc<FunctionCatalog>) {
+        match &self.catalog {
+            Some(known) if Arc::ptr_eq(known, current) => {}
+            Some(_) => {
+                self.store.verdicts_drop("function catalog changed");
+                self.catalog = Some(Arc::clone(current));
+            }
+            None => self.catalog = Some(Arc::clone(current)),
         }
     }
 

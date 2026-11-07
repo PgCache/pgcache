@@ -27,7 +27,7 @@ use super::{
     RawForwardReason, TransactionForwardReason, WriteLog, forward_cause, origin_connect,
 };
 use crate::cache::query::CacheableQuery;
-use crate::catalog::FunctionCatalog;
+use crate::catalog::SharedFunctionCatalog;
 #[cfg(feature = "fault-injection")]
 use crate::pg::protocol::encode::notice_response_encode;
 use crate::proxy::CacheabilityStore;
@@ -150,7 +150,7 @@ async fn handle_connection(
     ssl_mode: SslMode,
     server_name: &str,
     dispatch_handle: CacheDispatchHandle,
-    function_catalog: Arc<FunctionCatalog>,
+    function_catalog: SharedFunctionCatalog,
     origin_database: EcoString,
     cacheability_store: Arc<CacheabilityStore>,
 ) -> ConnectionResult<()> {
@@ -487,7 +487,7 @@ pub async fn connection_task(
     server_name: EcoString,
     dispatch_handle: CacheDispatchHandle,
     tls_acceptor: Option<Arc<tls::TlsAcceptor>>,
-    function_catalog: Arc<FunctionCatalog>,
+    function_catalog: SharedFunctionCatalog,
     origin_database: EcoString,
     cacheability_store: Arc<CacheabilityStore>,
 ) {
@@ -615,7 +615,7 @@ fn forward_reason_metric(reason: ForwardReason) {
 
 impl ConnectionState {
     pub(super) fn new(
-        function_catalog: Arc<FunctionCatalog>,
+        function_catalog: SharedFunctionCatalog,
         origin_database: EcoString,
         cacheability_store: Arc<CacheabilityStore>,
         dispatch_handle: CacheDispatchHandle,
@@ -688,7 +688,13 @@ impl ConnectionState {
     /// is being forwarded so origin reports the aborted-block error; it is
     /// never dispatched, so its forward is counted here.
     async fn forwarded_statement_effects_apply(&mut self, data: &BytesMut) {
-        match handle_query(data, &mut self.cacheability_cache, &self.function_catalog).await {
+        match handle_query(
+            data,
+            &mut self.cacheability_cache,
+            &self.function_catalog.load_full(),
+        )
+        .await
+        {
             Ok(Action::Forward(_, effects)) => self.forwarded_effects_apply(&effects),
             Ok(Action::CacheCheck(_)) => {
                 if self.transaction_status == TransactionStatus::Failed {
@@ -790,7 +796,7 @@ impl ConnectionState {
             let analyzed = handle_query(
                 &msg.data,
                 &mut self.cacheability_cache,
-                &self.function_catalog,
+                &self.function_catalog.load_full(),
             )
             .await;
             self.proxy_mode = self.simple_query_route(analyzed, msg);

@@ -3,7 +3,7 @@
 use ecow::EcoString;
 
 use crate::catalog::TableMetadata;
-use crate::oid::Oid;
+use crate::oid::{FunctionOid, Oid};
 use crate::pg::Lsn;
 use crate::pg::protocol::ByteString;
 
@@ -77,6 +77,10 @@ pub(crate) struct SchemaChange {
     /// may read what may have changed, so the privilege verdicts are
     /// flushed (PGC-463). A truncate cannot change privileges.
     pub(crate) privileges_changed: bool,
+    /// A function, procedure or aggregate created, replaced, altered or
+    /// dropped, by `pg_proc` oid (PGC-578): the queries calling it are
+    /// evicted and the function catalog reloaded.
+    pub(crate) functions_changed: Vec<FunctionOid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +99,7 @@ impl SchemaChange {
             && !self.views_changed
             && self.policies_changed.is_empty()
             && !self.privileges_changed
+            && self.functions_changed.is_empty()
     }
 }
 

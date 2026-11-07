@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::{sync::Arc, thread};
 
+use arc_swap::ArcSwap;
 use ecow::EcoString;
 use metrics_exporter_prometheus::PrometheusHandle;
 use rootcause::Report;
@@ -22,7 +23,7 @@ use crate::{
         CacheDispatchHandle, CacheDispatchUpdater, PinnedQuery, cache_generation_start,
         cache_supervise,
     },
-    catalog::{FunctionCatalog, FunctionVolatility},
+    catalog::{FunctionCatalog, FunctionVolatility, SharedFunctionCatalog},
     pg::{cdc::replication_cleanup, connect},
     query::ast::query_tree_convert_raw,
     settings::{Settings, SslMode},
@@ -152,8 +153,10 @@ pub fn proxy_run(
         .map_into_report::<ConnectionError>()?;
     // Replication provisioning now happens per cache generation in `cache_setup`,
     // so a restart re-establishes a slot the origin lost.
-    let function_catalog = pre_rt.block_on(function_catalog_load(settings))?;
-    let pinned = pinned_queries_validate(settings, &function_catalog);
+    let function_catalog: SharedFunctionCatalog = Arc::new(ArcSwap::new(
+        pre_rt.block_on(function_catalog_load(settings))?,
+    ));
+    let pinned = pinned_queries_validate(settings, &function_catalog.load());
     drop(pre_rt);
 
     // One shared multi-thread runtime hosts connection tasks + worker serves
@@ -209,6 +212,7 @@ pub fn proxy_run(
             settings,
             rt_handle.clone(),
             &pinned,
+            &function_catalog,
             &cancel,
             &dispatch_updater,
             &status_updater,
@@ -277,6 +281,7 @@ pub fn proxy_run(
             settings,
             rt_handle,
             &pinned,
+            &function_catalog,
             cancel,
             &dispatch_updater,
             &status_updater,
@@ -301,7 +306,7 @@ struct ConnectionContext {
     origin_database: EcoString,
     dispatch_handle: CacheDispatchHandle,
     tls_acceptor: Option<Arc<tls::TlsAcceptor>>,
-    function_catalog: Arc<FunctionCatalog>,
+    function_catalog: SharedFunctionCatalog,
     cacheability_store: Arc<CacheabilityStore>,
 }
 

@@ -2,7 +2,7 @@ use bytes::Bytes;
 use ecow::EcoString;
 use error_set::error_set;
 
-use crate::catalog::FunctionCatalog;
+use crate::catalog::FunctionFacts;
 use crate::oid::TypeOid;
 use crate::query::ast::rope::{Body, QueryTree, Select};
 use crate::query::transform::{AstTransformResult, query_tree_parameters_replace};
@@ -104,7 +104,7 @@ impl CacheableQuery {
     /// clauses are immutable. Functions in SELECT lists are always allowed.
     pub fn cacheable(
         tree: &QueryTree,
-        functions: &FunctionCatalog,
+        functions: &dyn FunctionFacts,
     ) -> Result<(), CacheabilityError> {
         // System catalogs (pg_catalog, pg_toast, unqualified pg_* relations) can't
         // be logically replicated, so registration against the cache db fails with
@@ -118,7 +118,7 @@ impl CacheableQuery {
     /// verdict as [`Self::cacheable`].
     pub fn try_new(
         tree: QueryTree,
-        functions: &FunctionCatalog,
+        functions: &dyn FunctionFacts,
     ) -> Result<Self, CacheabilityError> {
         Self::cacheable(&tree, functions)?;
         Ok(CacheableQuery { tree })

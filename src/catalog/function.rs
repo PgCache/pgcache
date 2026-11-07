@@ -3,7 +3,9 @@
 //! name rather than by the worst case of a bare name across the database.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use ecow::EcoString;
 #[cfg(feature = "proxy")]
 use tokio_postgres::{Client, Error};
@@ -66,7 +68,9 @@ impl FunctionKind {
 /// loader; the columns are the fields of [`FunctionRow`] in order.
 pub const FUNCTION_CATALOG_SQL: &str = "SELECT p.oid, n.nspname, p.proname, \
         p.pronargs, p.pronargdefaults, p.provariadic <> 0, p.provolatile::text, \
-        l.lanname, p.prosecdef, p.proretset, p.prorettype, p.prokind::text \
+        l.lanname, p.prosecdef, p.proretset, p.prorettype, p.prokind::text, \
+        format('%I.%I(%s)', n.nspname, p.proname, oidvectortypes(p.proargtypes)), \
+        md5(p.prosrc) \
  FROM pg_proc p \
  JOIN pg_namespace n ON p.pronamespace = n.oid \
  JOIN pg_language l ON l.oid = p.prolang";
@@ -88,6 +92,12 @@ pub struct FunctionRow {
     pub returns_set: bool,
     pub return_type: TypeOid,
     pub kind: FunctionKind,
+    /// `schema.name(argument types)`, quoted as identifiers: what names the
+    /// same function on another database (`to_regprocedure`).
+    pub identity: EcoString,
+    /// `md5(prosrc)`: the body, or a C symbol; equal on two databases when
+    /// the function is the same.
+    pub source_digest: EcoString,
 }
 
 impl FunctionRow {
@@ -97,6 +107,68 @@ impl FunctionRow {
         let declared = u32::from(self.arg_count);
         let optional = u32::from(self.default_count) + u32::from(self.variadic);
         arg_count >= declared.saturating_sub(optional) && (arg_count <= declared || self.variadic)
+    }
+}
+
+/// The catalog as the proxy and the writer share it: the writer stores a
+/// fresh one on a function-change signal, every reader loads the current.
+pub type SharedFunctionCatalog = Arc<ArcSwap<FunctionCatalog>>;
+
+/// What the cacheability check asks about a call: the volatility to judge
+/// it by, or `None` when no function it could name is known. The proxy
+/// answers from the catalog alone, the writer with the search_path in hand.
+pub trait FunctionFacts {
+    fn call_volatility(
+        &self,
+        schema: Option<&str>,
+        name: &str,
+        arg_count: u32,
+    ) -> Option<FunctionVolatility>;
+}
+
+/// Without a search_path: the builtins' worst case when a builtin fits the
+/// call, since those are what most calls name; otherwise the best case over
+/// the other candidates, leaving the writer, which knows the path and what
+/// the cache PG holds, to refuse or admit. A call nothing fits is unknown.
+impl FunctionFacts for FunctionCatalog {
+    fn call_volatility(
+        &self,
+        schema: Option<&str>,
+        name: &str,
+        arg_count: u32,
+    ) -> Option<FunctionVolatility> {
+        self.builtin_worst_volatility(schema, name, arg_count)
+            .or_else(|| {
+                self.candidates(schema, name, arg_count)
+                    .filter(|row| row.kind.is_plain())
+                    .map(|row| row.volatility)
+                    .min()
+            })
+    }
+}
+
+/// With the search_path in force: the worst case over every function the
+/// call can name on it.
+pub struct PathFunctions<'a> {
+    pub catalog: &'a FunctionCatalog,
+    pub search_path: &'a [&'a str],
+}
+
+impl FunctionFacts for PathFunctions<'_> {
+    fn call_volatility(
+        &self,
+        schema: Option<&str>,
+        name: &str,
+        arg_count: u32,
+    ) -> Option<FunctionVolatility> {
+        if schema.is_none_or(|schema| schema == "pg_catalog") && is_sql_form(name) {
+            return Some(FunctionVolatility::Immutable);
+        }
+        self.catalog
+            .on_path(schema, name, arg_count, self.search_path)
+            .filter(|row| row.kind.is_plain())
+            .map(|row| row.volatility)
+            .max()
     }
 }
 
@@ -133,6 +205,8 @@ impl FunctionCatalog {
                 .unwrap_or(FunctionVolatility::Volatile);
             let kind_code: &str = row.try_get(11)?;
             let kind = FunctionKind::from_prokind(kind_code).unwrap_or(FunctionKind::Function);
+            let identity: &str = row.try_get(12)?;
+            let source_digest: &str = row.try_get(13)?;
             let arg_count: i16 = row.try_get(3)?;
             let default_count: i16 = row.try_get(4)?;
             functions.push(FunctionRow {
@@ -148,6 +222,8 @@ impl FunctionCatalog {
                 returns_set: row.try_get(9)?,
                 return_type: row.try_get(10)?,
                 kind,
+                identity: EcoString::from(identity),
+                source_digest: EcoString::from(source_digest),
             });
         }
         Ok(Self::from_rows(functions))
@@ -155,6 +231,13 @@ impl FunctionCatalog {
 
     pub fn len(&self) -> usize {
         self.rows.len()
+    }
+
+    /// Whether `other` describes the same functions: the readers' verdicts
+    /// stay valid, so a reload that found nothing changed need not be
+    /// published.
+    pub fn same_as(&self, other: &FunctionCatalog) -> bool {
+        self.rows == other.rows
     }
 
     pub fn is_empty(&self) -> bool {
@@ -267,6 +350,8 @@ impl FunctionRow {
             returns_set: false,
             return_type: TypeOid::UNSPECIFIED,
             kind: FunctionKind::Function,
+            identity: EcoString::from(format!("pg_catalog.{name}(text)")),
+            source_digest: EcoString::from("digest"),
         }
     }
 
@@ -275,6 +360,7 @@ impl FunctionRow {
         Self {
             oid: FunctionOid::from_raw(20_000),
             schema: EcoString::from(schema),
+            identity: EcoString::from(format!("{schema}.{name}(text)")),
             ..Self::test_builtin(name, volatility)
         }
     }
@@ -320,6 +406,8 @@ mod tests {
             returns_set: false,
             return_type: TypeOid::UNSPECIFIED,
             kind: FunctionKind::Function,
+            identity: EcoString::from(format!("{schema}.{name}")),
+            source_digest: EcoString::from("digest"),
         }
     }
 
@@ -482,6 +570,50 @@ mod tests {
             c.builtin_worst_volatility(None, "LOWER", 1),
             Some(FunctionVolatility::Immutable)
         );
+    }
+
+    /// The proxy's verdict: builtins first; a name only user functions
+    /// answer passes on its best overload, for the writer to decide.
+    #[test]
+    fn test_proxy_facts_prefer_builtins_then_best_user_case() {
+        let c = catalog();
+        assert_eq!(
+            c.call_volatility(None, "lower", 1),
+            Some(FunctionVolatility::Immutable)
+        );
+        assert_eq!(
+            c.call_volatility(None, "lower", 2),
+            Some(FunctionVolatility::Immutable),
+            "app.lower(2 args) alone, immutable"
+        );
+        assert_eq!(
+            c.call_volatility(None, "ri_check", 2),
+            Some(FunctionVolatility::Volatile)
+        );
+        assert_eq!(c.call_volatility(None, "missing", 1), None);
+    }
+
+    /// The writer's verdict: the worst case over the path.
+    #[test]
+    fn test_path_facts_take_the_worst_on_the_path() {
+        let c = catalog();
+        let on = |path: &'static [&'static str]| PathFunctions {
+            catalog: &c,
+            search_path: path,
+        };
+        assert_eq!(
+            on(&["public"]).call_volatility(None, "lower", 1),
+            Some(FunctionVolatility::Immutable)
+        );
+        assert_eq!(
+            on(&["app", "public"]).call_volatility(None, "lower", 1),
+            Some(FunctionVolatility::Stable)
+        );
+        assert_eq!(
+            on(&["public"]).call_volatility(None, "coalesce", 2),
+            Some(FunctionVolatility::Immutable)
+        );
+        assert_eq!(on(&["public"]).call_volatility(None, "ri_check", 2), None);
     }
 
     #[test]

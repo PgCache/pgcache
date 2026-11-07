@@ -211,7 +211,8 @@ fn register_failure_log(key: impl std::fmt::Display, error: &CacheError) {
             | CacheError::RlsUnsupported { .. }
             | CacheError::RlsRoleCannotBypass
             | CacheError::FunctionUnknown { .. }
-            | CacheError::FunctionNotBuiltin { .. }
+            | CacheError::FunctionNotOnCache { .. }
+            | CacheError::FunctionNotImmutable { .. }
     ) {
         debug!(
             "query {key} forwarded (not cacheable): {}",

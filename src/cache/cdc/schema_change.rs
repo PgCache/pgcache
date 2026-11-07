@@ -8,7 +8,7 @@ use serde::Deserialize;
 use tracing::trace;
 
 use crate::cache::messages::{PartitionCreated, SchemaChange};
-use crate::oid::Oid;
+use crate::oid::{FunctionOid, Oid};
 
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
@@ -126,6 +126,11 @@ fn is_table(object_type: &str) -> bool {
     object_type == TABLE || object_type == FOREIGN_TABLE
 }
 
+/// `pg_identify_object` types that are `pg_proc` rows.
+fn is_function(object_type: &str) -> bool {
+    matches!(object_type, "function" | "procedure" | "aggregate")
+}
+
 /// Decode a `pgcache` logical message into the relation OIDs it affects.
 pub(super) fn schema_change_parse(content: &[u8]) -> Result<SchemaChange, serde_json::Error> {
     let mut change = SchemaChange::default();
@@ -143,6 +148,13 @@ pub(super) fn schema_change_parse(content: &[u8]) -> Result<SchemaChange, serde_
                     match object.identity.as_deref().and_then(policy_table_parse) {
                         Some(table) => change.policies_changed.push(table),
                         None => trace!(tag, "policy object without a table identity"),
+                    }
+                    continue;
+                }
+                if is_function(object_type) {
+                    match object.oid {
+                        Some(oid) => change.functions_changed.push(FunctionOid::from_raw(oid)),
+                        None => trace!(tag, "function object without an oid"),
                     }
                     continue;
                 }
@@ -175,6 +187,10 @@ pub(super) fn schema_change_parse(content: &[u8]) -> Result<SchemaChange, serde_
                     && is_table(&object.object_type)
                 {
                     change.dropped_tables.push(Oid::from_raw(oid));
+                } else if let Some(oid) = object.oid
+                    && is_function(&object.object_type)
+                {
+                    change.functions_changed.push(FunctionOid::from_raw(oid));
                 }
             }
         }
@@ -316,6 +332,33 @@ mod policy_tests {
             change.policies_changed,
             vec![("public".into(), "docs".into())]
         );
+        assert!(change.dropped_tables.is_empty());
+    }
+
+    /// A function created, replaced, altered or dropped is reported by oid;
+    /// procedures and aggregates are `pg_proc` rows too.
+    #[test]
+    fn test_schema_change_parse_collects_functions() {
+        let payload = br#"{"kind":"ddl","objects":[
+            {"tag":"CREATE FUNCTION","type":"function","oid":16400,"identity":"public.double_it(integer)","parent":null},
+            {"tag":"ALTER FUNCTION","type":"procedure","oid":16401,"identity":"public.p()","parent":null},
+            {"tag":"CREATE AGGREGATE","type":"aggregate","oid":16402,"identity":"public.agg(integer)","parent":null}]}"#;
+        let change = schema_change_parse(payload).expect("parse ddl payload");
+        assert_eq!(
+            change.functions_changed,
+            vec![
+                FunctionOid::from_raw(16400),
+                FunctionOid::from_raw(16401),
+                FunctionOid::from_raw(16402)
+            ]
+        );
+        assert!(change.altered_tables.is_empty());
+        assert!(!change.is_empty());
+
+        let dropped = br#"{"kind":"drop","objects":[
+            {"type":"function","oid":16400,"identity":"public.double_it(integer)","original":true}]}"#;
+        let change = schema_change_parse(dropped).expect("parse drop payload");
+        assert_eq!(change.functions_changed, vec![FunctionOid::from_raw(16400)]);
         assert!(change.dropped_tables.is_empty());
     }
 

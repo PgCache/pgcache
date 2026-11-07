@@ -43,6 +43,7 @@ Conventions: files are `ADR-XXX-brief-title.md` with the next sequential number;
 - [ADR-037](ADR-037-constraint-containment-index.md) — Generalized constraint-containment index *(generalizes ADR-024/029/030; shared with the CDC matcher; amended by ADR-059)*
 - [ADR-057](ADR-057-query-tree-with-side-table-bindings.md) — One immutable query tree with resolution as a side table keyed by pre-order `NodeId`; structural results of resolution as annotations; arena as the named second round *(supersedes ADR-002's parallel hierarchy)*
 - [ADR-064](ADR-064-opaque-scalar-operators.md) — Opaque scalar operators: one two-child `Operator` kind over arithmetic and the json operator family, never a constraint, volatility per operator under the stable-function rule *(extends ADR-057, ADR-059; amends ADR-056 part C)*
+- [ADR-065](ADR-065-function-catalog-and-admission.md) — Function catalog, resolution and admission: one shared `pg_proc` catalog, a proxy verdict by builtins and a writer verdict on the search_path, admission of what the cache database can run, eviction and reload on the function signal *(extends ADR-058)*
 
 ## Caching tiers & serving
 - [ADR-010](ADR-010-population-worker-pool.md) — Persistent population worker pool *(amended by ADR-050)*

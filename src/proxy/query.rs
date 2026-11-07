@@ -112,7 +112,7 @@ pub(super) enum Action {
 pub(super) async fn handle_query(
     data: &BytesMut,
     cacheability_cache: &mut CacheabilityCache,
-    function_catalog: &FunctionCatalog,
+    function_catalog: &Arc<FunctionCatalog>,
 ) -> Result<Action, ParseError> {
     let query = query_sql_extract(data).ok_or(ParseError::InvalidUtf8)?;
     analyze(query, cacheability_cache, function_catalog)
@@ -149,8 +149,9 @@ pub(super) fn query_sql_extract(data: &BytesMut) -> Option<&str> {
 pub(super) fn analyze(
     sql: &str,
     cacheability_cache: &mut CacheabilityCache,
-    function_catalog: &FunctionCatalog,
+    function_catalog: &Arc<FunctionCatalog>,
 ) -> Result<Action, ParseError> {
+    cacheability_cache.catalog_reconcile(function_catalog);
     cacheability_cache.epoch_reconcile();
 
     let key = SqlTextHash::of(sql);
@@ -198,10 +199,10 @@ pub(super) fn analyze(
             if let Some(spec) = explain_spec_extract(&query) {
                 Action::Explain(Arc::new(spec))
             } else {
-                match CacheableQuery::cacheable(&query, function_catalog) {
+                match CacheableQuery::cacheable(&query, function_catalog.as_ref()) {
                     // `cacheable` just passed, so `try_new` (same validation)
                     // cannot fail; forward conservatively if it ever disagrees.
-                    Ok(()) => match CacheableQuery::try_new(query, function_catalog) {
+                    Ok(()) => match CacheableQuery::try_new(query, function_catalog.as_ref()) {
                         Ok(cacheable_query) => Action::CacheCheck(Arc::new(cacheable_query)),
                         Err(_) => Action::Forward(
                             ForwardReason::UncacheableSelect,
@@ -309,8 +310,8 @@ mod tests {
     use crate::proxy::cacheability_memo::CACHEABILITY_MEMO_CAPACITY;
     use crate::proxy::cacheability_store::CacheabilityStore;
 
-    fn empty_catalog() -> FunctionCatalog {
-        FunctionCatalog::default()
+    fn empty_catalog() -> Arc<FunctionCatalog> {
+        Arc::new(FunctionCatalog::default())
     }
 
     /// Two connections analyzing the same text must share one interned payload.
@@ -422,14 +423,14 @@ mod tests {
         assert_eq!(store.len(), 1);
     }
 
-    fn analyze_fresh(sql: &str, fv: &FunctionCatalog) -> Action {
+    fn analyze_fresh(sql: &str, fv: &Arc<FunctionCatalog>) -> Action {
         let store = Arc::new(CacheabilityStore::new());
         analyze(sql, &mut CacheabilityCache::new(store), fv).expect("analyze sql")
     }
 
     #[test]
     fn test_analyze_dml_classifies_as_write() {
-        let fv = FunctionCatalog::default();
+        let fv = empty_catalog();
         match analyze_fresh("INSERT INTO t (a) VALUES (1)", &fv) {
             Action::Forward(
                 ForwardReason::UnsupportedStatement,
@@ -483,7 +484,7 @@ mod tests {
     }
 
     fn settings_of(sql: &str) -> SettingsEffect {
-        match analyze_fresh(sql, &FunctionCatalog::default()) {
+        match analyze_fresh(sql, &empty_catalog()) {
             Action::Forward(_, effects) => effects.settings,
             _ => panic!("expected a forward for {sql:?}"),
         }
@@ -513,7 +514,7 @@ mod tests {
     }
 
     fn custom_settings_of(sql: &str) -> Vec<CustomSettingEffect> {
-        match analyze_fresh(sql, &FunctionCatalog::default()) {
+        match analyze_fresh(sql, &empty_catalog()) {
             Action::Forward(_, effects) => effects.custom_settings.into_vec(),
             _ => panic!("expected a forward for {sql:?}"),
         }
@@ -558,7 +559,7 @@ mod tests {
         ];
         for (sql, expected) in cases {
             assert_eq!(
-                action_described(&analyze_fresh(sql, &FunctionCatalog::default())),
+                action_described(&analyze_fresh(sql, &empty_catalog())),
                 expected,
                 "{sql}"
             );
@@ -567,7 +568,7 @@ mod tests {
 
     #[test]
     fn test_analyze_txn_control_is_plain_forward() {
-        let fv = FunctionCatalog::default();
+        let fv = empty_catalog();
         for sql in ["BEGIN", "COMMIT", "SET search_path TO public"] {
             assert!(
                 matches!(
@@ -583,10 +584,10 @@ mod tests {
     fn test_analyze_volatile_where_function_is_a_write() {
         // Unknown and volatile functions in WHERE can modify the database;
         // stable ones cannot (PGC-124).
-        let fv = FunctionCatalog::test_builtins([
+        let fv = Arc::new(FunctionCatalog::test_builtins([
             ("f_volatile", FunctionVolatility::Volatile),
             ("f_stable", FunctionVolatility::Stable),
-        ]);
+        ]));
 
         for sql in [
             "SELECT * FROM t WHERE f_volatile(a) = 1",
@@ -620,10 +621,10 @@ mod tests {
         // A volatile nested inside a stable function still executes and can
         // modify the DB. The cacheability check short-circuits on the outer
         // stable, so write detection must walk the whole tree independently.
-        let fv = FunctionCatalog::test_builtins([
+        let fv = Arc::new(FunctionCatalog::test_builtins([
             ("f_volatile", FunctionVolatility::Volatile),
             ("f_stable", FunctionVolatility::Stable),
-        ]);
+        ]));
 
         assert!(
             matches!(
@@ -651,7 +652,7 @@ mod tests {
     #[test]
     fn test_analyze_multi_statement_is_a_write() {
         assert!(matches!(
-            analyze_fresh("SELECT 1; SELECT 2", &FunctionCatalog::default()),
+            analyze_fresh("SELECT 1; SELECT 2", &empty_catalog()),
             Action::Forward(
                 ForwardReason::Invalid,
                 StatementEffects {
@@ -664,7 +665,7 @@ mod tests {
 
     #[test]
     fn test_writes_are_not_memoized() {
-        let fv = FunctionCatalog::default();
+        let fv = empty_catalog();
         let mut cache = CacheabilityCache::new(Arc::new(CacheabilityStore::new()));
         // (sql, its action, memo entries afterwards): a write is classified
         // but left out of the memo (DML text is ~unique and its class can

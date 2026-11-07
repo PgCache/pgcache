@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, VecDeque},
-    sync::Arc,
-};
+use std::collections::{HashMap, VecDeque};
 
 use ecow::EcoString;
 use lru::LruCache;
@@ -9,7 +6,7 @@ use tokio_util::bytes::Bytes;
 
 use super::cacheability_memo::CacheabilityCache;
 use super::{ProxyMode, ProxyStatus};
-use crate::catalog::FunctionCatalog;
+use crate::catalog::SharedFunctionCatalog;
 use crate::query::write::IsolationLevel;
 use crate::{
     cache::{CacheDispatchHandle, CacheMessage},
@@ -113,7 +110,7 @@ pub(super) struct ConnectionState {
     telemetry: QueryTelemetry,
 
     /// Function volatility map for cacheability checks
-    function_catalog: Arc<FunctionCatalog>,
+    function_catalog: SharedFunctionCatalog,
 
     /// Extended query protocol pipeline state
     extended: ExtendedPending,

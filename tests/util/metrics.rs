@@ -31,7 +31,8 @@ pub(crate) struct MetricsSnapshot {
     pub queries_rls_forward_row_security_off: u64,
     /// Registrations refused on a function call (PGC-578).
     pub queries_function_forward_unknown: u64,
-    pub queries_function_forward_not_builtin: u64,
+    pub queries_function_forward_not_on_cache: u64,
+    pub queries_function_forward_not_immutable: u64,
     pub cache_subsumptions: u64,
     /// Subsumptions that needed an in-set column split to cover (PGC-494).
     pub cache_subsumptions_split: u64,
@@ -182,7 +183,8 @@ const SAMPLES: &[Sample] = samples! {
     "pgcache_queries_rls_forwards{reason=\"default_deny\"}" => queries_rls_forward_default_deny,
     "pgcache_queries_rls_forwards{reason=\"row_security_off\"}" => queries_rls_forward_row_security_off,
     "pgcache_queries_function_forwards{reason=\"unknown\"}" => queries_function_forward_unknown,
-    "pgcache_queries_function_forwards{reason=\"not_builtin\"}" => queries_function_forward_not_builtin,
+    "pgcache_queries_function_forwards{reason=\"not_on_cache\"}" => queries_function_forward_not_on_cache,
+    "pgcache_queries_function_forwards{reason=\"not_immutable\"}" => queries_function_forward_not_immutable,
     "pgcache_raw_writes_recorded" => raw_writes_recorded,
     "pgcache_raw_probes" => raw_probes,
     "pgcache_raw_forwards{scope=\"table\"}" => raw_forwards_table,
@@ -309,10 +311,17 @@ pub(crate) fn metrics_delta(before: &MetricsSnapshot, after: &MetricsSnapshot) -
     let mut after = after.clone();
     let mut delta = MetricsSnapshot::default();
     for sample in SAMPLES {
-        *(sample.field)(&mut delta) = *(sample.field)(&mut after) - *(sample.field)(&mut before);
+        let (before, after) = (*(sample.field)(&mut before), *(sample.field)(&mut after));
+        assert!(
+            after >= before,
+            "{} fell from {before} to {after}: a gauge sampled as a counter",
+            sample.name
+        );
+        *(sample.field)(&mut delta) = after - before;
     }
     // Gauges, not counters: carry the current value rather than a delta.
     delta.cache_coalesce_waiting = after.cache_coalesce_waiting;
+    delta.cache_merge_pending_depth = after.cache_merge_pending_depth;
     delta.cache_memo_slots = after.cache_memo_slots;
     delta.cache_queries_pending = after.cache_queries_pending;
     // Rates are cumulative averages, not meaningful for deltas: left at zero.

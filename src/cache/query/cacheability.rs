@@ -4,7 +4,7 @@
 use ecow::EcoString;
 
 use super::CacheabilityError;
-use crate::catalog::{FunctionCatalog, FunctionVolatility};
+use crate::catalog::{FunctionCatalog, FunctionFacts, FunctionVolatility};
 use crate::query::ast::rope::{
     Body, Case, Function, Join, JoinQual, NodeKind, Operator, Query, QueryTree, Scalar, ScalarKind,
     Select, SelectItem, Source, Where, WhereKind,
@@ -55,7 +55,7 @@ enum ExprContext {
 /// A query body: SELECT nodes and set-operation branches recursively.
 pub(super) fn body_cacheable(
     body: Body<'_>,
-    functions: &FunctionCatalog,
+    functions: &dyn FunctionFacts,
 ) -> Result<(), CacheabilityError> {
     match body {
         Body::Select(select) => select_cacheable(select, functions),
@@ -73,7 +73,7 @@ pub(super) fn body_cacheable(
 
 fn select_cacheable(
     select: Select<'_>,
-    functions: &FunctionCatalog,
+    functions: &dyn FunctionFacts,
 ) -> Result<(), CacheabilityError> {
     from_supported(select, functions)?;
     if let Some(where_clause) = select.where_clause() {
@@ -89,7 +89,7 @@ fn select_cacheable(
 
 fn from_supported(
     select: Select<'_>,
-    functions: &FunctionCatalog,
+    functions: &dyn FunctionFacts,
 ) -> Result<(), CacheabilityError> {
     let mut from = select.from();
     match (from.next(), from.next()) {
@@ -120,7 +120,7 @@ fn from_supported(
 
 fn source_supported(
     source: Source<'_>,
-    functions: &FunctionCatalog,
+    functions: &dyn FunctionFacts,
 ) -> Result<(), CacheabilityError> {
     match source {
         Source::Join(nested) => join_supported(nested, functions),
@@ -140,7 +140,7 @@ fn source_supported(
     }
 }
 
-fn join_supported(join: Join<'_>, functions: &FunctionCatalog) -> Result<(), CacheabilityError> {
+fn join_supported(join: Join<'_>, functions: &dyn FunctionFacts) -> Result<(), CacheabilityError> {
     // FULL OUTER JOINs are not cacheable: both sides are optional.
     if join.join_type() == JoinType::Full {
         return Err(CacheabilityError::UnsupportedFrom {
@@ -161,7 +161,7 @@ fn join_supported(join: Join<'_>, functions: &FunctionCatalog) -> Result<(), Cac
 fn where_cacheable(
     expr: Where<'_>,
     ctx: ExprContext,
-    functions: &FunctionCatalog,
+    functions: &dyn FunctionFacts,
 ) -> Result<(), CacheabilityError> {
     match expr.kind() {
         WhereKind::Binary(binary) => {
@@ -187,7 +187,7 @@ fn where_cacheable(
 fn subquery_inner_cacheable(
     query: Query<'_>,
     ctx: ExprContext,
-    functions: &FunctionCatalog,
+    functions: &dyn FunctionFacts,
 ) -> Result<(), CacheabilityError> {
     if matches!(ctx, ExprContext::JoinOn) {
         return Err(CacheabilityError::UnsupportedFrom {
@@ -200,7 +200,7 @@ fn subquery_inner_cacheable(
 fn scalar_cacheable(
     expr: Scalar<'_>,
     ctx: ExprContext,
-    functions: &FunctionCatalog,
+    functions: &dyn FunctionFacts,
 ) -> Result<(), CacheabilityError> {
     match expr.kind() {
         ScalarKind::Column(_) => Ok(()),
@@ -252,13 +252,12 @@ fn operator_volatility_check(
 
 /// A function call: immutable everywhere, any volatility in the SELECT list
 /// (re-evaluated at serve time); its arguments and FILTER must be cacheable.
-/// Judged by the builtin overloads the call can name, the worst of them: a
-/// user function never counts, since the cache PG cannot run it, and which
-/// overload the session's search_path picks is the writer's to resolve.
+/// Judged by what `functions` knows of the call: the proxy's catalog-only
+/// view, or the writer's with the search_path in force.
 fn function_cacheable(
     function: Function<'_>,
     ctx: ExprContext,
-    functions: &FunctionCatalog,
+    functions: &dyn FunctionFacts,
 ) -> Result<(), CacheabilityError> {
     let schema = function.schema().map(EcoString::as_str);
     // The cache PG holds only pg_catalog's functions; another schema's
@@ -272,7 +271,7 @@ fn function_cacheable(
     }
     let name = function.name();
     let arg_count = u32::try_from(function.args().len()).unwrap_or(u32::MAX);
-    let worst = functions.builtin_worst_volatility(schema, name, arg_count);
+    let worst = functions.call_volatility(schema, name, arg_count);
     if worst != Some(FunctionVolatility::Immutable) && !matches!(ctx, ExprContext::SelectList) {
         return Err(CacheabilityError::NonImmutableFunction {
             function: name.to_lowercase(),
@@ -292,7 +291,7 @@ fn function_cacheable(
 fn case_cacheable(
     case: Case<'_>,
     ctx: ExprContext,
-    functions: &FunctionCatalog,
+    functions: &dyn FunctionFacts,
 ) -> Result<(), CacheabilityError> {
     if let Some(arg) = case.arg() {
         scalar_cacheable(arg, ctx, functions)?;
@@ -359,6 +358,7 @@ mod tests {
             .map(|(name, volatility)| FunctionRow::test_builtin(name, volatility))
             .chain([
                 FunctionRow::test_user("app", "tenant_of", FunctionVolatility::Immutable),
+                FunctionRow::test_user("app", "tenant_clock", FunctionVolatility::Stable),
                 FunctionRow::test_user("app", "lower", FunctionVolatility::Stable),
             ])
             .collect();
@@ -900,13 +900,15 @@ mod tests {
         assert!(check_cacheable("SELECT pg_catalog.lower(name) FROM users").is_ok());
     }
 
-    /// A user function is never admitted in WHERE, immutable or not: the
-    /// cache PG cannot run it (PGC-474, PGC-578). A user overload beside a
-    /// builtin does not drag the builtin down either.
+    /// A user function in WHERE passes here on its best overload, for the
+    /// writer to admit or refuse with the search_path and the cache PG in
+    /// hand (PGC-578); one with no immutable overload is refused outright. A
+    /// user overload beside a builtin does not drag the builtin down.
     #[test]
-    fn test_user_functions_do_not_count() {
-        let err = check_cacheable("SELECT id FROM users WHERE tenant_of(id) = 1")
-            .expect_err("user function in WHERE");
+    fn test_user_functions_pass_on_their_best_case() {
+        assert!(check_cacheable("SELECT id FROM users WHERE tenant_of(id) = 1").is_ok());
+        let err = check_cacheable("SELECT id FROM users WHERE tenant_clock(id) = 1")
+            .expect_err("stable user function in WHERE");
         assert!(
             matches!(err, CacheabilityError::NonImmutableFunction { .. }),
             "{err}"

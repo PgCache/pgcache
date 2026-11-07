@@ -9,7 +9,7 @@ use tokio::runtime::Handle;
 use tokio::sync::Notify;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_postgres::Client;
-use tracing::debug;
+use tracing::{debug, info};
 
 use super::frame::{FRAME_BUF_CAPACITY, FrameRowEvent, FrameState, OverlayEntry};
 use super::merge_queue::{MERGE_BUF_CAPACITY, MergeQueue, StagingDiscard};
@@ -26,8 +26,8 @@ use crate::cache::{
     mv_shape::ShapeGate,
     types::{ActiveRelations, Cache, CacheStateView, CachedQueryState, CachedQueryView, ServingAt},
 };
-use crate::catalog::{CatalogTable, FunctionCatalog};
-use crate::oid::Oid;
+use crate::catalog::{CatalogTable, FunctionCatalog, SharedFunctionCatalog};
+use crate::oid::{FunctionOid, Oid};
 use crate::pg;
 use crate::pg::Lsn;
 use crate::pg::cdc::MESSAGE_PREFIX;
@@ -124,6 +124,9 @@ pub(crate) struct WriterShared {
     pub(crate) watermark_nudge: Arc<Notify>,
     /// Shared multi-thread runtime; MV build tasks are spawned here.
     pub(crate) runtime: Handle,
+    /// The origin's functions as the proxy reads them too (PGC-578); the
+    /// writer stores a fresh catalog at start and on every function signal.
+    pub(crate) function_catalog: SharedFunctionCatalog,
 }
 
 /// The cache volume, as read once at startup (PGC-251 Slice 2).
@@ -394,9 +397,12 @@ pub(super) struct WriterCore {
     pub(super) roles_digest: Option<EcoString>,
     /// The secured relations and their policies (PGC-113).
     pub(super) rls: RlsCatalog,
-    /// The origin's functions, for the cacheability check of an inlined
-    /// policy predicate.
-    pub(super) function_catalog: FunctionCatalog,
+    /// The origin's functions (PGC-578), shared with the proxy.
+    pub(super) function_catalog: SharedFunctionCatalog,
+    /// Functions the cache database was found to hold with origin's body,
+    /// by origin oid. Only presence is kept: an absence may end at any time
+    /// (the operator installs the function), a presence ends with a signal.
+    pub(super) function_presence: HashSet<FunctionOid>,
     /// The writer connection's resolved search_path: what `pg_get_expr`
     /// deparses a policy's table names under.
     pub(super) origin_search_path: Arc<[EcoString]>,
@@ -512,10 +518,6 @@ impl WriterCore {
                     .digest,
             )
         };
-        let function_catalog = FunctionCatalog::load(&origin_client)
-            .await
-            .map_into_report::<CacheError>()
-            .attach_loc("loading the function catalog for policy inlining")?;
         let origin_search_path = origin_search_path_read(&origin_client).await?;
         let WriterShared {
             state_view,
@@ -523,7 +525,18 @@ impl WriterCore {
             notify_tx,
             watermark_nudge,
             runtime,
+            function_catalog,
         } = shared;
+        // The proxy loaded its copy before this generation; functions created
+        // since are known from here on. An unchanged catalog is not
+        // republished, since every reader would drop its verdicts for nothing.
+        let fresh = FunctionCatalog::load(&origin_client)
+            .await
+            .map_into_report::<CacheError>()
+            .attach_loc("loading the function catalog at writer start")?;
+        if !function_catalog.load().same_as(&fresh) {
+            function_catalog.store(Arc::new(fresh));
+        }
 
         let mut core = Self {
             cache: Cache::new(settings),
@@ -589,6 +602,7 @@ impl WriterCore {
             roles_digest,
             rls: RlsCatalog::default(),
             function_catalog,
+            function_presence: HashSet::new(),
             origin_search_path,
         };
         core.rls_startup_load()
@@ -776,6 +790,26 @@ impl WriterCore {
     /// without this they hang forever. A no-op when nothing is parked.
     pub(super) fn waiters_fail(&self, fingerprint: Fingerprint) {
         let _ = self.notify_tx.send(WriterNotify::Failed { fingerprint });
+    }
+}
+
+impl WriterCore {
+    /// A function was created, replaced, altered or dropped on origin: read
+    /// the catalog afresh and publish it, and forget what the cache database
+    /// was found to hold and which fingerprint each session key resolved to,
+    /// since both were decided against the old catalog (PGC-578).
+    pub(super) async fn function_catalog_reload(&mut self) -> CacheResult<()> {
+        let fresh = FunctionCatalog::load(&self.db_origin)
+            .await
+            .map_into_report::<CacheError>()
+            .attach_loc("reloading the function catalog after a function signal")?;
+        info!(functions = fresh.len(), "function catalog reloaded");
+        if !self.function_catalog.load().same_as(&fresh) {
+            self.function_catalog.store(Arc::new(fresh));
+        }
+        self.function_presence.clear();
+        self.state_view.aliases.clear();
+        Ok(())
     }
 }
 

@@ -25,6 +25,7 @@ use crate::cache::{
     CacheDispatchPublisher, CacheError, CacheResult, MapIntoReport, PinnedQuery, ReportExt,
     StatusRequest,
 };
+use crate::catalog::SharedFunctionCatalog;
 use crate::pg;
 use crate::pg::cdc::replication_provision;
 use crate::result::error_chain_format;
@@ -52,6 +53,7 @@ pub(super) fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
     settings: &'settings Settings,
     handle: Handle,
     pinned: &[PinnedQuery],
+    function_catalog: SharedFunctionCatalog,
     cache_cancel: CancellationToken,
     status_rx: Receiver<StatusRequest>,
     dispatch_publisher: CacheDispatchPublisher,
@@ -135,6 +137,7 @@ pub(super) fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
                 notify_tx,
                 watermark_nudge: watermark_nudge_writer,
                 runtime: shared_runtime_writer,
+                function_catalog,
             };
             let result = writer_run(&settings_writer, channels, shared);
             if let Err(ref e) = result {

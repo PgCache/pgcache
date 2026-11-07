@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -10,6 +11,7 @@ use tracing::{debug, error, info, warn};
 use super::CacheGeneration;
 use super::setup::cache_setup;
 use crate::cache::{CacheDispatchUpdater, CacheResult, PinnedQuery, StatusRequest};
+use crate::catalog::SharedFunctionCatalog;
 use crate::proxy::StatusSenderUpdater;
 use crate::result::error_chain_format;
 use crate::settings::Settings;
@@ -28,6 +30,7 @@ pub fn cache_generation_start<'scope, 'env: 'scope, 'settings: 'scope>(
     settings: &'settings Settings,
     handle: Handle,
     pinned: &[PinnedQuery],
+    function_catalog: &SharedFunctionCatalog,
     root_cancel: &CancellationToken,
     dispatch_updater: &CacheDispatchUpdater,
     status_updater: &StatusSenderUpdater,
@@ -39,6 +42,7 @@ pub fn cache_generation_start<'scope, 'env: 'scope, 'settings: 'scope>(
         settings,
         handle,
         pinned,
+        Arc::clone(function_catalog),
         cancel.clone(),
         status_rx,
         dispatch_updater.publisher(),
@@ -71,6 +75,7 @@ pub fn cache_supervise<'scope, 'env: 'scope, 'settings: 'scope>(
     settings: &'settings Settings,
     handle: Handle,
     pinned: &[PinnedQuery],
+    function_catalog: &SharedFunctionCatalog,
     root_cancel: CancellationToken,
     dispatch_updater: &CacheDispatchUpdater,
     status_updater: &StatusSenderUpdater,
@@ -127,6 +132,7 @@ pub fn cache_supervise<'scope, 'env: 'scope, 'settings: 'scope>(
                 settings,
                 handle.clone(),
                 pinned,
+                function_catalog,
                 &root_cancel,
                 dispatch_updater,
                 status_updater,

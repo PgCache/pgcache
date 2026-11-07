@@ -18,11 +18,12 @@ use crate::cache::admission::{
 };
 use crate::cache::messages::RegisterRequest;
 use crate::cache::mv::{query_has_join, query_has_window};
+use crate::cache::query::{CacheabilityError, CacheableQuery};
 use crate::cache::types::{AliasResolution, ReadFacts, SharedQueryShape, SharedResolvedQuery};
 use crate::cache::update_query::{UpdateQueries, UpdateQuery};
 use crate::cache::writer::core::WriterCore;
-use crate::cache::{CacheError, CacheResult, ReportExt};
-use crate::catalog::is_sql_form;
+use crate::cache::{CacheError, CacheResult, MapIntoReport, ReportExt};
+use crate::catalog::{FunctionRow, PathFunctions, is_sql_form};
 use crate::oid::{FunctionOid, Oid};
 use crate::query::Fingerprint;
 use crate::query::ast::rope::{NodeKind, QueryTree};
@@ -79,15 +80,18 @@ struct CanonicalBinding {
 }
 
 /// Resolve every function the tree calls on `search_path`: the oids the
-/// entry depends on (PGC-578). A call no function fits, or one a user or
-/// extension function could answer, refuses the query: the cache PG has
-/// only PostgreSQL's own functions to serve and evaluate with. The parser's
-/// own forms (`coalesce`, ...) have no row and need none.
-fn functions_resolve(
-    core: &WriterCore,
+/// entry depends on (PGC-578). A call no function fits refuses the query,
+/// and so does one a function the cache database cannot run could answer:
+/// a user or extension function is admissible only when the cache database
+/// holds it with origin's body. The parser's own forms (`coalesce`, ...)
+/// have no row and need none. With the path known, the volatility rule is
+/// applied once more: the proxy judged a call by the catalog alone.
+async fn functions_resolve(
+    core: &mut WriterCore,
     tree: &QueryTree,
     search_path: &[&str],
 ) -> CacheResult<Vec<FunctionOid>> {
+    let catalog = core.function_catalog.load_full();
     let mut oids = Vec::new();
     for node in tree.nodes() {
         let NodeKind::Function {
@@ -102,36 +106,76 @@ fn functions_resolve(
         if schema.is_none() && is_sql_form(name) {
             continue;
         }
-        let mut found = false;
-        for row in core
-            .function_catalog
+        let candidates: Vec<&FunctionRow> = catalog
             .on_path(schema.as_deref(), name, *arg_count, search_path)
-        {
-            found = true;
-            if !row.oid.is_builtin() {
-                return Err(function_refusal(CacheError::FunctionNotBuiltin {
-                    function: EcoString::from(format!("{}.{}", row.schema, row.name)),
-                }));
-            }
-            oids.push(row.oid);
-        }
-        if !found {
+            .collect();
+        if candidates.is_empty() {
             return Err(function_refusal(CacheError::FunctionUnknown {
                 function: name.clone(),
                 arg_count: *arg_count,
             }));
         }
+        for row in candidates {
+            if !row.oid.is_builtin() && !function_on_cache(core, row).await? {
+                return Err(function_refusal(CacheError::FunctionNotOnCache {
+                    function: row.identity.clone(),
+                }));
+            }
+            oids.push(row.oid);
+        }
     }
+    let on_path = PathFunctions {
+        catalog: &catalog,
+        search_path,
+    };
+    CacheableQuery::cacheable(tree, &on_path).map_err(|e| {
+        let function = if let CacheabilityError::NonImmutableFunction { function } = e {
+            function
+        } else {
+            EcoString::from(e.to_string())
+        };
+        function_refusal(CacheError::FunctionNotImmutable { function })
+    })?;
     oids.sort_unstable();
     oids.dedup();
     Ok(oids)
 }
 
+/// The body of the function `$1` names on the cache database, if any.
+const FUNCTION_DIGEST_SQL: &str = "SELECT md5(prosrc) FROM pg_proc WHERE oid = to_regprocedure($1)";
+
+/// Whether the cache database holds `row`'s function with origin's body.
+/// A presence is remembered until the next function signal; an absence is
+/// asked again each time, since the operator may install the function at
+/// any moment and nothing signals that.
+async fn function_on_cache(core: &mut WriterCore, row: &FunctionRow) -> CacheResult<bool> {
+    if core.function_presence.contains(&row.oid) {
+        return Ok(true);
+    }
+    let found = core
+        .db_cache
+        .query_opt(FUNCTION_DIGEST_SQL, &[&row.identity.as_str()])
+        .await
+        .map_into_report::<CacheError>()
+        .attach_loc("looking a function up on the cache database")?;
+    let digest: Option<String> = match found {
+        Some(found) => found.try_get(0).map_into_report::<CacheError>()?,
+        None => None,
+    };
+    let present = digest.is_some_and(|digest| digest == row.source_digest.as_str());
+    if present {
+        core.function_presence.insert(row.oid);
+    }
+    Ok(present)
+}
+
 /// Count a function refusal by reason and wrap it as the registration's error.
 fn function_refusal(error: CacheError) -> Report<CacheError> {
     let m = crate::metrics::handles();
-    let counter = if matches!(error, CacheError::FunctionNotBuiltin { .. }) {
-        &m.query.function_forward_not_builtin
+    let counter = if matches!(error, CacheError::FunctionNotOnCache { .. }) {
+        &m.query.function_forward_not_on_cache
+    } else if matches!(error, CacheError::FunctionNotImmutable { .. }) {
+        &m.query.function_forward_not_immutable
     } else {
         &m.query.function_forward_unknown
     };
@@ -165,7 +209,8 @@ async fn query_bind_canonical(
             .map_err(|e| e.context_transform(CacheError::from))
             .attach_loc("resolving the query with its policies inlined")?;
     }
-    let function_oids = functions_resolve(core, resolution.bound.tree(), &search_path(keying))?;
+    let function_oids =
+        functions_resolve(core, resolution.bound.tree(), &search_path(keying)).await?;
     Ok(CanonicalBinding {
         resolution,
         user_max_limit,

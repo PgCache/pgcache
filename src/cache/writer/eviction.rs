@@ -7,7 +7,7 @@ use super::core::WriterCore;
 use super::core::fault;
 use crate::cache::Generation;
 use crate::cache::{CacheError, CacheResult, MapIntoReport, types::CachedQueryState};
-use crate::oid::Oid;
+use crate::oid::{FunctionOid, Oid};
 use crate::query::Fingerprint;
 use crate::result::error_chain_format;
 use crate::settings::CachePolicy;
@@ -513,6 +513,23 @@ impl WriterCore {
             .map(|q| q.fingerprint)
             .collect();
 
+        for fp in fingerprints {
+            self.cache_query_evict(fp).await?;
+        }
+        Ok(())
+    }
+
+    /// Evict every query that calls the function `oid` (PGC-578): its body
+    /// or definition changed on origin, so what the entries hold was
+    /// computed by the old one.
+    pub(super) async fn cache_function_invalidate(&mut self, oid: FunctionOid) -> CacheResult<()> {
+        let fingerprints: Vec<Fingerprint> = self
+            .cache
+            .cached_queries
+            .iter()
+            .filter(|q| q.function_oids.contains(&oid))
+            .map(|q| q.fingerprint)
+            .collect();
         for fp in fingerprints {
             self.cache_query_evict(fp).await?;
         }
