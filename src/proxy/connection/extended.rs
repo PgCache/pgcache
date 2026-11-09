@@ -186,7 +186,7 @@ impl ConnectionState {
         let analyzed = analyze(
             sql,
             &mut self.cacheability_cache,
-            &self.function_catalog.load_full(),
+            &self.function_catalog.load(),
         );
         let (sql_type, effects) = match analyzed {
             Ok(Action::CacheCheck(ast)) => {

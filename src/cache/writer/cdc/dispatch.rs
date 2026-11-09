@@ -517,7 +517,10 @@ impl WriterCdc {
         }
         // A function's body or definition changed (PGC-578): the entries
         // computed by the old one go, then the catalog is read afresh so
-        // the next registration and the proxy judge by the new one.
+        // the next registration and the proxy judge by the new one. A
+        // created function has an oid no entry recorded; the reload's alias
+        // clear covers it, since every session then resolves afresh and one
+        // whose path now reaches it is refused at resolution.
         if !change.functions_changed.is_empty() {
             for oid in &change.functions_changed {
                 core.cache_function_invalidate(*oid)

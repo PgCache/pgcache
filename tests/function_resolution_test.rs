@@ -11,8 +11,8 @@ use tokio_postgres::Client;
 use tokio_postgres::error::SqlState;
 
 use crate::util::{
-    MetricsSnapshot, TestContext, assert_proxy_rows_match_origin, connect_cache_db, metrics_delta,
-    query_warm, result_rows,
+    MetricsSnapshot, TestContext, assert_cache_hit, assert_proxy_rows_match_origin,
+    connect_cache_db, metrics_delta, query_warm, result_rows,
 };
 
 mod util;
@@ -27,6 +27,10 @@ const DOUBLE_IT: &str = "CREATE FUNCTION double_it(x INTEGER) RETURNS INTEGER \
 const TRIPLE_IT: &str = "CREATE OR REPLACE FUNCTION double_it(x INTEGER) RETURNS INTEGER \
      LANGUAGE sql IMMUTABLE AS $$ SELECT x * 3 $$";
 const DOUBLE_READ: &str = "SELECT id FROM items WHERE double_it(n) = 20 ORDER BY id";
+const APP_DOUBLE_IT: &str = "CREATE FUNCTION app.double_it(x INTEGER) RETURNS INTEGER \
+     LANGUAGE sql IMMUTABLE AS $$ SELECT x * 2 $$";
+const SHADOW_LOWER: &str = "CREATE FUNCTION app.lower(t TEXT) RETURNS TEXT \
+     LANGUAGE sql IMMUTABLE AS $$ SELECT 'shadow' $$";
 
 /// Origin with the items table and `statements` in place before pgcache
 /// starts, so its function catalog knows them from the start.
@@ -223,12 +227,7 @@ async fn test_dropping_a_function_evicts_its_queries() -> Result<(), Error> {
 /// the builtin and is cached.
 #[tokio::test]
 async fn test_user_overload_on_the_search_path_forwards() -> Result<(), Error> {
-    let mut ctx = setup_with(&[
-        "CREATE SCHEMA app",
-        "CREATE FUNCTION app.lower(t TEXT) RETURNS TEXT \
-         LANGUAGE sql IMMUTABLE AS $$ SELECT 'shadow' $$",
-    ])
-    .await?;
+    let mut ctx = setup_with(&["CREATE SCHEMA app", SHADOW_LOWER]).await?;
     let sql = "SELECT id, lower(name) AS low FROM items WHERE lower(name) = 'ann' ORDER BY id";
     query_warm(&mut ctx, sql).await?;
 
@@ -241,6 +240,77 @@ async fn test_user_overload_on_the_search_path_forwards() -> Result<(), Error> {
         d.queries_function_forward_not_on_cache
     })
     .await
+}
+
+/// A call qualified with a user schema is judged by that schema's function
+/// and cached once the cache database holds it.
+#[tokio::test]
+async fn test_schema_qualified_user_function_caches() -> Result<(), Error> {
+    let mut ctx = setup_with(&["CREATE SCHEMA app", APP_DOUBLE_IT]).await?;
+    cache_db_run(&ctx, "CREATE SCHEMA app").await?;
+    cache_db_run(&ctx, APP_DOUBLE_IT).await?;
+    query_warm(
+        &mut ctx,
+        "SELECT id FROM items WHERE app.double_it(n) = 20 ORDER BY id",
+    )
+    .await?;
+    Ok(())
+}
+
+/// A SQL-standard body (`BEGIN ATOMIC`) leaves `prosrc` empty, so the
+/// digest covers the body PostgreSQL stores parsed: a cache database holding
+/// the same identity with another body does not pass as present.
+#[tokio::test]
+async fn test_standard_body_differing_on_the_cache_database_forwards() -> Result<(), Error> {
+    let mut ctx = setup_with(&[
+        "CREATE FUNCTION double_it(x INTEGER) RETURNS INTEGER IMMUTABLE \
+         BEGIN ATOMIC SELECT x * 2; END",
+    ])
+    .await?;
+    cache_db_run(
+        &ctx,
+        "CREATE FUNCTION double_it(x INTEGER) RETURNS INTEGER IMMUTABLE \
+         BEGIN ATOMIC SELECT x * 3; END",
+    )
+    .await?;
+    let client = ctx.proxy_client_connect().await?;
+    let origin = ctx.origin_connect_as("postgres").await?;
+    forward_assert(&mut ctx, &client, &origin, DOUBLE_READ, |d| {
+        d.queries_function_forward_not_on_cache
+    })
+    .await
+}
+
+/// A function created after a call was cached has an oid no entry recorded.
+/// The reload clears the session-key aliases instead: a session whose path
+/// now reaches the new function resolves afresh and forwards, one whose path
+/// does not keeps the entry (after the one read that re-asks the privilege
+/// verdicts the DDL forgot, ADR-061).
+#[tokio::test]
+async fn test_function_created_on_a_path_makes_that_path_resolve_afresh() -> Result<(), Error> {
+    let mut ctx = setup_with(&["CREATE SCHEMA app"]).await?;
+    let sql = "SELECT id FROM items WHERE lower(name) = 'ann' ORDER BY id";
+    query_warm(&mut ctx, sql).await?;
+    let shadowed = ctx.proxy_client_connect().await?;
+    let origin = ctx.origin_connect_as("postgres").await?;
+    for client in [&shadowed, &origin] {
+        set_search_path(client, "app, public").await?;
+    }
+    let before = ctx.metrics().await?;
+    shadowed.simple_query(sql).await.map_err(Error::other)?;
+    assert_cache_hit(&mut ctx, before).await?;
+
+    ctx.origin_query(SHADOW_LOWER, &[]).await?;
+    ctx.cache_settle().await?;
+    forward_assert(&mut ctx, &shadowed, &origin, sql, |d| {
+        d.queries_function_forward_not_on_cache
+    })
+    .await?;
+    assert_proxy_rows_match_origin(&mut ctx, sql).await?;
+    let before = ctx.metrics().await?;
+    assert_proxy_rows_match_origin(&mut ctx, sql).await?;
+    assert_cache_hit(&mut ctx, before).await?;
+    Ok(())
 }
 
 /// A `pg_catalog`-qualified builtin in WHERE is cached like the bare name;

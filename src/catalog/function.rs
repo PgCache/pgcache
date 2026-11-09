@@ -55,11 +55,11 @@ impl FunctionKind {
         }
     }
 
-    /// A call in a scalar position names a function (a procedure only
-    /// through CALL); aggregates and window functions are judged by their
-    /// position, not their volatility.
+    /// A call in a scalar position names a function: a procedure is reached
+    /// only through CALL, and aggregates and window functions are judged by
+    /// their position, not their volatility.
     fn is_plain(self) -> bool {
-        matches!(self, FunctionKind::Function | FunctionKind::Procedure)
+        matches!(self, FunctionKind::Function)
     }
 }
 
@@ -70,7 +70,7 @@ pub const FUNCTION_CATALOG_SQL: &str = "SELECT p.oid, n.nspname, p.proname, \
         p.pronargs, p.pronargdefaults, p.provariadic <> 0, p.provolatile::text, \
         l.lanname, p.prosecdef, p.proretset, p.prorettype, p.prokind::text, \
         format('%I.%I(%s)', n.nspname, p.proname, oidvectortypes(p.proargtypes)), \
-        md5(p.prosrc) \
+        md5(coalesce(pg_get_function_sqlbody(p.oid), p.prosrc)) \
  FROM pg_proc p \
  JOIN pg_namespace n ON p.pronamespace = n.oid \
  JOIN pg_language l ON l.oid = p.prolang";
@@ -95,8 +95,9 @@ pub struct FunctionRow {
     /// `schema.name(argument types)`, quoted as identifiers: what names the
     /// same function on another database (`to_regprocedure`).
     pub identity: EcoString,
-    /// `md5(prosrc)`: the body, or a C symbol; equal on two databases when
-    /// the function is the same.
+    /// A digest of the body (the SQL-standard body when there is one, since
+    /// `prosrc` is empty for it) or of a C symbol; equal on two databases
+    /// when the function is the same.
     pub source_digest: EcoString,
 }
 
@@ -248,6 +249,10 @@ impl FunctionCatalog {
         &self.rows
     }
 
+    pub fn row(&self, oid: FunctionOid) -> Option<&FunctionRow> {
+        self.rows.iter().find(|row| row.oid == oid)
+    }
+
     /// Every overload of `name`, in any schema and of any arity.
     pub fn named<'s>(&'s self, name: &str) -> impl Iterator<Item = &'s FunctionRow> + use<'s> {
         self.by_name
@@ -259,7 +264,8 @@ impl FunctionCatalog {
 
     /// The overloads a call can name: those of `name` taking `arg_count`
     /// arguments, in `schema` when the call is qualified, else in any schema
-    /// (which one the search_path picks is the writer's resolution).
+    /// (which one the search_path picks is the writer's resolution). A
+    /// procedure is never one, since only CALL reaches it.
     pub fn candidates<'s>(
         &'s self,
         schema: Option<&'s str>,
@@ -267,7 +273,9 @@ impl FunctionCatalog {
         arg_count: u32,
     ) -> impl Iterator<Item = &'s FunctionRow> + use<'s> {
         self.named(name).filter(move |row| {
-            row.accepts(arg_count) && schema.is_none_or(|schema| row.schema == schema)
+            row.kind != FunctionKind::Procedure
+                && row.accepts(arg_count)
+                && schema.is_none_or(|schema| row.schema.eq_ignore_ascii_case(schema))
         })
     }
 
@@ -594,6 +602,70 @@ mod tests {
     }
 
     /// The writer's verdict: the worst case over the path.
+    /// A procedure shares the namespace but is reached only through CALL:
+    /// it is no candidate for a call in a scalar position.
+    #[test]
+    fn test_procedures_are_not_call_candidates() {
+        let c = FunctionCatalog::from_rows(vec![
+            row(
+                20_000,
+                "app",
+                "f",
+                1,
+                0,
+                false,
+                FunctionVolatility::Immutable,
+            ),
+            FunctionRow {
+                kind: FunctionKind::Procedure,
+                ..row(
+                    20_001,
+                    "app",
+                    "f",
+                    1,
+                    0,
+                    false,
+                    FunctionVolatility::Volatile,
+                )
+            },
+        ]);
+        assert_eq!(c.on_path(None, "f", 1, &["app"]).count(), 1);
+        let on = PathFunctions {
+            catalog: &c,
+            search_path: &["app"],
+        };
+        assert_eq!(
+            on.call_volatility(None, "f", 1),
+            Some(FunctionVolatility::Immutable)
+        );
+        assert_eq!(
+            c.call_volatility(None, "f", 1),
+            Some(FunctionVolatility::Immutable)
+        );
+    }
+
+    /// A qualifying schema is matched like the name, without regard to case.
+    #[test]
+    fn test_qualified_schema_matches_regardless_of_case() {
+        let c = FunctionCatalog::from_rows(vec![row(
+            20_000,
+            "app",
+            "f",
+            1,
+            0,
+            false,
+            FunctionVolatility::Immutable,
+        )]);
+        assert_eq!(c.candidates(Some("APP"), "F", 1).count(), 1);
+        assert_eq!(c.candidates(Some("other"), "f", 1).count(), 0);
+        assert_eq!(
+            c.row(FunctionOid::from_raw(20_000))
+                .map(|r| r.name.as_str()),
+            Some("f")
+        );
+        assert!(c.row(FunctionOid::from_raw(1)).is_none());
+    }
+
     #[test]
     fn test_path_facts_take_the_worst_on_the_path() {
         let c = catalog();

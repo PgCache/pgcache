@@ -16,11 +16,13 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
+use arc_swap::ArcSwapOption;
 use dashmap::DashMap;
 use tokio::sync::watch;
 
 use super::cacheability_memo::SqlTextHash;
 use super::query::Action;
+use crate::catalog::FunctionCatalog;
 use crate::id_hash::BuildIdHasher;
 
 /// Interned cacheability verdicts shared by every connection.
@@ -44,6 +46,8 @@ pub struct CacheabilityStore {
     /// next query, so an idle one would otherwise pin its handles indefinitely
     /// — exactly the pooled connections a pressure drop needs to reclaim.
     epoch_tx: watch::Sender<u64>,
+    /// The function catalog the interned verdicts were analyzed against.
+    catalog: ArcSwapOption<FunctionCatalog>,
 }
 
 impl CacheabilityStore {
@@ -53,6 +57,26 @@ impl CacheabilityStore {
             epoch: AtomicU64::new(0),
             pressured: AtomicBool::new(false),
             epoch_tx: watch::Sender::new(0),
+            catalog: ArcSwapOption::empty(),
+        }
+    }
+
+    /// Note the catalog the next analysis runs against. A verdict judged a
+    /// function by the old catalog may be wrong under the new one, so the
+    /// first connection to bring a new catalog drops every interned verdict,
+    /// once for the process; the epoch move then drains every memo.
+    pub(super) fn catalog_reconcile(&self, current: &Arc<FunctionCatalog>) {
+        let known = self.catalog.load();
+        if known
+            .as_ref()
+            .is_some_and(|known| Arc::ptr_eq(known, current))
+        {
+            return;
+        }
+        drop(known);
+        let previous = self.catalog.swap(Some(Arc::clone(current)));
+        if previous.is_some_and(|previous| !Arc::ptr_eq(&previous, current)) {
+            self.verdicts_drop("function catalog changed");
         }
     }
 

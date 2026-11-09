@@ -421,6 +421,10 @@ impl DeparseContext for Bound<'_> {
     }
 
     fn function_name_deparse(&mut self, function: Function<'_>, buf: &mut String) {
+        if let Some(schema) = function.schema() {
+            buf.push_str(schema);
+            buf.push('.');
+        }
         buf.push_str(function.name());
     }
 

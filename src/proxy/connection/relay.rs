@@ -691,7 +691,7 @@ impl ConnectionState {
         match handle_query(
             data,
             &mut self.cacheability_cache,
-            &self.function_catalog.load_full(),
+            &self.function_catalog.load(),
         )
         .await
         {
@@ -796,7 +796,7 @@ impl ConnectionState {
             let analyzed = handle_query(
                 &msg.data,
                 &mut self.cacheability_cache,
-                &self.function_catalog.load_full(),
+                &self.function_catalog.load(),
             )
             .await;
             self.proxy_mode = self.simple_query_route(analyzed, msg);

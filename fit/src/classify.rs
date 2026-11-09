@@ -109,7 +109,6 @@ pub enum PassthroughReason {
     UnsupportedSubquery,
     NonImmutableFunction,
     NonImmutableOperator,
-    SchemaQualifiedFunction,
     HasLimit,
     SystemCatalogReference,
     SessionTerm,
@@ -128,7 +127,7 @@ impl PassthroughReason {
             PassthroughReason::UnsupportedSubquery => "unsupported subquery",
             PassthroughReason::NonImmutableFunction => "non-immutable function",
             PassthroughReason::NonImmutableOperator => "non-immutable operator",
-            PassthroughReason::SchemaQualifiedFunction => "schema-qualified function",
+
             PassthroughReason::HasLimit => "LIMIT not cacheable here",
             PassthroughReason::SystemCatalogReference => "system catalog reference",
             PassthroughReason::SessionTerm => "session-dependent term",
@@ -163,10 +162,7 @@ fn cacheability_reason(error: &CacheabilityError) -> (PassthroughReason, Option<
             PassthroughReason::NonImmutableOperator,
             Some(operator.to_string()),
         ),
-        CacheabilityError::SchemaQualifiedFunction { function } => (
-            PassthroughReason::SchemaQualifiedFunction,
-            Some(function.to_string()),
-        ),
+
         CacheabilityError::HasLimit => (PassthroughReason::HasLimit, None),
         CacheabilityError::SystemCatalogReference { relation } => (
             PassthroughReason::SystemCatalogReference,

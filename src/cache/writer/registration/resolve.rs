@@ -129,20 +129,23 @@ async fn functions_resolve(
         search_path,
     };
     CacheableQuery::cacheable(tree, &on_path).map_err(|e| {
-        let function = if let CacheabilityError::NonImmutableFunction { function } = e {
-            function
+        if let CacheabilityError::NonImmutableFunction { function } = e {
+            function_refusal(CacheError::FunctionNotImmutable { function })
         } else {
-            EcoString::from(e.to_string())
-        };
-        function_refusal(CacheError::FunctionNotImmutable { function })
+            Report::from(CacheError::CanonicalUncacheable {
+                reason: EcoString::from(e.to_string()),
+            })
+        }
     })?;
     oids.sort_unstable();
     oids.dedup();
     Ok(oids)
 }
 
-/// The body of the function `$1` names on the cache database, if any.
-const FUNCTION_DIGEST_SQL: &str = "SELECT md5(prosrc) FROM pg_proc WHERE oid = to_regprocedure($1)";
+/// The body digest of the function `$1` names on the cache database, if
+/// any; the same expression as the catalog's.
+const FUNCTION_DIGEST_SQL: &str = "SELECT md5(coalesce(pg_get_function_sqlbody(oid), prosrc)) \
+     FROM pg_proc WHERE oid = to_regprocedure($1)";
 
 /// Whether the cache database holds `row`'s function with origin's body.
 /// A presence is remembered until the next function signal; an absence is

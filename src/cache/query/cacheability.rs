@@ -260,15 +260,6 @@ fn function_cacheable(
     functions: &dyn FunctionFacts,
 ) -> Result<(), CacheabilityError> {
     let schema = function.schema().map(EcoString::as_str);
-    // The cache PG holds only pg_catalog's functions; another schema's
-    // function is admissible once the writer resolves it (PGC-578).
-    if let Some(schema) = schema
-        && schema != "pg_catalog"
-    {
-        return Err(CacheabilityError::SchemaQualifiedFunction {
-            function: format!("{schema}.{}", function.name()).into(),
-        });
-    }
     let name = function.name();
     let arg_count = u32::try_from(function.args().len()).unwrap_or(u32::MAX);
     let worst = functions.call_volatility(schema, name, arg_count);
@@ -930,17 +921,28 @@ mod tests {
         }
     }
 
+    /// A call qualified with another schema is judged by that schema's
+    /// overloads, not the builtin's: unknown there it is refused in WHERE
+    /// like any unknown function, immutable there it passes to the writer.
     #[test]
-    fn test_other_schema_qualified_function_not_cacheable() {
+    fn test_other_schema_qualified_function_judged_by_its_schema() {
+        let err = check_cacheable("SELECT id FROM users WHERE myschema.lower(name) = 'x'")
+            .expect_err("unknown in that schema");
+        assert!(
+            matches!(&err, CacheabilityError::NonImmutableFunction { function } if function == "lower"),
+            "{err}"
+        );
+        let err = check_cacheable("SELECT id FROM users WHERE app.lower(name) = 'x'")
+            .expect_err("stable in app");
+        assert!(
+            matches!(&err, CacheabilityError::NonImmutableFunction { .. }),
+            "{err}"
+        );
         for sql in [
             "SELECT myschema.lower(name) FROM users",
-            "SELECT id FROM users WHERE myschema.lower(name) = 'x'",
+            "SELECT id FROM users WHERE app.tenant_of(id) = 1",
         ] {
-            let err = check_cacheable(sql).expect_err("schema-qualified function rejected");
-            assert!(
-                matches!(&err, CacheabilityError::SchemaQualifiedFunction { function } if function == "myschema.lower"),
-                "{sql}: {err}"
-            );
+            assert!(check_cacheable(sql).is_ok(), "{sql}");
         }
     }
 

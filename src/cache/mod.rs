@@ -256,5 +256,11 @@ error_set! {
     QueryResolutionError := {
         ResolveError(ResolveError),
         DecorrelateError(DecorrelateError),
+        /// The canonical form, its policies inlined, fails a cacheability
+        /// rule the query as written passed at the proxy.
+        #[display("canonical form is not cacheable: {reason}")]
+        CanonicalUncacheable {
+            reason: EcoString,
+        },
     }
 }

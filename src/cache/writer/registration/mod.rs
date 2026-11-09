@@ -213,6 +213,7 @@ fn register_failure_log(key: impl std::fmt::Display, error: &CacheError) {
             | CacheError::FunctionUnknown { .. }
             | CacheError::FunctionNotOnCache { .. }
             | CacheError::FunctionNotImmutable { .. }
+            | CacheError::CanonicalUncacheable { .. }
     ) {
         debug!(
             "query {key} forwarded (not cacheable): {}",

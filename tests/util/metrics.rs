@@ -304,6 +304,19 @@ impl MetricsSnapshot {
     }
 }
 
+/// The gauges among the samples: a current value, not a count, so a delta
+/// carries the later snapshot's value instead of a difference.
+const GAUGES: &[&str] = &[
+    "pgcache_cache_merge_discards_pending",
+    "pgcache_cache_merge_pending_depth",
+    "pgcache_cache_staging_held",
+    "pgcache_cache_population_workers",
+    "pgcache_cache_serve_pool_size",
+    "pgcache_cache_coalesce_waiting",
+    "pgcache_cache_memo_slots",
+    "pgcache_cache_queries_pending",
+];
+
 /// Calculate metrics delta between two snapshots.
 /// Useful for asserting metrics within a consolidated test where metrics accumulate.
 pub(crate) fn metrics_delta(before: &MetricsSnapshot, after: &MetricsSnapshot) -> MetricsSnapshot {
@@ -312,18 +325,17 @@ pub(crate) fn metrics_delta(before: &MetricsSnapshot, after: &MetricsSnapshot) -
     let mut delta = MetricsSnapshot::default();
     for sample in SAMPLES {
         let (before, after) = (*(sample.field)(&mut before), *(sample.field)(&mut after));
+        if GAUGES.contains(&sample.name) {
+            *(sample.field)(&mut delta) = after;
+            continue;
+        }
         assert!(
             after >= before,
-            "{} fell from {before} to {after}: a gauge sampled as a counter",
+            "{} fell from {before} to {after}: a gauge sampled as a counter, add it to GAUGES",
             sample.name
         );
         *(sample.field)(&mut delta) = after - before;
     }
-    // Gauges, not counters: carry the current value rather than a delta.
-    delta.cache_coalesce_waiting = after.cache_coalesce_waiting;
-    delta.cache_merge_pending_depth = after.cache_merge_pending_depth;
-    delta.cache_memo_slots = after.cache_memo_slots;
-    delta.cache_queries_pending = after.cache_queries_pending;
     // Rates are cumulative averages, not meaningful for deltas: left at zero.
     delta
 }

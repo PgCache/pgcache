@@ -423,6 +423,34 @@ mod tests {
         assert_eq!(store.len(), 1);
     }
 
+    /// A catalog change drops the interned verdicts once for the process: the
+    /// first connection to bring the new catalog clears the store, the others
+    /// find it noted and keep what has been re-interned since.
+    #[test]
+    fn test_catalog_change_drops_verdicts_once() {
+        let store = Arc::new(CacheabilityStore::new());
+        let first_catalog = empty_catalog();
+        let mut first = CacheabilityCache::new(Arc::clone(&store));
+        let mut second = CacheabilityCache::new(Arc::clone(&store));
+        analyze("SELECT a FROM t WHERE id = 1", &mut first, &first_catalog).expect("analyze");
+        analyze("SELECT a FROM t WHERE id = 2", &mut second, &first_catalog).expect("analyze");
+        assert_eq!(store.len(), 2);
+
+        let second_catalog = empty_catalog();
+        analyze("SELECT a FROM t WHERE id = 1", &mut first, &second_catalog).expect("analyze");
+        assert_eq!(store.len(), 1, "dropped, then one re-interned");
+        analyze("SELECT a FROM t WHERE id = 2", &mut second, &second_catalog).expect("analyze");
+        assert_eq!(store.len(), 2, "the second connection does not drop again");
+
+        let mut fresh = CacheabilityCache::new(Arc::clone(&store));
+        analyze("SELECT a FROM t WHERE id = 3", &mut fresh, &second_catalog).expect("analyze");
+        assert_eq!(
+            store.len(),
+            3,
+            "a new connection on the current catalog keeps the store"
+        );
+    }
+
     fn analyze_fresh(sql: &str, fv: &Arc<FunctionCatalog>) -> Action {
         let store = Arc::new(CacheabilityStore::new());
         analyze(sql, &mut CacheabilityCache::new(store), fv).expect("analyze sql")
