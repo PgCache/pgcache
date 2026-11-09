@@ -131,6 +131,17 @@ fn is_function(object_type: &str) -> bool {
     matches!(object_type, "function" | "procedure" | "aggregate")
 }
 
+/// A command that can move or rename functions without listing them.
+/// `CREATE EXTENSION` and the extension's drop list every function they
+/// create or remove; `ALTER EXTENSION ... SET SCHEMA` and `ALTER SCHEMA ...
+/// RENAME` report the container only.
+fn relocates_functions(tag: &str, object_type: &str) -> bool {
+    matches!(
+        (tag, object_type),
+        ("ALTER EXTENSION", "extension") | ("ALTER SCHEMA", "schema")
+    )
+}
+
 /// Decode a `pgcache` logical message into the relation OIDs it affects.
 pub(super) fn schema_change_parse(content: &[u8]) -> Result<SchemaChange, serde_json::Error> {
     let mut change = SchemaChange::default();
@@ -156,6 +167,10 @@ pub(super) fn schema_change_parse(content: &[u8]) -> Result<SchemaChange, serde_
                         Some(oid) => change.functions_changed.push(FunctionOid::from_raw(oid)),
                         None => trace!(tag, "function object without an oid"),
                     }
+                    continue;
+                }
+                if relocates_functions(tag, object_type) {
+                    change.functions_relocated = true;
                     continue;
                 }
                 match (tag, object.oid, object.parent) {
@@ -360,6 +375,41 @@ mod policy_tests {
         let change = schema_change_parse(dropped).expect("parse drop payload");
         assert_eq!(change.functions_changed, vec![FunctionOid::from_raw(16400)]);
         assert!(change.dropped_tables.is_empty());
+    }
+
+    /// `CREATE EXTENSION` reports every command its script ran, the
+    /// functions among them, so they are collected like any other; the
+    /// extension object itself adds nothing.
+    #[test]
+    fn test_schema_change_parse_collects_an_extensions_functions() {
+        let payload = br#"{"kind":"ddl","objects":[
+            {"tag":"CREATE FUNCTION","type":"function","oid":16500,"identity":"public.similarity(text,text)","parent":null},
+            {"tag":"CREATE OPERATOR","type":"operator","oid":16501,"identity":"public.%(text,text)","parent":null},
+            {"tag":"CREATE EXTENSION","type":"extension","oid":16502,"identity":"pg_trgm","parent":null}]}"#;
+        let change = schema_change_parse(payload).expect("parse ddl payload");
+        assert_eq!(change.functions_changed, vec![FunctionOid::from_raw(16500)]);
+        assert!(!change.functions_relocated);
+    }
+
+    /// Moving an extension or renaming a schema reports the container only,
+    /// so the catalog is marked for a reload.
+    #[test]
+    fn test_schema_change_parse_marks_relocated_functions() {
+        for payload in [
+            br#"{"kind":"ddl","objects":[
+            {"tag":"ALTER EXTENSION","type":"extension","oid":16502,"identity":"pg_trgm","parent":null}]}"# as &[u8],
+            br#"{"kind":"ddl","objects":[
+            {"tag":"ALTER SCHEMA","type":"schema","oid":16600,"identity":"app2","parent":null}]}"#,
+        ] {
+            let change = schema_change_parse(payload).expect("parse ddl payload");
+            assert!(change.functions_relocated);
+            assert!(change.functions_changed.is_empty());
+            assert!(!change.is_empty());
+        }
+        let created = br#"{"kind":"ddl","objects":[
+            {"tag":"CREATE SCHEMA","type":"schema","oid":16600,"identity":"app","parent":null}]}"#;
+        let change = schema_change_parse(created).expect("parse ddl payload");
+        assert!(!change.functions_relocated, "a new schema holds nothing");
     }
 
     #[test]

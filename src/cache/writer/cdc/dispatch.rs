@@ -520,8 +520,9 @@ impl WriterCdc {
         // the next registration and the proxy judge by the new one. A
         // created function has an oid no entry recorded; the reload's alias
         // clear covers it, since every session then resolves afresh and one
-        // whose path now reaches it is refused at resolution.
-        if !change.functions_changed.is_empty() {
+        // whose path now reaches it is refused at resolution. A relocation
+        // names no function; the reload finds the identities that changed.
+        if !change.functions_changed.is_empty() || change.functions_relocated {
             for oid in &change.functions_changed {
                 core.cache_function_invalidate(*oid)
                     .await

@@ -340,3 +340,36 @@ async fn test_builtins_and_sql_forms_are_cached() -> Result<(), Error> {
     }
     Ok(())
 }
+
+/// `ALTER EXTENSION ... SET SCHEMA` reports the extension, not its
+/// functions. The catalog is reloaded all the same, and the entries calling
+/// a function whose identity changed are evicted: the bare call no longer
+/// resolves on origin, so the next read forwards and gets origin's error.
+#[tokio::test]
+async fn test_extension_moved_to_another_schema_evicts_its_callers() -> Result<(), Error> {
+    let mut ctx = setup_with(&["CREATE EXTENSION pg_trgm", "CREATE SCHEMA app"]).await?;
+    cache_db_run(&ctx, "CREATE EXTENSION pg_trgm").await?;
+    let sql = "SELECT id FROM items WHERE similarity(name, 'Ann') > 0.5 ORDER BY id";
+    query_warm(&mut ctx, sql).await?;
+
+    ctx.origin_query("ALTER EXTENSION pg_trgm SET SCHEMA app", &[])
+        .await?;
+    ctx.cache_settle().await?;
+    let client = ctx.proxy_client_connect().await?;
+    let before = ctx.metrics().await?;
+    let error = client
+        .simple_query(sql)
+        .await
+        .expect_err("origin no longer resolves the bare name");
+    assert_eq!(
+        error.code(),
+        Some(&SqlState::UNDEFINED_FUNCTION),
+        "origin's own error: {error}"
+    );
+    let after = ctx.metrics_after_outcomes(&before, 1).await?;
+    let delta = metrics_delta(&before, &after);
+    assert_eq!(delta.queries_cache_hit, 0, "never served the evicted entry");
+    assert_eq!(delta.queries_function_forward_unknown, 1, "{delta:#?}");
+    assert_eq!(delta.queries_cache_error, 0);
+    Ok(())
+}

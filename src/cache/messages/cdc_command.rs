@@ -81,6 +81,11 @@ pub(crate) struct SchemaChange {
     /// dropped, by `pg_proc` oid (PGC-578): the queries calling it are
     /// evicted and the function catalog reloaded.
     pub(crate) functions_changed: Vec<FunctionOid>,
+    /// `ALTER EXTENSION` or `ALTER SCHEMA`: functions may have moved or
+    /// been renamed with no function object reported, so the catalog is
+    /// reloaded and the queries calling a function whose identity changed
+    /// are evicted.
+    pub(crate) functions_relocated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +104,7 @@ impl SchemaChange {
             && !self.views_changed
             && self.policies_changed.is_empty()
             && !self.privileges_changed
+            && !self.functions_relocated
             && self.functions_changed.is_empty()
     }
 }

@@ -26,7 +26,7 @@ use crate::cache::{
     mv_shape::ShapeGate,
     types::{ActiveRelations, Cache, CacheStateView, CachedQueryState, CachedQueryView, ServingAt},
 };
-use crate::catalog::{CatalogTable, FunctionCatalog, SharedFunctionCatalog};
+use crate::catalog::{CatalogTable, FunctionCatalog, FunctionRow, SharedFunctionCatalog};
 use crate::oid::{FunctionOid, Oid};
 use crate::pg;
 use crate::pg::Lsn;
@@ -804,8 +804,26 @@ impl WriterCore {
             .map_into_report::<CacheError>()
             .attach_loc("reloading the function catalog after a function signal")?;
         info!(functions = fresh.len(), "function catalog reloaded");
-        if !self.function_catalog.load().same_as(&fresh) {
+        let known = self.function_catalog.load_full();
+        if !known.same_as(&fresh) {
+            // A function moved to another schema or renamed (`ALTER
+            // EXTENSION ... SET SCHEMA`, `ALTER SCHEMA ... RENAME`) keeps its
+            // oid and body, yet a call under the old name now fails on
+            // origin; the entries computed under it go.
+            let fresh_by_oid: HashMap<FunctionOid, &FunctionRow> =
+                fresh.rows().iter().map(|row| (row.oid, row)).collect();
+            for row in known.rows() {
+                let relocated = fresh_by_oid
+                    .get(&row.oid)
+                    .is_none_or(|current| current.identity != row.identity);
+                if relocated {
+                    self.cache_function_invalidate(row.oid)
+                        .await
+                        .attach_loc("a function's identity changed on origin")?;
+                }
+            }
             self.function_catalog.store(Arc::new(fresh));
+            self.rls_policies_reparse().await?;
         }
         self.function_presence.clear();
         self.state_view.aliases.clear();
