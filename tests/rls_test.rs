@@ -14,8 +14,8 @@ use std::time::Duration;
 use tokio_postgres::{Client, SimpleQueryMessage, error::SqlState};
 
 use crate::util::{
-    MetricsSnapshot, TestContext, assert_cache_hit, assert_cache_miss, metrics_delta, query_warm,
-    result_rows,
+    MetricsSnapshot, TestContext, assert_cache_hit, assert_cache_miss, connect_cache_db,
+    metrics_delta, query_warm, result_rows,
 };
 
 mod util;
@@ -24,6 +24,12 @@ type Rows = Vec<Vec<Option<String>>>;
 
 const TENANT_READ: &str = "SELECT id, body FROM tenant_docs ORDER BY id";
 const OWNED_READ: &str = "SELECT id, body FROM owned_docs ORDER BY id";
+const JUDGED_READ: &str = "SELECT id, body FROM judged_docs ORDER BY id";
+
+/// `public.tenant_of`: on the writer connection's search_path, so a policy
+/// calling it deparses the bare name.
+const TENANT_OF: &str = "CREATE FUNCTION public.tenant_of(id int) RETURNS int \
+     LANGUAGE sql IMMUTABLE AS $$ SELECT id % 2 $$";
 
 /// `tenant_docs`, readable by `tenant_user` and `tenant_peer`, under a
 /// permissive policy selecting the tenant named by `app.tenant_id`.
@@ -58,6 +64,38 @@ async fn owned_docs_create(ctx: &mut TestContext) -> Result<(), Error> {
         ctx.origin_query(sql, &[]).await?;
     }
     ctx.cache_settle().await
+}
+
+/// pgcache started over `public.tenant_of`, so its catalog knows the
+/// function from the start, then `app.judged_docs`, readable by
+/// `judged_user`, under a policy that calls it; the cache database holds the
+/// function too.
+async fn judged_docs_setup() -> Result<TestContext, Error> {
+    let mut ctx = TestContext::setup_before_start(|origin| async move {
+        for sql in ["CREATE SCHEMA app", TENANT_OF] {
+            origin.simple_query(sql).await.map_err(Error::other)?;
+        }
+        Ok(origin)
+    })
+    .await?;
+    for sql in [
+        "CREATE TABLE app.judged_docs (id int primary key, body text)",
+        "INSERT INTO app.judged_docs VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+        "CREATE ROLE judged_user LOGIN",
+        "GRANT USAGE ON SCHEMA app TO judged_user",
+        "GRANT SELECT ON app.judged_docs TO judged_user",
+        "ALTER TABLE app.judged_docs ENABLE ROW LEVEL SECURITY",
+        "CREATE POLICY odd_docs ON app.judged_docs FOR SELECT USING (tenant_of(id) = 1)",
+    ] {
+        ctx.origin_query(sql, &[]).await?;
+    }
+    connect_cache_db(&ctx.dbs)
+        .await?
+        .simple_query(TENANT_OF)
+        .await
+        .map_err(Error::other)?;
+    ctx.cache_settle().await?;
+    Ok(ctx)
 }
 
 /// Through the proxy as `user`, and directly on origin as `user`, both with
@@ -650,5 +688,79 @@ async fn test_policy_alias_shadowing_the_query_alias_keeps_the_correlation() -> 
     let served = register(&mut ctx, &bob, sql).await?;
     assert_eq!(served, vec![row("2", "b")]);
     assert_eq!(served, rows(&origin_bob, sql).await?);
+    Ok(())
+}
+
+/// A policy's function call is deparsed bare when the writer connection's
+/// search_path reaches it; the inlined call means that function for a
+/// session whose own path does not reach it, so the read is cached rather
+/// than refused as unknown.
+#[tokio::test]
+async fn test_policy_function_resolves_on_the_writers_path() -> Result<(), Error> {
+    let mut ctx = judged_docs_setup().await?;
+    let (proxied, origin) = sessions_as(&ctx, "judged_user", None).await?;
+    for client in [&proxied, &origin] {
+        client
+            .simple_query("SET search_path = app")
+            .await
+            .map_err(Error::other)?;
+    }
+    let served = register(&mut ctx, &proxied, JUDGED_READ).await?;
+    assert_eq!(served, vec![row("1", "a"), row("3", "c")]);
+    assert_eq!(served, rows(&origin, JUDGED_READ).await?);
+    Ok(())
+}
+
+/// A same-named function on the session's search_path is not the one the
+/// policy calls: origin enforces the policy's own function, and so does the
+/// cached entry, although the session's one is absent from the cache
+/// database.
+#[tokio::test]
+async fn test_policy_function_is_not_taken_from_the_sessions_path() -> Result<(), Error> {
+    let mut ctx = judged_docs_setup().await?;
+    ctx.origin_query(
+        "CREATE FUNCTION app.tenant_of(id int) RETURNS int LANGUAGE sql IMMUTABLE AS $$ SELECT 1 $$",
+        &[],
+    )
+    .await?;
+    ctx.cache_settle().await?;
+    let (proxied, origin) = sessions_as(&ctx, "judged_user", None).await?;
+    for client in [&proxied, &origin] {
+        client
+            .simple_query("SET search_path = app, public")
+            .await
+            .map_err(Error::other)?;
+    }
+    let served = register(&mut ctx, &proxied, JUDGED_READ).await?;
+    assert_eq!(served, vec![row("1", "a"), row("3", "c")]);
+    assert_eq!(served, rows(&origin, JUDGED_READ).await?);
+    Ok(())
+}
+
+/// A bare call that functions in two schemas of the writer's search_path
+/// answer cannot be told apart by arity, so the policy is not inlined and
+/// the read forwards.
+#[tokio::test]
+async fn test_policy_calling_an_overloaded_builtin_is_not_inlined() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    for sql in [
+        "CREATE FUNCTION public.lower(t text) RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT 'x' $$",
+        "CREATE TABLE vague_docs (id int primary key, body text)",
+        "INSERT INTO vague_docs VALUES (1, 'a'), (2, 'B')",
+        "CREATE ROLE vague_user LOGIN",
+        "GRANT SELECT ON vague_docs TO vague_user",
+        "ALTER TABLE vague_docs ENABLE ROW LEVEL SECURITY",
+        "CREATE POLICY lowered ON vague_docs FOR SELECT USING (lower(body) = 'a')",
+    ] {
+        ctx.origin_query(sql, &[]).await?;
+    }
+    ctx.cache_settle().await?;
+    let (proxied, _) = sessions_as(&ctx, "vague_user", None).await?;
+    let sql = "SELECT id, body FROM vague_docs ORDER BY id";
+    let result = rls_forward_assert(&mut ctx, &proxied, sql, |d| d.queries_rls_skipped).await?;
+    assert_eq!(
+        result_rows(&result.map_err(Error::other)?),
+        vec![row("1", "a")]
+    );
     Ok(())
 }

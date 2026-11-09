@@ -19,7 +19,7 @@ use super::core::WriterCore;
 use crate::cache::query::CacheableQuery;
 use crate::cache::types::RlsRelations;
 use crate::cache::{CacheError, CacheResult, MapIntoReport, Report, ReportExt};
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, is_sql_form};
 use crate::oid::Oid;
 use crate::pg::identifier_quote_into;
 use crate::query::ast::rope::{
@@ -315,8 +315,8 @@ impl WriterCore {
         })
     }
 
-    /// `qual` as the WHERE of a one-table SELECT, its table names
-    /// schema-qualified as the writer's connection resolves them (the
+    /// `qual` as the WHERE of a one-table SELECT, its table and function
+    /// names schema-qualified as the writer's connection resolves them (the
     /// context `pg_get_expr` deparsed them under), bound to find the
     /// policy table's own column references. A catalog read failure is an
     /// uninlinable policy, not a failed load.
@@ -335,7 +335,7 @@ impl WriterCore {
         sql.push_str(" WHERE ");
         sql.push_str(qual);
         let tree = query_tree_parse(&sql).map_err(|e| EcoString::from(e.to_string()))?;
-        let qualified = self.rls_tables_qualify(&tree).await?;
+        let qualified = self.rls_names_qualify(&tree).await?;
         // A second reference to the policy table is a different row set than
         // the one the predicate filters; not modelled here.
         let self_references = qualified
@@ -382,9 +382,12 @@ impl WriterCore {
         Ok(parsed_qual_of(&bound, relation_oid))
     }
 
-    /// `tree` with every bare table name given the schema it resolves to on
-    /// the writer connection's search_path.
-    async fn rls_tables_qualify(&mut self, tree: &QueryTree) -> Result<QueryTree, EcoString> {
+    /// `tree` with every bare table and function name given the schema it
+    /// resolves to on the writer connection's search_path, the path
+    /// `pg_get_expr` left it bare under. A policy holds its calls by oid;
+    /// qualified, the inlined call names that oid for every session's
+    /// resolution, the population and the cache database alike.
+    async fn rls_names_qualify(&mut self, tree: &QueryTree) -> Result<QueryTree, EcoString> {
         let mut schemas: HashMap<EcoString, EcoString> = HashMap::new();
         for (schema, name) in tree.table_names() {
             if schema.is_some() || schemas.contains_key(name) {
@@ -397,31 +400,107 @@ impl WriterCore {
                 .map_err(|e| EcoString::from(error_chain_format(e.current_context())))?;
             schemas.insert(EcoString::from(name), resolved);
         }
-        if schemas.is_empty() {
+        let functions = self.rls_function_schemas(tree)?;
+        if schemas.is_empty() && functions.is_empty() {
             return Ok(tree.clone());
         }
         let mut builder = TreeBuilder::new();
         tree_emit_mapped(&mut builder, tree.root().node_ref(), &|node| {
-            let NodeKind::Table {
+            if let NodeKind::Table {
                 schema,
                 name,
                 alias,
                 alias_column_count,
             } = node.kind()
-            else {
-                return None;
-            };
-            if !schema.is_empty() {
-                return None;
+                && schema.is_empty()
+            {
+                return schemas.get(name).map(|resolved| NodeKind::Table {
+                    schema: resolved.clone(),
+                    name: name.clone(),
+                    alias: alias.clone(),
+                    alias_column_count: *alias_column_count,
+                });
             }
-            schemas.get(name).map(|resolved| NodeKind::Table {
-                schema: resolved.clone(),
-                name: name.clone(),
-                alias: alias.clone(),
-                alias_column_count: *alias_column_count,
-            })
+            if let NodeKind::Function {
+                schema: None,
+                name,
+                arg_count,
+                agg_star,
+                agg_distinct,
+                order_count,
+                has_filter,
+                has_over,
+            } = node.kind()
+            {
+                return functions.get(&(name.clone(), *arg_count)).map(|resolved| {
+                    NodeKind::Function {
+                        schema: Some(resolved.clone()),
+                        name: name.clone(),
+                        arg_count: *arg_count,
+                        agg_star: *agg_star,
+                        agg_distinct: *agg_distinct,
+                        order_count: *order_count,
+                        has_filter: *has_filter,
+                        has_over: *has_over,
+                    }
+                });
+            }
+            None
         });
         Ok(builder.finish().0)
+    }
+
+    /// The schema to qualify each bare function call with, by name and
+    /// arity: the one its candidates on the writer connection's search_path
+    /// share. A call only `pg_catalog` answers stays bare, since no session
+    /// path can take it elsewhere; one with candidates in two schemas is
+    /// not told apart by arity, and makes the policy uninlinable, as does
+    /// one nothing answers.
+    fn rls_function_schemas(
+        &self,
+        tree: &QueryTree,
+    ) -> Result<HashMap<(EcoString, u32), EcoString>, EcoString> {
+        let catalog = self.function_catalog.load();
+        let path: Vec<&str> = self
+            .origin_search_path
+            .iter()
+            .map(EcoString::as_str)
+            .collect();
+        let mut schemas: HashMap<(EcoString, u32), EcoString> = HashMap::new();
+        for node in tree.nodes() {
+            let NodeKind::Function {
+                schema: None,
+                name,
+                arg_count,
+                ..
+            } = &node.kind
+            else {
+                continue;
+            };
+            let key = (name.clone(), *arg_count);
+            if is_sql_form(name) || schemas.contains_key(&key) {
+                continue;
+            }
+            let mut candidates = catalog
+                .on_path(None, name, *arg_count, &path)
+                .map(|row| row.schema.as_str());
+            let Some(first) = candidates.next() else {
+                return Err(format!(
+                    "the policy calls {name}, which no function on the writer's search_path answers"
+                )
+                .into());
+            };
+            if candidates.any(|schema| schema != first) {
+                return Err(format!(
+                    "the policy calls {name}, which more than one schema on the writer's search_path holds"
+                )
+                .into());
+            }
+            if first != "pg_catalog" {
+                schemas.insert(key, EcoString::from(first));
+            }
+        }
+        Ok(schemas)
     }
 
     async fn rls_applicability(&self, role: &str, relation_oid: Oid) -> CacheResult<Applicability> {
