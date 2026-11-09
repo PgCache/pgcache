@@ -82,6 +82,7 @@ Conventions: files are `ADR-XXX-brief-title.md` with the next sequential number;
 - [ADR-021](ADR-021-observability-admin-api.md) — Observability admin API (health/readiness/metrics/status HTTP endpoints)
 - [ADR-022](ADR-022-per-query-metrics.md) — Per-query metrics (hit/miss/invalidation/latency)
 - [ADR-046](ADR-046-cache-side-explain-pseudo-function.md) — Cache-side EXPLAIN via an intercepted `pgcache_explain(...)` pseudo-function (no stamping, no new unsafe)
+- [ADR-066](ADR-066-cache-locale-mirroring-and-glibc-host.md) — Cache database created under origin's locale, a fail-closed text-ordering probe at startup, and a Debian (glibc) Docker image in place of Alpine *(extends ADR-056's locale gate)*
 - [ADR-019](ADR-019-anonymous-telemetry.md) — Anonymous telemetry *(Proposed)*
 
 ## Cross-cutting notes

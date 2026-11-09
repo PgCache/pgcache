@@ -5,11 +5,14 @@ use std::thread;
 use arc_swap::ArcSwap;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver, unbounded_channel};
+use tokio_postgres::Client;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument};
 
 use super::cdc_driver::cdc_run;
+use super::collation_probe::collation_probe;
 use super::cpu_monitor::cpu_monitor;
+use super::database_locale::DatabaseLocale;
 use super::memory_monitor::{CountCapEstimator, memory_monitor, shared_buffers_bytes_query};
 use super::population_pool::population_pool_controller;
 use super::reg_gate::reg_gate_controller;
@@ -68,24 +71,46 @@ pub(super) fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
         .map_err(|r| r.context_transform(|_| CacheError::CdcFailure))
         .attach_loc("provisioning replication on origin")?;
 
-    cache_database_reset(settings).attach_loc("resetting cache database")?;
+    // One origin session reads what setup needs from origin: the database
+    // locale the cache database is created under (PGC-587, text served from
+    // cache has to sort as origin sorts it) and the literal-semantics settings
+    // every pgcache session is pinned to (origin's defaults for the role
+    // pgcache connects as, PGC-287 class 2).
+    let origin_facts: CacheResult<(Client, DatabaseLocale, ReferenceSettings)> =
+        handle.block_on(async {
+            let client = pg::connect(&settings.origin, "reference settings")
+                .await
+                .map_into_report::<CacheError>()?;
+            let locale = DatabaseLocale::probe(&client)
+                .await
+                .attach_loc("reading origin's database locale")?;
+            let reference = ReferenceSettings::probe(&client)
+                .await
+                .attach_loc("reading the reference session settings from origin")?;
+            Ok((client, locale, reference))
+        });
+    let (origin_client, origin_locale, reference) =
+        origin_facts.attach_loc("reading origin's locale and reference settings")?;
+    info!("origin database locale: {}", origin_locale.describe());
 
-    // The literal-semantics settings every pgcache session is pinned to:
-    // origin's defaults for the role pgcache connects as (PGC-287 class 2).
-    let reference: CacheResult<ReferenceSettings> = handle.block_on(async {
-        let client = pg::connect(&settings.origin, "reference settings")
-            .await
-            .map_into_report::<CacheError>()?;
-        let reference = ReferenceSettings::probe(&client)
-            .await
-            .attach_loc("reading the reference session settings from origin")?;
+    cache_database_reset(settings, &origin_locale).attach_loc("resetting cache database")?;
+
+    let cache_check: CacheResult<()> = handle.block_on(async {
         let cache_client = pg::connect(&settings.cache, "reference locales")
             .await
             .map_into_report::<CacheError>()?;
         reference.locales_check(&cache_client).await?;
-        Ok(reference)
+        // Same collation name on both sides is not the same order: the
+        // host's libc or ICU build decides, so sort a sample and compare.
+        let cache_locale = DatabaseLocale::probe(&cache_client)
+            .await
+            .attach_loc("reading the cache database locale")?;
+        collation_probe(&origin_client, &cache_client, &origin_locale, &cache_locale)
+            .await
+            .attach_loc("comparing text ordering between origin and the cache database")
     });
-    let reference = reference.attach_loc("establishing the reference session settings")?;
+    cache_check.attach_loc("checking the cache database against origin's locale")?;
+    drop(origin_client);
     info!(
         "reference session settings: TimeZone={} DateStyle=ISO,{} IntervalStyle={} \
          lc_monetary={} lc_numeric={} lc_time={}",

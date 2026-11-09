@@ -13,9 +13,10 @@ use std::sync::{Arc, LazyLock};
 
 use arc_swap::ArcSwap;
 use ecow::EcoString;
+use rootcause::Report;
 use tokio_postgres::Client;
 
-use super::{CacheError, CacheResult, MapIntoReport, ReportExt};
+use super::{CacheError, CacheResult, MapIntoReport, ReportExt, SetupError};
 use crate::query::literal_settings::LiteralSettings;
 
 /// Origin's defaults for the literal-semantics settings.
@@ -34,6 +35,19 @@ pub(crate) struct ReferenceSettings {
 
 /// The locale settings a serve applies, in the order `locales` holds them.
 const LOCALE_GUCS: [&str; 3] = ["lc_monetary", "lc_numeric", "lc_time"];
+
+/// Test-only (fault-injection feature): `PGCACHE_FAULT_REFERENCE_LC_MONETARY`
+/// replaces origin's `lc_monetary` so `locales_check` can be exercised against
+/// a locale the cache host does not have, on one host.
+#[cfg(feature = "fault-injection")]
+fn fault_apply(locales: &mut [String; LOCALE_GUCS.len()]) {
+    if let Ok(value) = std::env::var("PGCACHE_FAULT_REFERENCE_LC_MONETARY") {
+        locales[0] = value;
+    }
+}
+
+#[cfg(not(feature = "fault-injection"))]
+fn fault_apply(_locales: &mut [String; LOCALE_GUCS.len()]) {}
 
 impl Default for ReferenceSettings {
     fn default() -> Self {
@@ -56,6 +70,7 @@ impl ReferenceSettings {
         for (locale, name) in locales.iter_mut().zip(LOCALE_GUCS) {
             *locale = show(name).await?;
         }
+        fault_apply(&mut locales);
         Ok(Self::new(
             &show("TimeZone").await?,
             &show("DateStyle").await?,
@@ -101,12 +116,18 @@ impl ReferenceSettings {
         cache
             .batch_execute(&self.locales_check_sql())
             .await
-            .map_into_report::<CacheError>()
-            .attach_loc(format!(
-                "applying origin's default locales on the cache database \
-                 (lc_monetary={}, lc_numeric={}, lc_time={}): install them on the cache host",
-                self.locales[0], self.locales[1], self.locales[2]
-            ))
+            .map_err(|e| {
+                let detail = e
+                    .as_db_error()
+                    .map_or_else(|| e.to_string(), |db| db.message().to_owned());
+                Report::<CacheError>::from(CacheError::from(SetupError::ReferenceLocales {
+                    lc_monetary: self.locales[0].to_string(),
+                    lc_numeric: self.locales[1].to_string(),
+                    lc_time: self.locales[2].to_string(),
+                    detail,
+                }))
+            })
+            .attach_loc("applying origin's default locales on the cache database")
     }
 
     /// The statements that pin a session to the reference: the date-time

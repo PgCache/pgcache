@@ -1,3 +1,5 @@
+use std::io::{BufRead, BufReader, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -78,6 +80,7 @@ fn main() -> Result<(), Report> {
 
     let settings = match RunMode::from_args()? {
         RunMode::Check(preflight) => return preflight_main(&preflight),
+        RunMode::Healthcheck(socket) => healthcheck_main(socket),
         RunMode::Serve(settings) => *settings,
     };
     let cancel = CancellationToken::new();
@@ -189,6 +192,38 @@ fn main() -> Result<(), Report> {
 
         res
     })
+}
+
+/// `--healthcheck`: GET `/healthz` on the admin socket of a running pgcache
+/// and exit 0 when it answers 200. The container image has no `curl` or
+/// `wget`; this is what its `HEALTHCHECK` runs.
+fn healthcheck_main(socket: SocketAddr) -> ! {
+    let timeout = Duration::from_secs(2);
+    let outcome = TcpStream::connect_timeout(&socket, timeout).and_then(|mut stream| {
+        stream.set_read_timeout(Some(timeout))?;
+        stream.set_write_timeout(Some(timeout))?;
+        stream.write_all(
+            format!("GET /healthz HTTP/1.0\r\nHost: {socket}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )?;
+        let mut status_line = String::new();
+        BufReader::new(stream).read_line(&mut status_line)?;
+        Ok(status_line)
+    });
+    match outcome {
+        Ok(status) if status.split_whitespace().nth(1) == Some("200") => std::process::exit(0),
+        Ok(status) => {
+            eprintln!(
+                "pgcache healthcheck: {socket} answered {}",
+                status.trim_end()
+            );
+            std::process::exit(1)
+        }
+        Err(e) => {
+            eprintln!("pgcache healthcheck: {socket}: {e}");
+            std::process::exit(1)
+        }
+    }
 }
 
 /// `--check`: run the origin readiness checks, print the report and exit.

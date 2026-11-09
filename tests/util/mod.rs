@@ -32,7 +32,8 @@ pub(crate) use process::{
     PgCacheProcess, TempDBs, connect_cache_db, connect_pgcache, connect_pgcache_allowlist,
     connect_pgcache_clock, connect_pgcache_pinned, connect_pgcache_pinned_fault,
     connect_pgcache_pinned_small_cache, connect_pgcache_small_cache, connect_pgcache_tls,
-    pgcache_client_connect, pgtemp_start, proxy_wait_for_ready, start_databases,
+    find_available_port, pgcache_client_connect, pgcache_run_to_exit, pgtemp_start,
+    proxy_wait_for_ready, start_databases,
 };
 pub(crate) use wire::{WireClient, WireMessage, WireResponse};
 

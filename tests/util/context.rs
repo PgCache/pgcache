@@ -138,10 +138,7 @@ impl TestContext {
         F: FnOnce(Client) -> Fut,
         Fut: std::future::Future<Output = Result<Client, Error>>,
     {
-        let (dbs, origin) = start_databases().await?;
-        let origin = before_start(origin).await?;
-        let connected = connect_pgcache(&dbs).await?;
-        Ok(Self::assemble(dbs, origin, connected))
+        Self::setup_before_start_with_args(before_start, &[]).await
     }
 
     /// Read `sql` until it is served from cache. A role's first read of a
@@ -191,6 +188,22 @@ impl TestContext {
     /// regardless of size).
     pub(crate) async fn setup_with_args(extra_args: &[&str]) -> Result<Self, Error> {
         let (dbs, origin) = start_databases().await?;
+        let connected = connect_pgcache_args(&dbs, extra_args).await?;
+        Ok(Self::assemble(dbs, origin, connected))
+    }
+
+    /// [`Self::setup_before_start`] with extra pgcache CLI args, for state
+    /// the args point at (an origin database `before_start` creates).
+    pub(crate) async fn setup_before_start_with_args<F, Fut>(
+        before_start: F,
+        extra_args: &[&str],
+    ) -> Result<Self, Error>
+    where
+        F: FnOnce(Client) -> Fut,
+        Fut: std::future::Future<Output = Result<Client, Error>>,
+    {
+        let (dbs, origin) = start_databases().await?;
+        let origin = before_start(origin).await?;
         let connected = connect_pgcache_args(&dbs, extra_args).await?;
         Ok(Self::assemble(dbs, origin, connected))
     }

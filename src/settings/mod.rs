@@ -324,6 +324,8 @@ pub struct PreflightSettings {
 pub enum RunMode {
     Serve(Box<Settings>),
     Check(Box<PreflightSettings>),
+    /// `--healthcheck`: probe the admin socket of a running pgcache and exit.
+    Healthcheck(SocketAddr),
 }
 
 #[derive(Debug, Clone)]

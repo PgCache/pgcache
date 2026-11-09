@@ -165,6 +165,39 @@ error_set! {
         ExtensionOutdated {
             function: &'static str,
         },
+        /// The cache host lacks a locale every serve applies (origin's default
+        /// `lc_monetary`, `lc_numeric` or `lc_time`), so no hit could ever be
+        /// served; refuse at startup (PGC-477).
+        #[display("cache host cannot apply origin's default locales (lc_monetary={lc_monetary}, lc_numeric={lc_numeric}, lc_time={lc_time}): {detail}; install them on the cache host")]
+        ReferenceLocales {
+            lc_monetary: String,
+            lc_numeric: String,
+            lc_time: String,
+            detail: String,
+        },
+        /// The cache cluster cannot create a database under origin's locale
+        /// (PGC-587); serving under another would reorder text.
+        #[display("cache database cannot be created with origin's locale ({locale}): install the locale on the cache host, or run the cache on a PostgreSQL whose locale provider matches origin's")]
+        DatabaseLocale {
+            locale: String,
+        },
+        /// The cache database came up under another locale provider than
+        /// origin's, so the same collation name means different rules.
+        #[display("cache database uses the {cache} locale provider where origin uses {origin}; the cache cluster's template default took over, so recreate the cache cluster with a matching --locale-provider")]
+        LocaleProviderMismatch {
+            origin: &'static str,
+            cache: &'static str,
+        },
+        /// The cache host's libc or ICU orders text differently from origin's
+        /// under the same collation name (PGC-587).
+        #[display("cache host orders text differently from origin: at sample position {position} origin has {origin_string:?} where the cache has {cache_string:?} (origin {origin_locale}; cache {cache_locale}); run the cache on a host whose libc or ICU build matches origin's")]
+        CollationMismatch {
+            position: usize,
+            origin_string: String,
+            cache_string: String,
+            origin_locale: String,
+            cache_locale: String,
+        },
     }
 
 

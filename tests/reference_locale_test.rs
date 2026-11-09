@@ -3,10 +3,13 @@
 //! pgoutput is parsed back under the same `lc_monetary`.
 
 use std::io::Error;
+use std::time::Duration;
 
 use tokio_postgres::SimpleQueryMessage;
 
-use crate::util::{TestContext, assert_cache_hit, assert_cache_miss};
+use crate::util::{
+    TestContext, assert_cache_hit, assert_cache_miss, pgcache_run_to_exit, start_databases,
+};
 
 mod util;
 
@@ -71,5 +74,35 @@ async fn test_money_round_trips_under_origin_locale() -> Result<(), Error> {
         "applied from pgoutput under origin's locale"
     );
     let _ = assert_cache_hit(&mut ctx, m).await?;
+    Ok(())
+}
+
+/// Origin's default `lc_monetary` is a locale the cache host does not have:
+/// startup is refused naming the locales, instead of coming up on a host that
+/// could never serve a hit. On musl the gate passed vacuously, since its
+/// `setlocale` accepts any name (PGC-477, PGC-587).
+#[tokio::test]
+async fn test_startup_refused_when_origin_locale_is_missing_on_cache_host() -> Result<(), Error> {
+    let (dbs, _origin) = start_databases().await?;
+    let output = pgcache_run_to_exit(
+        &dbs,
+        &["--cache_policy", "fifo"],
+        &[("PGCACHE_FAULT_REFERENCE_LC_MONETARY", "xx_XX.UTF-8")],
+        Duration::from_secs(60),
+    )?;
+    assert!(!output.status.success(), "startup refused");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        text.contains("install them on the cache host"),
+        "names the remedy: {text}"
+    );
+    assert!(
+        text.contains("lc_monetary=xx_XX.UTF-8"),
+        "names the missing locale: {text}"
+    );
     Ok(())
 }

@@ -1,8 +1,10 @@
 use rootcause::Report;
 use tokio::runtime::Builder;
+use tokio_postgres::error::SqlState;
 use tokio_postgres::{Client, Config, NoTls};
 use tracing::{debug, error};
 
+use super::database_locale::{DatabaseLocale, server_version_num};
 use crate::cache::{CacheError, CacheResult, MapIntoReport, ReportExt, SetupError};
 use crate::result::error_chain_format;
 use crate::settings::Settings;
@@ -11,8 +13,12 @@ use crate::settings::Settings;
 const STAMP_RANGE_SIGNATURE: &str =
     "pgcache_generation_stamp_range(oid, oid, bigint, integer, integer)";
 
-/// Reset the cache database by dropping and recreating it
-pub(super) fn cache_database_reset(settings: &Settings) -> CacheResult<()> {
+/// Reset the cache database by dropping and recreating it under origin's
+/// locale, so text collates on the cache as it does on origin (PGC-587).
+pub(super) fn cache_database_reset(
+    settings: &Settings,
+    locale: &DatabaseLocale,
+) -> CacheResult<()> {
     let rt = Builder::new_current_thread()
         .enable_all()
         .build()
@@ -57,11 +63,31 @@ pub(super) fn cache_database_reset(settings: &Settings) -> CacheResult<()> {
             .map_into_report::<CacheError>()
             .attach_loc("dropping cache database")?;
 
-        admin_client
-            .execute(&format!("CREATE DATABASE {db_name}"), &[])
+        // No fallback to the template's locale: a cache that sorts text
+        // differently from origin serves wrong orders, so refuse instead.
+        // Only a locale the server rejects is a locale problem; a full disk or
+        // a busy template0 keeps its own error.
+        let cache_version = server_version_num(&admin_client).await?;
+        if let Err(e) = admin_client
+            .execute(&locale.create_database_sql(db_name, cache_version), &[])
             .await
-            .map_into_report::<CacheError>()
-            .attach_loc("creating cache database")?;
+        {
+            let locale_rejected = matches!(
+                e.code(),
+                Some(&SqlState::INVALID_PARAMETER_VALUE)
+                    | Some(&SqlState::FEATURE_NOT_SUPPORTED)
+                    | Some(&SqlState::SYNTAX_ERROR)
+            );
+            return Err(if locale_rejected {
+                Report::<CacheError>::from(CacheError::from(SetupError::DatabaseLocale {
+                    locale: locale.describe(),
+                }))
+                .attach_loc(format!("creating cache database: {e}"))
+            } else {
+                Report::<CacheError>::from(CacheError::from(e))
+                    .attach_loc("creating cache database")
+            });
+        }
 
         // Connect to fresh cache database and create extension
         let (cache_client, cache_conn) = Config::new()

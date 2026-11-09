@@ -6,8 +6,10 @@ use std::{
     net::TcpListener,
     ops::{Deref, DerefMut},
     path::Path,
-    process::{Child, Command, Stdio},
+    process::{Child, Command, Output, Stdio},
     sync::Once,
+    thread::JoinHandle,
+    time::{Duration, Instant},
 };
 
 use pgcache_lib::tls::{MakeRustlsConnect, tls_config_with_cert};
@@ -28,7 +30,7 @@ fn crypto_provider_init() {
     });
 }
 
-pub(super) fn find_available_port() -> Result<u16, Error> {
+pub(crate) fn find_available_port() -> Result<u16, Error> {
     // Bind to port 0 to let the OS assign an available port
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
@@ -372,6 +374,58 @@ pub(crate) async fn connect_pgcache(
     cdc_startup_wait(metrics_port).await?;
     let client = pgcache_client_connect(listen_port).await?;
     Ok((pgcache, listen_port, metrics_port, client))
+}
+
+/// Run pgcache to exit with the args and environment given and return its
+/// status and output, for a startup pgcache is expected to refuse. Waits at
+/// most `timeout`; a process still running then is killed and reported.
+pub(crate) fn pgcache_run_to_exit(
+    dbs: &TempDBs,
+    extra_args: &[&str],
+    env: &[(&str, &str)],
+    timeout: Duration,
+) -> Result<Output, Error> {
+    let listen_port = find_available_port()?;
+    let metrics_port = find_available_port()?;
+    let mut cmd = pgcache_cmd(dbs, listen_port, metrics_port, extra_args);
+    for (name, value) in env {
+        cmd.env(name, value);
+    }
+    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    // Drain both pipes while waiting: pgcache logs synchronously, and a full
+    // pipe would stall it before the line the caller is looking for.
+    let stdout = pipe_drain(child.stdout.take());
+    let stderr = pipe_drain(child.stderr.take());
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if started.elapsed() > timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Error::other(format!(
+                "pgcache still running after {timeout:?}; expected it to exit"
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    Ok(Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    })
+}
+
+/// Read a child's pipe to EOF on its own thread.
+fn pipe_drain<R: Read + Send + 'static>(pipe: Option<R>) -> JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut bytes);
+        }
+        bytes
+    })
 }
 
 /// Connect to pgcache with extra CLI args appended after the default

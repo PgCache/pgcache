@@ -178,6 +178,7 @@ pub(super) struct CliArgs {
     pub(super) pinned_tables: Option<String>,
     pub(super) telemetry_off: bool,
     pub(super) check: bool,
+    pub(super) healthcheck: bool,
 }
 
 /// CLI values for the runtime-adjustable settings ([`DynamicConfig`]).
@@ -438,6 +439,7 @@ fn cli_args_parse() -> ConfigResult<(CliArgs, Option<SettingsToml>, Option<PathB
             Long("pinned_tables") => args.pinned_tables = Some(arg_string(&mut parser)?),
             Long("telemetry_off") => args.telemetry_off = true,
             Long("check") => args.check = true,
+            Long("healthcheck") => args.healthcheck = true,
             Long("help") => {
                 Settings::print_usage_and_exit(parser.bin_name().unwrap_or_default());
             }
@@ -784,9 +786,30 @@ pub(super) fn settings_build_cli_only(args: CliArgs) -> ConfigResult<Settings> {
     })
 }
 
+/// The admin socket `--healthcheck` probes: the flag, else the config file's
+/// `[metrics]` socket. Without either there is nothing to probe.
+fn healthcheck_socket_resolve(
+    flag: Option<SocketAddr>,
+    config: Option<&SettingsToml>,
+) -> ConfigResult<SocketAddr> {
+    flag.or_else(|| config.and_then(|c| c.metrics.as_ref()).map(|m| m.socket))
+        .ok_or_else(|| {
+            ConfigError::ArgumentMissing {
+                name: "metrics_socket",
+            }
+            .into()
+        })
+}
+
 impl RunMode {
     pub fn from_args() -> ConfigResult<RunMode> {
         let (args, config, config_path) = cli_args_parse()?;
+        if args.healthcheck {
+            return Ok(RunMode::Healthcheck(healthcheck_socket_resolve(
+                args.metrics_socket,
+                config.as_ref(),
+            )?));
+        }
         if args.check {
             return Ok(RunMode::Check(Box::new(preflight_settings_build(
                 args, config,
@@ -830,7 +853,8 @@ impl Settings {
             [--pinned_tables TABLE1,TABLE2,...] (pin SELECT * FROM table for each table) \n \
             [--log_level LEVEL] (e.g., debug, info, pgcache_lib::cache=debug) \n \
             [--telemetry_off] (disable anonymous telemetry) \n \
-            [--check] (check the origin is ready for pgcache, print a report and exit; cache settings not needed)"
+            [--check] (check the origin is ready for pgcache, print a report and exit; cache settings not needed) \n \
+            [--healthcheck] (probe a running pgcache's /healthz on --metrics_socket and exit 0 when it answers; for container health checks)"
         );
         std::process::exit(1);
     }
