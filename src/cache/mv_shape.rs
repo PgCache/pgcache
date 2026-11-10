@@ -25,6 +25,11 @@ pub enum ShapeGate {
     /// (the source-row cache already holds exactly these rows), `UNION ALL`
     /// (trivial concat of cached branches), and `VALUES`.
     Skip,
+    /// The result must be computed afresh on every hit: the SELECT list
+    /// calls a stable function (`now()`, `to_char(...)`) whose value a
+    /// materialized result or a memoized response would freeze (PGC-589).
+    /// Never materialize, never memoize; every hit serves source rows.
+    Recompute,
 }
 
 /// Whether every ORDER BY item of the query can be served: an ORDER BY of

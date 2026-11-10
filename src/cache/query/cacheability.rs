@@ -4,10 +4,10 @@
 use ecow::EcoString;
 
 use super::CacheabilityError;
-use crate::catalog::{FunctionCatalog, FunctionFacts, FunctionVolatility};
+use crate::catalog::{FunctionCatalog, FunctionFacts, FunctionVolatility, is_settings_stable};
 use crate::query::ast::rope::{
-    Body, Case, Function, Join, JoinQual, NodeKind, Operator, Query, QueryTree, Scalar, ScalarKind,
-    Select, SelectItem, Source, Where, WhereKind,
+    Body, Case, FrameBound, Function, Join, JoinQual, NodeKind, Operator, Query, QueryTree, Scalar,
+    ScalarKind, Select, SelectItem, Source, Where, WhereKind, Window,
 };
 use crate::query::ast::{Deparse, JoinType, LiteralValue, ScalarOp};
 
@@ -40,11 +40,14 @@ fn pg_prefixed(s: &str) -> bool {
 
 /// Where in the query tree a cacheability check is being evaluated.
 ///
-/// Functions in the SELECT list are safe (re-evaluated against cached rows);
-/// immutable functions are safe in any context; non-immutable functions in
-/// a WHERE, a join's ON or a FILTER are rejected. A join's ON also rejects
-/// subqueries: decorrelation reads only WHERE, so a correlated one there
-/// would register in its correlated form.
+/// An immutable function is cacheable wherever it stands. A volatile one
+/// never is: it may answer differently per call or have side effects, which
+/// no replay on the cache database reproduces. A stable one is cacheable in
+/// the SELECT list alone, and only an allowlisted builtin whose result the
+/// serve recomputes per hit from the clock and the session's settings
+/// (PGC-589); elsewhere it would decide membership or order. A join's ON
+/// also rejects subqueries: decorrelation reads only WHERE, so a correlated
+/// one there would register in its correlated form.
 #[derive(Clone, Copy)]
 enum ExprContext {
     WhereClause,
@@ -53,10 +56,7 @@ enum ExprContext {
 }
 
 /// A query body: SELECT nodes and set-operation branches recursively.
-pub(super) fn body_cacheable(
-    body: Body<'_>,
-    functions: &dyn FunctionFacts,
-) -> Result<(), CacheabilityError> {
+fn body_cacheable(body: Body<'_>, functions: &dyn FunctionFacts) -> Result<(), CacheabilityError> {
     match body {
         Body::Select(select) => select_cacheable(select, functions),
         Body::Values(_) => Err(CacheabilityError::UnsupportedQueryType { kind: "VALUES" }),
@@ -65,10 +65,23 @@ pub(super) fn body_cacheable(
             if set_op.left().has_limit() || set_op.right().has_limit() {
                 return Err(CacheabilityError::HasLimit);
             }
-            body_cacheable(set_op.left().body(), functions)?;
-            body_cacheable(set_op.right().body(), functions)
+            query_cacheable(set_op.left(), functions)?;
+            query_cacheable(set_op.right(), functions)
         }
     }
+}
+
+/// A query: its body and its ORDER BY, whose expressions decide the order
+/// served and are judged like a predicate.
+pub(super) fn query_cacheable(
+    query: Query<'_>,
+    functions: &dyn FunctionFacts,
+) -> Result<(), CacheabilityError> {
+    body_cacheable(query.body(), functions)?;
+    for clause in query.order_by() {
+        scalar_cacheable(clause.expr(), ExprContext::WhereClause, functions)?;
+    }
+    Ok(())
 }
 
 fn select_cacheable(
@@ -83,6 +96,11 @@ fn select_cacheable(
         if let SelectItem::Expr(expr) = item {
             scalar_cacheable(expr.expr(), ExprContext::SelectList, functions)?;
         }
+    }
+    // GROUP BY admits column references only (the converter refuses
+    // expressions there); HAVING filters groups like a WHERE filters rows.
+    if let Some(having) = select.having() {
+        where_cacheable(having, ExprContext::WhereClause, functions)?;
     }
     Ok(())
 }
@@ -106,9 +124,9 @@ fn from_supported(
                 });
             }
             // LIMIT in a derived table is valid SQL, so only the body is checked.
-            body_cacheable(subquery.query().body(), functions)
+            query_cacheable(subquery.query(), functions)
         }
-        (Some(Source::CteRef(cte_ref)), None) => body_cacheable(cte_ref.query().body(), functions),
+        (Some(Source::CteRef(cte_ref)), None) => query_cacheable(cte_ref.query(), functions),
         (None, _) => Err(CacheabilityError::UnsupportedFrom {
             construct: "no FROM clause",
         }),
@@ -134,9 +152,9 @@ fn source_supported(
                     kind: "derived table without alias",
                 });
             }
-            body_cacheable(subquery.query().body(), functions)
+            query_cacheable(subquery.query(), functions)
         }
-        Source::CteRef(cte_ref) => body_cacheable(cte_ref.query().body(), functions),
+        Source::CteRef(cte_ref) => query_cacheable(cte_ref.query(), functions),
     }
 }
 
@@ -194,7 +212,7 @@ fn subquery_inner_cacheable(
             construct: "subquery in join condition",
         });
     }
-    body_cacheable(query.body(), functions)
+    query_cacheable(query, functions)
 }
 
 fn scalar_cacheable(
@@ -234,7 +252,7 @@ fn scalar_cacheable(
 
 /// An operator whose every overload is immutable passes anywhere; one with a
 /// STABLE overload (`@@`, `||`) only in the SELECT list, as a stable
-/// function does.
+/// function does: its rendering depends on the session's settings alone.
 fn operator_volatility_check(
     operator: Operator<'_>,
     ctx: ExprContext,
@@ -250,10 +268,11 @@ fn operator_volatility_check(
     Ok(())
 }
 
-/// A function call: immutable everywhere, any volatility in the SELECT list
-/// (re-evaluated at serve time); its arguments and FILTER must be cacheable.
-/// Judged by what `functions` knows of the call: the proxy's catalog-only
-/// view, or the writer's with the search_path in force.
+/// A function call: immutable, or an allowlisted stable builtin in the
+/// SELECT list, with cacheable arguments, FILTER and window. Judged by what
+/// `functions` knows of the call: the proxy's catalog-only view, or the
+/// writer's with the search_path in force. A call no row answers is
+/// non-immutable, conservatively.
 fn function_cacheable(
     function: Function<'_>,
     ctx: ExprContext,
@@ -262,11 +281,23 @@ fn function_cacheable(
     let schema = function.schema().map(EcoString::as_str);
     let name = function.name();
     let arg_count = u32::try_from(function.args().len()).unwrap_or(u32::MAX);
-    let worst = functions.call_volatility(schema, name, arg_count);
-    if worst != Some(FunctionVolatility::Immutable) && !matches!(ctx, ExprContext::SelectList) {
-        return Err(CacheabilityError::NonImmutableFunction {
-            function: name.to_lowercase(),
-        });
+    match functions.call_volatility(schema, name, arg_count) {
+        Some(FunctionVolatility::Immutable) => {}
+        Some(FunctionVolatility::Volatile) => {
+            return Err(CacheabilityError::VolatileFunction {
+                function: name.to_lowercase(),
+            });
+        }
+        Some(FunctionVolatility::Stable)
+            if matches!(ctx, ExprContext::SelectList)
+                && schema.is_none_or(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
+                && is_settings_stable(name)
+                && functions.call_only_builtins(schema, name, arg_count) => {}
+        Some(FunctionVolatility::Stable) | None => {
+            return Err(CacheabilityError::NonImmutableFunction {
+                function: name.to_lowercase(),
+            });
+        }
     }
     for arg in function.args() {
         scalar_cacheable(arg, ctx, functions)?;
@@ -275,6 +306,32 @@ fn function_cacheable(
     // rejected as in a WHERE.
     if let Some(filter) = function.filter() {
         where_cacheable(filter, ExprContext::WhereClause, functions)?;
+    }
+    if let Some(window) = function.over() {
+        window_cacheable(window, functions)?;
+    }
+    Ok(())
+}
+
+/// A window's PARTITION BY, ORDER BY and frame offsets decide which rows a
+/// window function sees, so they are judged like a predicate.
+fn window_cacheable(
+    window: Window<'_>,
+    functions: &dyn FunctionFacts,
+) -> Result<(), CacheabilityError> {
+    for expr in window.partition_by() {
+        scalar_cacheable(expr, ExprContext::WhereClause, functions)?;
+    }
+    for clause in window.order_by() {
+        scalar_cacheable(clause.expr(), ExprContext::WhereClause, functions)?;
+    }
+    if let Some(frame) = window.frame() {
+        for bound in [frame.start(), frame.end()] {
+            if let FrameBound::OffsetPreceding(offset) | FrameBound::OffsetFollowing(offset) = bound
+            {
+                scalar_cacheable(offset, ExprContext::WhereClause, functions)?;
+            }
+        }
     }
     Ok(())
 }
@@ -295,6 +352,26 @@ fn case_cacheable(
         scalar_cacheable(default, ctx, functions)?;
     }
     Ok(())
+}
+
+/// Whether the query calls a stable function or operator: one the serve
+/// must evaluate per hit, since a materialized result or a memoized
+/// response would freeze its value (PGC-589). On a cacheable query such a
+/// call stands in the SELECT list, the one place the rule admits it.
+pub fn query_tree_has_stable_call(tree: &QueryTree, functions: &dyn FunctionFacts) -> bool {
+    tree.nodes().any(|node| {
+        if let NodeKind::Function {
+            schema,
+            name,
+            arg_count,
+            ..
+        } = &node.kind
+        {
+            return functions.call_volatility(schema.as_deref(), name, *arg_count)
+                == Some(FunctionVolatility::Stable);
+        }
+        matches!(&node.kind, NodeKind::Operator { op, .. } if matches!(op, ScalarOp::Json(op) if !op.is_immutable()))
+    })
 }
 
 /// Whether the query contains any function that can modify the database:
@@ -320,7 +397,7 @@ mod tests {
 
     use super::*;
     use crate::cache::query::CacheableQuery;
-    use crate::catalog::FunctionRow;
+    use crate::catalog::{FunctionRow, PathFunctions};
     use crate::query::ast::query_tree_parse;
 
     /// A test catalog of common builtins.
@@ -338,12 +415,20 @@ mod tests {
             "replace",
             "substring",
             "date_trunc",
+            "count",
+            "sum",
+            "avg",
+            "min",
+            "max",
+            "row_number",
         ]
         .into_iter()
         .map(|name| (name, FunctionVolatility::Immutable));
         let rows = immutable
             .chain([
                 ("now", FunctionVolatility::Stable),
+                ("to_char", FunctionVolatility::Stable),
+                ("pg_backend_pid", FunctionVolatility::Stable),
                 ("random", FunctionVolatility::Volatile),
             ])
             .map(|(name, volatility)| FunctionRow::test_builtin(name, volatility))
@@ -380,7 +465,11 @@ mod tests {
         );
         assert_eq!(
             display("SELECT id FROM a WHERE score > RANDOM()"),
-            "Non-immutable function: random"
+            "Volatile function: random"
+        );
+        assert_eq!(
+            display("SELECT id FROM a WHERE created_at > now()"),
+            "Non-immutable function: now"
         );
         assert_eq!(
             display("SELECT relname FROM pg_catalog.pg_class"),
@@ -569,7 +658,8 @@ mod tests {
             assert!(
                 matches!(
                     check_cacheable(sql),
-                    Err(CacheabilityError::NonImmutableFunction { .. })
+                    Err(CacheabilityError::NonImmutableFunction { .. }
+                        | CacheabilityError::VolatileFunction { .. })
                 ),
                 "{sql}"
             );
@@ -876,13 +966,10 @@ mod tests {
     }
 
     #[test]
-    fn test_case_with_nested_function_cacheable() {
+    fn test_case_with_nested_stable_function_cacheable_in_select_list() {
         let sql = "SELECT CASE WHEN date_trunc('day', now()) = '2024-01-01' THEN 'yes' ELSE 'no' END FROM orders WHERE tenant_id = 1";
         let result = check_cacheable(sql);
-        assert!(
-            result.is_ok(),
-            "CASE with nested function calls should be cacheable: {result:?}"
-        );
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[test]
@@ -938,12 +1025,13 @@ mod tests {
             matches!(&err, CacheabilityError::NonImmutableFunction { .. }),
             "{err}"
         );
-        for sql in [
-            "SELECT myschema.lower(name) FROM users",
-            "SELECT id FROM users WHERE app.tenant_of(id) = 1",
-        ] {
-            assert!(check_cacheable(sql).is_ok(), "{sql}");
-        }
+        let err = check_cacheable("SELECT myschema.lower(name) FROM users")
+            .expect_err("unknown in that schema, in the SELECT list too");
+        assert!(
+            matches!(&err, CacheabilityError::NonImmutableFunction { function } if function == "lower"),
+            "{err}"
+        );
+        assert!(check_cacheable("SELECT id FROM users WHERE app.tenant_of(id) = 1").is_ok());
     }
 
     #[test]
@@ -1001,7 +1089,7 @@ mod tests {
         let sql = "SELECT * FROM orders WHERE random() > 0.5";
         let result = check_cacheable(sql);
         assert!(
-            matches!(result, Err(CacheabilityError::NonImmutableFunction { .. })),
+            matches!(result, Err(CacheabilityError::VolatileFunction { .. })),
             "Volatile function in WHERE should not be cacheable: {result:?}"
         );
     }
@@ -1018,7 +1106,7 @@ mod tests {
 
     /// The json operators whose every overload is immutable pass anywhere
     /// (PGC-577); `@@` and `||`, which have STABLE overloads, follow the
-    /// stable-function rule: SELECT list only.
+    /// stable-function rule.
     #[test]
     fn test_json_operators_follow_the_function_volatility_rule() {
         for sql in [
@@ -1034,6 +1122,7 @@ mod tests {
         for (sql, operator) in [
             ("SELECT id FROM docs WHERE data || '{}' = '{}'", "||"),
             ("SELECT id FROM docs WHERE data @@ '$.a == 1'", "@@"),
+            ("SELECT id FROM docs ORDER BY data || '{}'", "||"),
             (
                 "SELECT id FROM docs JOIN other ON other.data @@ docs.data",
                 "@@",
@@ -1057,15 +1146,126 @@ mod tests {
         );
     }
 
+    /// A stable builtin on the allowlist is cacheable in the SELECT list,
+    /// where the serve recomputes it per hit; anywhere else it would decide
+    /// membership or order (PGC-589).
     #[test]
-    fn test_stable_function_in_select_list_cacheable() {
-        // Functions in SELECT list are always allowed (re-evaluated at serve time)
-        let sql = "SELECT now() FROM orders WHERE tenant_id = 1";
-        let result = check_cacheable(sql);
+    fn test_allowlisted_stable_function_cacheable_in_select_list_only() {
+        for sql in [
+            "SELECT now() FROM orders WHERE tenant_id = 1",
+            "SELECT to_char(created_at, 'YYYY'), pg_catalog.now() FROM orders WHERE tenant_id = 1",
+            "SELECT count(*), to_char(now(), 'HH24') FROM orders GROUP BY tenant_id",
+        ] {
+            assert!(check_cacheable(sql).is_ok(), "{sql}");
+        }
+        for sql in [
+            "SELECT id FROM orders ORDER BY now()",
+            "SELECT id FROM orders WHERE created_at > now()",
+            "SELECT count(*) FROM orders GROUP BY tenant_id HAVING max(created_at) > now()",
+            "SELECT row_number() OVER (ORDER BY to_char(created_at, 'YYYY')) FROM orders",
+        ] {
+            let err = check_cacheable(sql).expect_err(sql);
+            assert!(
+                matches!(&err, CacheabilityError::NonImmutableFunction { .. }),
+                "{sql}: {err}"
+            );
+        }
+    }
+
+    /// A stable call outside the allowlist forwards even in the SELECT
+    /// list: a builtin reading connection state answers for the cache
+    /// connection, and a user function reads tables the cache holds in
+    /// part. A user overload of an allowlisted name is for the writer, with
+    /// the search_path in hand.
+    #[test]
+    fn test_stable_function_outside_the_allowlist_not_cacheable() {
+        for sql in [
+            "SELECT pg_backend_pid() FROM orders WHERE id = 1",
+            "SELECT app.tenant_clock(id) FROM orders WHERE id = 1",
+            "SELECT tenant_clock(id) FROM orders WHERE id = 1",
+        ] {
+            let err = check_cacheable(sql).expect_err(sql);
+            assert!(
+                matches!(&err, CacheabilityError::NonImmutableFunction { .. }),
+                "{sql}: {err}"
+            );
+        }
+        let catalog = FunctionCatalog::from_rows(vec![
+            FunctionRow::test_builtin("to_char", FunctionVolatility::Stable),
+            FunctionRow::test_user("app", "to_char", FunctionVolatility::Stable),
+        ]);
+        let tree = query_tree_parse("SELECT to_char(n, '999') FROM a").expect("convert");
         assert!(
-            result.is_ok(),
-            "Stable function in SELECT list should be cacheable: {result:?}"
+            CacheableQuery::cacheable(&tree, &catalog).is_ok(),
+            "a builtin answers: the writer decides on the path"
         );
+        let on_app = PathFunctions {
+            catalog: &catalog,
+            search_path: &["app", "public"],
+        };
+        let err = CacheableQuery::cacheable(&tree, &on_app).expect_err("user overload on the path");
+        assert!(
+            matches!(&err, CacheabilityError::NonImmutableFunction { .. }),
+            "{err}"
+        );
+        let on_public = PathFunctions {
+            catalog: &catalog,
+            search_path: &["public"],
+        };
+        assert!(CacheableQuery::cacheable(&tree, &on_public).is_ok());
+    }
+
+    /// The scan the shape gate reads: a stable call or operator anywhere in
+    /// a cacheable query means the serve must recompute the result per hit.
+    #[test]
+    fn test_query_tree_has_stable_call() {
+        let functions = test_function_catalog();
+        let has = |sql: &str| {
+            query_tree_has_stable_call(&query_tree_parse(sql).expect("convert"), &functions)
+        };
+        assert!(has("SELECT now(), id FROM a"));
+        assert!(has(
+            "SELECT count(*), to_char(max(created_at), 'YYYY') FROM a"
+        ));
+        assert!(has("SELECT data || '{}' FROM docs"));
+        assert!(!has("SELECT lower(name), count(*) FROM a GROUP BY name"));
+        assert!(!has("SELECT data -> 'a' FROM docs"));
+    }
+
+    /// A volatile call is refused wherever it stands: it may answer
+    /// differently per call or have side effects, which a replay on the
+    /// cache database never reproduces (PGC-589). Every clause is judged,
+    /// subqueries and set-operation branches included.
+    #[test]
+    fn test_volatile_function_refused_in_every_clause() {
+        for sql in [
+            "SELECT random(), id FROM a",
+            "SELECT id FROM a ORDER BY random()",
+            "SELECT count(*) FROM a GROUP BY id HAVING count(*) > random()",
+            "SELECT row_number() OVER (ORDER BY random()) FROM a",
+            "SELECT row_number() OVER (PARTITION BY random()) FROM a",
+            "SELECT sum(id) OVER (ORDER BY id ROWS BETWEEN random()::int PRECEDING AND CURRENT ROW) FROM a",
+            "SELECT id FROM (SELECT id FROM a ORDER BY random()) s",
+            "SELECT id FROM a UNION SELECT id FROM b ORDER BY random()",
+            "SELECT (SELECT id FROM b ORDER BY random() LIMIT 1) FROM a",
+            "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b ORDER BY random())",
+            "SELECT count(*) FILTER (WHERE random() > 0.5) FROM a",
+            "SELECT lower(random()::text) FROM a",
+        ] {
+            let err = check_cacheable(sql).expect_err(sql);
+            assert!(
+                matches!(&err, CacheabilityError::VolatileFunction { function } if function == "random"),
+                "{sql}: {err}"
+            );
+        }
+        for sql in [
+            "SELECT count(*), sum(amount), max(id) FROM orders WHERE tenant_id = 1",
+            "SELECT row_number() OVER (PARTITION BY tenant_id ORDER BY id) FROM orders",
+            "SELECT id FROM orders ORDER BY lower(name)",
+            "SELECT count(*) FROM orders GROUP BY tenant_id HAVING count(*) > 1",
+        ] {
+            assert!(check_cacheable(sql).is_ok(), "{sql}");
+        }
     }
 
     #[test]

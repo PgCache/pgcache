@@ -277,7 +277,9 @@ mod classify_tests {
 
     use super::*;
     use crate::cache::query::CacheableQuery;
-    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, FunctionCatalog, TableMetadata};
+    use crate::catalog::{
+        Catalog, ColumnMetadata, ColumnPosition, FunctionCatalog, FunctionVolatility, TableMetadata,
+    };
     use crate::oid::{Oid, TypeOid};
     use crate::query::ast::query_tree_parse;
     use crate::query::resolve::ResolvedQuery;
@@ -300,8 +302,11 @@ mod classify_tests {
 
     fn resolve(sql: &str, tables: &Catalog) -> ResolvedQuery {
         let tree = query_tree_parse(sql).expect("convert");
-        let cacheable =
-            CacheableQuery::try_new(tree, &FunctionCatalog::default()).expect("cacheable");
+        let cacheable = CacheableQuery::try_new(
+            tree,
+            &FunctionCatalog::test_builtins([("count", FunctionVolatility::Immutable)]),
+        )
+        .expect("cacheable");
         let tree = cacheable.tree().clone();
         ResolvedQuery::resolve(tree, tables, &["public"]).expect("resolve")
     }

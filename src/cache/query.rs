@@ -11,8 +11,8 @@ mod cacheability;
 mod limit;
 mod request;
 
-pub use cacheability::query_tree_has_volatile_function;
-use cacheability::{body_cacheable, references_system_catalog};
+use cacheability::{query_cacheable, references_system_catalog};
+pub use cacheability::{query_tree_has_stable_call, query_tree_has_volatile_function};
 
 pub use limit::{limit_clause_of, limit_is_sufficient, limit_rows_needed};
 pub use request::RequestQuery;
@@ -33,12 +33,21 @@ error_set! {
         UnsupportedSubquery {
             kind: &'static str,
         },
+        /// A STABLE call, or one no catalog row answers, where only an
+        /// immutable one is cacheable.
         #[display("Non-immutable function: {function}")]
         NonImmutableFunction {
             function: EcoString,
         },
-        /// An operator with a STABLE overload (`@@`, `||`) outside the
-        /// SELECT list, under the rule for stable functions.
+        /// A VOLATILE call anywhere: its result may differ per call and it
+        /// may have side effects, neither of which a replay on the cache
+        /// database reproduces (PGC-589).
+        #[display("Volatile function: {function}")]
+        VolatileFunction {
+            function: EcoString,
+        },
+        /// An operator with a STABLE overload (`@@`, `||`), under the rule
+        /// for stable functions.
         #[display("Non-immutable operator: {operator}")]
         NonImmutableOperator {
             operator: EcoString,
@@ -96,8 +105,8 @@ impl CacheableQuery {
     /// cacheability before choosing whether to build the (owning) value or run
     /// further analysis on the same borrow.
     ///
-    /// Validates the query structure and ensures all functions in WHERE/FROM
-    /// clauses are immutable. Functions in SELECT lists are always allowed.
+    /// Validates the query structure and the volatility of every function
+    /// and operator in every clause.
     pub fn cacheable(
         tree: &QueryTree,
         functions: &dyn FunctionFacts,
@@ -107,7 +116,7 @@ impl CacheableQuery {
         // "unacceptable schema name". Reject up front and forward to origin —
         // e.g. psql's \d, which queries pg_class/pg_namespace.
         references_system_catalog(tree)?;
-        body_cacheable(tree.root().body(), functions)
+        query_cacheable(tree.root(), functions)
     }
 
     /// Build a cacheable query, validating it first. Fails with the same

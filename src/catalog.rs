@@ -24,7 +24,7 @@ mod function;
 
 pub use function::{
     FUNCTION_CATALOG_SQL, FunctionCatalog, FunctionFacts, FunctionKind, FunctionRow,
-    FunctionVolatility, PathFunctions, SharedFunctionCatalog, is_sql_form,
+    FunctionVolatility, PathFunctions, SharedFunctionCatalog, is_settings_stable, is_sql_form,
 };
 
 /// Column storage: sorted by position with O(1) name lookups.

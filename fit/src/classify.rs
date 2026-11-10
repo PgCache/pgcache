@@ -108,6 +108,7 @@ pub enum PassthroughReason {
     UnsupportedFrom,
     UnsupportedSubquery,
     NonImmutableFunction,
+    VolatileFunction,
     NonImmutableOperator,
     HasLimit,
     SystemCatalogReference,
@@ -126,6 +127,7 @@ impl PassthroughReason {
             PassthroughReason::UnsupportedFrom => "unsupported FROM clause",
             PassthroughReason::UnsupportedSubquery => "unsupported subquery",
             PassthroughReason::NonImmutableFunction => "non-immutable function",
+            PassthroughReason::VolatileFunction => "volatile function",
             PassthroughReason::NonImmutableOperator => "non-immutable operator",
 
             PassthroughReason::HasLimit => "LIMIT not cacheable here",
@@ -156,6 +158,10 @@ fn cacheability_reason(error: &CacheabilityError) -> (PassthroughReason, Option<
         ),
         CacheabilityError::NonImmutableFunction { function } => (
             PassthroughReason::NonImmutableFunction,
+            Some(function.to_string()),
+        ),
+        CacheabilityError::VolatileFunction { function } => (
+            PassthroughReason::VolatileFunction,
             Some(function.to_string()),
         ),
         CacheabilityError::NonImmutableOperator { operator } => (
@@ -463,9 +469,7 @@ mod tests {
         let verdict = classify("SELECT * FROM users WHERE id = floor(random() * 100)::int");
         assert!(matches!(
             passthrough_reason(&verdict),
-            Some(
-                PassthroughReason::NonImmutableFunction | PassthroughReason::ConversionUnsupported
-            )
+            Some(PassthroughReason::VolatileFunction | PassthroughReason::ConversionUnsupported)
         ));
     }
 

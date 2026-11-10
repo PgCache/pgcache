@@ -68,11 +68,12 @@ fn memo_capture_begin(
     // partition (Skip, or a Measure query whose size gate failed → Ineligible).
     // A Measure query serves source rows while its MV is still Pending; memoizing
     // that would shadow the MV once it's built. Both states are sticky, so a memo
-    // captured here never later acquires an MV.
+    // captured here never later acquires an MV. A result the serve recomputes
+    // per hit (a stable call in the SELECT list) is never memoized.
     let mv_ineligible = state_view
         .cached_queries
         .get(&msg.fingerprint)
-        .is_some_and(|v| v.mv.state().memo_eligible());
+        .is_some_and(|v| v.mv.memo_eligible());
     if !mv_ineligible {
         return None;
     }

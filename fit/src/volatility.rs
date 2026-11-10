@@ -98,8 +98,11 @@ mod tests {
         );
         assert_eq!(worst("concat", 3), Some(FunctionVolatility::Stable));
         assert_eq!(worst("substring", 2), Some(FunctionVolatility::Immutable));
-        // An aggregate is in the catalog but never judged by volatility.
-        assert_eq!(worst("max", 1), None);
+        // An aggregate is judged by its declared volatility like any other
+        // function (PGC-589); the json aggregates are STABLE, the rest
+        // immutable.
+        assert_eq!(worst("max", 1), Some(FunctionVolatility::Immutable));
+        assert_eq!(worst("json_agg", 1), Some(FunctionVolatility::Stable));
         assert!(
             b.catalog
                 .named("max")

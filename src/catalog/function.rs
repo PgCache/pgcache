@@ -54,13 +54,6 @@ impl FunctionKind {
             _ => None,
         }
     }
-
-    /// A call in a scalar position names a function: a procedure is reached
-    /// only through CALL, and aggregates and window functions are judged by
-    /// their position, not their volatility.
-    fn is_plain(self) -> bool {
-        matches!(self, FunctionKind::Function)
-    }
 }
 
 /// SQL behind [`FunctionCatalog::load`]. Public so pgcache-fit's embedded
@@ -125,6 +118,12 @@ pub trait FunctionFacts {
         name: &str,
         arg_count: u32,
     ) -> Option<FunctionVolatility>;
+
+    /// Whether the functions the call names are PostgreSQL's own, which the
+    /// stable allowlist (`is_settings_stable`) is written for: at the proxy,
+    /// that a builtin answers the call; at the writer, that nothing else on
+    /// the search_path does.
+    fn call_only_builtins(&self, schema: Option<&str>, name: &str, arg_count: u32) -> bool;
 }
 
 /// Without a search_path: the builtins' worst case when a builtin fits the
@@ -141,10 +140,17 @@ impl FunctionFacts for FunctionCatalog {
         self.builtin_worst_volatility(schema, name, arg_count)
             .or_else(|| {
                 self.candidates(schema, name, arg_count)
-                    .filter(|row| row.kind.is_plain())
                     .map(|row| row.volatility)
                     .min()
             })
+    }
+
+    fn call_only_builtins(&self, schema: Option<&str>, name: &str, arg_count: u32) -> bool {
+        if schema.is_none_or(|schema| schema == "pg_catalog") && is_sql_form(name) {
+            return true;
+        }
+        self.candidates(schema, name, arg_count)
+            .any(|row| row.oid.is_builtin())
     }
 }
 
@@ -167,9 +173,19 @@ impl FunctionFacts for PathFunctions<'_> {
         }
         self.catalog
             .on_path(schema, name, arg_count, self.search_path)
-            .filter(|row| row.kind.is_plain())
             .map(|row| row.volatility)
             .max()
+    }
+
+    fn call_only_builtins(&self, schema: Option<&str>, name: &str, arg_count: u32) -> bool {
+        if schema.is_none_or(|schema| schema == "pg_catalog") && is_sql_form(name) {
+            return true;
+        }
+        let mut candidates = self
+            .catalog
+            .on_path(schema, name, arg_count, self.search_path)
+            .peekable();
+        candidates.peek().is_some() && candidates.all(|row| row.oid.is_builtin())
     }
 }
 
@@ -311,7 +327,7 @@ impl FunctionCatalog {
             return Some(FunctionVolatility::Immutable);
         }
         self.candidates(schema, name, arg_count)
-            .filter(|row| row.oid.is_builtin() && row.kind.is_plain())
+            .filter(|row| row.oid.is_builtin())
             .map(|row| row.volatility)
             .max()
     }
@@ -330,6 +346,49 @@ pub fn is_sql_form(name: &str) -> bool {
     SQL_FORM_FUNCTIONS
         .iter()
         .any(|form| form.eq_ignore_ascii_case(name))
+}
+
+/// The STABLE builtins a cached SELECT list may call (PGC-589): their
+/// result depends only on the clock and on the session settings the serve
+/// applies (`TimeZone`, `DateStyle`, `IntervalStyle`, the `lc_*` locales),
+/// so the cache database evaluates them per hit to the session's answer.
+/// Every other stable builtin reads connection or server state
+/// (`current_database`, `pg_backend_pid`, `has_table_privilege`, ...) that
+/// the cache connection gets wrong, and a user-defined stable function
+/// usually reads tables the cache holds only in part.
+const SETTINGS_STABLE_FUNCTIONS: &[&str] = &[
+    "now",
+    "transaction_timestamp",
+    "statement_timestamp",
+    "age",
+    "date_bin",
+    "date_part",
+    "date_trunc",
+    "extract",
+    "make_timestamptz",
+    "timezone",
+    "to_char",
+    "to_date",
+    "to_number",
+    "to_timestamp",
+    "concat",
+    "concat_ws",
+    "format",
+    "json_agg",
+    "json_agg_strict",
+    "json_object_agg",
+    "json_object_agg_strict",
+    "json_object_agg_unique",
+    "json_object_agg_unique_strict",
+    "jsonb_agg",
+    "jsonb_agg_strict",
+];
+
+/// Whether `name` is one of the stable builtins a SELECT list may call.
+pub fn is_settings_stable(name: &str) -> bool {
+    SETTINGS_STABLE_FUNCTIONS
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(name))
 }
 
 fn lowercased(name: &str) -> EcoString {

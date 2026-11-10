@@ -18,7 +18,7 @@ use crate::cache::admission::{
 };
 use crate::cache::messages::RegisterRequest;
 use crate::cache::mv::{query_has_join, query_has_window};
-use crate::cache::query::{CacheabilityError, CacheableQuery};
+use crate::cache::query::{CacheabilityError, CacheableQuery, query_tree_has_stable_call};
 use crate::cache::types::{AliasResolution, ReadFacts, SharedQueryShape, SharedResolvedQuery};
 use crate::cache::update_query::{UpdateQueries, UpdateQuery};
 use crate::cache::writer::core::WriterCore;
@@ -129,7 +129,9 @@ async fn functions_resolve(
         search_path,
     };
     CacheableQuery::cacheable(tree, &on_path).map_err(|e| {
-        if let CacheabilityError::NonImmutableFunction { function } = e {
+        if let CacheabilityError::NonImmutableFunction { function }
+        | CacheabilityError::VolatileFunction { function } = e
+        {
             function_refusal(CacheError::FunctionNotImmutable { function })
         } else {
             Report::from(CacheError::CanonicalUncacheable {
@@ -406,8 +408,14 @@ impl WriterRegistration {
         // and `query_register` / MV setup reuse `shape_gate`.
         let decorrelated =
             query_decorrelate_checked(&bound, &self.aggregate_functions)?.map(Arc::new);
-        let shape_gate =
-            shape_gate_classify(&bound, decorrelated.as_deref(), &self.aggregate_functions);
+        let recompute_per_hit =
+            query_tree_has_stable_call(bound.tree(), &**core.function_catalog.load());
+        let shape_gate = shape_gate_classify(
+            &bound,
+            decorrelated.as_deref(),
+            &self.aggregate_functions,
+            recompute_per_hit,
+        );
         let (max_limit, mv_limit) = resolution_limits(
             &bound,
             decorrelated.as_deref(),

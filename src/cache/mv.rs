@@ -121,7 +121,7 @@ pub(crate) fn backoff_duration(wasted: u32) -> Option<Duration> {
 /// exists yet in any case.
 pub fn mv_state_initial(gate: ShapeGate) -> MvState {
     match gate {
-        ShapeGate::Skip => MvState::Skipped,
+        ShapeGate::Skip | ShapeGate::Recompute => MvState::Skipped,
         ShapeGate::Gated => MvState::Pending { has_table: false },
     }
 }
@@ -172,6 +172,13 @@ impl MvMeta {
     /// Current MV state (`MvState` is `Copy`).
     pub fn state(&self) -> MvState {
         self.state
+    }
+
+    /// Whether a source-row serve of this query may be memoized: only once
+    /// the MV layer is out for good, and never for a result the serve must
+    /// recompute per hit.
+    pub fn memo_eligible(&self) -> bool {
+        self.shape_gate != ShapeGate::Recompute && self.state.memo_eligible()
     }
 
     /// Consecutive no-payoff builds (for status/observability).
@@ -414,10 +421,20 @@ mod tests {
     #[test]
     fn test_mv_state_initial_maps_from_gate() {
         assert_eq!(mv_state_initial(ShapeGate::Skip), MvState::Skipped);
+        assert_eq!(mv_state_initial(ShapeGate::Recompute), MvState::Skipped);
         assert_eq!(
             mv_state_initial(ShapeGate::Gated),
             MvState::Pending { has_table: false }
         );
+    }
+
+    /// A result the serve recomputes per hit is never memoized, although
+    /// its MV state is the terminal `Skipped` every memo otherwise needs.
+    #[test]
+    fn test_recompute_gate_is_never_memo_eligible() {
+        assert!(MvMeta::new(ShapeGate::Skip, None).memo_eligible());
+        assert!(!MvMeta::new(ShapeGate::Recompute, None).memo_eligible());
+        assert!(!MvMeta::new(ShapeGate::Gated, None).memo_eligible());
     }
 
     #[test]

@@ -362,7 +362,7 @@ async fn mv_output_columns(client: &Client, ctx: &MvBuildContext) -> CacheResult
 ///
 /// Called only before a first build — rebuilds inherit the sticky gate result.
 async fn mv_gate_passes(client: &Client, ctx: &MvBuildContext) -> CacheResult<bool> {
-    if ctx.shape_gate == ShapeGate::Skip {
+    if ctx.shape_gate != ShapeGate::Gated {
         return Ok(false);
     }
     let source_rows = match ctx.populated_rows {

@@ -186,13 +186,18 @@ pub fn query_decorrelate_checked(
 
 /// Classify a query's shape for MV eligibility on its decorrelated form
 /// when it has one, so the shape classified is the shape population and
-/// rebuild see.
+/// rebuild see. A query whose SELECT list the serve must recompute per hit
+/// (a stable call, PGC-589) is `Recompute` whatever its shape.
 #[cfg(feature = "proxy")]
 pub(crate) fn shape_gate_classify(
     bound: &ResolvedQuery,
     decorrelated: Option<&ResolvedQuery>,
     aggregate_functions: &HashSet<EcoString>,
+    recompute_per_hit: bool,
 ) -> ShapeGate {
+    if recompute_per_hit {
+        return ShapeGate::Recompute;
+    }
     shape_classify(decorrelated.unwrap_or(bound), aggregate_functions)
 }
 
