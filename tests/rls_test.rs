@@ -46,7 +46,7 @@ async fn tenant_docs_create(ctx: &mut TestContext) -> Result<(), Error> {
     ] {
         ctx.origin_query(sql, &[]).await?;
     }
-    ctx.cache_settle().await
+    ctx.cdc_apply_settle().await
 }
 
 /// `owned_docs`, readable by `alice` and `bob`, each seeing the rows they
@@ -63,7 +63,7 @@ async fn owned_docs_create(ctx: &mut TestContext) -> Result<(), Error> {
     ] {
         ctx.origin_query(sql, &[]).await?;
     }
-    ctx.cache_settle().await
+    ctx.cdc_apply_settle().await
 }
 
 /// pgcache started over `public.tenant_of`, so its catalog knows the
@@ -94,7 +94,7 @@ async fn judged_docs_setup() -> Result<TestContext, Error> {
         .simple_query(TENANT_OF)
         .await
         .map_err(Error::other)?;
-    ctx.cache_settle().await?;
+    ctx.cdc_apply_settle().await?;
     Ok(ctx)
 }
 
@@ -556,7 +556,7 @@ async fn test_restrictive_policy_is_anded_with_permissive() -> Result<(), Error>
     ] {
         ctx.origin_query(sql, &[]).await?;
     }
-    ctx.cache_settle().await?;
+    ctx.cdc_apply_settle().await?;
     let (user, origin) = sessions_as(&ctx, "tenant_user", Some("1")).await?;
 
     let served = register(&mut ctx, &user, TENANT_READ).await?;
@@ -581,7 +581,7 @@ async fn test_uninlinable_policy_forwards() -> Result<(), Error> {
     ] {
         ctx.origin_query(sql, &[]).await?;
     }
-    ctx.cache_settle().await?;
+    ctx.cdc_apply_settle().await?;
     let (gambler, _) = sessions_as(&ctx, "gambler", None).await?;
     let sql = "SELECT id, body FROM lucky_docs ORDER BY id";
 
@@ -676,7 +676,7 @@ async fn test_policy_alias_shadowing_the_query_alias_keeps_the_correlation() -> 
     ] {
         ctx.origin_query(sql, &[]).await?;
     }
-    ctx.cache_settle().await?;
+    ctx.cdc_apply_settle().await?;
     let sql = "SELECT id, body FROM tenant_docs m ORDER BY id";
 
     let (alice, origin_alice) = sessions_as(&ctx, "alice", None).await?;
@@ -754,7 +754,7 @@ async fn test_policy_calling_an_overloaded_builtin_is_not_inlined() -> Result<()
     ] {
         ctx.origin_query(sql, &[]).await?;
     }
-    ctx.cache_settle().await?;
+    ctx.cdc_apply_settle().await?;
     let (proxied, _) = sessions_as(&ctx, "vague_user", None).await?;
     let sql = "SELECT id, body FROM vague_docs ORDER BY id";
     let result = rls_forward_assert(&mut ctx, &proxied, sql, |d| d.queries_rls_skipped).await?;

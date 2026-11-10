@@ -1276,6 +1276,7 @@ async fn setup_flagged_exclusions(
     if replica_identity_full {
         ctx.origin_query("ALTER TABLE pb REPLICA IDENTITY FULL", &[])
             .await?;
+        ctx.cdc_apply_settle().await?;
     }
     ctx.query(
         "INSERT INTO pa SELECT g, g FROM generate_series(1, 9) g",

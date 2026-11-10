@@ -203,7 +203,7 @@ async fn test_dropping_a_function_evicts_its_queries() -> Result<(), Error> {
 
     ctx.origin_query("DROP FUNCTION double_it(INTEGER)", &[])
         .await?;
-    ctx.cache_settle().await?;
+    ctx.cdc_apply_settle().await?;
     let client = ctx.proxy_client_connect().await?;
     let before = ctx.metrics().await?;
     let error = client
@@ -354,7 +354,7 @@ async fn test_extension_moved_to_another_schema_evicts_its_callers() -> Result<(
 
     ctx.origin_query("ALTER EXTENSION pg_trgm SET SCHEMA app", &[])
         .await?;
-    ctx.cache_settle().await?;
+    ctx.cdc_apply_settle().await?;
     let client = ctx.proxy_client_connect().await?;
     let before = ctx.metrics().await?;
     let error = client

@@ -31,7 +31,7 @@ async fn roles_create(ctx: &mut TestContext) -> Result<(), Error> {
     ] {
         ctx.origin_query(sql, &[]).await?;
     }
-    ctx.cache_settle().await
+    ctx.cdc_apply_settle().await
 }
 
 /// Register `sql` through `client` into a steady cache hit: the registering
@@ -141,6 +141,7 @@ async fn test_role_with_column_grant_reads_only_granted_columns() -> Result<(), 
     roles_create(&mut ctx).await?;
     ctx.origin_query("GRANT SELECT (id) ON secret TO outsider", &[])
         .await?;
+    ctx.cdc_apply_settle().await?;
 
     let reader = ctx.proxy_client_connect_as("reader").await?;
     register(&mut ctx, &reader, READ_BOTH).await?;
@@ -170,6 +171,7 @@ async fn test_zero_column_read_needs_any_granted_column() -> Result<(), Error> {
     ] {
         ctx.origin_query(sql, &[]).await?;
     }
+    ctx.cdc_apply_settle().await?;
 
     let reader = ctx.proxy_client_connect_as("reader").await?;
     register(&mut ctx, &reader, READ_COUNT).await?;
@@ -194,6 +196,7 @@ async fn test_set_role_switches_the_checked_identity() -> Result<(), Error> {
     ] {
         ctx.origin_query(sql, &[]).await?;
     }
+    ctx.cdc_apply_settle().await?;
 
     let reader = ctx.proxy_client_connect_as("reader").await?;
     register(&mut ctx, &reader, READ_BOTH).await?;
@@ -279,7 +282,7 @@ async fn test_function_execute_privilege_is_checked() -> Result<(), Error> {
     ] {
         ctx.origin_query(sql, &[]).await?;
     }
-    ctx.cache_settle().await?;
+    ctx.cdc_apply_settle().await?;
     let sql = "SELECT upper(v) FROM secret WHERE id = 1";
 
     let reader = ctx.proxy_client_connect_as("reader").await?;
@@ -306,7 +309,7 @@ async fn test_schema_usage_is_checked() -> Result<(), Error> {
     ] {
         ctx.origin_query(sql, &[]).await?;
     }
-    ctx.cache_settle().await?;
+    ctx.cdc_apply_settle().await?;
     let sql = "SELECT id, v FROM vault.t WHERE id = 1";
 
     let reader = ctx.proxy_client_connect_as("reader").await?;
@@ -370,7 +373,7 @@ async fn membership_create(ctx: &mut TestContext) -> Result<(), Error> {
     ] {
         ctx.origin_query(sql, &[]).await?;
     }
-    ctx.cache_settle().await
+    ctx.cdc_apply_settle().await
 }
 
 /// A membership `REVOKE` fires no schema-change signal; the role poll sees

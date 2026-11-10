@@ -355,6 +355,7 @@ async fn test_replica_identity_full_pk_change_removes_old_row() -> Result<(), Er
     .await?;
     ctx.origin_query("ALTER TABLE items REPLICA IDENTITY FULL", &[])
         .await?;
+    ctx.cdc_apply_settle().await?;
     ctx.query("INSERT INTO items (id, owner, val) VALUES (1, 10, 5)", &[])
         .await?;
     let q10 = "SELECT id, val FROM items WHERE owner = 10 ORDER BY id";
@@ -399,6 +400,7 @@ async fn test_replica_identity_full_rung_zero_precision() -> Result<(), Error> {
     .await?;
     ctx.origin_query("ALTER TABLE items REPLICA IDENTITY FULL", &[])
         .await?;
+    ctx.cdc_apply_settle().await?;
     ctx.query(
         "INSERT INTO items (id, owner, val) VALUES (1, 10, 5), (2, 20, 7)",
         &[],
@@ -622,6 +624,7 @@ async fn test_replica_identity_index_delete_and_key_update() -> Result<(), Error
     ] {
         ctx.origin_query(sql, &[]).await?;
     }
+    ctx.cdc_apply_settle().await?;
     ctx.query(
         "INSERT INTO ri_keyed VALUES (1, 100, 5), (2, 200, 7), (3, 300, 9)",
         &[],

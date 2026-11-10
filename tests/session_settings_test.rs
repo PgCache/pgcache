@@ -85,7 +85,7 @@ async fn user_schemas_create(ctx: &mut TestContext) -> Result<(), Error> {
     ] {
         ctx.origin_query(sql, &[]).await?;
     }
-    ctx.cache_settle().await
+    ctx.cdc_apply_settle().await
 }
 
 async fn config_table_create(
