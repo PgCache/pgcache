@@ -12,7 +12,7 @@ use tokio_postgres::Client;
 
 use crate::util::{
     TestContext, assert_cache_hit, assert_cache_miss, assert_proxy_rows_match_origin,
-    metrics_delta, query_warm, result_rows,
+    connect_cache_db, metrics_delta, query_warm, result_rows,
 };
 
 mod util;
@@ -168,6 +168,19 @@ async fn test_allowlisted_stable_call_is_recomputed_per_hit() -> Result<(), Erro
             "never served from a materialized result: {sql}"
         );
     }
+    let mv_tables: i64 = connect_cache_db(&ctx.dbs)
+        .await?
+        .query_one(
+            "SELECT count(*) FROM pg_tables WHERE schemaname = 'pgcache_mv'",
+            &[],
+        )
+        .await
+        .map_err(Error::other)?
+        .get(0);
+    assert_eq!(
+        mv_tables, 0,
+        "no materialized result is built for an entry recomputed per hit"
+    );
     Ok(())
 }
 
@@ -179,6 +192,31 @@ async fn test_allowlisted_stable_formatting_call_is_cached() -> Result<(), Error
     let m = query_warm(&mut ctx, sql).await?;
     assert_proxy_rows_match_origin(&mut ctx, sql).await?;
     assert_cache_hit(&mut ctx, m).await?;
+    Ok(())
+}
+
+/// `current_user` in a SELECT list is a session term: the read forwards and
+/// each role sees its own name, never the cache connection's.
+#[tokio::test]
+async fn test_current_user_in_select_list_forwards() -> Result<(), Error> {
+    let mut ctx = setup().await?;
+    for sql in [
+        "CREATE ROLE ann LOGIN",
+        "CREATE ROLE bob LOGIN",
+        "GRANT SELECT ON items TO ann, bob",
+    ] {
+        ctx.origin_query(sql, &[]).await?;
+    }
+    ctx.cdc_apply_settle().await?;
+    let sql = "SELECT current_user AS who, id FROM items WHERE id = 1";
+    for user in ["ann", "bob"] {
+        let client = ctx.proxy_client_connect_as(user).await?;
+        let served = uncacheable_read(&mut ctx, &client, sql).await?;
+        assert_eq!(
+            served,
+            vec![vec![Some(user.to_owned()), Some("1".to_owned())]]
+        );
+    }
     Ok(())
 }
 

@@ -450,6 +450,30 @@ mod tests {
         tables
     }
 
+    /// A query whose SELECT list the serve must recompute per hit is
+    /// `Recompute` whatever its shape (PGC-589); otherwise the shape decides.
+    #[test]
+    fn test_shape_gate_recompute_per_hit_overrides_the_shape() {
+        let tables = catalog();
+        let aggregate_functions = HashSet::from([EcoString::from("count")]);
+        for sql in [
+            "SELECT id, x FROM a WHERE id = 1",
+            "SELECT count(*) FROM a JOIN b ON a.id = b.id WHERE a.x = 1",
+        ] {
+            let bound = ResolvedQuery::parse_resolve(sql, &tables, &["public"]).expect("resolve");
+            assert_eq!(
+                shape_gate_classify(&bound, None, &aggregate_functions, true),
+                ShapeGate::Recompute,
+                "{sql}"
+            );
+            assert_ne!(
+                shape_gate_classify(&bound, None, &aggregate_functions, false),
+                ShapeGate::Recompute,
+                "{sql}"
+            );
+        }
+    }
+
     fn admission_analysis(sql: &str) -> AdmissionAnalysis {
         let tables = catalog();
         let bound =
