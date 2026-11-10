@@ -12,7 +12,8 @@ mod limit;
 mod request;
 
 use cacheability::{query_cacheable, references_system_catalog};
-pub use cacheability::{query_tree_has_stable_call, query_tree_has_volatile_function};
+#[cfg(feature = "proxy")]
+pub(crate) use cacheability::{query_tree_has_stable_call, query_tree_has_volatile_function};
 
 pub use limit::{limit_clause_of, limit_is_sufficient, limit_rows_needed};
 pub use request::RequestQuery;

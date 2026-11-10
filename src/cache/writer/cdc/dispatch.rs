@@ -2,6 +2,7 @@
 //! registration, and converting row commands into buffered frame events that
 //! the replay (`apply`) later decides.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -18,7 +19,7 @@ use crate::cache::writer::core::WriterCore;
 use crate::cache::writer::frame::{FRAME_ROWS_CAPACITY, FrameRowEvent, FrameState, ToastState};
 use crate::cache::{CacheError, CacheResult, MapIntoReport, ReportExt};
 use crate::catalog::TableMetadata;
-use crate::oid::Oid;
+use crate::oid::{FunctionOid, Oid};
 use crate::pg;
 use crate::pg::Lsn;
 use crate::settings::Settings;
@@ -470,6 +471,24 @@ impl WriterCdc {
                 core.publication_oids.remove(&relation_oid);
             }
         }
+        // `ALTER SCHEMA ... RENAME` changes the name every table in it is
+        // cached and registered under, with no table object reported.
+        for namespace_oid in &change.schemas_altered {
+            for cached_oid in core
+                .tables_in_namespace(*namespace_oid)
+                .await
+                .attach_loc("listing the cached tables of an altered schema")?
+            {
+                info!(
+                    namespace_oid = %namespace_oid,
+                    cached_oid = %cached_oid,
+                    "origin altered the schema of a cached table: evicting its queries"
+                );
+                self.cached_relation_forget(core, cached_oid)
+                    .await
+                    .attach_loc("schema change on a cached table's schema")?;
+            }
+        }
         if change.views_changed {
             let cached: Vec<Oid> = core
                 .cache
@@ -523,11 +542,10 @@ impl WriterCdc {
         // whose path now reaches it is refused at resolution. A relocation
         // names no function; the reload finds the identities that changed.
         if !change.functions_changed.is_empty() || change.functions_relocated {
-            for oid in &change.functions_changed {
-                core.cache_function_invalidate(*oid)
-                    .await
-                    .attach_loc("a function changed on origin")?;
-            }
+            let changed: HashSet<FunctionOid> = change.functions_changed.iter().copied().collect();
+            core.cache_functions_invalidate(&changed)
+                .await
+                .attach_loc("a function changed on origin")?;
             core.function_catalog_reload().await?;
         }
         Ok(())

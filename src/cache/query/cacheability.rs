@@ -4,7 +4,9 @@
 use ecow::EcoString;
 
 use super::CacheabilityError;
-use crate::catalog::{FunctionCatalog, FunctionFacts, FunctionVolatility, is_settings_stable};
+#[cfg(feature = "proxy")]
+use crate::catalog::FunctionCatalog;
+use crate::catalog::{FunctionFacts, FunctionVolatility, is_settings_stable};
 use crate::query::ast::rope::{
     Body, Case, FrameBound, Function, Join, JoinQual, NodeKind, Operator, Query, QueryTree, Scalar,
     ScalarKind, Select, SelectItem, Source, Where, WhereKind, Window,
@@ -43,11 +45,13 @@ fn pg_prefixed(s: &str) -> bool {
 /// An immutable function is cacheable wherever it stands. A volatile one
 /// never is: it may answer differently per call or have side effects, which
 /// no replay on the cache database reproduces. A stable one is cacheable in
-/// the SELECT list alone, and only an allowlisted builtin whose result the
-/// serve recomputes per hit from the clock and the session's settings
-/// (PGC-589); elsewhere it would decide membership or order. A join's ON
-/// also rejects subqueries: decorrelation reads only WHERE, so a correlated
-/// one there would register in its correlated form.
+/// the query's own SELECT list alone, and only an allowlisted builtin whose
+/// result the serve recomputes per hit from the clock and the session's
+/// settings (PGC-589); elsewhere it would decide membership or order, a
+/// subquery's or derived table's SELECT list included, since its value
+/// feeds the enclosing query. A join's ON also rejects subqueries:
+/// decorrelation reads only WHERE, so a correlated one there would register
+/// in its correlated form.
 #[derive(Clone, Copy)]
 enum ExprContext {
     WhereClause,
@@ -55,29 +59,56 @@ enum ExprContext {
     SelectList,
 }
 
-/// A query body: SELECT nodes and set-operation branches recursively.
-fn body_cacheable(body: Body<'_>, functions: &dyn FunctionFacts) -> Result<(), CacheabilityError> {
+/// A query body: SELECT nodes and set-operation branches recursively. The
+/// branches of a set operation share the query's output, so they keep its
+/// `output` context.
+fn body_cacheable(
+    body: Body<'_>,
+    output: ExprContext,
+    functions: &dyn FunctionFacts,
+) -> Result<(), CacheabilityError> {
     match body {
-        Body::Select(select) => select_cacheable(select, functions),
+        Body::Select(select) => select_cacheable(select, output, functions),
         Body::Values(_) => Err(CacheabilityError::UnsupportedQueryType { kind: "VALUES" }),
         Body::SetOp(set_op) => {
             // LIMIT/OFFSET on branches makes them non-cacheable
             if set_op.left().has_limit() || set_op.right().has_limit() {
                 return Err(CacheabilityError::HasLimit);
             }
-            query_cacheable(set_op.left(), functions)?;
-            query_cacheable(set_op.right(), functions)
+            query_cacheable_at(set_op.left(), output, functions)?;
+            query_cacheable_at(set_op.right(), output, functions)
         }
     }
 }
 
-/// A query: its body and its ORDER BY, whose expressions decide the order
-/// served and are judged like a predicate.
+/// The statement's query: its SELECT list is the output the serve
+/// recomputes per hit, the one place a stable call is admitted.
 pub(super) fn query_cacheable(
     query: Query<'_>,
     functions: &dyn FunctionFacts,
 ) -> Result<(), CacheabilityError> {
-    body_cacheable(query.body(), functions)?;
+    query_cacheable_at(query, ExprContext::SelectList, functions)
+}
+
+/// A query whose SELECT list feeds the enclosing query: a subquery, a
+/// derived table or a CTE. Its items decide membership or order there, so
+/// they are judged like a predicate.
+fn nested_query_cacheable(
+    query: Query<'_>,
+    functions: &dyn FunctionFacts,
+) -> Result<(), CacheabilityError> {
+    query_cacheable_at(query, ExprContext::WhereClause, functions)
+}
+
+/// A query: its body, with `output` the context its SELECT list is judged
+/// in, and its ORDER BY, whose expressions decide the order served and are
+/// judged like a predicate.
+fn query_cacheable_at(
+    query: Query<'_>,
+    output: ExprContext,
+    functions: &dyn FunctionFacts,
+) -> Result<(), CacheabilityError> {
+    body_cacheable(query.body(), output, functions)?;
     for clause in query.order_by() {
         scalar_cacheable(clause.expr(), ExprContext::WhereClause, functions)?;
     }
@@ -86,6 +117,7 @@ pub(super) fn query_cacheable(
 
 fn select_cacheable(
     select: Select<'_>,
+    output: ExprContext,
     functions: &dyn FunctionFacts,
 ) -> Result<(), CacheabilityError> {
     from_supported(select, functions)?;
@@ -94,7 +126,7 @@ fn select_cacheable(
     }
     for item in select.items().into_iter().flatten() {
         if let SelectItem::Expr(expr) = item {
-            scalar_cacheable(expr.expr(), ExprContext::SelectList, functions)?;
+            scalar_cacheable(expr.expr(), output, functions)?;
         }
     }
     // GROUP BY admits column references only (the converter refuses
@@ -124,9 +156,9 @@ fn from_supported(
                 });
             }
             // LIMIT in a derived table is valid SQL, so only the body is checked.
-            query_cacheable(subquery.query(), functions)
+            nested_query_cacheable(subquery.query(), functions)
         }
-        (Some(Source::CteRef(cte_ref)), None) => query_cacheable(cte_ref.query(), functions),
+        (Some(Source::CteRef(cte_ref)), None) => nested_query_cacheable(cte_ref.query(), functions),
         (None, _) => Err(CacheabilityError::UnsupportedFrom {
             construct: "no FROM clause",
         }),
@@ -152,9 +184,9 @@ fn source_supported(
                     kind: "derived table without alias",
                 });
             }
-            query_cacheable(subquery.query(), functions)
+            nested_query_cacheable(subquery.query(), functions)
         }
-        Source::CteRef(cte_ref) => query_cacheable(cte_ref.query(), functions),
+        Source::CteRef(cte_ref) => nested_query_cacheable(cte_ref.query(), functions),
     }
 }
 
@@ -212,7 +244,7 @@ fn subquery_inner_cacheable(
             construct: "subquery in join condition",
         });
     }
-    query_cacheable(query, functions)
+    nested_query_cacheable(query, functions)
 }
 
 fn scalar_cacheable(
@@ -269,10 +301,10 @@ fn operator_volatility_check(
 }
 
 /// A function call: immutable, or an allowlisted stable builtin in the
-/// SELECT list, with cacheable arguments, FILTER and window. Judged by what
-/// `functions` knows of the call: the proxy's catalog-only view, or the
-/// writer's with the search_path in force. A call no row answers is
-/// non-immutable, conservatively.
+/// SELECT list, with cacheable arguments, aggregate ORDER BY, FILTER and
+/// window. Judged by what `functions` knows of the call: the proxy's
+/// catalog-only view, or the writer's with the search_path in force. A call
+/// no row answers is non-immutable, conservatively.
 fn function_cacheable(
     function: Function<'_>,
     ctx: ExprContext,
@@ -302,8 +334,11 @@ fn function_cacheable(
     for arg in function.args() {
         scalar_cacheable(arg, ctx, functions)?;
     }
-    // FILTER predicates run per input row, so a volatile function there is
-    // rejected as in a WHERE.
+    // An aggregate's ORDER BY decides the value it builds, a FILTER which
+    // rows it sees: both are judged as in a WHERE.
+    for clause in function.agg_order() {
+        scalar_cacheable(clause.expr(), ExprContext::WhereClause, functions)?;
+    }
     if let Some(filter) = function.filter() {
         where_cacheable(filter, ExprContext::WhereClause, functions)?;
     }
@@ -358,7 +393,8 @@ fn case_cacheable(
 /// must evaluate per hit, since a materialized result or a memoized
 /// response would freeze its value (PGC-589). On a cacheable query such a
 /// call stands in the SELECT list, the one place the rule admits it.
-pub fn query_tree_has_stable_call(tree: &QueryTree, functions: &dyn FunctionFacts) -> bool {
+#[cfg(any(feature = "proxy", test))]
+pub(crate) fn query_tree_has_stable_call(tree: &QueryTree, functions: &dyn FunctionFacts) -> bool {
     tree.nodes().any(|node| {
         if let NodeKind::Function {
             schema,
@@ -378,7 +414,11 @@ pub fn query_tree_has_stable_call(tree: &QueryTree, functions: &dyn FunctionFact
 /// a VOLATILE function, or one absent from the catalog (unknown, so
 /// conservatively volatile). Every function anywhere in the tree counts,
 /// under the worst of the name's overloads in any schema.
-pub fn query_tree_has_volatile_function(tree: &QueryTree, functions: &FunctionCatalog) -> bool {
+#[cfg(feature = "proxy")]
+pub(crate) fn query_tree_has_volatile_function(
+    tree: &QueryTree,
+    functions: &FunctionCatalog,
+) -> bool {
     tree.nodes().any(|node| {
         let NodeKind::Function { name, .. } = &node.kind else {
             return false;
@@ -421,6 +461,7 @@ mod tests {
             "min",
             "max",
             "row_number",
+            "string_agg",
         ]
         .into_iter()
         .map(|name| (name, FunctionVolatility::Immutable));
@@ -1155,14 +1196,23 @@ mod tests {
             "SELECT now() FROM orders WHERE tenant_id = 1",
             "SELECT to_char(created_at, 'YYYY'), pg_catalog.now() FROM orders WHERE tenant_id = 1",
             "SELECT count(*), to_char(now(), 'HH24') FROM orders GROUP BY tenant_id",
+            "SELECT now() FROM orders UNION ALL SELECT now() FROM archived",
         ] {
             assert!(check_cacheable(sql).is_ok(), "{sql}");
         }
+        // A nested query's SELECT list feeds the enclosing query: a stable
+        // value there decides the outer membership at population time.
         for sql in [
             "SELECT id FROM orders ORDER BY now()",
             "SELECT id FROM orders WHERE created_at > now()",
             "SELECT count(*) FROM orders GROUP BY tenant_id HAVING max(created_at) > now()",
             "SELECT row_number() OVER (ORDER BY to_char(created_at, 'YYYY')) FROM orders",
+            "SELECT string_agg(name, ',' ORDER BY to_char(created_at, 'YYYY')) FROM orders",
+            "SELECT id FROM orders WHERE created_at < (SELECT now() FROM b LIMIT 1)",
+            "SELECT id FROM orders WHERE created_at IN (SELECT now() FROM b)",
+            "SELECT s.at FROM (SELECT now() AS at, id FROM orders) s",
+            "WITH c AS (SELECT now() AS at, id FROM orders) SELECT at FROM c",
+            "SELECT (SELECT now() FROM b LIMIT 1) FROM orders",
         ] {
             let err = check_cacheable(sql).expect_err(sql);
             assert!(
@@ -1250,6 +1300,7 @@ mod tests {
             "SELECT (SELECT id FROM b ORDER BY random() LIMIT 1) FROM a",
             "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b ORDER BY random())",
             "SELECT count(*) FILTER (WHERE random() > 0.5) FROM a",
+            "SELECT string_agg(name, ',' ORDER BY random()) FROM a",
             "SELECT lower(random()::text) FROM a",
         ] {
             let err = check_cacheable(sql).expect_err(sql);

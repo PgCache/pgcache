@@ -702,6 +702,31 @@ impl WriterCore {
     /// The cached tables a signal on `relation_oid` lands on: the tables
     /// whose partition tree holds it, and every cached partition under it
     /// (an `ALTER TABLE` on a partitioned root reaches its partitions).
+    /// The cached tables origin holds in `namespace_oid`: the ones an `ALTER
+    /// SCHEMA` renamed or re-owned, which the signal does not list.
+    pub(super) async fn tables_in_namespace(&self, namespace_oid: Oid) -> CacheResult<Vec<Oid>> {
+        let cached: Vec<Oid> = self
+            .cache
+            .tables
+            .iter()
+            .map(|table| table.relation_oid)
+            .collect();
+        if cached.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = self
+            .db_origin
+            .query(
+                "SELECT oid FROM pg_class WHERE relnamespace = $1 AND oid = ANY($2)",
+                &[&namespace_oid, &cached],
+            )
+            .await
+            .map_into_report::<CacheError>()?;
+        rows.iter()
+            .map(|row| row.try_get(0).map_into_report::<CacheError>())
+            .collect()
+    }
+
     pub(super) fn tables_over_relation(&self, relation_oid: Oid) -> Vec<Oid> {
         self.cache
             .tables

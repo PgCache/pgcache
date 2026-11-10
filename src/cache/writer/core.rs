@@ -22,7 +22,7 @@ use crate::cache::reference_settings;
 use crate::cache::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
     messages::{QueryCommand, WriterNotify},
-    mv::{MvMeta, MvState},
+    mv::MvMeta,
     mv_shape::ShapeGate,
     types::{ActiveRelations, Cache, CacheStateView, CachedQueryState, CachedQueryView, ServingAt},
 };
@@ -203,7 +203,7 @@ pub(super) struct WriterCore {
     /// after its row was replayed but before the commit (PGC-350). Every query
     /// the frame invalidates joins it before the bracket.
     pub(super) frame_memo_evictions: FingerprintSet,
-    /// Fingerprints whose `MvState` is memo-eligible — the filter the CDC rows
+    /// Fingerprints whose `MvMeta` is memo-eligible — the filter the CDC rows
     /// apply to their candidates before `frame_memo_evictions`. Writer-owned,
     /// kept in step with every eligible state write and with query removal.
     pub(super) memo_eligible: FingerprintSet,
@@ -689,19 +689,20 @@ impl WriterCore {
         mv_limit: Option<u64>,
     ) {
         let meta = MvMeta::new(shape_gate, mv_limit);
-        let state = meta.state();
+        let eligible = meta.memo_eligible();
         if let Some(mut view) = self.state_view.cached_queries.get_mut(&fingerprint) {
             view.mv = meta;
         }
-        self.memo_eligibility_record(fingerprint, state);
+        self.memo_eligibility_record(fingerprint, eligible);
     }
 
-    /// Track a query's MV state for the CDC memo-eviction filter, creating its
-    /// memo slot as it turns eligible. A query that turns eligible while a
-    /// batch is open joins the batch's eviction set: rows replayed earlier
-    /// filtered it out, yet a capture can still land before the commit.
-    pub(super) fn memo_eligibility_record(&mut self, fingerprint: Fingerprint, state: MvState) {
-        if !state.memo_eligible() {
+    /// Track a query's memo eligibility (`MvMeta::memo_eligible`: its MV state
+    /// and shape gate) for the CDC memo-eviction filter, creating its memo
+    /// slot as it turns eligible. A query that turns eligible while a batch
+    /// is open joins the batch's eviction set: rows replayed earlier filtered
+    /// it out, yet a capture can still land before the commit.
+    pub(super) fn memo_eligibility_record(&mut self, fingerprint: Fingerprint, eligible: bool) {
+        if !eligible {
             return;
         }
         if self.memo_eligible.insert(fingerprint) {
@@ -805,28 +806,34 @@ impl WriterCore {
             .attach_loc("reloading the function catalog after a function signal")?;
         info!(functions = fresh.len(), "function catalog reloaded");
         let known = self.function_catalog.load_full();
-        if !known.same_as(&fresh) {
+        let changed = !known.same_as(&fresh);
+        if changed {
             // A function moved to another schema or renamed (`ALTER
             // EXTENSION ... SET SCHEMA`, `ALTER SCHEMA ... RENAME`) keeps its
             // oid and body, yet a call under the old name now fails on
             // origin; the entries computed under it go.
             let fresh_by_oid: HashMap<FunctionOid, &FunctionRow> =
                 fresh.rows().iter().map(|row| (row.oid, row)).collect();
-            for row in known.rows() {
-                let relocated = fresh_by_oid
-                    .get(&row.oid)
-                    .is_none_or(|current| current.identity != row.identity);
-                if relocated {
-                    self.cache_function_invalidate(row.oid)
-                        .await
-                        .attach_loc("a function's identity changed on origin")?;
-                }
-            }
+            let relocated: HashSet<FunctionOid> = known
+                .rows()
+                .iter()
+                .filter(|row| {
+                    fresh_by_oid
+                        .get(&row.oid)
+                        .is_none_or(|current| current.identity != row.identity)
+                })
+                .map(|row| row.oid)
+                .collect();
+            self.cache_functions_invalidate(&relocated)
+                .await
+                .attach_loc("a function's identity changed on origin")?;
             self.function_catalog.store(Arc::new(fresh));
-            self.rls_policies_reparse().await?;
         }
         self.function_presence.clear();
         self.state_view.aliases.clear();
+        if changed {
+            self.rls_policies_reparse().await;
+        }
         Ok(())
     }
 }

@@ -193,15 +193,26 @@ impl WriterCore {
     /// Every loaded relation's policies parsed again, after the function
     /// catalog changed: a qual's calls are qualified against the catalog at
     /// parse time, so a function renamed or moved since, or one the catalog
-    /// lacked, leaves a verdict only a fresh parse corrects.
-    pub(super) async fn rls_policies_reparse(&mut self) -> CacheResult<()> {
+    /// lacked, leaves a verdict only a fresh parse corrects. A relation whose
+    /// read fails is forgotten and loaded again at its first read, as at
+    /// startup; the signal that brought the change is not failed over it.
+    pub(super) async fn rls_policies_reparse(&mut self) {
         let loaded: Vec<Oid> = self.rls.tables.keys().copied().collect();
-        for relation_oid in loaded {
-            self.rls_table_reload(relation_oid)
-                .await
-                .attach_loc("reparsing a secured relation's policies")?;
+        if loaded.is_empty() {
+            return;
         }
-        Ok(())
+        for relation_oid in loaded {
+            if let Err(e) = self.rls_table_load(relation_oid).await {
+                self.rls.tables.remove(&relation_oid);
+                warn!(
+                    relation_oid = %relation_oid,
+                    "reparsing a secured relation's policies failed, retried at its first read: {}",
+                    error_chain_format(e.current_context())
+                );
+            }
+        }
+        self.rls_relations_publish();
+        self.rls_aliases_clear();
     }
 
     /// The relation a policy signal names, from origin's catalog: the one

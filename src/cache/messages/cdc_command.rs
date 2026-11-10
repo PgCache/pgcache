@@ -86,6 +86,10 @@ pub(crate) struct SchemaChange {
     /// reloaded and the queries calling a function whose identity changed
     /// are evicted.
     pub(crate) functions_relocated: bool,
+    /// `ALTER SCHEMA`, by namespace oid: a rename changes the name every
+    /// table in it is cached under, with no table object reported, so the
+    /// cached tables origin holds in the schema are evicted.
+    pub(crate) schemas_altered: Vec<Oid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +110,7 @@ impl SchemaChange {
             && !self.privileges_changed
             && !self.functions_relocated
             && self.functions_changed.is_empty()
+            && self.schemas_altered.is_empty()
     }
 }
 

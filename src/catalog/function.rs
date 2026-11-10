@@ -360,7 +360,8 @@ const SETTINGS_STABLE_FUNCTIONS: &[&str] = &[
     "now",
     "transaction_timestamp",
     "statement_timestamp",
-    "age",
+    // `age` is left out: `age(xid)` reads the transaction counter and shares
+    // the name and arity with `age(timestamptz)`.
     "date_bin",
     "date_part",
     "date_trunc",
@@ -385,7 +386,7 @@ const SETTINGS_STABLE_FUNCTIONS: &[&str] = &[
 ];
 
 /// Whether `name` is one of the stable builtins a SELECT list may call.
-pub fn is_settings_stable(name: &str) -> bool {
+pub(crate) fn is_settings_stable(name: &str) -> bool {
     SETTINGS_STABLE_FUNCTIONS
         .iter()
         .any(|allowed| allowed.eq_ignore_ascii_case(name))

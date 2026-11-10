@@ -131,6 +131,8 @@ fn is_function(object_type: &str) -> bool {
     matches!(object_type, "function" | "procedure" | "aggregate")
 }
 
+const SCHEMA: &str = "schema";
+
 /// A command that can move or rename functions without listing them.
 /// `CREATE EXTENSION` and the extension's drop list every function they
 /// create or remove; `ALTER EXTENSION ... SET SCHEMA` and `ALTER SCHEMA ...
@@ -138,7 +140,7 @@ fn is_function(object_type: &str) -> bool {
 fn relocates_functions(tag: &str, object_type: &str) -> bool {
     matches!(
         (tag, object_type),
-        ("ALTER EXTENSION", "extension") | ("ALTER SCHEMA", "schema")
+        ("ALTER EXTENSION", "extension") | ("ALTER SCHEMA", SCHEMA)
     )
 }
 
@@ -171,6 +173,11 @@ pub(super) fn schema_change_parse(content: &[u8]) -> Result<SchemaChange, serde_
                 }
                 if relocates_functions(tag, object_type) {
                     change.functions_relocated = true;
+                    if object_type == SCHEMA
+                        && let Some(oid) = object.oid
+                    {
+                        change.schemas_altered.push(Oid::from_raw(oid));
+                    }
                     continue;
                 }
                 match (tag, object.oid, object.parent) {
@@ -410,6 +417,22 @@ mod policy_tests {
             {"tag":"CREATE SCHEMA","type":"schema","oid":16600,"identity":"app","parent":null}]}"#;
         let change = schema_change_parse(created).expect("parse ddl payload");
         assert!(!change.functions_relocated, "a new schema holds nothing");
+        assert!(change.schemas_altered.is_empty());
+    }
+
+    /// `ALTER SCHEMA` names the schema by oid: its tables are found on
+    /// origin, since the payload lists none. An extension's alter moves no
+    /// table.
+    #[test]
+    fn test_schema_change_parse_names_an_altered_schema() {
+        let altered = br#"{"kind":"ddl","objects":[
+            {"tag":"ALTER SCHEMA","type":"schema","oid":16600,"identity":"app2","parent":null}]}"#;
+        let change = schema_change_parse(altered).expect("parse ddl payload");
+        assert_eq!(change.schemas_altered, vec![Oid::from_raw(16600)]);
+        let extension = br#"{"kind":"ddl","objects":[
+            {"tag":"ALTER EXTENSION","type":"extension","oid":16502,"identity":"pg_trgm","parent":null}]}"#;
+        let change = schema_change_parse(extension).expect("parse ddl payload");
+        assert!(change.schemas_altered.is_empty());
     }
 
     #[test]

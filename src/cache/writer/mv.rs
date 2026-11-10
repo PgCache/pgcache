@@ -536,7 +536,8 @@ impl WriterCore {
             return;
         };
         view.mv.state_set(new_state);
+        let eligible = view.mv.memo_eligible();
         drop(view);
-        self.memo_eligibility_record(fingerprint, new_state);
+        self.memo_eligibility_record(fingerprint, eligible);
     }
 }

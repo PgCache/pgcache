@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 
 use tracing::{debug, error, trace, warn};
@@ -522,12 +523,18 @@ impl WriterCore {
     /// Evict every query that calls the function `oid` (PGC-578): its body
     /// or definition changed on origin, so what the entries hold was
     /// computed by the old one.
-    pub(super) async fn cache_function_invalidate(&mut self, oid: FunctionOid) -> CacheResult<()> {
+    pub(super) async fn cache_functions_invalidate(
+        &mut self,
+        oids: &HashSet<FunctionOid>,
+    ) -> CacheResult<()> {
+        if oids.is_empty() {
+            return Ok(());
+        }
         let fingerprints: Vec<Fingerprint> = self
             .cache
             .cached_queries
             .iter()
-            .filter(|q| q.function_oids.contains(&oid))
+            .filter(|q| q.function_oids.iter().any(|oid| oids.contains(oid)))
             .map(|q| q.fingerprint)
             .collect();
         for fp in fingerprints {

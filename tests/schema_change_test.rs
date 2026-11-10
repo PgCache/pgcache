@@ -413,6 +413,50 @@ async fn test_rename_of_cached_table_survives_publication_drain() -> Result<(), 
     Ok(())
 }
 
+/// `ALTER SCHEMA ... RENAME` moves every table in it under a new name with
+/// no table object reported: the cached ones are evicted, a read under the
+/// old name fails as it does on origin, and one under the new name
+/// repopulates.
+#[tokio::test]
+async fn test_rename_of_a_schema_evicts_its_cached_tables() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    for statement in [
+        "create schema moved",
+        "create table moved.t (id integer primary key, val text)",
+        "insert into moved.t (id, val) values (1, 'one')",
+    ] {
+        ctx.query(statement, &[]).await?;
+    }
+
+    let q = "select id, val from moved.t where id = 1";
+    assert_repopulated(&mut ctx, q, &["1"]).await?;
+
+    ctx.query("alter schema moved rename to moved2", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+
+    let err = ctx
+        .simple_query(q)
+        .await
+        .expect_err("read under the old schema name fails");
+    let code = err
+        .get_ref()
+        .and_then(|e| e.downcast_ref::<tokio_postgres::Error>())
+        .and_then(tokio_postgres::Error::as_db_error)
+        .map(|db| db.code().clone());
+    assert_eq!(
+        code,
+        Some(SqlState::UNDEFINED_TABLE),
+        "unexpected error: {err}"
+    );
+
+    let q = "select id, val from moved2.t where id = 1";
+    assert_repopulated(&mut ctx, q, &["1"]).await?;
+
+    Ok(())
+}
+
 /// A legacy inheritance child with two parents: the DDL trigger's parent
 /// lookup runs inside the user's statement and must not fail it (a scalar
 /// subquery over `pg_inherits` did). The stream carries on afterwards.
