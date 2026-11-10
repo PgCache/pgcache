@@ -12,7 +12,7 @@ use tokio::task::LocalSet;
 use tokio::time::{Instant, Interval};
 
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 
 use super::cdc::WriterCdc;
 #[cfg(feature = "fault-injection")]
@@ -114,7 +114,16 @@ struct WriterLoop {
     gauges_interval: Interval,
     /// The role catalog poll (PGC-548); `None` when disabled.
     role_poll_interval: Option<Interval>,
+    /// Until the stream settles past the writer's startup position, a
+    /// keepalive is requested on every tick so an idle origin does not
+    /// leave cacheable reads forwarding for the walsender's own cadence;
+    /// `None` once caught up.
+    catchup_interval: Option<Interval>,
 }
+
+/// How often the writer asks the CDC thread for a keepalive while the stream
+/// has not settled past the startup position.
+const STARTUP_CATCHUP_NUDGE_INTERVAL: Duration = Duration::from_millis(250);
 
 /// The next tick of an optional interval; never, when there is none.
 async fn interval_tick(interval: &mut Option<Interval>) {
@@ -169,6 +178,8 @@ impl WriterLoop {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             interval
         });
+        let mut catchup_interval = tokio::time::interval(STARTUP_CATCHUP_NUDGE_INTERVAL);
+        catchup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         #[cfg(feature = "fault-injection")]
         fault::init();
@@ -190,6 +201,7 @@ impl WriterLoop {
             cancel,
             gauges_interval,
             role_poll_interval,
+            catchup_interval: Some(catchup_interval),
         })
     }
 
@@ -206,6 +218,10 @@ impl WriterLoop {
                 }
                 () = interval_tick(&mut self.role_poll_interval) => {
                     self.core.roles_poll().await;
+                    LoopStep::Continue
+                }
+                () = interval_tick(&mut self.catchup_interval) => {
+                    self.catchup_tick();
                     LoopStep::Continue
                 }
                 msg = self.query_rx.recv() => self.query_command_received(msg, QuerySource::Dispatch).await,
@@ -231,6 +247,17 @@ impl WriterLoop {
             }
             self.merges_drain_if_quiescent().await;
             self.queue_gauges_publish();
+        }
+    }
+
+    /// Request a keepalive while the stream has not settled past the startup
+    /// position; stop ticking once it has.
+    fn catchup_tick(&mut self) {
+        if self.core.state_view.cdc_caught_up() {
+            info!("the stream settled past the startup position: cacheable reads are served");
+            self.catchup_interval = None;
+        } else {
+            self.core.merges.watermark_nudge.notify_one();
         }
     }
 

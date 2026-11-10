@@ -74,6 +74,49 @@ struct CdcStatusSnapshot {
     /// `settled_lsn`: every origin transaction committing at or below it is
     /// either applied to the cache or produced no decodable output.
     settled: u64,
+    /// `startup_lsn`: origin's position after the writer's startup loads;
+    /// cacheable reads forward until `settled` reaches it.
+    startup: u64,
+}
+
+/// Wait until the proxy serves cacheable reads: the writer has published its
+/// startup position and the stream has settled past it. `/status` answers
+/// 503 until the writer is up, so that is waited through too.
+pub(crate) async fn cdc_startup_wait(metrics_port: u16) -> Result<(), Error> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Ok((200, body)) = http_get(metrics_port, "/status").await
+            && let Ok(cdc) = cdc_snapshot_parse(&body)
+            && cdc.startup != u64::MAX
+            && cdc.settled >= cdc.startup
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::other(
+                "the stream never settled past the writer's startup position",
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn cdc_snapshot_parse(body: &str) -> Result<CdcStatusSnapshot, Error> {
+    let json: serde_json::Value = serde_json::from_str(body).map_err(Error::other)?;
+    let cdc = json
+        .get("cdc")
+        .ok_or_else(|| Error::other("status body missing cdc block"))?;
+    let lsn = |field: &str| {
+        cdc.get(field)
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| Error::other(format!("cdc.{field} missing or not a u64")))
+    };
+    Ok(CdcStatusSnapshot {
+        received: lsn("last_received_lsn")?,
+        applied: lsn("last_applied_lsn")?,
+        settled: lsn("settled_lsn")?,
+        startup: lsn("startup_lsn")?,
+    })
 }
 
 /// What a `connect_pgcache_*` call yields: the spawned proxy, its listen
@@ -490,21 +533,7 @@ impl TestContext {
         if status != 200 {
             return Err(Error::other(format!("/status returned {status}: {body}")));
         }
-        let json: serde_json::Value = serde_json::from_str(&body)
-            .map_err(|e| Error::other(format!("invalid JSON: {e}\nbody: {body}")))?;
-        let cdc = json
-            .get("cdc")
-            .ok_or_else(|| Error::other("status body missing cdc block"))?;
-        let lsn = |field: &str| {
-            cdc.get(field)
-                .and_then(serde_json::Value::as_u64)
-                .ok_or_else(|| Error::other(format!("cdc.{field} missing or not a u64")))
-        };
-        Ok(CdcStatusSnapshot {
-            received: lsn("last_received_lsn")?,
-            applied: lsn("last_applied_lsn")?,
-            settled: lsn("settled_lsn")?,
-        })
+        cdc_snapshot_parse(&body)
     }
 
     /// Wait until the writer reports exactly `count` registered queries on

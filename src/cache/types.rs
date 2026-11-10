@@ -478,6 +478,12 @@ pub struct CacheStateView {
     /// gate's forward attribution (PGC-440): a forward whose blocking bound is
     /// at or below it is waiting on apply/settle, above it on origin delivery.
     pub received_lsn: Arc<AtomicU64>,
+    /// Origin's WAL position once the writer has loaded its startup
+    /// catalogs (raw `Lsn`; `u64::MAX` until then). Cacheable reads forward
+    /// until `settled_lsn` passes it: before that the stream has not yet
+    /// delivered every change the writer's catalogs predate, and an entry
+    /// could register against state a late signal then undoes.
+    pub startup_lsn: AtomicU64,
     /// The write-target map for the read-after-write gate (ADR-048), published
     /// whole by the writer on every change to the cached tables or their alias
     /// lists; a connection loads it wait-free when it records a write.
@@ -507,6 +513,12 @@ impl std::fmt::Debug for CacheStateView {
 }
 
 impl CacheStateView {
+    /// Whether the stream has settled past the writer's startup position, so
+    /// a cacheable read may be served rather than forwarded.
+    pub fn cdc_caught_up(&self) -> bool {
+        self.settled_lsn.load(Ordering::Relaxed) >= self.startup_lsn.load(Ordering::Relaxed)
+    }
+
     pub fn new(dynamic: DynamicConfigHandle) -> CacheResult<Self> {
         let latency_template =
             Histogram::new(2).map_err(|_| Report::from(CacheError::LatencyHistogram))?;
@@ -530,6 +542,7 @@ impl CacheStateView {
             serve_pool: Arc::new(ServePool::default()),
             settled_lsn: Arc::new(AtomicU64::new(0)),
             received_lsn: Arc::new(AtomicU64::new(0)),
+            startup_lsn: AtomicU64::new(u64::MAX),
             write_targets: ArcSwap::from_pointee(WriteTargetMap::default()),
             rls_relations: ArcSwap::from_pointee(RlsRelations::default()),
             memo: ResultMemo::new(dynamic),

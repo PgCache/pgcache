@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use ecow::EcoString;
 use postgres_types::PgLsn;
@@ -608,7 +609,29 @@ impl WriterCore {
         core.rls_startup_load()
             .await
             .attach_loc("loading row-level security policies at writer start")?;
+        core.startup_position_publish().await?;
         Ok(core)
+    }
+
+    /// Origin's WAL position now that the startup catalogs are loaded:
+    /// dispatch forwards cacheable reads until the stream settles past it,
+    /// and the CDC thread is asked for a keepalive so an idle origin
+    /// advances the watermark within a round trip rather than at its own
+    /// cadence (the event loop repeats the request until caught up).
+    async fn startup_position_publish(&mut self) -> CacheResult<()> {
+        let row = self
+            .db_origin
+            .query_one("SELECT pg_current_wal_lsn()", &[])
+            .await
+            .map_into_report::<CacheError>()
+            .attach_loc("reading origin's WAL position at writer start")?;
+        let lsn = Lsn::from(row.get::<_, PgLsn>(0));
+        self.state_view
+            .startup_lsn
+            .store(lsn.get(), Ordering::Relaxed);
+        self.merges.watermark_nudge.notify_one();
+        info!(startup_lsn = %lsn, "cacheable reads forward until the stream settles past the startup position");
+        Ok(())
     }
 
     /// Borrow a cleared candidate `FingerprintSet` from the scratch pool

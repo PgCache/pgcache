@@ -20,7 +20,7 @@ pub(crate) use assertions::{
     assert_limit_order_decides, assert_proxy_rows_match_origin, assert_row_at, assert_row_fields,
     extract_row, result_rows, rows_of,
 };
-pub(crate) use context::{TestContext, cache_settle_at, lsn_parse};
+pub(crate) use context::{TestContext, cache_settle_at, cdc_startup_wait, lsn_parse};
 pub(crate) use http::{http_get, http_post, http_put};
 pub(crate) use metrics::{
     MetricsSnapshot, assert_cache_hit, assert_cache_miss, assert_not_subsumed, assert_subsume_hit,

@@ -61,6 +61,11 @@ pub struct CdcStatusData {
     /// keepalives at drained points), so it is the field that answers "has
     /// pgcache applied every effect up to this origin LSN".
     pub settled_lsn: Lsn,
+    /// Origin's WAL position when the writer finished its startup loads;
+    /// cacheable reads forward until `settled_lsn` reaches it. `u64::MAX`
+    /// until the writer has published it.
+    #[serde(default)]
+    pub startup_lsn: Lsn,
 }
 
 /// Per-query status for a cached query.

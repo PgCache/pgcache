@@ -15,6 +15,8 @@ use pgtemp::{PgTempDB, PgTempDBBuilder};
 use tokio_postgres::{Client, Config, NoTls};
 use tokio_util::bytes::{Buf, BytesMut};
 
+use super::context::cdc_startup_wait;
+
 static CRYPTO_INIT: Once = Once::new();
 
 /// Initialize the rustls crypto provider (required before using TLS)
@@ -367,6 +369,7 @@ pub(crate) async fn connect_pgcache(
     let metrics_port = find_available_port()?;
     let mut pgcache = pgcache_spawn(dbs, listen_port, metrics_port, &["--cache_policy", "fifo"]);
     proxy_wait_for_ready(&mut pgcache).map_err(Error::other)?;
+    cdc_startup_wait(metrics_port).await?;
     let client = pgcache_client_connect(listen_port).await?;
     Ok((pgcache, listen_port, metrics_port, client))
 }
@@ -383,6 +386,7 @@ pub(super) async fn connect_pgcache_args(
     args.extend_from_slice(extra_args);
     let mut pgcache = pgcache_spawn(dbs, listen_port, metrics_port, &args);
     proxy_wait_for_ready(&mut pgcache).map_err(Error::other)?;
+    cdc_startup_wait(metrics_port).await?;
     let client = pgcache_client_connect(listen_port).await?;
     Ok((pgcache, listen_port, metrics_port, client))
 }
@@ -417,6 +421,7 @@ pub(super) async fn connect_pgcache_fault_args(
     let metrics_port = find_available_port()?;
     let mut pgcache = pgcache_spawn_env(dbs, listen_port, metrics_port, args, env);
     proxy_wait_for_ready(&mut pgcache).map_err(Error::other)?;
+    cdc_startup_wait(metrics_port).await?;
     let client = pgcache_client_connect(listen_port).await?;
     Ok((pgcache, listen_port, metrics_port, client))
 }
@@ -441,6 +446,7 @@ pub(crate) async fn connect_pgcache_clock(
         ],
     );
     proxy_wait_for_ready(&mut pgcache).map_err(Error::other)?;
+    cdc_startup_wait(metrics_port).await?;
     let client = pgcache_client_connect(listen_port).await?;
     Ok((pgcache, listen_port, metrics_port, client))
 }
@@ -462,6 +468,7 @@ pub(crate) async fn connect_pgcache_small_cache(
         &[("PGCACHE_FAULT_EVICTION_COUNT_CAP", &cap)],
     );
     proxy_wait_for_ready(&mut pgcache).map_err(Error::other)?;
+    cdc_startup_wait(metrics_port).await?;
     let client = pgcache_client_connect(listen_port).await?;
     Ok((pgcache, listen_port, metrics_port, client))
 }
@@ -480,6 +487,7 @@ pub(crate) async fn connect_pgcache_allowlist(
         &["--cache_policy", "fifo", "--allowed_tables", allowed_tables],
     );
     proxy_wait_for_ready(&mut pgcache).map_err(Error::other)?;
+    cdc_startup_wait(metrics_port).await?;
     let client = pgcache_client_connect(listen_port).await?;
     Ok((pgcache, listen_port, metrics_port, client))
 }
@@ -498,6 +506,7 @@ pub(crate) async fn connect_pgcache_pinned(
         &["--cache_policy", "fifo", "--pinned_queries", pinned_queries],
     );
     proxy_wait_for_ready(&mut pgcache).map_err(Error::other)?;
+    cdc_startup_wait(metrics_port).await?;
     let client = pgcache_client_connect(listen_port).await?;
     Ok((pgcache, listen_port, metrics_port, client))
 }
@@ -521,6 +530,7 @@ pub(crate) async fn connect_pgcache_pinned_small_cache(
         &[("PGCACHE_FAULT_EVICTION_COUNT_CAP", &cap)],
     );
     proxy_wait_for_ready(&mut pgcache).map_err(Error::other)?;
+    cdc_startup_wait(metrics_port).await?;
     let client = pgcache_client_connect(listen_port).await?;
     Ok((pgcache, listen_port, metrics_port, client))
 }
@@ -543,6 +553,7 @@ pub(crate) async fn connect_pgcache_pinned_fault(
         env,
     );
     proxy_wait_for_ready(&mut pgcache).map_err(Error::other)?;
+    cdc_startup_wait(metrics_port).await?;
     let client = pgcache_client_connect(listen_port).await?;
     Ok((pgcache, listen_port, metrics_port, client))
 }
@@ -569,6 +580,7 @@ pub(crate) async fn connect_pgcache_tls(
         ],
     );
     proxy_wait_for_ready(&mut pgcache).map_err(Error::other)?;
+    cdc_startup_wait(metrics_port).await?;
 
     let cert_path = Path::new("tests/data/certs/server.crt");
     let tls_config = tls_config_with_cert(cert_path)?;

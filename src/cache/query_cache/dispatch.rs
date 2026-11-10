@@ -269,8 +269,9 @@ impl CacheDispatch {
             return;
         }
 
-        if !self.cdc_connected.load(Ordering::Relaxed) {
-            // CDC down: forward to origin rather than serve possibly-stale data.
+        // CDC down, or not yet settled past the writer's startup position:
+        // forward to origin rather than serve possibly-stale data.
+        if !self.cdc_connected.load(Ordering::Relaxed) || !self.state_view.cdc_caught_up() {
             let data = message.into_data();
             let _ = reply_forward(
                 reply_tx,

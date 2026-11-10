@@ -139,6 +139,7 @@ impl WriterCore {
                 last_received_lsn,
                 last_applied_lsn: self.last_applied_lsn,
                 settled_lsn: Lsn::from_raw(self.state_view.settled_lsn.load(Ordering::Relaxed)),
+                startup_lsn: Lsn::from_raw(self.state_view.startup_lsn.load(Ordering::Relaxed)),
             },
             queries,
             fault_injection: cfg!(feature = "fault-injection"),
