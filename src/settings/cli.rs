@@ -445,6 +445,10 @@ fn cli_args_parse() -> ConfigResult<(CliArgs, Option<SettingsToml>, Option<PathB
             Long("help") => {
                 Settings::print_usage_and_exit(parser.bin_name().unwrap_or_default());
             }
+            Long("version") => {
+                println!("pgcache {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             Short(_) | Long(_) | Value(_) => {
                 return Err(ConfigError::ArgumentError(BoxedError::new(arg.unexpected())).into());
             }
@@ -862,7 +866,8 @@ impl Settings {
             [--telemetry_off] (disable anonymous telemetry) \n \
             [--check] (check the origin is ready for pgcache, print a report and exit; cache settings not needed) \n \
             [--healthcheck] (probe a running pgcache's /healthz on --metrics_socket and exit 0 when it answers; for container health checks) \n \
-            [--origin_locale] (print origin's database locale, provider and collation version on one line and exit; the image picks its cache PostgreSQL from it)"
+            [--origin_locale] (print origin's database locale, provider and collation version on one line and exit; the image picks its cache PostgreSQL from it) \n \
+            [--version] (print the pgcache version and exit)"
         );
         std::process::exit(1);
     }

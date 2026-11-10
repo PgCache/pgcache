@@ -51,3 +51,18 @@ async fn test_healthcheck_requires_a_metrics_socket() -> Result<(), Error> {
     );
     Ok(())
 }
+
+/// `--version` prints the crate version and exits 0 before any settings are
+/// resolved, so it needs no origin or cache.
+#[test]
+fn test_version_flag_prints_crate_version() {
+    let output = Command::new(env!("CARGO_BIN_EXE_pgcache"))
+        .arg("--version")
+        .output()
+        .expect("run pgcache --version");
+    assert!(output.status.success(), "exit 0");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        format!("pgcache {}", env!("CARGO_PKG_VERSION"))
+    );
+}
