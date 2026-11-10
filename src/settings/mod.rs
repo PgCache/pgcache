@@ -326,6 +326,9 @@ pub enum RunMode {
     Check(Box<PreflightSettings>),
     /// `--healthcheck`: probe the admin socket of a running pgcache and exit.
     Healthcheck(SocketAddr),
+    /// `--origin_locale`: print origin's database locale on one line and exit;
+    /// the image's entrypoint picks its cache PostgreSQL flavour from it.
+    OriginLocale(Box<PreflightSettings>),
 }
 
 #[derive(Debug, Clone)]

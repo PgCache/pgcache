@@ -15,6 +15,7 @@ use tracing_appender::non_blocking::NonBlockingBuilder;
 #[cfg(not(feature = "console"))]
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
+use pgcache_lib::cache::database_locale_describe;
 use pgcache_lib::metrics::metrics_recorder_install;
 #[cfg(not(feature = "console"))]
 use pgcache_lib::metrics::names::LOG_DROPPED_LINES;
@@ -81,6 +82,7 @@ fn main() -> Result<(), Report> {
     let settings = match RunMode::from_args()? {
         RunMode::Check(preflight) => return preflight_main(&preflight),
         RunMode::Healthcheck(socket) => healthcheck_main(socket),
+        RunMode::OriginLocale(preflight) => return origin_locale_main(&preflight),
         RunMode::Serve(settings) => *settings,
     };
     let cancel = CancellationToken::new();
@@ -228,6 +230,15 @@ fn healthcheck_main(socket: SocketAddr) -> ! {
 
 /// `--check`: run the origin readiness checks, print the report and exit.
 /// Exit status is 1 when any check failed; warnings alone exit 0.
+fn origin_locale_main(settings: &PreflightSettings) -> Result<(), Report> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let line = runtime.block_on(database_locale_describe(&settings.origin))?;
+    println!("{line}");
+    Ok(())
+}
+
 fn preflight_main(settings: &PreflightSettings) -> Result<(), Report> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

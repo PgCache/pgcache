@@ -17,6 +17,7 @@ pub(crate) mod serve_pool;
 mod setup;
 mod supervise;
 
+pub use database_locale::database_locale_describe;
 pub use supervise::{cache_generation_start, cache_supervise};
 
 /// One generation of the cache subsystem: the cancel token that fires on its

@@ -8,6 +8,8 @@ use postgres_protocol::escape::escape_literal;
 use tokio_postgres::Client;
 
 use crate::cache::{CacheError, CacheResult, MapIntoReport, ReportExt};
+use crate::pg;
+use crate::settings::PgSettings;
 
 /// Which library orders text under the database default collation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +166,19 @@ impl DatabaseLocale {
         }
         text
     }
+}
+
+/// `--origin_locale`: connect to origin and describe its database locale, the
+/// line the image's entrypoint picks a cache PostgreSQL flavour from.
+pub async fn database_locale_describe(settings: &PgSettings) -> CacheResult<String> {
+    let client = pg::connect(settings, "origin locale")
+        .await
+        .map_into_report::<CacheError>()
+        .attach_loc("connecting to origin")?;
+    let locale = DatabaseLocale::probe(&client)
+        .await
+        .attach_loc("reading origin's database locale")?;
+    Ok(locale.describe())
 }
 
 #[cfg(test)]

@@ -61,6 +61,8 @@ mod reply;
 #[cfg(feature = "proxy")]
 mod runtime;
 #[cfg(feature = "proxy")]
+pub use runtime::database_locale_describe;
+#[cfg(feature = "proxy")]
 mod serve;
 pub mod serve_decision;
 #[cfg(feature = "proxy")]

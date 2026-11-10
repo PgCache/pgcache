@@ -179,6 +179,7 @@ pub(super) struct CliArgs {
     pub(super) telemetry_off: bool,
     pub(super) check: bool,
     pub(super) healthcheck: bool,
+    pub(super) origin_locale: bool,
 }
 
 /// CLI values for the runtime-adjustable settings ([`DynamicConfig`]).
@@ -440,6 +441,7 @@ fn cli_args_parse() -> ConfigResult<(CliArgs, Option<SettingsToml>, Option<PathB
             Long("telemetry_off") => args.telemetry_off = true,
             Long("check") => args.check = true,
             Long("healthcheck") => args.healthcheck = true,
+            Long("origin_locale") => args.origin_locale = true,
             Long("help") => {
                 Settings::print_usage_and_exit(parser.bin_name().unwrap_or_default());
             }
@@ -815,6 +817,11 @@ impl RunMode {
                 args, config,
             )?)));
         }
+        if args.origin_locale {
+            return Ok(RunMode::OriginLocale(Box::new(preflight_settings_build(
+                args, config,
+            )?)));
+        }
         Ok(RunMode::Serve(Box::new(settings_build(
             args,
             config,
@@ -854,7 +861,8 @@ impl Settings {
             [--log_level LEVEL] (e.g., debug, info, pgcache_lib::cache=debug) \n \
             [--telemetry_off] (disable anonymous telemetry) \n \
             [--check] (check the origin is ready for pgcache, print a report and exit; cache settings not needed) \n \
-            [--healthcheck] (probe a running pgcache's /healthz on --metrics_socket and exit 0 when it answers; for container health checks)"
+            [--healthcheck] (probe a running pgcache's /healthz on --metrics_socket and exit 0 when it answers; for container health checks) \n \
+            [--origin_locale] (print origin's database locale, provider and collation version on one line and exit; the image picks its cache PostgreSQL from it)"
         );
         std::process::exit(1);
     }

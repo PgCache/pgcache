@@ -150,3 +150,26 @@ async fn test_startup_refused_when_collation_order_differs() -> Result<(), Error
     );
     Ok(())
 }
+
+/// `--origin_locale` prints origin's locale line and exits 0; the image's
+/// entrypoint chooses its cache PostgreSQL flavour from it.
+#[tokio::test]
+async fn test_origin_locale_mode_prints_origin_locale() -> Result<(), Error> {
+    let (dbs, _origin) = start_databases().await?;
+    let output = pgcache_run_to_exit(&dbs, &["--origin_locale"], &[], Duration::from_secs(30))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "exit 0: {stdout}");
+    let line = stdout
+        .lines()
+        .find(|l| l.starts_with("provider="))
+        .unwrap_or_default();
+    assert!(
+        line.contains("provider=libc"),
+        "names the provider: {stdout}"
+    );
+    assert!(
+        line.contains("lc_collate="),
+        "names the collation: {stdout}"
+    );
+    Ok(())
+}

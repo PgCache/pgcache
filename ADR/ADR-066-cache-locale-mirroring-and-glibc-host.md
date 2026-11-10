@@ -24,12 +24,12 @@ Nothing installable fixes musl; ICU at `initdb` bypasses libc but matches only a
 ### Positive
 - A text `ORDER BY` served from cache returns origin's order on glibc origins from Debian, Ubuntu, Amazon Linux 2023 and the Kubernetes operators.
 - The `lc_monetary`, `lc_numeric` and `lc_time` gate becomes real: glibc rejects an uninstalled locale, so the refusal and its message now hold.
-- An RDS or Aurora origin behind the image refuses startup with the disagreeing pair named, instead of serving reordered results silently.
+- An origin the cache host cannot order like refuses startup with the disagreeing pair named, instead of serving reordered results silently.
 - Column-level collations stay the per-column work of PGC-459; the database default is what this ADR fixes.
 
 ### Negative
-- About 35 MB more compressed image and a larger scanner package set (apt, dpkg, perl-base).
-- An RDS origin cannot be served by the stock image until its database uses ICU or `C`, or the cache runs on a host with the same collation library.
+- About 110 MB more compressed image, almost all locale data; the Debian package set scans with fewer findings than the Alpine one did.
+- An RDS or Aurora origin needs a cache PostgreSQL on the same glibc lineage; ADR-067 adds one to the image.
 - Mirroring adds one origin round trip at setup and a second `pg_database` read on the cache; both are startup-only.
 
 ## Implementation Notes
