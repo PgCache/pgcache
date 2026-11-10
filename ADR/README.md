@@ -44,6 +44,7 @@ Conventions: files are `ADR-XXX-brief-title.md` with the next sequential number;
 - [ADR-057](ADR-057-query-tree-with-side-table-bindings.md) — One immutable query tree with resolution as a side table keyed by pre-order `NodeId`; structural results of resolution as annotations; arena as the named second round *(supersedes ADR-002's parallel hierarchy)*
 - [ADR-064](ADR-064-opaque-scalar-operators.md) — Opaque scalar operators: one two-child `Operator` kind over arithmetic and the json operator family, never a constraint, volatility per operator under the stable-function rule *(extends ADR-057, ADR-059; amends ADR-056 part C)*
 - [ADR-065](ADR-065-function-catalog-and-admission.md) — Function catalog, resolution and admission: one shared `pg_proc` catalog, a proxy verdict by builtins and a writer verdict on the search_path, admission of what the cache database can run, eviction and reload on the function signal *(extends ADR-058)*
+- [ADR-066](ADR-066-session-term-expression-keying.md) — Session terms in client queries by expression keying: the proxy folds each fragment over `current_setting`/`current_user` to a literal under the session's values and keys the read on the literals, the writer substitutes them by position; a tracked `set_config` is no write *(extends ADR-062, ADR-056)*
 
 ## Caching tiers & serving
 - [ADR-010](ADR-010-population-worker-pool.md) — Persistent population worker pool *(amended by ADR-050)*
@@ -59,7 +60,7 @@ Conventions: files are `ADR-XXX-brief-title.md` with the next sequential number;
 - [ADR-040](ADR-040-shape-keyed-serving.md) — Shape-keyed prepared-statement serving (collapse per-literal plan churn)
 - [ADR-060](ADR-060-limit-capped-population.md) — LIMIT-capped population: the cache holds a superset of a capped query's top N; root-only, ordered capped read; CDC keeps the superset
 - [ADR-061](ADR-061-hit-path-privilege-verdicts.md) — Hit-path privilege verdicts: per-(role, object) read privileges asked of origin by role name, cached in the state view, gated at the hit and the coalesce drain, flushed by every DDL signal *(amended: role changes observed by a catalog poll)*
-- [ADR-062](ADR-062-rls-policy-inlining.md) — Row-level security by policy inlining: the writer ANDs the role's applicable policies onto the bound query at resolution; the proxy keys the read on role, `row_security` and the custom settings the policies read
+- [ADR-062](ADR-062-rls-policy-inlining.md) — Row-level security by policy inlining: the writer ANDs the role's applicable policies onto the bound query at resolution; the proxy keys the read on role, `row_security` and the custom settings the policies read *(amended by ADR-066: terms in a client's own query)*
 
 ## CDC & cache consistency
 - [ADR-018](ADR-018-dynamic-publication-management.md) — Dynamic publication management (filter CDC at source via ALTER PUBLICATION)

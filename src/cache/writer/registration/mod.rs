@@ -214,6 +214,7 @@ fn register_failure_log(key: impl std::fmt::Display, error: &CacheError) {
             | CacheError::FunctionNotOnCache { .. }
             | CacheError::FunctionNotImmutable { .. }
             | CacheError::CanonicalUncacheable { .. }
+            | CacheError::SessionTermValues { .. }
     ) {
         debug!(
             "query {key} forwarded (not cacheable): {}",
@@ -233,30 +234,27 @@ fn register_failure_log(key: impl std::fmt::Display, error: &CacheError) {
 async fn resolve_command(core: &mut WriterCore, request: ResolveRequest) {
     let session_key = request.session_key;
     trace!("command query resolve {session_key}");
-    let result = match resolve::query_fingerprint_resolve(
-        core,
-        request.cacheable_query.tree(),
-        &request.keying,
-    )
-    .await
-    {
-        Ok((fingerprint, resolution)) => {
-            core.state_view.aliases.insert(
-                session_key,
-                Alias {
-                    fingerprint,
-                    tick: core.alias_tick,
-                    rls: request.keying.rls.is_some(),
-                    resolution: Some(resolution),
-                },
-            );
-            ResolveResult::Resolved(fingerprint)
-        }
-        Err(e) => {
-            register_failure_log(session_key, e.current_context());
-            ResolveResult::Unresolvable
-        }
-    };
+    let result =
+        match resolve::query_fingerprint_resolve(core, &request.cacheable_query, &request.keying)
+            .await
+        {
+            Ok((fingerprint, resolution)) => {
+                core.state_view.aliases.insert(
+                    session_key,
+                    Alias {
+                        fingerprint,
+                        tick: core.alias_tick,
+                        rls: request.keying.rls.is_some(),
+                        resolution: Some(resolution),
+                    },
+                );
+                ResolveResult::Resolved(fingerprint)
+            }
+            Err(e) => {
+                register_failure_log(session_key, e.current_context());
+                ResolveResult::Unresolvable
+            }
+        };
     let _ = request.reply_tx.send(result);
 }
 

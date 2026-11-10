@@ -14,8 +14,10 @@ use pgcache_lib::cache::query::{limit_clause_of, limit_rows_needed};
 use pgcache_lib::cache::{CacheabilityError, CacheableQuery};
 use pgcache_lib::catalog::Catalog;
 use pgcache_lib::oid::Oid;
-use pgcache_lib::query::ast::rope::QueryTree;
-use pgcache_lib::query::ast::{AstError, RawStatement, WhereParseError, statement_convert_raw};
+use pgcache_lib::query::ast::rope::{NodeKind, QueryTree};
+use pgcache_lib::query::ast::{
+    AstError, LiteralValue, RawStatement, SessionTerm, WhereParseError, statement_convert_raw,
+};
 use pgcache_lib::query::constraints::TableRanges;
 use pgcache_lib::query::join_region::{JoinRegion, query_join_region};
 use pgcache_lib::query::literal_settings::LiteralSettings;
@@ -237,6 +239,9 @@ pub struct CacheableAnalysis {
     pub join_region: Option<JoinRegion>,
     /// One entry per admitted update query (the subsumer side).
     pub admissions: Vec<FitAdmission>,
+    /// The session values the read is keyed on (PGC-580), as the report's
+    /// detail line: `None` for a read of no session term.
+    pub session_terms: Option<String>,
 }
 
 /// The slice of a [`TableAdmission`] the offline registry keeps.
@@ -400,7 +405,41 @@ pub fn statement_classify(
         references,
         join_region,
         admissions,
+        session_terms: session_terms_label(&cacheable),
     }))
+}
+
+/// "keyed on the session: app.tenant, current_user" for a read with session
+/// terms (ADR-066), naming the custom settings and the role terms it reads.
+fn session_terms_label(query: &CacheableQuery) -> Option<String> {
+    if !query.has_session_terms() {
+        return None;
+    }
+    let mut names: Vec<&str> = query
+        .setting_names()
+        .iter()
+        .map(EcoString::as_str)
+        .collect();
+    let mut current_user = false;
+    let mut session_user = false;
+    for node in query.tree().nodes() {
+        match &node.kind {
+            NodeKind::Literal(LiteralValue::SessionTerm(SessionTerm::CurrentUser)) => {
+                current_user = true;
+            }
+            NodeKind::Literal(LiteralValue::SessionTerm(SessionTerm::SessionUser)) => {
+                session_user = true;
+            }
+            _ => {}
+        }
+    }
+    if current_user {
+        names.push("current_user");
+    }
+    if session_user {
+        names.push("session_user");
+    }
+    Some(format!("keyed on the session: {}", names.join(", ")))
 }
 
 /// Test-only: parse SQL straight to a tree through the same raw path the

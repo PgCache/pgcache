@@ -7,8 +7,8 @@ use super::ParseError;
 use super::cacheability_memo::{CacheabilityCache, SqlTextHash};
 use super::explain::{ExplainSpec, explain_spec_extract};
 use crate::{
-    cache::query::{CacheableQuery, query_tree_has_volatile_function},
-    catalog::FunctionCatalog,
+    cache::query::{CacheableQuery, query_tree_has_volatile_function_except},
+    catalog::{FunctionCatalog, schema_is_builtin},
     query::ast::rope::{Function, NodeKind, QueryTree, View},
     query::ast::{AstError, LiteralValue, RawStatement, statement_convert_raw},
     query::guc::Guc,
@@ -21,46 +21,75 @@ use crate::{
 /// The settings effect of the `set_config` calls in a converted statement:
 /// each call with a literal name touches that setting (an untracked name is
 /// a custom setting, with its value when that is a literal too), scoped by
-/// a literal `is_local`; a call
-/// whose name is not a literal may change anything. The caller only asks
-/// when the text mentions `set_config`, so finding no call means it hides
-/// somewhere the converter does not model and the answer is likewise
-/// everything.
-fn set_config_calls_effect(tree: &QueryTree) -> (SettingsEffect, CustomSettingEffects) {
-    let mut effect = SettingsEffect::NONE;
+/// a literal `is_local`; a bound or computed `is_local` leaves the value
+/// unknown and lasting, the probe deciding. A call whose name is not a
+/// literal, or a `set_config` of another schema (a user's function the
+/// text scan matched), may change anything. The caller only asks when the
+/// text mentions `set_config`, so finding no call means it hides somewhere
+/// the converter does not model and the answer is likewise everything.
+fn set_config_calls_effect(tree: &QueryTree) -> SetConfigEffects {
+    let unknown = SetConfigEffects {
+        settings: SettingsEffect::all(),
+        custom: CustomSettingEffects::new(),
+        tracked: false,
+    };
+    let mut settings = SettingsEffect::NONE;
     let mut custom = CustomSettingEffects::new();
     let mut calls = 0usize;
     for position in tree.root().node_ref().subtree() {
-        let NodeKind::Function { name, .. } = position.kind() else {
+        let NodeKind::Function { schema, name, .. } = position.kind() else {
             continue;
         };
         if !name.eq_ignore_ascii_case("set_config") {
             continue;
         }
+        if !schema_is_builtin(schema.as_deref()) {
+            return unknown;
+        }
         calls += 1;
         let mut args = Function::from_ref(position).args();
         let Some(LiteralValue::String(name)) = args.next().and_then(|arg| arg.literal()) else {
-            return (SettingsEffect::all(), CustomSettingEffects::new());
+            return unknown;
         };
         let value = args.next().and_then(|arg| arg.literal()).cloned();
-        let local = args.next().and_then(|arg| arg.literal()) == Some(&LiteralValue::Boolean(true));
+        let local = match args.next().and_then(|arg| arg.literal()) {
+            Some(LiteralValue::Boolean(local)) => Some(*local),
+            _ => None,
+        };
         if let Some(guc) = Guc::parse(name.as_str()) {
-            effect = effect.union(SettingsEffect::guc(guc, local));
+            settings = settings.union(SettingsEffect::guc(guc, local.unwrap_or(false)));
         } else {
+            let (value, parameter) = match (value, local) {
+                (Some(LiteralValue::String(value)), Some(_)) => (Some(value), None),
+                (Some(LiteralValue::Parameter(placeholder)), Some(_)) => (None, Some(placeholder)),
+                _ => (None, None),
+            };
+            let local = local.unwrap_or(false);
             custom.push(CustomSettingEffect {
                 name: name.to_ascii_lowercase(),
-                value: match value {
-                    Some(LiteralValue::String(value)) => Some(value),
-                    _ => None,
-                },
+                value,
+                parameter,
                 local,
             });
         }
     }
     if calls == 0 {
-        return (SettingsEffect::all(), CustomSettingEffects::new());
+        return unknown;
     }
-    (effect, custom)
+    SetConfigEffects {
+        settings,
+        custom,
+        tracked: true,
+    }
+}
+
+/// What a statement's `set_config` calls do to the session: the tracked
+/// settings and the custom settings they name, and whether every call named
+/// its setting by a literal (`tracked`); otherwise anything may have changed.
+struct SetConfigEffects {
+    settings: SettingsEffect,
+    custom: CustomSettingEffects,
+    tracked: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -171,7 +200,7 @@ pub(super) fn analyze(
     // forwarded statement (a SELECT, a DO block, a CALL); a text scan is the
     // conservative catch-all, and a false positive only costs a re-probe.
     let mentions_set_config = sql_mentions_set_config(sql);
-    let isolation = if mentions_set_config {
+    let mut isolation = if mentions_set_config {
         IsolationEffect::SessionUnknown
     } else {
         IsolationEffect::None
@@ -184,6 +213,9 @@ pub(super) fn analyze(
         SettingsEffect::NONE
     };
     let mut custom_settings = CustomSettingEffects::new();
+    // A SELECT whose `set_config` calls all name their setting is tracked by
+    // those names; such a call is then no write (it changes no table).
+    let mut set_config_tracked = false;
 
     let mut action = match convert_result {
         Ok(RawStatement::Select {
@@ -191,7 +223,15 @@ pub(super) fn analyze(
             ..
         }) => {
             if mentions_set_config {
-                (settings, custom_settings) = set_config_calls_effect(&query);
+                let effects = set_config_calls_effect(&query);
+                // Every call named its setting: the isolation default is
+                // touched only when one of them names it.
+                if effects.tracked && !effects.settings.touches(Guc::DefaultTransactionIsolation) {
+                    isolation = IsolationEffect::None;
+                }
+                settings = effects.settings;
+                custom_settings = effects.custom;
+                set_config_tracked = effects.tracked;
             }
             // `SELECT pgcache_explain(...)` is intercepted before cacheability
             // classification (it would otherwise be an uncacheable unknown
@@ -216,8 +256,12 @@ pub(super) fn analyze(
                         // carrying one is a potential write (PGC-124). Scanned
                         // only now that the query is known uncacheable — the
                         // cacheable path never pays for it.
-                        let effects = if query_tree_has_volatile_function(&query, function_catalog)
-                        {
+                        let exempt = set_config_tracked.then_some("set_config");
+                        let effects = if query_tree_has_volatile_function_except(
+                            &query,
+                            function_catalog,
+                            exempt,
+                        ) {
                             StatementEffects::write(WriteClass::Connection, isolation)
                         } else {
                             StatementEffects::read_only(isolation, None)
@@ -530,6 +574,7 @@ mod tests {
             // Untracked names are no effect; a non-literal name may be anything.
             ("SELECT set_config('request.jwt.claims', '{}', true)", SettingsEffect::NONE),
             ("SELECT set_config($1, 'x', false)", SettingsEffect::all()),
+            ("SELECT app.set_config('timezone', 'x', false)", SettingsEffect::all()),
             // Hidden from the converter: the text scan's answer stands.
             ("DO $$ BEGIN PERFORM SET_CONFIG('x', 'y', false); END $$", SettingsEffect::all()),
             ("SELECT now()", SettingsEffect::NONE),
@@ -555,12 +600,24 @@ mod tests {
         let effect = |name: &str, value: Option<&str>, local: bool| CustomSettingEffect {
             name: name.into(),
             value: value.map(Into::into),
+            parameter: None,
             local,
+        };
+        let bound = CustomSettingEffect {
+            name: "app.tenant".into(),
+            value: None,
+            parameter: Some("$1".into()),
+            local: false,
         };
         #[rustfmt::skip]
         let cases = [
             ("SELECT set_config('request.jwt.claims', '{}', true)", vec![effect("request.jwt.claims", Some("{}"), true)]),
-            ("SELECT set_config('app.tenant', $1, false)", vec![effect("app.tenant", None, false)]),
+            ("SELECT set_config('app.tenant', $1, false)", vec![bound]),
+            ("SELECT pg_catalog.set_config('app.tenant', '7', false)", vec![effect("app.tenant", Some("7"), false)]),
+            // A bound `is_local` leaves the value unknown and lasting.
+            ("SELECT set_config('app.tenant', '7', $1)", vec![effect("app.tenant", None, false)]),
+            // A user's `set_config` is no settings call the proxy tracks.
+            ("SELECT app.set_config('app.tenant', '7', true)", vec![]),
             ("SELECT set_config('timezone', 'UTC', true)", vec![]),
             ("SET app.tenant = '7'", vec![effect("app.tenant", Some("7"), false)]),
             ("SELECT now()", vec![]),
@@ -576,6 +633,10 @@ mod tests {
         #[rustfmt::skip]
         let cases = [
             ("SELECT set_config('default_transaction_isolation', 'serializable', false)",
+             "UncacheableSelect write=None isolation=SessionUnknown"),
+            ("SELECT set_config('app.tenant', '7', true)",
+             "UncacheableSelect write=None isolation=None"),
+            ("SELECT app.set_config('app.tenant', '7', true)",
              "UncacheableSelect write=Some(Connection) isolation=SessionUnknown"),
             ("DO $$ BEGIN PERFORM SET_CONFIG('x', 'y', false); END $$",
              "UnsupportedStatement write=Some(Connection) isolation=SessionUnknown"),

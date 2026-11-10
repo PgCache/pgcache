@@ -4,8 +4,16 @@ use error_set::error_set;
 
 use crate::catalog::FunctionFacts;
 use crate::oid::TypeOid;
+#[cfg(feature = "proxy")]
+use crate::query::ast::LiteralValue;
+use crate::query::ast::NodeId;
 use crate::query::ast::rope::{Body, QueryTree, Select};
-use crate::query::transform::{AstTransformResult, query_tree_parameters_replace};
+use crate::query::transform::{
+    AstTransformResult, query_tree_parameters_replace_remapped, query_tree_setting_names,
+    query_tree_term_fragments,
+};
+#[cfg(feature = "proxy")]
+use crate::query::transform::{SessionTermContext, TermFoldError, query_tree_term_fragments_fold};
 
 mod cacheability;
 mod limit;
@@ -13,7 +21,9 @@ mod request;
 
 use cacheability::{query_cacheable, references_system_catalog};
 #[cfg(feature = "proxy")]
-pub(crate) use cacheability::{query_tree_has_stable_call, query_tree_has_volatile_function};
+pub(crate) use cacheability::{
+    query_tree_has_stable_call, query_tree_has_volatile_function_except,
+};
 
 pub use limit::{limit_clause_of, limit_is_sufficient, limit_rows_needed};
 pub use request::RequestQuery;
@@ -74,11 +84,61 @@ error_set! {
 #[derive(Debug, Clone)]
 pub struct CacheableQuery {
     tree: QueryTree,
+    /// The roots of the session-term fragments (PGC-580), in pre-order:
+    /// the proxy folds each to a literal under the session's values and
+    /// the writer substitutes them before binding. Found once on the
+    /// verdict's tree and carried through parameter substitution, so the
+    /// writer replaces exactly what the proxy folded.
+    term_fragments: Vec<NodeId>,
+    /// The custom settings the fragments read, sorted and distinct.
+    setting_names: Vec<EcoString>,
 }
 
 impl CacheableQuery {
     pub fn tree(&self) -> &QueryTree {
         &self.tree
+    }
+
+    /// Whether the query reads the session (`current_setting`,
+    /// `current_user`): it is then keyed on the folded values.
+    pub fn has_session_terms(&self) -> bool {
+        !self.term_fragments.is_empty()
+    }
+
+    /// The roots of the session-term fragments, in pre-order.
+    pub fn term_fragments(&self) -> &[NodeId] {
+        &self.term_fragments
+    }
+
+    /// The custom settings the query's terms read, sorted and distinct.
+    pub fn setting_names(&self) -> &[EcoString] {
+        &self.setting_names
+    }
+
+    /// The query's fragments folded under `context`, in pre-order, for the
+    /// key and for the writer's substitution.
+    #[cfg(feature = "proxy")]
+    pub(crate) fn term_fragments_fold(
+        &self,
+        context: &SessionTermContext,
+    ) -> Result<Vec<LiteralValue>, TermFoldError> {
+        query_tree_term_fragments_fold(&self.tree, &self.term_fragments, context)
+    }
+
+    fn from_tree(tree: QueryTree) -> Self {
+        let term_fragments = query_tree_term_fragments(&tree);
+        let mut setting_names: Vec<EcoString> = if term_fragments.is_empty() {
+            Vec::new()
+        } else {
+            query_tree_setting_names(&tree).cloned().collect()
+        };
+        setting_names.sort();
+        setting_names.dedup();
+        CacheableQuery {
+            tree,
+            term_fragments,
+            setting_names,
+        }
     }
 
     /// The SELECT body of this query, if it is a simple SELECT: `None` for
@@ -92,12 +152,24 @@ impl CacheableQuery {
 
     /// Substitute bind parameters, producing the per-literal form of this
     /// query. Substitution only replaces `Parameter` literals and
-    /// constant-folds, so the result inherits this query's validation.
+    /// constant-folds, so the result inherits this query's validation. The
+    /// fragments follow their nodes to the substituted tree: none holds a
+    /// parameter, so each lands in one place.
     pub fn parameters_replace(
         &self,
         parameters: &QueryParameters,
     ) -> AstTransformResult<CacheableQuery> {
-        query_tree_parameters_replace(&self.tree, parameters).map(|tree| CacheableQuery { tree })
+        let (tree, remap) = query_tree_parameters_replace_remapped(&self.tree, parameters)?;
+        let term_fragments = self
+            .term_fragments
+            .iter()
+            .map(|id| remap.new_id(*id).unwrap_or(*id))
+            .collect();
+        Ok(CacheableQuery {
+            tree,
+            term_fragments,
+            setting_names: self.setting_names.clone(),
+        })
     }
 }
 
@@ -127,7 +199,7 @@ impl CacheableQuery {
         functions: &dyn FunctionFacts,
     ) -> Result<Self, CacheabilityError> {
         Self::cacheable(&tree, functions)?;
-        Ok(CacheableQuery { tree })
+        Ok(CacheableQuery::from_tree(tree))
     }
 }
 
@@ -180,4 +252,79 @@ pub struct QueryParameter {
     pub value: Option<Bytes>,
     pub format: i16,
     pub oid: TypeOid,
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use postgres_types::Type as PgType;
+
+    use super::*;
+    use crate::catalog::FunctionCatalog;
+    use crate::query::ast::query_tree_parse;
+    use crate::query::ast::rope::Plain;
+    use crate::query::ast::rope::deparse::query_deparse_with;
+    use crate::query::transform::{
+        CustomSettingValue, query_tree_term_fragments_fold, query_tree_term_fragments_replace,
+    };
+
+    fn params(values: &[(&[u8], PgType)]) -> QueryParameters {
+        QueryParameters {
+            values: values
+                .iter()
+                .map(|(v, _)| Some(Bytes::copy_from_slice(v)))
+                .collect(),
+            formats: vec![0; values.len()],
+            oids: values
+                .iter()
+                .map(|(_, ty)| TypeOid::from_type(ty))
+                .collect(),
+        }
+    }
+
+    fn plain(tree: &QueryTree) -> String {
+        let mut buf = String::new();
+        query_deparse_with(tree.root(), &mut Plain, &mut buf);
+        buf
+    }
+
+    /// The fragments the proxy folds on the placeholder tree are the ones
+    /// the writer replaces on the substituted tree: a parameter beside a
+    /// term keeps the term the fragment, and folded arithmetic ahead of it
+    /// moves its position without losing it.
+    #[test]
+    fn test_term_fragments_follow_parameter_substitution() {
+        let tree = query_tree_parse(
+            "SELECT id FROM t WHERE id > $1 + 1 \
+             AND tenant = coalesce(current_setting('app.tenant', true), $2)",
+        )
+        .expect("parse");
+        let query = CacheableQuery::try_new(tree, &FunctionCatalog::default()).expect("cacheable");
+        assert_eq!(query.term_fragments().len(), 1);
+        assert_eq!(query.setting_names(), ["app.tenant"]);
+        let context = SessionTermContext {
+            current_user: None,
+            session_user: None,
+            settings: vec![("app.tenant".into(), CustomSettingValue::Unset)],
+        };
+        let values = query.term_fragments_fold(&context).expect("fold");
+        assert_eq!(values, [LiteralValue::Null]);
+
+        let bound = query
+            .parameters_replace(&params(&[(b"1", PgType::INT4), (b"9", PgType::TEXT)]))
+            .expect("bind");
+        assert_eq!(bound.setting_names(), ["app.tenant"]);
+        let replaced =
+            query_tree_term_fragments_replace(bound.tree(), bound.term_fragments(), &values)
+                .expect("replace");
+        assert_eq!(
+            plain(&replaced),
+            "SELECT id FROM t WHERE id > 2 AND tenant = COALESCE(NULL, '9')"
+        );
+        assert_eq!(
+            query_tree_term_fragments_fold(bound.tree(), bound.term_fragments(), &context)
+                .expect("fold"),
+            values
+        );
+    }
 }

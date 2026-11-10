@@ -4,6 +4,9 @@ mod parameters;
 pub(crate) mod predicate_pushdown;
 mod session_terms;
 mod substitute;
+#[cfg(feature = "proxy")]
+mod term_eval;
+mod term_fold;
 mod values;
 
 use error_set::error_set;
@@ -42,7 +45,14 @@ pub use session_terms::{
     CustomSettingValue, SessionTermContext, SessionTermError, query_tree_has_session_term,
     query_tree_session_terms_replace, query_tree_setting_names,
 };
-pub use substitute::query_tree_parameters_replace;
+pub use substitute::{query_tree_parameters_replace, query_tree_parameters_replace_remapped};
+#[cfg(feature = "proxy")]
+pub(crate) use term_eval::{
+    TermFoldError, query_tree_term_fragments_fold, query_tree_term_fragments_replace,
+};
+pub(crate) use term_fold::{
+    query_tree_term_fragments, scalar_is_term_fragment, where_subquery_is_term_fragment,
+};
 pub use values::{
     BATCH_IDX_COLUMN, PgEvalTemplate, TableOccurrence, membership_batch_into,
     membership_unnest_into, membership_values_into, table_occurrence_at,

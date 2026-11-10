@@ -262,5 +262,11 @@ error_set! {
         CanonicalUncacheable {
             reason: EcoString,
         },
+        /// The folded session-term values the proxy keyed the read on do not
+        /// pair with the query's fragments (PGC-580); the read forwards.
+        #[display("session terms: {reason}")]
+        SessionTermValues {
+            reason: EcoString,
+        },
     }
 }

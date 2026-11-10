@@ -78,6 +78,7 @@ unsafe fn variable_set_custom_effect(s: *const pg::VariableSetStmt) -> CustomSet
         effects.push(CustomSettingEffect {
             name: EcoString::from(name.to_ascii_lowercase()),
             value,
+            parameter: None,
             local: (*s).is_local,
         });
         effects

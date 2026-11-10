@@ -25,7 +25,7 @@ mod function;
 pub(crate) use function::is_settings_stable;
 pub use function::{
     FUNCTION_CATALOG_SQL, FunctionCatalog, FunctionFacts, FunctionKind, FunctionRow,
-    FunctionVolatility, PathFunctions, SharedFunctionCatalog, is_sql_form,
+    FunctionVolatility, PathFunctions, SharedFunctionCatalog, is_sql_form, schema_is_builtin,
 };
 
 /// Column storage: sorted by position with O(1) name lookups.

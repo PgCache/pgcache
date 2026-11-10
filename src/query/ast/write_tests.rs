@@ -704,6 +704,7 @@ fn test_custom_setting_effects_of_set_and_reset() {
     let effect = |name: &str, value: Option<&str>, local: bool| CustomSettingEffect {
         name: name.into(),
         value: value.map(Into::into),
+        parameter: None,
         local,
     };
     #[rustfmt::skip]

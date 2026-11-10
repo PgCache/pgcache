@@ -14,7 +14,8 @@ use super::constant_fold::literal_arithmetic_fold;
 use super::parameters::literal_value_parameters_replace;
 use crate::cache::QueryParameters;
 use crate::query::ast::rope::{
-    NodeKind, NodeRef, QueryTree, Replacement, Replacements, Scalar, ScalarKind, TreeBuilder, View,
+    NodeKind, NodeRef, QueryTree, Remap, Replacement, Replacements, Scalar, ScalarKind,
+    TreeBuilder, View,
 };
 use crate::query::ast::{LiteralValue, NodeId, ScalarOp};
 
@@ -24,17 +25,27 @@ pub fn query_tree_parameters_replace(
     tree: &QueryTree,
     parameters: &QueryParameters,
 ) -> AstTransformResult<QueryTree> {
+    query_tree_parameters_replace_remapped(tree, parameters).map(|(tree, _)| tree)
+}
+
+/// [`query_tree_parameters_replace`] with where the kept nodes landed, for a
+/// side table keyed on the base tree's positions. An unchanged tree comes
+/// with the empty remap, under which every position is its own.
+pub fn query_tree_parameters_replace_remapped(
+    tree: &QueryTree,
+    parameters: &QueryParameters,
+) -> AstTransformResult<(QueryTree, Remap)> {
     let mut pass = Pass {
         parameters,
         replacements: Replacements::new(),
     };
     pass.subtree(tree.root().node_ref())?;
     if pass.replacements.is_empty() {
-        return Ok(tree.clone());
+        return Ok((tree.clone(), Remap::default()));
     }
     let mut builder = TreeBuilder::over(tree);
     builder.copy(tree.root().node_ref(), &mut pass.replacements);
-    Ok(builder.finish().0)
+    Ok(builder.finish())
 }
 
 struct Pass<'a> {

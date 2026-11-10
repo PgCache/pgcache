@@ -20,10 +20,14 @@ use crate::pg::protocol::extended::{
 use crate::pg::protocol::frontend::PgFrontendMessage;
 use crate::pg::protocol::session::{Portal, PreparedStatement, ResultFormats, StatementType};
 use crate::proxy::query::{Action, ForwardReason, analyze};
+use crate::query::ast::LiteralValue;
 use crate::query::transform::{
-    delete_statement_parameterize, insert_statement_parameterize, update_statement_parameterize,
+    delete_statement_parameterize, insert_statement_parameterize, literal_value_parameters_replace,
+    update_statement_parameterize,
 };
-use crate::query::write::{StatementEffects, WriteClass};
+use crate::query::write::{
+    CustomSettingEffect, CustomSettingEffects, StatementEffects, WriteClass,
+};
 
 /// What Parse-time analysis decided about a statement.
 struct StatementAnalysis {
@@ -71,6 +75,49 @@ fn write_class_bind(class: &WriteClass, portal: &Portal, stmt: &PreparedStatemen
             class.clone()
         }
     }
+}
+
+/// Resolve a `set_config` value that arrives as a bind parameter against the
+/// portal (PGC-580), so the setting is known without a probe. A value that
+/// does not decode to text stays unknown, and the probe samples it.
+fn custom_settings_bind(
+    effects: &CustomSettingEffects,
+    portal: &Portal,
+    stmt: &PreparedStatement,
+) -> CustomSettingEffects {
+    if effects.iter().all(|effect| effect.parameter.is_none()) {
+        return effects.clone();
+    }
+    let parameters = QueryParameters {
+        values: portal.parameter_values.clone(),
+        formats: portal.parameter_formats.clone(),
+        oids: stmt.parameter_oids.clone(),
+    };
+    effects
+        .iter()
+        .map(|effect| {
+            let Some(placeholder) = &effect.parameter else {
+                return effect.clone();
+            };
+            let mut literal = LiteralValue::Parameter(placeholder.clone());
+            let value = match literal_value_parameters_replace(&mut literal, &parameters) {
+                Ok(()) => {
+                    if let LiteralValue::String(value) = literal {
+                        Some(value)
+                    } else {
+                        None
+                    }
+                }
+                Err(_) => None,
+            };
+            CustomSettingEffect {
+                name: effect.name.clone(),
+                value,
+                parameter: None,
+                local: effect.local,
+            }
+        })
+        .collect()
 }
 
 impl ConnectionState {
@@ -282,7 +329,7 @@ impl ConnectionState {
             isolation: stmt.effects.isolation,
             transaction: stmt.effects.transaction,
             settings: stmt.effects.settings,
-            custom_settings: stmt.effects.custom_settings.clone(),
+            custom_settings: custom_settings_bind(&stmt.effects.custom_settings, portal, stmt),
         }
     }
 

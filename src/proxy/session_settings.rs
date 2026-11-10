@@ -380,6 +380,7 @@ impl ScopeViews {
             search_path: Arc::from([]),
             literals: LiteralSettings::default(),
             rls: None,
+            term_values: Vec::new(),
         });
         Self {
             keying: Err(SettingsForwardReason::SettingUnknown(Guc::SearchPath)),
@@ -490,12 +491,14 @@ impl SessionSettings {
                     search_path,
                     literals: literals.clone(),
                     rls: None,
+                    term_values: Vec::new(),
                 })
             }),
             label: Arc::new(KeyingSettings {
                 search_path: self.search_path.resolve().unwrap_or_else(|| Arc::from([])),
                 literals,
                 rls: None,
+                term_values: Vec::new(),
             }),
             output: Arc::new(self.output_settings_build(in_block)),
             role: self
@@ -596,10 +599,16 @@ impl SessionSettings {
         }
     }
 
-    /// The session values the policies over `names` are inlined under at
-    /// this scope (PGC-113): the roles in force and each named setting as
-    /// known, unset, or not yet sampled.
-    pub(crate) fn rls_context(&self, names: &[EcoString], in_block: bool) -> SessionTermContext {
+    /// The session values a read's terms take at this scope: the roles in
+    /// force and each of the `names` settings as known, unset, or not yet
+    /// sampled. The policies of a secured relation are inlined under them
+    /// (PGC-113) and a client query's own fragments fold under them
+    /// (PGC-580).
+    pub(crate) fn session_term_context(
+        &self,
+        names: &[EcoString],
+        in_block: bool,
+    ) -> SessionTermContext {
         let custom = |name: &EcoString| match self.custom.get(name).map(|s| s.effective(in_block)) {
             Some(SettingValue::Known(value)) => CustomSettingValue::Known(value.clone()),
             Some(SettingValue::Unset) => CustomSettingValue::Unset,
@@ -940,7 +949,7 @@ mod tests {
         );
         assert_eq!(
             settings
-                .rls_context(std::slice::from_ref(&tenant), false)
+                .session_term_context(std::slice::from_ref(&tenant), false)
                 .settings,
             vec![(tenant.clone(), CustomSettingValue::Unknown)]
         );
@@ -957,7 +966,7 @@ mod tests {
         assert!(!settings.probe_needed(false));
         assert_eq!(
             settings
-                .rls_context(std::slice::from_ref(&tenant), false)
+                .session_term_context(std::slice::from_ref(&tenant), false)
                 .settings,
             vec![(tenant.clone(), CustomSettingValue::Unset)]
         );
@@ -965,6 +974,7 @@ mod tests {
         let set = |value: &str, local: bool| CustomSettingEffect {
             name: tenant.clone(),
             value: Some(value.into()),
+            parameter: None,
             local,
         };
         settings.custom_effects_apply(&[set("7", false)], false);
@@ -972,7 +982,7 @@ mod tests {
             !settings.probe_needed(false),
             "a literal SET needs no probe"
         );
-        let context = settings.rls_context(std::slice::from_ref(&tenant), false);
+        let context = settings.session_term_context(std::slice::from_ref(&tenant), false);
         assert_eq!(
             context.settings,
             vec![(tenant.clone(), CustomSettingValue::Known("7".into()))]
@@ -982,14 +992,14 @@ mod tests {
         settings.custom_effects_apply(&[set("8", true)], true);
         assert_eq!(
             settings
-                .rls_context(std::slice::from_ref(&tenant), true)
+                .session_term_context(std::slice::from_ref(&tenant), true)
                 .settings,
             vec![(tenant.clone(), CustomSettingValue::Known("8".into()))],
             "the block's value"
         );
         assert_eq!(
             settings
-                .rls_context(std::slice::from_ref(&tenant), false)
+                .session_term_context(std::slice::from_ref(&tenant), false)
                 .settings,
             vec![(tenant.clone(), CustomSettingValue::Known("7".into()))],
             "the session's value outside the block"
@@ -997,7 +1007,7 @@ mod tests {
         settings.block_exit();
         assert_eq!(
             settings
-                .rls_context(std::slice::from_ref(&tenant), true)
+                .session_term_context(std::slice::from_ref(&tenant), true)
                 .settings,
             vec![(tenant.clone(), CustomSettingValue::Known("7".into()))]
         );
@@ -1007,6 +1017,7 @@ mod tests {
             &[CustomSettingEffect {
                 name: tenant.clone(),
                 value: None,
+                parameter: None,
                 local: false,
             }],
             false,
@@ -1017,7 +1028,7 @@ mod tests {
         settings.effect_apply(SettingsEffect::all(), false);
         assert!(settings.probe_needed(false));
         assert_eq!(
-            settings.rls_context(&[tenant], false).settings[0].1,
+            settings.session_term_context(&[tenant], false).settings[0].1,
             CustomSettingValue::Unknown
         );
     }

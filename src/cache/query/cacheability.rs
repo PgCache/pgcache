@@ -5,13 +5,14 @@ use ecow::EcoString;
 
 use super::CacheabilityError;
 #[cfg(feature = "proxy")]
-use crate::catalog::FunctionCatalog;
+use crate::catalog::{FunctionCatalog, schema_is_builtin};
 use crate::catalog::{FunctionFacts, FunctionVolatility, is_settings_stable};
 use crate::query::ast::rope::{
     Body, Case, FrameBound, Function, Join, JoinQual, NodeKind, Operator, Query, QueryTree, Scalar,
     ScalarKind, Select, SelectItem, Source, Where, WhereKind, Window,
 };
 use crate::query::ast::{Deparse, JoinType, LiteralValue, ScalarOp};
+use crate::query::transform::{scalar_is_term_fragment, where_subquery_is_term_fragment};
 
 /// Reject queries that reference a PostgreSQL system catalog: a `pg_`
 /// prefix on the schema or the table name, anywhere in the tree.
@@ -224,6 +225,11 @@ fn where_cacheable(
             .try_for_each(|operand| where_cacheable(operand, ctx, functions)),
         WhereKind::Unary(unary) => where_cacheable(unary.expr(), ctx, functions),
         WhereKind::Subquery(subquery) => {
+            // The FROM-less wrapper over a session term folds to a literal
+            // (PGC-580), like the scalar form.
+            if where_subquery_is_term_fragment(subquery) {
+                return Ok(());
+            }
             subquery_inner_cacheable(subquery.query(), ctx, functions)?;
             if let Some(test) = subquery.test_expr() {
                 scalar_cacheable(test, ctx, functions)?;
@@ -252,6 +258,12 @@ fn scalar_cacheable(
     ctx: ExprContext,
     functions: &dyn FunctionFacts,
 ) -> Result<(), CacheabilityError> {
+    // A session-term fragment folds to a literal under the session's values
+    // before the query is keyed (PGC-580), so it is cacheable wherever a
+    // literal is; a term the fold cannot reach falls through and refuses.
+    if scalar_is_term_fragment(expr) {
+        return Ok(());
+    }
     match expr.kind() {
         ScalarKind::Column(_) => Ok(()),
         // A session term is a placeholder for a value origin would read from
@@ -413,16 +425,25 @@ pub(crate) fn query_tree_has_stable_call(tree: &QueryTree, functions: &dyn Funct
 /// Whether the query contains any function that can modify the database:
 /// a VOLATILE function, or one absent from the catalog (unknown, so
 /// conservatively volatile). Every function anywhere in the tree counts,
-/// under the worst of the name's overloads in any schema.
+/// under the worst of the name's overloads in any schema. The built-in
+/// calls of `exempt` are left out: `set_config` is volatile yet writes no
+/// table, and its effect on the session is tracked by name, so a SELECT
+/// calling nothing else volatile is no write for the read-after-write gate.
 #[cfg(feature = "proxy")]
-pub(crate) fn query_tree_has_volatile_function(
+pub(crate) fn query_tree_has_volatile_function_except(
     tree: &QueryTree,
     functions: &FunctionCatalog,
+    exempt: Option<&str>,
 ) -> bool {
     tree.nodes().any(|node| {
-        let NodeKind::Function { name, .. } = &node.kind else {
+        let NodeKind::Function { schema, name, .. } = &node.kind else {
             return false;
         };
+        if exempt.is_some_and(|exempt| name.eq_ignore_ascii_case(exempt))
+            && schema_is_builtin(schema.as_deref())
+        {
+            return false;
+        }
         !matches!(
             functions.name_worst_volatility(name),
             Some(FunctionVolatility::Immutable | FunctionVolatility::Stable)
@@ -515,14 +536,6 @@ mod tests {
         assert_eq!(
             display("SELECT relname FROM pg_catalog.pg_class"),
             "System catalog reference: pg_catalog.pg_class"
-        );
-        assert_eq!(
-            display("SELECT id FROM a WHERE owner = current_user"),
-            "Session term: CURRENT_USER"
-        );
-        assert_eq!(
-            display("SELECT id FROM a WHERE tenant = current_setting('app.tenant', true)::int"),
-            "Session term: current_setting('app.tenant', true)"
         );
         assert_eq!(
             display("SELECT * FROM (SELECT 1)"),
@@ -1280,6 +1293,31 @@ mod tests {
         assert!(has("SELECT data || '{}' FROM docs"));
         assert!(!has("SELECT lower(name), count(*) FROM a GROUP BY name"));
         assert!(!has("SELECT data -> 'a' FROM docs"));
+    }
+
+    /// A session term stands inside a fragment the proxy folds to a literal
+    /// under the session's values (PGC-580), so it is cacheable wherever a
+    /// literal is: a predicate, the SELECT list, an argument, the
+    /// documented FROM-less scalar subquery wrapper.
+    #[test]
+    fn test_session_term_fragments_are_cacheable() {
+        for sql in [
+            "SELECT id FROM a WHERE owner = current_user",
+            "SELECT id FROM a WHERE tenant = current_setting('app.tenant', true)::int",
+            "SELECT current_user, id FROM a WHERE id = 1",
+            "SELECT id FROM a WHERE name = lower(current_setting('app.name'))",
+            "SELECT id FROM a WHERE owner = (SELECT current_setting('app.who'))",
+            "SELECT id FROM a WHERE owner = \
+             (current_setting('request.jwt.claims', true)::jsonb ->> 'sub')",
+        ] {
+            assert!(check_cacheable(sql).is_ok(), "{sql}");
+        }
+        // A built-in setting changes under `SET` with no custom shadow to
+        // fold from, so it stays a bare term and the query forwards.
+        assert!(matches!(
+            check_cacheable("SELECT id FROM a WHERE tz = current_setting('timezone')"),
+            Err(CacheabilityError::SessionTerm { .. })
+        ));
     }
 
     /// A volatile call is refused wherever it stands: it may answer

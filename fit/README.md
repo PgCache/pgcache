@@ -137,6 +137,9 @@ unsupported SQL feature: 2 statements (33.3%)
     FROM clause type
 ```
 
+A cacheable read of a session term (`current_user`, `current_setting('app.tenant')`)
+carries the values it is keyed on as its detail line: `keyed on the session: app.tenant`.
+
 Within a group, statements are ordered by time when the input has it, else by
 calls, else by how often they occur (`[3×]`).
 

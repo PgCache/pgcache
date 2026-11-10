@@ -339,6 +339,12 @@ impl FunctionCatalog {
     }
 }
 
+/// Whether a call's schema names PostgreSQL's own functions: unqualified
+/// (`pg_catalog` is searched first) or `pg_catalog` itself.
+pub fn schema_is_builtin(schema: Option<&str>) -> bool {
+    schema.is_none_or(|schema| schema == "pg_catalog")
+}
+
 /// Whether `name` is a form the parser spells as a function call without a
 /// `pg_proc` row behind it (`coalesce`, `nullif`, ...): evaluated by the
 /// executor itself, so immutable and present on every PostgreSQL.

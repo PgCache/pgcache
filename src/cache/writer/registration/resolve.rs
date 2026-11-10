@@ -29,6 +29,7 @@ use crate::query::Fingerprint;
 use crate::query::ast::rope::{NodeKind, QueryTree};
 use crate::query::keying_settings::KeyingSettings;
 use crate::query::resolve::{ResolvedQuery, TableSlot};
+use crate::query::transform::query_tree_term_fragments_replace;
 
 /// Resolve schema for a table: use explicit schema if provided, otherwise lookup via search path.
 async fn table_schema_resolve(
@@ -194,9 +195,27 @@ fn function_refusal(error: CacheError) -> Report<CacheError> {
 /// the one registration asserts on both come from here.
 async fn query_bind_canonical(
     core: &mut WriterCore,
-    query: &QueryTree,
+    query: &CacheableQuery,
     keying: &KeyingSettings,
 ) -> CacheResult<CanonicalBinding> {
+    // The session terms the proxy folded take their literals first (PGC-580),
+    // so the canonical form holds the values the read was keyed on.
+    let substituted;
+    let query = if keying.term_values.is_empty() && !query.has_session_terms() {
+        query.tree()
+    } else {
+        substituted = query_tree_term_fragments_replace(
+            query.tree(),
+            query.term_fragments(),
+            &keying.term_values,
+        )
+        .map_err(|e| {
+            Report::from(CacheError::SessionTermValues {
+                reason: e.to_string().into(),
+            })
+        })?;
+        &substituted
+    };
     let (base_query, user_max_limit) = base_query_prepare(query);
     cache_tables_ensure(core, &base_query, &keying.search_path).await?;
     let path = search_path(keying);
@@ -228,7 +247,7 @@ async fn query_bind_canonical(
 /// binding that produced it for the registration to reuse.
 pub(super) async fn query_fingerprint_resolve(
     core: &mut WriterCore,
-    query: &QueryTree,
+    query: &CacheableQuery,
     keying: &KeyingSettings,
 ) -> CacheResult<(Fingerprint, AliasResolution)> {
     let CanonicalBinding {
@@ -349,8 +368,7 @@ impl WriterRegistration {
                     resolution: CanonicalResolution { bound, literals },
                     user_max_limit,
                     function_oids,
-                } = query_bind_canonical(core, request.cacheable_query.tree(), &request.keying)
-                    .await?;
+                } = query_bind_canonical(core, &request.cacheable_query, &request.keying).await?;
                 crate::metrics::handles()
                     .reg
                     .register_bind

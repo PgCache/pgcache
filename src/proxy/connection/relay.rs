@@ -38,6 +38,7 @@ use crate::proxy::query::{Action, ForwardReason, handle_query};
 use crate::proxy::session_settings::SessionSettings;
 use crate::proxy::{ConnectionError, ConnectionResult, ProxyMode, ProxyStatus};
 use crate::query::guc::Guc;
+use crate::query::transform::TermFoldError;
 use crate::query::write::StatementEffects;
 use crate::result::ReportExt;
 use crate::{
@@ -247,13 +248,32 @@ async fn handle_connection(
                         continue;
                     }
                 };
-                crate::metrics::handles().query.cacheable.increment(1);
                 // A read over a row-level-secured relation is keyed on the
-                // session values its policies read as well (PGC-113).
+                // session values its policies read as well (PGC-113), and a
+                // read with session terms of its own on their folded values
+                // (PGC-580); a value the session cannot supply forwards.
                 let keying = match msg.cacheable_query() {
-                    Some(cq) => state.rls_keying_apply(keying, cq.tree(), in_block),
+                    Some(cq) => match state.session_keying_apply(keying, cq, in_block) {
+                        Ok(keying) => keying,
+                        Err(reason) => {
+                            debug!("{reason}, forwarding to origin");
+                            let m = crate::metrics::handles();
+                            m.query.uncacheable.increment(1);
+                            match reason {
+                                TermFoldError::Term(_) => {
+                                    m.query.rls_forward_setting_unknown.increment(1);
+                                }
+                                TermFoldError::Unfoldable { .. } => {
+                                    m.query.rls_forward_unsupported.increment(1);
+                                }
+                            }
+                            state.cache_slot_forward_to_origin(msg);
+                            continue;
+                        }
+                    },
                     None => keying,
                 };
+                crate::metrics::handles().query.cacheable.increment(1);
                 // Hashed once here for the gate, the timing id and dispatch. A
                 // parameterized read is keyed on its placeholders and values,
                 // never on a substituted tree.

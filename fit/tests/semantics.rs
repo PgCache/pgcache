@@ -209,6 +209,40 @@ mod stable {
         assert_eq!(reason(4), "system catalog reference");
     }
 
+    /// A read of a custom setting or the role is cacheable, keyed on the
+    /// session's values (ADR-066); the detail names them. A built-in
+    /// setting is a bare session term and forwards.
+    #[test]
+    fn test_check_session_term_read_is_keyed_on_the_session() {
+        let report = check_json(
+            "stable_session_terms.sql",
+            "SELECT * FROM docs WHERE tenant = current_setting('app.tenant')::int;\n\
+             SELECT * FROM docs WHERE owner = current_user AND \
+             region = coalesce(current_setting('app.region', true), 'eu');\n\
+             SELECT * FROM docs WHERE tz = current_setting('timezone');\n",
+        );
+        let verdicts = report["verdicts"].as_array().expect("verdicts array");
+        assert_eq!(verdicts[0]["verdict"], "cacheable");
+        assert_eq!(verdicts[0]["detail"], "keyed on the session: app.tenant");
+        assert_eq!(verdicts[1]["verdict"], "cacheable");
+        assert_eq!(
+            verdicts[1]["detail"],
+            "keyed on the session: app.region, current_user"
+        );
+        assert_eq!(verdicts[2]["verdict"], "passthrough");
+        assert_eq!(verdicts[2]["reason"], "session-dependent term");
+
+        let text = check_text(
+            "stable_session_terms_text.sql",
+            "SELECT * FROM docs WHERE tenant = current_setting('app.tenant')::int;\n",
+            &["--statements"],
+        );
+        assert!(text.contains(
+            "Cacheable statements:\n  SELECT * FROM docs WHERE tenant = \
+             current_setting('app.tenant')::int\n    keyed on the session: app.tenant"
+        ));
+    }
+
     #[test]
     fn test_check_verdicts_aggregate_repeated_statements() {
         let report = check_json(

@@ -172,6 +172,10 @@ pub struct CustomSettingEffect {
     /// read; `None` (`RESET`, `TO DEFAULT`, a computed value) leaves the
     /// setting unknown until a probe samples it.
     pub value: Option<EcoString>,
+    /// The `$n` placeholder the value arrives in, when it is a bind
+    /// parameter: resolved from the portal at Execute (PGC-580), so a
+    /// request that sets its claims by parameter needs no probe.
+    pub parameter: Option<EcoString>,
     /// Transaction-scoped: the change reverts when the block ends.
     pub local: bool,
 }

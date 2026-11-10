@@ -106,7 +106,7 @@ pub fn query_tree_session_terms_replace(
 }
 
 /// The literal a term stands for in `context`.
-fn term_value(
+pub(super) fn term_value(
     term: &SessionTerm,
     context: &SessionTermContext,
 ) -> Result<LiteralValue, SessionTermError> {

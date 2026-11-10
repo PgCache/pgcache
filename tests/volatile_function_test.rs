@@ -195,10 +195,11 @@ async fn test_allowlisted_stable_formatting_call_is_cached() -> Result<(), Error
     Ok(())
 }
 
-/// `current_user` in a SELECT list is a session term: the read forwards and
-/// each role sees its own name, never the cache connection's.
+/// `current_user` in a SELECT list is a session term, keyed on the role
+/// (PGC-580): each role has its own cached entry with its own name, never
+/// the cache connection's.
 #[tokio::test]
-async fn test_current_user_in_select_list_forwards() -> Result<(), Error> {
+async fn test_current_user_in_select_list_is_keyed_on_the_role() -> Result<(), Error> {
     let mut ctx = setup().await?;
     for sql in [
         "CREATE ROLE ann LOGIN",
@@ -210,11 +211,24 @@ async fn test_current_user_in_select_list_forwards() -> Result<(), Error> {
     ctx.cdc_apply_settle().await?;
     let sql = "SELECT current_user AS who, id FROM items WHERE id = 1";
     for user in ["ann", "bob"] {
+        // The role's first reads may forward while its privilege verdicts
+        // are looked up; the entry serves once they are in.
         let client = ctx.proxy_client_connect_as(user).await?;
-        let served = uncacheable_read(&mut ctx, &client, sql).await?;
+        let mut served = None;
+        for _ in 0..40 {
+            let m = ctx.metrics().await?;
+            let read = rows(&client, sql).await?;
+            let delta = metrics_delta(&m, &ctx.metrics_after_outcomes(&m, 1).await?);
+            if delta.queries_cache_hit == 1 {
+                served = Some(read);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         assert_eq!(
             served,
-            vec![vec![Some(user.to_owned()), Some("1".to_owned())]]
+            Some(vec![vec![Some(user.to_owned()), Some("1".to_owned())]]),
+            "{user} is served its own name from cache"
         );
     }
     Ok(())

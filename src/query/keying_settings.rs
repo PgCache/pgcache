@@ -13,6 +13,7 @@ use ecow::EcoString;
 
 use crate::cache::QueryParameters;
 use crate::query::SessionKey;
+use crate::query::ast::LiteralValue;
 use crate::query::ast::rope::QueryTree;
 use crate::query::ast::{query_tree_session_key, query_tree_session_key_with_binds};
 use crate::query::literal_settings::LiteralSettings;
@@ -36,6 +37,10 @@ pub struct KeyingSettings {
     pub literals: LiteralSettings,
     /// Set for a read over a relation with row-level security.
     pub rls: Option<Arc<RlsKeying>>,
+    /// The query's own session-term fragments folded under the session's
+    /// values, in pre-order (PGC-580): part of the key, and what the writer
+    /// substitutes before binding. Empty for a query reading no term.
+    pub term_values: Vec<LiteralValue>,
 }
 
 impl KeyingSettings {
@@ -48,14 +53,16 @@ impl KeyingSettings {
         ))
     }
 
-    /// `key` with the RLS context folded in, when the read has one.
+    /// `key` with the RLS context and the folded term values folded in,
+    /// when the read has either.
     fn rls_fold(&self, key: SessionKey) -> SessionKey {
-        let Some(rls) = &self.rls else {
+        if self.rls.is_none() && self.term_values.is_empty() {
             return key;
-        };
+        }
         let mut hasher = DefaultHasher::new();
         key.get().hash(&mut hasher);
-        rls.hash(&mut hasher);
+        self.rls.hash(&mut hasher);
+        self.term_values.hash(&mut hasher);
         SessionKey::from_raw(hasher.finish())
     }
 
@@ -85,7 +92,44 @@ mod tests {
             search_path: Arc::from([EcoString::from("public")]),
             literals: LiteralSettings::default(),
             rls: rls.map(Arc::new),
+            term_values: Vec::new(),
         }
+    }
+
+    /// The folded term values key the read: equal values key alike, a
+    /// different value or none keys apart.
+    #[test]
+    fn test_term_values_fold_into_the_session_key() {
+        let tree = query_tree_parse(
+            "SELECT id FROM docs WHERE tenant = current_setting('app.tenant')::int",
+        )
+        .expect("parse");
+        let with = |values: Vec<LiteralValue>| KeyingSettings {
+            term_values: values,
+            ..keying(None)
+        };
+        let tenant_7 = with(vec![LiteralValue::StringWithCast(
+            "7".into(),
+            "int4".into(),
+        )]);
+        let key = tenant_7.session_key(&tree);
+        assert_eq!(
+            key,
+            with(vec![LiteralValue::StringWithCast(
+                "7".into(),
+                "int4".into()
+            )])
+            .session_key(&tree)
+        );
+        assert_ne!(
+            key,
+            with(vec![LiteralValue::StringWithCast(
+                "8".into(),
+                "int4".into()
+            )])
+            .session_key(&tree)
+        );
+        assert_ne!(key, keying(None).session_key(&tree));
     }
 
     fn rls(user: &str, tenant: CustomSettingValue, row_security: Option<bool>) -> RlsKeying {

@@ -52,7 +52,8 @@ pub struct StatementVerdict {
     /// Target table of a write (or of a data-modifying CTE).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub table: Option<String>,
-    /// Underlying parse/conversion error message, when there is one.
+    /// Underlying parse/conversion error message, when there is one; for a
+    /// cacheable read of a session term, the values it is keyed on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
     pub occurrences: u64,
@@ -250,6 +251,7 @@ pub fn check_report_build(
                     }
                     (ParseOutcome::SelectUnconvertible { error, .. }, _) => Some(error.clone()),
                     (_, Verdict::Passthrough { detail, .. }) => detail.clone(),
+                    (_, Verdict::Cacheable(analysis)) => analysis.session_terms.clone(),
                     _ => None,
                 };
                 verdicts.push(StatementVerdict {
