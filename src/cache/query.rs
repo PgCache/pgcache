@@ -4,8 +4,6 @@ use error_set::error_set;
 
 use crate::catalog::FunctionFacts;
 use crate::oid::TypeOid;
-#[cfg(feature = "proxy")]
-use crate::query::ast::LiteralValue;
 use crate::query::ast::NodeId;
 use crate::query::ast::rope::{Body, QueryTree, Select};
 use crate::query::transform::{
@@ -13,7 +11,9 @@ use crate::query::transform::{
     query_tree_term_fragments,
 };
 #[cfg(feature = "proxy")]
-use crate::query::transform::{SessionTermContext, TermFoldError, query_tree_term_fragments_fold};
+use crate::query::transform::{
+    FoldedTerm, SessionTermContext, SessionTermError, query_tree_term_fragments_fold,
+};
 
 mod cacheability;
 mod limit;
@@ -116,13 +116,20 @@ impl CacheableQuery {
     }
 
     /// The query's fragments folded under `context`, in pre-order, for the
-    /// key and for the writer's substitution.
+    /// key and for the writer's substitution; a term the session cannot
+    /// supply is the reason the read forwards.
     #[cfg(feature = "proxy")]
     pub(crate) fn term_fragments_fold(
         &self,
         context: &SessionTermContext,
-    ) -> Result<Vec<LiteralValue>, TermFoldError> {
-        query_tree_term_fragments_fold(&self.tree, &self.term_fragments, context)
+    ) -> Result<Vec<FoldedTerm>, SessionTermError> {
+        let values = query_tree_term_fragments_fold(&self.tree, &self.term_fragments, context);
+        for value in &values {
+            if let FoldedTerm::Unavailable(error) = value {
+                return Err(error.clone());
+            }
+        }
+        Ok(values)
     }
 
     fn from_tree(tree: QueryTree) -> Self {
@@ -261,9 +268,9 @@ mod tests {
 
     use super::*;
     use crate::catalog::FunctionCatalog;
-    use crate::query::ast::query_tree_parse;
     use crate::query::ast::rope::Plain;
     use crate::query::ast::rope::deparse::query_deparse_with;
+    use crate::query::ast::{LiteralValue, query_tree_parse};
     use crate::query::transform::{
         CustomSettingValue, query_tree_term_fragments_fold, query_tree_term_fragments_replace,
     };
@@ -308,7 +315,7 @@ mod tests {
             settings: vec![("app.tenant".into(), CustomSettingValue::Unset)],
         };
         let values = query.term_fragments_fold(&context).expect("fold");
-        assert_eq!(values, [LiteralValue::Null]);
+        assert_eq!(values, [FoldedTerm::Value(LiteralValue::Null)]);
 
         let bound = query
             .parameters_replace(&params(&[(b"1", PgType::INT4), (b"9", PgType::TEXT)]))
@@ -322,8 +329,7 @@ mod tests {
             "SELECT id FROM t WHERE id > 2 AND tenant = COALESCE(NULL, '9')"
         );
         assert_eq!(
-            query_tree_term_fragments_fold(bound.tree(), bound.term_fragments(), &context)
-                .expect("fold"),
+            query_tree_term_fragments_fold(bound.tree(), bound.term_fragments(), &context),
             values
         );
     }

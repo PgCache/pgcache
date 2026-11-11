@@ -1,15 +1,13 @@
-//! Session-term substitution on the rope (PGC-113): each `current_user`,
-//! `session_user` and `current_setting(…)` literal becomes the session's
-//! value, in one copy of the tree. A tree with no term comes back by
-//! refcount.
+//! Session terms and their values (PGC-113): what the session holds for
+//! `current_user`, `session_user` and each custom setting, the value a term
+//! stands for under it, and what a fragment over terms folds to for the key
+//! and the writer's substitution (`term_eval`).
 
 use ecow::EcoString;
 use error_set::error_set;
 
-use crate::query::ast::rope::{
-    NodeKind, NodeRef, QueryTree, Replacement, Replacements, TreeBuilder, View,
-};
-use crate::query::ast::{LiteralValue, NodeId, SessionTerm};
+use crate::query::ast::rope::{NodeKind, QueryTree};
+use crate::query::ast::{LiteralValue, SessionTerm};
 
 /// A custom setting's value as the session holds it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -45,6 +43,7 @@ impl SessionTermContext {
 }
 
 error_set! {
+    #[derive(Clone, PartialEq, Eq, Hash)]
     SessionTermError := {
         #[display("the role in force is unknown")]
         UserUnknown,
@@ -56,13 +55,28 @@ error_set! {
         SettingUnset {
             name: EcoString,
         },
+        /// The session's value is one origin's own evaluation rejects (a
+        /// claims setting that is not json): the read is origin's error.
+        #[display("the session value is one origin rejects: {reason}")]
+        ValueRejected {
+            reason: &'static str,
+        },
     }
 }
 
-/// Whether any literal of `tree` is a session term.
-pub fn query_tree_has_session_term(tree: &QueryTree) -> bool {
-    tree.nodes()
-        .any(|node| matches!(node.kind, NodeKind::Literal(LiteralValue::SessionTerm(_))))
+/// What a fragment stands for under the session: for the key, and for the
+/// writer's substitution.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum FoldedTerm {
+    /// The literal the fragment folds to.
+    Value(LiteralValue),
+    /// The fragment is a shape origin evaluates (a typed `nullif`, a json
+    /// value compared whole): its bare terms, in pre-order, are substituted
+    /// on their own, the raw values keying the read.
+    Terms(Vec<LiteralValue>),
+    /// A term the session cannot supply, or a value origin would reject:
+    /// the reason the read forwards when the fragment is needed.
+    Unavailable(SessionTermError),
 }
 
 /// The custom setting names `tree` reads.
@@ -80,32 +94,8 @@ pub fn query_tree_setting_names(tree: &QueryTree) -> impl Iterator<Item = &EcoSt
     })
 }
 
-/// `tree` with every session term replaced by its value in `context`.
-pub fn query_tree_session_terms_replace(
-    tree: &QueryTree,
-    context: &SessionTermContext,
-) -> Result<QueryTree, SessionTermError> {
-    let mut replacements = Replacements::new();
-    let root = tree.root().node_ref();
-    let end = root.end();
-    let mut next = u32::try_from(root.id().index()).unwrap_or(u32::MAX);
-    while next < end {
-        let position: NodeRef<'_> = root.at_position(NodeId::from_index(next));
-        if let NodeKind::Literal(LiteralValue::SessionTerm(term)) = position.kind() {
-            let value = term_value(term, context)?;
-            replacements.push(position.id(), Replacement::Leaf(NodeKind::Literal(value)));
-        }
-        next += 1;
-    }
-    if replacements.is_empty() {
-        return Ok(tree.clone());
-    }
-    let mut builder = TreeBuilder::over(tree);
-    builder.copy(root, &mut replacements);
-    Ok(builder.finish().0)
-}
-
 /// The literal a term stands for in `context`.
+#[cfg(feature = "proxy")]
 pub(super) fn term_value(
     term: &SessionTerm,
     context: &SessionTermContext,
@@ -132,18 +122,10 @@ pub(super) fn term_value(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "proxy"))]
 mod tests {
     use super::*;
     use crate::query::ast::query_tree_parse;
-    use crate::query::ast::rope::Plain;
-    use crate::query::ast::rope::deparse::query_deparse_with;
-
-    fn plain(tree: &QueryTree) -> String {
-        let mut buf = String::new();
-        query_deparse_with(tree.root(), &mut Plain, &mut buf);
-        buf
-    }
 
     fn context(user: Option<&str>, settings: &[(&str, CustomSettingValue)]) -> SessionTermContext {
         SessionTermContext {
@@ -160,75 +142,71 @@ mod tests {
         CustomSettingValue::Known(value.into())
     }
 
+    fn setting(name: &str, missing_ok: bool) -> SessionTerm {
+        SessionTerm::CurrentSetting {
+            name: name.into(),
+            missing_ok,
+        }
+    }
+
     #[test]
-    fn test_terms_are_replaced_by_the_session_values() {
+    fn test_terms_take_the_session_values() {
         let tree = query_tree_parse(
             "SELECT id FROM docs WHERE owner = current_user \
              AND tenant = current_setting('app.tenant') \
              AND region = current_setting('app.region', true)",
         )
         .expect("parse");
-        assert!(query_tree_has_session_term(&tree));
         assert_eq!(
             query_tree_setting_names(&tree)
                 .map(EcoString::as_str)
                 .collect::<Vec<_>>(),
             ["app.tenant", "app.region"]
         );
-        let replaced = query_tree_session_terms_replace(
-            &tree,
-            &context(
-                Some("alice"),
-                &[
-                    ("app.tenant", known("7")),
-                    ("app.region", CustomSettingValue::Unset),
-                ],
-            ),
-        )
-        .expect("every term known");
-        assert_eq!(
-            plain(&replaced),
-            "SELECT id FROM docs WHERE owner = 'alice' AND tenant = '7' AND region = NULL"
+        let ctx = context(
+            Some("alice"),
+            &[
+                ("app.tenant", known("7")),
+                ("app.region", CustomSettingValue::Unset),
+            ],
         );
-        assert!(!query_tree_has_session_term(&replaced));
+        assert_eq!(
+            term_value(&SessionTerm::CurrentUser, &ctx),
+            Ok(LiteralValue::String("alice".into()))
+        );
+        assert_eq!(
+            term_value(&setting("app.tenant", false), &ctx),
+            Ok(LiteralValue::String("7".into()))
+        );
+        assert_eq!(
+            term_value(&setting("app.region", true), &ctx),
+            Ok(LiteralValue::Null)
+        );
     }
 
-    fn error_of(tree: &QueryTree, context: &SessionTermContext) -> String {
-        match query_tree_session_terms_replace(tree, context) {
-            Ok(_) => panic!("a term cannot be substituted"),
-            Err(error) => error.to_string(),
-        }
+    fn error_of(term: &SessionTerm, context: &SessionTermContext) -> String {
+        term_value(term, context)
+            .expect_err("a term the session cannot supply")
+            .to_string()
     }
 
     #[test]
     fn test_unknown_or_unset_terms_are_errors() {
-        let tree =
-            query_tree_parse("SELECT id FROM docs WHERE tenant = current_setting('app.tenant')")
-                .expect("parse");
+        let tenant = setting("app.tenant", false);
         assert_eq!(
-            error_of(&tree, &context(Some("alice"), &[])),
+            error_of(&tenant, &context(Some("alice"), &[])),
             "setting app.tenant is not known"
         );
         assert_eq!(
             error_of(
-                &tree,
+                &tenant,
                 &context(Some("alice"), &[("app.tenant", CustomSettingValue::Unset)])
             ),
             "setting app.tenant is not set"
         );
-        let tree =
-            query_tree_parse("SELECT id FROM docs WHERE owner = session_user").expect("parse");
         assert_eq!(
-            error_of(&tree, &context(None, &[])),
+            error_of(&SessionTerm::SessionUser, &context(None, &[])),
             "the role in force is unknown"
         );
-    }
-
-    #[test]
-    fn test_tree_without_terms_is_returned_unchanged() {
-        let tree = query_tree_parse("SELECT id FROM docs WHERE id = 1").expect("parse");
-        assert!(!query_tree_has_session_term(&tree));
-        let same = query_tree_session_terms_replace(&tree, &context(None, &[])).expect("no term");
-        assert_eq!(plain(&same), plain(&tree));
     }
 }

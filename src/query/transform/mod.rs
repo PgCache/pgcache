@@ -42,13 +42,13 @@ pub(crate) use parameters::{
 pub(crate) use parameters::{literal_is_parameterizable, literal_value_parameters_replace};
 pub use predicate_pushdown::query_predicate_pushdown;
 pub use session_terms::{
-    CustomSettingValue, SessionTermContext, SessionTermError, query_tree_has_session_term,
-    query_tree_session_terms_replace, query_tree_setting_names,
+    CustomSettingValue, FoldedTerm, SessionTermContext, SessionTermError, query_tree_setting_names,
 };
 pub use substitute::{query_tree_parameters_replace, query_tree_parameters_replace_remapped};
 #[cfg(feature = "proxy")]
 pub(crate) use term_eval::{
     TermFoldError, query_tree_term_fragments_fold, query_tree_term_fragments_replace,
+    query_tree_term_fragments_replace_remapped,
 };
 pub(crate) use term_fold::{
     query_tree_term_fragments, scalar_is_term_fragment, where_subquery_is_term_fragment,

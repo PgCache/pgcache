@@ -38,7 +38,7 @@ use crate::proxy::query::{Action, ForwardReason, handle_query};
 use crate::proxy::session_settings::SessionSettings;
 use crate::proxy::{ConnectionError, ConnectionResult, ProxyMode, ProxyStatus};
 use crate::query::guc::Guc;
-use crate::query::transform::TermFoldError;
+use crate::query::transform::SessionTermError;
 use crate::query::write::StatementEffects;
 use crate::result::ReportExt;
 use crate::{
@@ -259,13 +259,10 @@ async fn handle_connection(
                             debug!("{reason}, forwarding to origin");
                             let m = crate::metrics::handles();
                             m.query.uncacheable.increment(1);
-                            match reason {
-                                TermFoldError::Term(_) => {
-                                    m.query.rls_forward_setting_unknown.increment(1);
-                                }
-                                TermFoldError::Unfoldable { .. } => {
-                                    m.query.rls_forward_unsupported.increment(1);
-                                }
+                            if matches!(reason, SessionTermError::ValueRejected { .. }) {
+                                m.query.rls_forward_unsupported.increment(1);
+                            } else {
+                                m.query.rls_forward_setting_unknown.increment(1);
                             }
                             state.cache_slot_forward_to_origin(msg);
                             continue;

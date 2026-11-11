@@ -1,15 +1,17 @@
 //! Row-level security by policy inlining (PGC-113). The writer loads each
 //! secured relation's policies from origin, decides which apply to the role
 //! a read runs as (attributes, ownership, `FORCE`, membership in the
-//! policies' role lists, all origin's own answers), substitutes the session
-//! values the read carries, and ANDs the result onto the relation's
-//! references before the query is resolved for its fingerprint. The inlined
+//! policies' role lists, all origin's own answers), substitutes the folded
+//! term fragments the read carries (the proxy folded them under the session
+//! from this writer's publication, ADR-066), and ANDs the result onto the
+//! relation's references before the query is resolved for its fingerprint. The inlined
 //! predicate is an ordinary conjunct from then on: population, CDC and
 //! serving need nothing more. What cannot be inlined is refused, and the
 //! read forwards.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ecow::EcoString;
 use tokio_postgres::Row;
@@ -17,7 +19,7 @@ use tracing::{debug, warn};
 
 use super::core::WriterCore;
 use crate::cache::query::CacheableQuery;
-use crate::cache::types::RlsRelations;
+use crate::cache::types::{RlsPolicyTerms, RlsRelationTerms, RlsRelations};
 use crate::cache::{CacheError, CacheResult, MapIntoReport, Report, ReportExt};
 use crate::catalog::{Catalog, is_sql_form};
 use crate::oid::Oid;
@@ -26,10 +28,11 @@ use crate::query::ast::rope::{
     Body, NodeKind, NodeRef, QueryTree, Select, Source, TreeBuilder, View, Where,
 };
 use crate::query::ast::{BinaryOp, JoinType, NodeId, query_tree_parse};
-use crate::query::keying_settings::KeyingSettings;
+use crate::query::keying_settings::{KeyingSettings, RlsKeying, RlsRelationFold};
 use crate::query::resolve::{ColumnTarget, ResolvedQuery, TableSlot};
 use crate::query::transform::{
-    SessionTermError, query_tree_session_terms_replace, query_tree_setting_names,
+    FoldedTerm, SessionTermError, TermFoldError, query_tree_setting_names,
+    query_tree_term_fragments_replace_remapped,
 };
 use crate::result::error_chain_format;
 
@@ -57,6 +60,11 @@ const RLS_POLICIES_SQL: &str = "SELECT p.polname::text, p.polpermissive, \
 /// the owner without `FORCE`), and the policies whose role list it has the
 /// privileges of, as origin decides (`has_privs_of_role`). No row: no such
 /// role or relation.
+/// The version the next loaded table takes. Process-wide, not per writer:
+/// a restarted writer loads every table afresh, and a fold the proxy took
+/// under the previous writer's publication must pair with nothing.
+static RLS_VERSIONS: AtomicU64 = AtomicU64::new(1);
+
 const RLS_APPLICABILITY_SQL: &str = "SELECT c.relrowsecurity, \
             r.rolsuper OR r.rolbypassrls OR (c.relowner = r.oid AND NOT c.relforcerowsecurity), \
             ARRAY(SELECT p.polname::text FROM pg_policy p \
@@ -67,11 +75,13 @@ const RLS_APPLICABILITY_SQL: &str = "SELECT c.relrowsecurity, \
      FROM pg_roles r, pg_class c WHERE r.rolname = $1 AND c.oid = $2";
 
 /// A policy's USING expression, parsed as the WHERE of `SELECT 1 FROM
-/// <table>` with every table it names schema-qualified, and the positions
-/// of the column references that are the policy table's own (as opposed to
-/// a subquery's), which take the reference's qualifier when inlined.
+/// <table>` with every table it names schema-qualified and its term
+/// fragments found, shared with the publication the proxy folds from, and
+/// the positions of the column references that are the policy table's own
+/// (as opposed to a subquery's), which take the reference's qualifier when
+/// inlined.
 struct ParsedQual {
-    tree: QueryTree,
+    terms: Arc<RlsPolicyTerms>,
     own_columns: HashSet<NodeId>,
 }
 
@@ -84,9 +94,10 @@ struct RlsPolicy {
 
 struct RlsTable {
     name: EcoString,
+    /// The load this state came from, so a read keyed under an earlier
+    /// publication of the policies is told apart.
+    version: u64,
     policies: Vec<RlsPolicy>,
-    /// The custom settings the policies read, for the proxy's keying.
-    settings: Vec<EcoString>,
 }
 
 /// The secured relations the writer knows, by relation OID.
@@ -244,12 +255,19 @@ impl WriterCore {
     }
 
     fn rls_relations_publish(&self) {
-        let relations = RlsRelations::new(
-            self.rls
-                .tables
-                .values()
-                .map(|table| (table.name.clone(), table.settings.clone())),
-        );
+        let relations = RlsRelations::new(self.rls.tables.iter().map(|(oid, table)| {
+            Arc::new(RlsRelationTerms::new(
+                table.name.clone(),
+                *oid,
+                table.version,
+                table
+                    .policies
+                    .iter()
+                    .filter_map(|policy| policy.qual.as_ref().ok())
+                    .map(|parsed| Arc::clone(&parsed.terms))
+                    .collect(),
+            ))
+        }));
         self.state_view.rls_relations.store(Arc::new(relations));
     }
 
@@ -284,18 +302,12 @@ impl WriterCore {
             .map_into_report::<CacheError>()
             .attach_loc("reading a relation's policies")?;
         let mut policies = Vec::with_capacity(rows.len());
-        let mut settings: Vec<EcoString> = Vec::new();
         for row in &rows {
-            let policy = self
-                .rls_policy_build(row, relation_oid, &schema, &name)
-                .await?;
-            if let Ok(parsed) = &policy.qual {
-                settings.extend(query_tree_setting_names(&parsed.tree).cloned());
-            }
-            policies.push(policy);
+            policies.push(
+                self.rls_policy_build(row, relation_oid, &schema, &name)
+                    .await?,
+            );
         }
-        settings.sort();
-        settings.dedup();
         debug!(
             relation_oid = %relation_oid,
             policies = policies.len(),
@@ -305,8 +317,8 @@ impl WriterCore {
             relation_oid,
             RlsTable {
                 name,
+                version: RLS_VERSIONS.fetch_add(1, Ordering::Relaxed),
                 policies,
-                settings,
             },
         );
         Ok(true)
@@ -323,7 +335,7 @@ impl WriterCore {
         let permissive: bool = row.try_get(1).map_into_report::<CacheError>()?;
         let qual: &str = row.try_get(2).map_into_report::<CacheError>()?;
         let qual = self
-            .rls_qual_parse(qual, relation_oid, schema, name)
+            .rls_qual_parse(qual, policy_name, relation_oid, schema, name)
             .await
             .map_err(|reason| {
                 debug!(
@@ -348,6 +360,7 @@ impl WriterCore {
     async fn rls_qual_parse(
         &mut self,
         qual: &str,
+        policy_name: &str,
         relation_oid: Oid,
         schema: &str,
         name: &str,
@@ -404,7 +417,7 @@ impl WriterCore {
         {
             return Err(format!("the policy reads the built-in setting {name}").into());
         }
-        Ok(parsed_qual_of(&bound, relation_oid))
+        Ok(parsed_qual_of(&bound, relation_oid, policy_name))
     }
 
     /// `tree` with every bare table and function name given the schema it
@@ -576,7 +589,7 @@ impl WriterCore {
             // relation set predates this relation. The names are out now.
             return Err(rls_refusal(CacheError::RlsNoContext));
         };
-        let Some(role) = &rls.terms.current_user else {
+        let Some(role) = &rls.current_user else {
             return Err(rls_refusal(CacheError::RlsRoleUnknown));
         };
 
@@ -598,27 +611,37 @@ impl WriterCore {
                     reason: "a secured relation's policies are not loaded",
                 }));
             };
+            // The fold the proxy took from another publication of these
+            // policies pairs with nothing here: the read forwards once and
+            // is keyed afresh.
+            let Some(folds) = rls_relation_fold(rls, *relation_oid, table.version) else {
+                return Err(rls_refusal(CacheError::RlsNoContext));
+            };
             let mut policies = Vec::new();
-            for policy in table.policies.iter().filter(|p| names.contains(&p.name)) {
+            for policy in &table.policies {
+                if !names.contains(&policy.name) {
+                    continue;
+                }
                 let parsed = policy.qual.as_ref().map_err(|reason| {
                     rls_refusal(CacheError::RlsUninlinable {
                         policy: policy.name.clone(),
                         reason: reason.clone(),
                     })
                 })?;
-                let tree = query_tree_session_terms_replace(&parsed.tree, &rls.terms)
-                    .map_err(|e| rls_refusal(term_error(e)))?;
-                CacheableQuery::cacheable(&tree, &**self.function_catalog.load()).map_err(|e| {
-                    rls_refusal(CacheError::RlsUninlinable {
-                        policy: policy.name.clone(),
-                        reason: EcoString::from(e.to_string()),
-                    })
-                })?;
-                policies.push(InlinedPolicy {
-                    tree,
-                    own_columns: parsed.own_columns.clone(),
-                    permissive: policy.permissive,
-                });
+                let Some(fold) = folds.policies.iter().find(|fold| fold.name == policy.name) else {
+                    return Err(rls_refusal(CacheError::RlsNoContext));
+                };
+                let inlined = policy_inline(parsed, &fold.values, policy.permissive)
+                    .map_err(|e| rls_refusal(fold_error(e)))?;
+                CacheableQuery::cacheable(&inlined.tree, &**self.function_catalog.load()).map_err(
+                    |e| {
+                        rls_refusal(CacheError::RlsUninlinable {
+                            policy: policy.name.clone(),
+                            reason: EcoString::from(e.to_string()),
+                        })
+                    },
+                )?;
+                policies.push(inlined);
             }
             let qualifier = reference_qualifier(bound.tree(), *reference);
             let Some(predicate) = ReferencePredicate::new(qualifier, policies) else {
@@ -635,7 +658,7 @@ impl WriterCore {
 
 /// A bound policy qual (`SELECT 1 FROM <table> WHERE <qual>`) with the
 /// positions of the policy table's own column references.
-fn parsed_qual_of(bound: &ResolvedQuery, relation_oid: Oid) -> ParsedQual {
+fn parsed_qual_of(bound: &ResolvedQuery, relation_oid: Oid, policy_name: &str) -> ParsedQual {
     let bindings = bound.bindings();
     let own_columns = bound
         .tree()
@@ -652,9 +675,45 @@ fn parsed_qual_of(bound: &ResolvedQuery, relation_oid: Oid) -> ParsedQual {
         .map(|node| node.id())
         .collect();
     ParsedQual {
-        tree: bound.tree().clone(),
+        terms: Arc::new(RlsPolicyTerms::new(
+            EcoString::from(policy_name),
+            bound.tree().clone(),
+        )),
         own_columns,
     }
+}
+
+/// `parsed` with `values` substituted for its fragments, ready to inline.
+/// A fragment of several nodes becomes one leaf, so the own-column
+/// positions follow the substitution through its remap.
+fn policy_inline(
+    parsed: &ParsedQual,
+    values: &[FoldedTerm],
+    permissive: bool,
+) -> Result<InlinedPolicy, TermFoldError> {
+    let (tree, remap) = query_tree_term_fragments_replace_remapped(
+        &parsed.terms.tree,
+        &parsed.terms.fragments,
+        values,
+    )?;
+    let own_columns = parsed
+        .own_columns
+        .iter()
+        .filter_map(|id| remap.new_id(*id))
+        .collect();
+    Ok(InlinedPolicy {
+        tree,
+        own_columns,
+        permissive,
+    })
+}
+
+/// The fold the proxy carried for `relation_oid`, when it was taken from
+/// the publication `version`.
+fn rls_relation_fold(rls: &RlsKeying, relation_oid: Oid, version: u64) -> Option<&RlsRelationFold> {
+    rls.relations
+        .iter()
+        .find(|fold| fold.relation_oid == relation_oid && fold.version == version)
 }
 
 /// `bound` with each reference's predicate ANDed onto the WHERE of the
@@ -763,12 +822,14 @@ fn source_references(source: Source<'_>, nullable: bool, out: &mut Vec<(NodeId, 
 }
 
 /// The error a session term that cannot be substituted refuses the read with.
-fn term_error(error: SessionTermError) -> CacheError {
+fn fold_error(error: TermFoldError) -> CacheError {
     match error {
-        SessionTermError::UserUnknown => CacheError::RlsRoleUnknown,
-        SessionTermError::SettingUnknown { name } | SessionTermError::SettingUnset { name } => {
-            CacheError::RlsSettingUnknown { name }
-        }
+        TermFoldError::Term(SessionTermError::UserUnknown) => CacheError::RlsRoleUnknown,
+        TermFoldError::Term(
+            SessionTermError::SettingUnknown { name } | SessionTermError::SettingUnset { name },
+        ) => CacheError::RlsSettingUnknown { name },
+        TermFoldError::Term(SessionTermError::ValueRejected { reason })
+        | TermFoldError::Unfoldable { reason } => CacheError::RlsUnsupported { reason },
     }
 }
 
@@ -1064,6 +1125,8 @@ mod tests {
     use super::*;
     use crate::catalog::{ColumnMetadata, ColumnPosition, TableMetadata};
     use crate::oid::TypeOid;
+    use crate::query::ast::LiteralValue;
+    use crate::query::keying_settings::RlsPolicyFold;
 
     /// `docs` (secured) and `memberships`, text columns, OIDs 1001 and 1002.
     fn catalog() -> Catalog {
@@ -1097,14 +1160,20 @@ mod tests {
             .unwrap_or_else(|e| panic!("{sql} resolves: {e:?}"))
     }
 
-    fn policy(qual: &str, permissive: bool, tables: &Catalog) -> InlinedPolicy {
+    /// A policy over `docs` with `values` substituted for its fragments.
+    fn policy_with(
+        qual: &str,
+        values: &[FoldedTerm],
+        permissive: bool,
+        tables: &Catalog,
+    ) -> InlinedPolicy {
         let bound = bind(&format!("SELECT 1 FROM docs WHERE {qual}"), tables);
-        let parsed = parsed_qual_of(&bound, Oid::from_raw(1001));
-        InlinedPolicy {
-            tree: parsed.tree,
-            own_columns: parsed.own_columns,
-            permissive,
-        }
+        let parsed = parsed_qual_of(&bound, Oid::from_raw(1001), "policy");
+        policy_inline(&parsed, values, permissive).expect("the values pair with the fragments")
+    }
+
+    fn policy(qual: &str, permissive: bool, tables: &Catalog) -> InlinedPolicy {
+        policy_with(qual, &[], permissive, tables)
     }
 
     /// `sql` rewritten with `policies` on every reference of `docs`.
@@ -1129,6 +1198,51 @@ mod tests {
             })
             .collect();
         Ok(rls_rewrite(&bound, &predicates)?.sql())
+    }
+
+    /// A fold pairs with a relation's policies only when the proxy took it
+    /// from the publication the writer holds now; another version, or a
+    /// relation the fold does not carry, pairs with nothing.
+    #[test]
+    fn test_relation_fold_pairs_by_oid_and_version() {
+        let fold = |oid: u32, version: u64| RlsRelationFold {
+            relation_oid: Oid::from_raw(oid),
+            version,
+            policies: vec![RlsPolicyFold {
+                name: "tenant".into(),
+                values: vec![FoldedTerm::Value(LiteralValue::String("7".into()))],
+            }],
+        };
+        let rls = RlsKeying {
+            current_user: Some("alice".into()),
+            row_security: Some(true),
+            relations: vec![fold(1001, 3), fold(1002, 1)],
+        };
+        assert!(rls_relation_fold(&rls, Oid::from_raw(1001), 3).is_some());
+        assert!(rls_relation_fold(&rls, Oid::from_raw(1002), 1).is_some());
+        assert!(rls_relation_fold(&rls, Oid::from_raw(1001), 4).is_none());
+        assert!(rls_relation_fold(&rls, Oid::from_raw(1003), 1).is_none());
+    }
+
+    /// A fragment of several nodes (`current_setting(…)::int`) substitutes
+    /// to one leaf, moving every position after it: the own columns still
+    /// take the reference's qualifier.
+    #[test]
+    fn test_own_columns_after_a_fragment_follow_the_substitution() {
+        let tables = catalog();
+        let tenant = policy_with(
+            "tenant = current_setting('app.tenant')::int AND owner = 'alice'",
+            &[FoldedTerm::Value(LiteralValue::StringWithCast(
+                "7".into(),
+                "int4".into(),
+            ))],
+            true,
+            &tables,
+        );
+        assert_eq!(
+            rewrite("SELECT id FROM docs d", vec![tenant]).expect("rewrites"),
+            "SELECT id FROM docs d WHERE d.tenant = '7'::int4 AND d.owner = 'alice'"
+        );
     }
 
     #[test]

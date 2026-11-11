@@ -20,6 +20,9 @@ use super::reg_gate::RegGate;
 use super::serve_pool_state::ServePool;
 use super::update_query::UpdateQueries;
 use crate::oid::{FunctionOid, Oid};
+use crate::query::ast::NodeId;
+use crate::query::ast::rope::QueryTree;
+use crate::query::transform::{query_tree_setting_names, query_tree_term_fragments};
 use crate::query::update::ReadRelations;
 use crate::{
     cache::{CacheError, CacheResult, memo::ResultMemo, mv::MvMeta, query::CacheableQuery},
@@ -62,25 +65,90 @@ pub struct AliasResolution {
     pub(crate) user_max_limit: Option<u64>,
 }
 
+/// A relation origin applies row-level security to, as the writer publishes
+/// it for the proxy's keying (PGC-113): each parsed policy's qual with its
+/// term fragments, which the proxy folds under the session and the writer
+/// inlines with the same literals, and the custom settings those read,
+/// which the connection tracks from its first read.
+#[derive(Debug)]
+pub struct RlsRelationTerms {
+    pub name: EcoString,
+    pub relation_oid: Oid,
+    /// Unique to one load of the relation's policies in this process: a
+    /// fold taken from another version is refused, and the read forwards
+    /// once.
+    pub version: u64,
+    /// The parsed policies, uninlinable ones left out.
+    pub policies: Vec<Arc<RlsPolicyTerms>>,
+    settings: Vec<EcoString>,
+}
+
+impl RlsRelationTerms {
+    pub fn new(
+        name: EcoString,
+        relation_oid: Oid,
+        version: u64,
+        policies: Vec<Arc<RlsPolicyTerms>>,
+    ) -> Self {
+        let mut settings: Vec<EcoString> = policies
+            .iter()
+            .flat_map(|policy| query_tree_setting_names(&policy.tree).cloned())
+            .collect();
+        settings.sort();
+        settings.dedup();
+        Self {
+            name,
+            relation_oid,
+            version,
+            policies,
+            settings,
+        }
+    }
+
+    /// The custom settings the policies read, sorted and distinct.
+    pub fn settings(&self) -> &[EcoString] {
+        &self.settings
+    }
+}
+
+/// A policy's qual as the writer parsed it, with the roots of its term
+/// fragments in pre-order; the proxy's fold is paired back by the policy's
+/// name.
+#[derive(Debug)]
+pub struct RlsPolicyTerms {
+    pub name: EcoString,
+    pub tree: QueryTree,
+    pub fragments: Vec<NodeId>,
+}
+
+impl RlsPolicyTerms {
+    pub fn new(name: EcoString, tree: QueryTree) -> Self {
+        let fragments = query_tree_term_fragments(&tree);
+        Self {
+            name,
+            tree,
+            fragments,
+        }
+    }
+}
+
 /// The relations origin applies row-level security to, by bare name (any
-/// schema), each with the custom settings its policies read (PGC-113). The
-/// proxy keys a read naming one of them on the session's values of those
-/// settings and its role; the writer resolves the name exactly and inlines.
+/// schema). The proxy keys a read naming one of them on its role and the
+/// policies' folded fragments; the writer resolves the name exactly and
+/// inlines.
 #[derive(Debug, Default)]
 pub struct RlsRelations {
-    by_name: HashMap<EcoString, Vec<EcoString>>,
+    by_name: HashMap<EcoString, Vec<Arc<RlsRelationTerms>>>,
 }
 
 impl RlsRelations {
-    /// From `(table name, settings its policies read)` entries; two
-    /// relations of one name in different schemas pool their settings.
-    pub fn new(entries: impl IntoIterator<Item = (EcoString, Vec<EcoString>)>) -> Self {
-        let mut by_name: HashMap<EcoString, Vec<EcoString>> = HashMap::new();
-        for (name, settings) in entries {
-            let pooled = by_name.entry(name).or_default();
-            pooled.extend(settings);
-            pooled.sort();
-            pooled.dedup();
+    pub fn new(relations: impl IntoIterator<Item = Arc<RlsRelationTerms>>) -> Self {
+        let mut by_name: HashMap<EcoString, Vec<Arc<RlsRelationTerms>>> = HashMap::new();
+        for relation in relations {
+            by_name
+                .entry(relation.name.clone())
+                .or_default()
+                .push(relation);
         }
         Self { by_name }
     }
@@ -89,9 +157,9 @@ impl RlsRelations {
         self.by_name.is_empty()
     }
 
-    /// The settings the policies of any relation named `name` read, or
-    /// `None` when no such relation has row-level security.
-    pub fn settings_of(&self, name: &str) -> Option<&[EcoString]> {
+    /// The secured relations named `name`, in any schema, or `None` when no
+    /// such relation has row-level security.
+    pub fn relations_of(&self, name: &str) -> Option<&[Arc<RlsRelationTerms>]> {
         self.by_name.get(name).map(Vec::as_slice)
     }
 }

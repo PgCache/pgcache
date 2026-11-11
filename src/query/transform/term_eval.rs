@@ -3,18 +3,21 @@
 //! semantics origin would apply — NULL propagation through `coalesce`,
 //! `nullif` and the json access operators, a cast to `json`/`jsonb` parsing
 //! its text, a text extraction rendering only what renders the same in json
-//! and jsonb. Whatever origin would render itself is left unfolded, and the
-//! read forwards.
+//! and jsonb. Whatever origin would render itself is left unfolded: the
+//! fragment degrades to its bare terms, substituted on their own as before
+//! fragments, and the key carries their raw values. A value origin would
+//! reject outright (text that is not json) is not degraded, since no form
+//! of the read populates: it is unavailable, and the read forwards.
 
 use ecow::EcoString;
 use error_set::error_set;
 use serde_json::Value as Json;
 
-use super::session_terms::{SessionTermContext, SessionTermError, term_value};
+use super::session_terms::{FoldedTerm, SessionTermContext, SessionTermError, term_value};
 use super::term_fold::bare_select_item;
 use crate::query::ast::rope::{
-    NodeKind, NodeRef, QueryTree, Replacement, Replacements, Scalar, ScalarKind, TreeBuilder,
-    TypeCast, View, WhereSubquery,
+    NodeKind, NodeRef, QueryTree, Remap, Replacement, Replacements, Scalar, ScalarKind,
+    TreeBuilder, TypeCast, View, WhereSubquery,
 };
 use crate::query::ast::{JsonOp, LiteralValue, NodeId, ScalarOp};
 use crate::query::cast::{CastTarget, cast_target_deparse};
@@ -37,43 +40,107 @@ enum Folded {
     Json(Json),
 }
 
-/// Every fragment of `tree` folded under `context`, in pre-order.
+/// Every fragment of `tree` under `context`, in pre-order.
 pub(crate) fn query_tree_term_fragments_fold(
     tree: &QueryTree,
     fragments: &[NodeId],
     context: &SessionTermContext,
-) -> Result<Vec<LiteralValue>, TermFoldError> {
+) -> Vec<FoldedTerm> {
     let root = tree.root().node_ref();
     fragments
         .iter()
-        .map(|id| position_term_fold(root.at_position(*id), context))
+        .map(|id| {
+            let position = root.at_position(*id);
+            match position_term_fold(position, context) {
+                Ok(value) => FoldedTerm::Value(value),
+                Err(TermFoldError::Term(error)) => FoldedTerm::Unavailable(error),
+                Err(TermFoldError::Unfoldable { .. }) => fragment_terms_fold(position, context),
+            }
+        })
+        .collect()
+}
+
+/// The bare terms of the fragment at `position`, each its value.
+fn fragment_terms_fold(position: NodeRef<'_>, context: &SessionTermContext) -> FoldedTerm {
+    let mut values = Vec::new();
+    for node in position.subtree() {
+        if let NodeKind::Literal(LiteralValue::SessionTerm(term)) = node.kind() {
+            match term_value(term, context) {
+                Ok(value) => values.push(value),
+                Err(error) => return FoldedTerm::Unavailable(error),
+            }
+        }
+    }
+    FoldedTerm::Terms(values)
+}
+
+/// The positions of the bare terms of the fragment at `position`, in
+/// pre-order: what [`FoldedTerm::Terms`] pairs with.
+fn fragment_term_positions(position: NodeRef<'_>) -> Vec<NodeId> {
+    position
+        .subtree()
+        .filter(|node| matches!(node.kind(), NodeKind::Literal(LiteralValue::SessionTerm(_))))
+        .map(|node| node.id())
         .collect()
 }
 
 /// `tree` with the fragments rooted at `fragments` replaced by `values`,
-/// pairing in order: the literals the proxy folded, applied by the writer
-/// to the fragments the proxy recorded.
+/// pairing in order: what the proxy folded, applied by the writer to the
+/// fragments the proxy recorded. A degraded fragment keeps its shape and
+/// takes the values at its bare terms; an unavailable one is the error.
 pub(crate) fn query_tree_term_fragments_replace(
     tree: &QueryTree,
     fragments: &[NodeId],
-    values: &[LiteralValue],
+    values: &[FoldedTerm],
 ) -> Result<QueryTree, TermFoldError> {
+    query_tree_term_fragments_replace_remapped(tree, fragments, values).map(|(tree, _)| tree)
+}
+
+/// [`query_tree_term_fragments_replace`] with where the kept nodes landed:
+/// a fragment of several nodes becomes one leaf, so a position recorded on
+/// `tree` after it (the inliner's own-column positions) moves.
+pub(crate) fn query_tree_term_fragments_replace_remapped(
+    tree: &QueryTree,
+    fragments: &[NodeId],
+    values: &[FoldedTerm],
+) -> Result<(QueryTree, Remap), TermFoldError> {
     if fragments.len() != values.len() {
         return Err(unfoldable(
             "the folded values do not pair with the fragments",
         ));
     }
     if fragments.is_empty() {
-        return Ok(tree.clone());
-    }
-    let mut replacements = Replacements::new();
-    for (id, value) in fragments.iter().zip(values) {
-        replacements.push(*id, Replacement::Leaf(NodeKind::Literal(value.clone())));
+        let mut builder = TreeBuilder::over(tree);
+        builder.keep(tree.root().id());
+        return Ok(builder.finish());
     }
     let root = tree.root().node_ref();
+    let mut replacements = Replacements::new();
+    for (id, value) in fragments.iter().zip(values) {
+        match value {
+            FoldedTerm::Value(value) => {
+                replacements.push(*id, Replacement::Leaf(NodeKind::Literal(value.clone())));
+            }
+            FoldedTerm::Terms(values) => {
+                let positions = fragment_term_positions(root.at_position(*id));
+                if positions.len() != values.len() {
+                    return Err(unfoldable(
+                        "the term values do not pair with the fragment's terms",
+                    ));
+                }
+                for (position, value) in positions.into_iter().zip(values) {
+                    replacements.push(
+                        position,
+                        Replacement::Leaf(NodeKind::Literal(value.clone())),
+                    );
+                }
+            }
+            FoldedTerm::Unavailable(error) => return Err(TermFoldError::Term(error.clone())),
+        }
+    }
     let mut builder = TreeBuilder::over(tree);
     builder.copy(root, &mut replacements);
-    Ok(builder.finish().0)
+    Ok(builder.finish())
 }
 
 /// The fragment rooted at `position` folded under `context`.
@@ -193,9 +260,11 @@ fn cast_fold(cast: TypeCast<'_>, context: &SessionTermContext) -> Result<Folded,
         }
         Folded::Literal(LiteralValue::String(text)) => {
             if to_json {
-                serde_json::from_str(&text)
-                    .map(Folded::Json)
-                    .map_err(|_| unfoldable("a json literal origin would reject"))
+                serde_json::from_str(&text).map(Folded::Json).map_err(|_| {
+                    TermFoldError::Term(SessionTermError::ValueRejected {
+                        reason: "a json document origin would reject",
+                    })
+                })
             } else {
                 Ok(Folded::Literal(LiteralValue::StringWithCast(
                     text,
@@ -550,21 +619,16 @@ mod tests {
     }
 
     /// What origin would render itself is left to origin: a decimal number
-    /// as text, an object as text, a json value as the result, a json
-    /// literal that does not parse.
+    /// as text, an object as text, a json value as the result.
     #[test]
     fn test_values_origin_renders_are_unfoldable() {
-        let ctx = context(
-            None,
-            &[("request.jwt.claims", known(CLAIMS)), ("bad", known("{"))],
-        );
+        let ctx = context(None, &[("request.jwt.claims", known(CLAIMS))]);
         let claims = "current_setting('request.jwt.claims', true)::jsonb";
         for expr in [
             format!("{claims} ->> 'x'"),
             format!("{claims} ->> 'aud'"),
             format!("{claims} -> 'sub'"),
             format!("{claims}::text"),
-            "current_setting('bad', true)::jsonb ->> 'a'".to_owned(),
         ] {
             assert!(
                 matches!(folded(&expr, &ctx), Err(TermFoldError::Unfoldable { .. })),
@@ -592,15 +656,16 @@ mod tests {
                 ("app.note", known("hi")),
             ],
         );
-        let values = query_tree_term_fragments_fold(&tree, &fragments, &ctx).expect("fold");
+        let values = query_tree_term_fragments_fold(&tree, &fragments, &ctx);
         assert_eq!(
             values,
-            vec![
+            [
                 text("none"),
                 text("alice"),
                 text_as("7", "int4"),
                 text("hi")
             ]
+            .map(FoldedTerm::Value)
         );
         let replaced =
             query_tree_term_fragments_replace(&tree, &fragments, &values).expect("replace");
@@ -621,13 +686,89 @@ mod tests {
         .expect("parse");
         let fragments = query_tree_term_fragments(&wrapped);
         let ctx = context(None, &[("app.who", known("ann"))]);
-        let values = query_tree_term_fragments_fold(&wrapped, &fragments, &ctx).expect("fold");
+        let values = query_tree_term_fragments_fold(&wrapped, &fragments, &ctx);
         let replaced =
             query_tree_term_fragments_replace(&wrapped, &fragments, &values).expect("replace");
         assert_eq!(
             plain(&replaced),
             "SELECT id FROM t WHERE owner = 'ann' AND id > 1"
         );
+    }
+
+    /// A fragment whose shape is origin's to evaluate (a typed `nullif`, a
+    /// json value compared whole) degrades to its bare terms: their values
+    /// key the read and are substituted on their own, as before fragments.
+    /// A term the session cannot supply is carried as the reason, which the
+    /// replace refuses.
+    #[test]
+    fn test_unfoldable_fragment_degrades_to_its_terms() {
+        let tree = query_tree_parse(
+            "SELECT id FROM t WHERE tenant = nullif(current_setting('app.tenant')::int, 0) \
+             AND claims = current_setting('app.claims')::jsonb \
+             AND who = current_setting('app.who', true)",
+        )
+        .expect("parse");
+        let fragments = query_tree_term_fragments(&tree);
+        assert_eq!(fragments.len(), 3);
+        let ctx = context(
+            None,
+            &[
+                ("app.tenant", known("7")),
+                ("app.claims", known(r#"{"a":1}"#)),
+                ("app.who", CustomSettingValue::Unset),
+            ],
+        );
+        let values = query_tree_term_fragments_fold(&tree, &fragments, &ctx);
+        assert_eq!(
+            values,
+            [
+                FoldedTerm::Terms(vec![text("7")]),
+                FoldedTerm::Terms(vec![text(r#"{"a":1}"#)]),
+                FoldedTerm::Value(LiteralValue::Null),
+            ]
+        );
+        let replaced =
+            query_tree_term_fragments_replace(&tree, &fragments, &values).expect("replace");
+        assert_eq!(
+            plain(&replaced),
+            "SELECT id FROM t WHERE tenant = NULLIF(('7')::int4, 0) \
+             AND claims = ('{\"a\":1}')::jsonb AND who = NULL"
+        );
+
+        let unknown = context(None, &[("app.claims", known("{}"))]);
+        let values = query_tree_term_fragments_fold(&tree, &fragments, &unknown);
+        assert!(matches!(
+            values[0],
+            FoldedTerm::Unavailable(SessionTermError::SettingUnknown { .. })
+        ));
+        assert!(matches!(
+            query_tree_term_fragments_replace(&tree, &fragments, &values),
+            Err(TermFoldError::Term(SessionTermError::SettingUnknown { .. }))
+        ));
+    }
+
+    /// Text that is not json fails the cast on origin whatever form the
+    /// read takes, so it is not degraded to its terms: the fragment is
+    /// unavailable and the read forwards.
+    #[test]
+    fn test_a_value_origin_rejects_is_unavailable() {
+        let tree = query_tree_parse(
+            "SELECT id FROM t WHERE owner = current_setting('app.claims')::jsonb ->> 'sub'",
+        )
+        .expect("parse");
+        let fragments = query_tree_term_fragments(&tree);
+        let ctx = context(None, &[("app.claims", known(""))]);
+        let values = query_tree_term_fragments_fold(&tree, &fragments, &ctx);
+        assert_eq!(
+            values,
+            [FoldedTerm::Unavailable(SessionTermError::ValueRejected {
+                reason: "a json document origin would reject",
+            })]
+        );
+        assert!(matches!(
+            query_tree_term_fragments_replace(&tree, &fragments, &values),
+            Err(TermFoldError::Term(SessionTermError::ValueRejected { .. }))
+        ));
     }
 
     /// A cast over a cast literal converts between types (`'007'::int::text`
