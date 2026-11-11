@@ -25,6 +25,12 @@ type Rows = Vec<Vec<Option<String>>>;
 const TENANT_READ: &str = "SELECT id, body FROM tenant_docs ORDER BY id";
 const OWNED_READ: &str = "SELECT id, body FROM owned_docs ORDER BY id";
 const JUDGED_READ: &str = "SELECT id, body FROM judged_docs ORDER BY id";
+const CLAIMED_READ: &str = "SELECT id, body FROM claimed_docs ORDER BY id";
+const NULLED_READ: &str = "SELECT id, body FROM nulled_docs ORDER BY id";
+
+const ANN_TOKEN: &str = r#"{"sub":"ann","role":"authenticated","exp":1700000000}"#;
+const ANN_TOKEN_LATER: &str = r#"{"sub":"ann","role":"authenticated","exp":1700000999}"#;
+const BOB_TOKEN: &str = r#"{"sub":"bob","role":"authenticated","exp":1700000000}"#;
 
 /// `public.tenant_of`: on the writer connection's search_path, so a policy
 /// calling it deparses the bare name.
@@ -60,6 +66,41 @@ async fn owned_docs_create(ctx: &mut TestContext) -> Result<(), Error> {
         "GRANT SELECT ON owned_docs TO alice, bob",
         "ALTER TABLE owned_docs ENABLE ROW LEVEL SECURITY",
         "CREATE POLICY owner_policy ON owned_docs FOR SELECT USING (owner = current_user)",
+    ] {
+        ctx.origin_query(sql, &[]).await?;
+    }
+    ctx.cdc_apply_settle().await
+}
+
+/// `claimed_docs`, readable by `claimant`, under the Supabase-style policy
+/// selecting the owner named by the `sub` claim of `request.jwt.claims`.
+async fn claimed_docs_create(ctx: &mut TestContext) -> Result<(), Error> {
+    for sql in [
+        "CREATE TABLE claimed_docs (id int primary key, owner text, body text)",
+        "INSERT INTO claimed_docs VALUES (1, 'ann', 'a'), (2, 'bob', 'b'), (3, 'ann', 'c')",
+        "CREATE ROLE claimant LOGIN",
+        "GRANT SELECT ON claimed_docs TO claimant",
+        "ALTER TABLE claimed_docs ENABLE ROW LEVEL SECURITY",
+        "CREATE POLICY claim_policy ON claimed_docs FOR SELECT \
+         USING (owner = (current_setting('request.jwt.claims', true)::jsonb ->> 'sub'))",
+    ] {
+        ctx.origin_query(sql, &[]).await?;
+    }
+    ctx.cdc_apply_settle().await
+}
+
+/// `nulled_docs`, readable by `nulled_user`, under a policy whose term sits
+/// in a typed `nullif`: a shape the fold refuses, so the term is substituted
+/// on its own and the rest is left to the database, as before PGC-580.
+async fn nulled_docs_create(ctx: &mut TestContext) -> Result<(), Error> {
+    for sql in [
+        "CREATE TABLE nulled_docs (id int primary key, tenant int, body text)",
+        "INSERT INTO nulled_docs VALUES (1, 1, 'a'), (2, 2, 'b'), (3, 1, 'c')",
+        "CREATE ROLE nulled_user LOGIN",
+        "GRANT SELECT ON nulled_docs TO nulled_user",
+        "ALTER TABLE nulled_docs ENABLE ROW LEVEL SECURITY",
+        "CREATE POLICY nulled_policy ON nulled_docs FOR SELECT \
+         USING (tenant = nullif(current_setting('app.tenant_id')::int, 0))",
     ] {
         ctx.origin_query(sql, &[]).await?;
     }
@@ -105,14 +146,28 @@ async fn sessions_as(
     user: &str,
     tenant: Option<&str>,
 ) -> Result<(Client, Client), Error> {
+    let set = tenant.map(|tenant| format!("SET app.tenant_id = '{tenant}'"));
+    sessions_with(ctx, user, set.as_deref().as_slice()).await
+}
+
+/// Through the proxy as `user`, and directly on origin as `user`, each with
+/// `statements` run first.
+async fn sessions_with(
+    ctx: &TestContext,
+    user: &str,
+    statements: &[&str],
+) -> Result<(Client, Client), Error> {
     let proxied = ctx.proxy_client_connect_as(user).await?;
     let origin = ctx.origin_connect_as(user).await?;
-    if let Some(tenant) = tenant {
-        let set = format!("SET app.tenant_id = '{tenant}'");
-        proxied.simple_query(&set).await.map_err(Error::other)?;
-        origin.simple_query(&set).await.map_err(Error::other)?;
+    for sql in statements {
+        proxied.simple_query(sql).await.map_err(Error::other)?;
+        origin.simple_query(sql).await.map_err(Error::other)?;
     }
     Ok((proxied, origin))
+}
+
+fn token_set(token: &str) -> String {
+    format!("SELECT set_config('request.jwt.claims', '{token}', false)")
 }
 
 async fn rows(client: &Client, sql: &str) -> Result<Rows, Error> {
@@ -762,5 +817,111 @@ async fn test_policy_calling_an_overloaded_builtin_is_not_inlined() -> Result<()
         result_rows(&result.map_err(Error::other)?),
         vec![row("1", "a")]
     );
+    Ok(())
+}
+
+/// A policy extracting a claim from the JWT claims setting is keyed on the
+/// claim, as a client query's own extraction is (ADR-066): a later token of
+/// the same user, differing in `exp`, is a hit on the same entry with no
+/// registration of its own, and another user's token has its own entry.
+#[tokio::test]
+async fn test_jwt_claim_policy_is_keyed_on_the_claim() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    claimed_docs_create(&mut ctx).await?;
+    let (ann, origin_ann) = sessions_with(&ctx, "claimant", &[&token_set(ANN_TOKEN)]).await?;
+    let served = register(&mut ctx, &ann, CLAIMED_READ).await?;
+    assert_eq!(served, vec![row("1", "a"), row("3", "c")]);
+    assert_eq!(served, rows(&origin_ann, CLAIMED_READ).await?);
+
+    let (ann_later, _) = sessions_with(&ctx, "claimant", &[&token_set(ANN_TOKEN_LATER)]).await?;
+    assert_eq!(
+        hit_wait(&mut ctx, &ann_later, CLAIMED_READ).await?,
+        served,
+        "a later token of the same user shares the entry"
+    );
+
+    let (bob, origin_bob) = sessions_with(&ctx, "claimant", &[&token_set(BOB_TOKEN)]).await?;
+    let served = register(&mut ctx, &bob, CLAIMED_READ).await?;
+    assert_eq!(served, vec![row("2", "b")]);
+    assert_eq!(served, rows(&origin_bob, CLAIMED_READ).await?);
+    Ok(())
+}
+
+/// The PostgREST request shape over a secured table: a block that sets the
+/// claims for the block and reads. A second request with a later token of
+/// the same user is a hit; outside a request the claims setting is an
+/// empty string, which is not json, and the read is origin's error through
+/// the proxy as directly.
+#[cfg(feature = "fault-injection")]
+#[tokio::test]
+async fn test_postgrest_style_block_over_a_claim_policy_is_served_per_claim() -> Result<(), Error> {
+    // In-block serving needs the read-after-write gate the harness turns off.
+    let mut ctx = TestContext::setup_fault(&[("PGCACHE_FAULT_READ_YOUR_WRITES_OFF", "0")]).await?;
+    claimed_docs_create(&mut ctx).await?;
+    let (proxied, origin) = sessions_with(&ctx, "claimant", &[]).await?;
+    let request_begin = |token: &str| {
+        [
+            "BEGIN".to_owned(),
+            format!("SELECT set_config('request.jwt.claims', '{token}', true)"),
+        ]
+    };
+    for client in [&proxied, &origin] {
+        for sql in request_begin(ANN_TOKEN) {
+            client.simple_query(&sql).await.map_err(Error::other)?;
+        }
+    }
+    let served = register(&mut ctx, &proxied, CLAIMED_READ).await?;
+    assert_eq!(served, vec![row("1", "a"), row("3", "c")]);
+    assert_eq!(served, rows(&origin, CLAIMED_READ).await?);
+    for client in [&proxied, &origin] {
+        client.simple_query("COMMIT").await.map_err(Error::other)?;
+    }
+
+    for client in [&proxied, &origin] {
+        for sql in request_begin(ANN_TOKEN_LATER) {
+            client.simple_query(&sql).await.map_err(Error::other)?;
+        }
+    }
+    assert_eq!(hit_wait(&mut ctx, &proxied, CLAIMED_READ).await?, served);
+    for client in [&proxied, &origin] {
+        client.simple_query("COMMIT").await.map_err(Error::other)?;
+    }
+
+    for client in [&proxied, &origin] {
+        let result = client.simple_query(CLAIMED_READ).await;
+        assert_sqlstate(
+            result,
+            &SqlState::INVALID_TEXT_REPRESENTATION,
+            "an empty claims setting is not json",
+        );
+    }
+    Ok(())
+}
+
+/// A policy term in a shape the fold refuses (a typed `nullif`) is still
+/// inlined, the term substituted on its own: what slice 1 cached stays
+/// cached, keyed on the setting's value.
+#[tokio::test]
+async fn test_unfoldable_policy_fragment_substitutes_its_term() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    nulled_docs_create(&mut ctx).await?;
+    let (user, origin) = sessions_as(&ctx, "nulled_user", Some("1")).await?;
+    let served = register(&mut ctx, &user, NULLED_READ).await?;
+    assert_eq!(served, vec![row("1", "a"), row("3", "c")]);
+    assert_eq!(served, rows(&origin, NULLED_READ).await?);
+
+    for client in [&user, &origin] {
+        client
+            .simple_query("SET app.tenant_id = '0'")
+            .await
+            .map_err(Error::other)?;
+    }
+    let served = register(&mut ctx, &user, NULLED_READ).await?;
+    assert_eq!(
+        served,
+        Vec::<Vec<Option<String>>>::new(),
+        "nullif gives NULL"
+    );
+    assert_eq!(served, rows(&origin, NULLED_READ).await?);
     Ok(())
 }
