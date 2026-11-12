@@ -80,8 +80,8 @@ async fn test_drop_table_stops_serving_and_recreated_table_caches() -> Result<()
     Ok(())
 }
 
-/// Attaching a non-empty partition under `publish_via_partition_root`
-/// (PGC-70): the partition's existing rows never arrive as inserts, so the
+/// Attaching a non-empty partition (PGC-70): the partition's existing rows
+/// never arrive as inserts, so the
 /// signal must repopulate the parent's queries. Detaching removes them again.
 #[tokio::test]
 async fn test_partition_attach_and_detach_repopulate_parent() -> Result<(), Error> {
@@ -216,9 +216,8 @@ async fn assert_repopulated(
     Ok(())
 }
 
-/// `TRUNCATE` of a partition under `publish_via_partition_root` (PGC-70):
-/// pgoutput sends nothing for it, so the per-partition truncate trigger must
-/// signal it and the parent's queries repopulate without the partition's rows.
+/// `TRUNCATE` of a partition (PGC-70): the parent's queries repopulate
+/// without the partition's rows.
 #[tokio::test]
 async fn test_partition_truncate_repopulates_parent() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;

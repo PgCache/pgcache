@@ -22,7 +22,7 @@ use crate::cache::cdc::CdcProcessorHandles;
 use crate::cache::messages::WriterNotify;
 use crate::cache::query_cache::CacheDispatch;
 use crate::cache::reference_settings::{self, ReferenceSettings};
-use crate::cache::types::{ActiveRelations, CacheStateView};
+use crate::cache::types::{CacheStateView, StreamRelations};
 use crate::cache::writer::{WriterChannels, WriterShared, writer_run};
 use crate::cache::{
     CacheDispatchPublisher, CacheError, CacheResult, MapIntoReport, PinnedQuery, ReportExt,
@@ -124,7 +124,7 @@ pub(super) fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
     reference_settings::install(reference);
 
     let state_view = Arc::new(CacheStateView::new(settings.dynamic.clone())?);
-    let active_relations: ActiveRelations =
+    let stream_relations: StreamRelations =
         Arc::new(ArcSwap::from_pointee(std::collections::HashSet::new()));
 
     let (query_tx, query_rx) = unbounded_channel();
@@ -143,7 +143,7 @@ pub(super) fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
     // subsystem cancel so a subsystem teardown propagates to it.
     let settings_writer = settings.clone();
     let state_view_writer = Arc::clone(&state_view);
-    let active_relations_writer = Arc::clone(&active_relations);
+    let stream_relations_writer = Arc::clone(&stream_relations);
     let cancel_writer = cache_cancel.child_token();
     let watermark_nudge_writer = Arc::clone(&watermark_nudge);
     let shared_runtime_writer = handle.clone();
@@ -158,7 +158,7 @@ pub(super) fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
             };
             let shared = WriterShared {
                 state_view: state_view_writer,
-                active_relations: active_relations_writer,
+                stream_relations: stream_relations_writer,
                 notify_tx,
                 watermark_nudge: watermark_nudge_writer,
                 runtime: shared_runtime_writer,
@@ -181,7 +181,7 @@ pub(super) fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
     // the whole cache subsystem.
     let cdc_handles = CdcProcessorHandles {
         cdc_tx: cdc_cmd_tx,
-        active_relations: Arc::clone(&active_relations),
+        stream_relations: Arc::clone(&stream_relations),
         watermark_nudge: Arc::clone(&watermark_nudge),
         received_lsn: Arc::clone(&state_view.received_lsn),
     };

@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use lru::LruCache;
 use metrics::Histogram;
-use tracing::{info, trace};
+use tracing::{info, trace, warn};
 
 use super::segment_eval::PreparedEvalKey;
 use super::{BATCH_FRAMES_MAX, PREPARED_EVAL_CACHE_CAPACITY, SQL_BUFFER_CAPACITY, WriterCdc};
@@ -17,12 +17,24 @@ use crate::cache::messages::{CdcCommand, CdcValue, SchemaChange};
 use crate::cache::reference_settings;
 use crate::cache::writer::core::WriterCore;
 use crate::cache::writer::frame::{FRAME_ROWS_CAPACITY, FrameRowEvent, FrameState, ToastState};
+use crate::cache::writer::stream_route::{ColumnMap, LayoutMismatch, row_remap};
 use crate::cache::{CacheError, CacheResult, MapIntoReport, ReportExt};
 use crate::catalog::TableMetadata;
 use crate::oid::{FunctionOid, Oid};
 use crate::pg;
 use crate::pg::Lsn;
 use crate::settings::Settings;
+
+/// Where a row change lands, by the relation it streams under.
+enum StreamRoute {
+    /// A cached table with no cached table above it.
+    Table,
+    /// A partition: each cached table holding it, with the map that carries
+    /// the partition's tuples into the table's layout.
+    Partition(Vec<(Oid, ColumnMap)>),
+    /// No cached table takes the relation's rows.
+    Unrouted,
+}
 
 /// What the schema-change signal reports for a relation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,20 +191,59 @@ impl WriterCdc {
             CdcCommand::Insert {
                 relation_oid,
                 row_data,
-            } => {
-                self.insert_command_event(core, relation_oid, row_data)
-                    .await?
-            }
+            } => match self.stream_route(core, relation_oid).await? {
+                StreamRoute::Table => {
+                    self.insert_command_event(core, relation_oid, row_data)
+                        .await?
+                }
+                StreamRoute::Partition(targets) => {
+                    for (target, map) in targets {
+                        let row_data = row_remap(&map, &row_data);
+                        let event = self.insert_command_event(core, target, row_data).await?;
+                        self.frame_row_push_some(core, event).await?;
+                    }
+                    None
+                }
+                StreamRoute::Unrouted => None,
+            },
             CdcCommand::Update {
                 relation_oid,
                 key_data,
                 row_data,
-            } => update_command_event(core, relation_oid, key_data, row_data),
+            } => match self.stream_route(core, relation_oid).await? {
+                StreamRoute::Table => update_command_event(core, relation_oid, key_data, row_data),
+                StreamRoute::Partition(targets) => {
+                    for (target, map) in targets {
+                        let event = update_command_event(
+                            core,
+                            target,
+                            row_remap(&map, &key_data),
+                            row_remap(&map, &row_data),
+                        );
+                        self.frame_row_push_some(core, event).await?;
+                    }
+                    None
+                }
+                StreamRoute::Unrouted => None,
+            },
             CdcCommand::Delete {
                 relation_oid,
                 row_data,
-            } => delete_command_event(core, relation_oid, row_data),
-            CdcCommand::Truncate { relation_oids } => truncate_command_event(core, relation_oids),
+            } => match self.stream_route(core, relation_oid).await? {
+                StreamRoute::Table => delete_command_event(core, relation_oid, row_data),
+                StreamRoute::Partition(targets) => {
+                    for (target, map) in targets {
+                        let event = delete_command_event(core, target, row_remap(&map, &row_data));
+                        self.frame_row_push_some(core, event).await?;
+                    }
+                    None
+                }
+                StreamRoute::Unrouted => None,
+            },
+            CdcCommand::Truncate { relation_oids } => {
+                let relation_oids = self.truncate_route(core, relation_oids).await?;
+                truncate_command_event(core, relation_oids)
+            }
             CdcCommand::SchemaChange(change) => {
                 self.schema_change_handle(core, change).await?;
                 None
@@ -244,6 +295,166 @@ impl WriterCdc {
             relation_oid,
             row_data,
         }))
+    }
+
+    async fn frame_row_push_some(
+        &mut self,
+        core: &mut WriterCore,
+        event: Option<FrameRowEvent>,
+    ) -> CacheResult<()> {
+        match event {
+            Some(event) => self.frame_row_push(core, event).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Where a row change on `stream_oid` lands. A target whose layout the
+    /// partition's tuples cannot be carried into is forgotten, to be
+    /// registered again from origin's current catalog.
+    async fn stream_route(
+        &mut self,
+        core: &mut WriterCore,
+        stream_oid: Oid,
+    ) -> CacheResult<StreamRoute> {
+        let Some(targets) = core.stream_routes.targets(stream_oid) else {
+            return Ok(if core.relation_refcounts.contains_key(&stream_oid) {
+                StreamRoute::Table
+            } else {
+                StreamRoute::Unrouted
+            });
+        };
+        let targets = targets.to_vec();
+        let mut routed = Vec::with_capacity(targets.len());
+        for target in targets {
+            if target == stream_oid {
+                routed.push((target, None));
+                continue;
+            }
+            match core.stream_column_map(stream_oid, target) {
+                Ok(map) => routed.push((target, map)),
+                Err(mismatch) => {
+                    self.stream_target_forget(core, stream_oid, target, mismatch)
+                        .await?;
+                }
+            }
+        }
+        Ok(StreamRoute::Partition(routed))
+    }
+
+    async fn stream_target_forget(
+        &mut self,
+        core: &mut WriterCore,
+        stream_oid: Oid,
+        target: Oid,
+        mismatch: LayoutMismatch,
+    ) -> CacheResult<()> {
+        warn!(
+            relation_oid = %stream_oid,
+            cached_oid = %target,
+            "a partition's rows cannot be applied to a cached table ({}): evicting its queries",
+            mismatch.reason()
+        );
+        self.cached_relation_forget(core, target)
+            .await
+            .attach_loc("partition layout does not fit a cached table")
+    }
+
+    /// The relations a `TRUNCATE` empties in place. A truncated partition
+    /// cached on its own is one; a cached table above it lost part of its
+    /// rows and is forgotten.
+    async fn truncate_route(
+        &mut self,
+        core: &mut WriterCore,
+        relation_oids: Vec<Oid>,
+    ) -> CacheResult<Vec<Oid>> {
+        let mut in_place = Vec::with_capacity(relation_oids.len());
+        for relation_oid in relation_oids {
+            let above: Vec<Oid> = core
+                .stream_routes
+                .targets(relation_oid)
+                .unwrap_or_default()
+                .iter()
+                .copied()
+                .filter(|target| *target != relation_oid)
+                .collect();
+            for cached_oid in above {
+                // An earlier partition of the same statement may have
+                // forgotten it already.
+                if !core.cache.tables.contains_key1(&cached_oid) {
+                    continue;
+                }
+                info!(
+                    relation_oid = %relation_oid,
+                    cached_oid = %cached_oid,
+                    "origin truncated a partition of a cached table: evicting its queries"
+                );
+                self.cached_relation_forget(core, cached_oid)
+                    .await
+                    .attach_loc("partition truncated under a cached table")?;
+            }
+            if core.relation_refcounts.contains_key(&relation_oid) {
+                in_place.push(relation_oid);
+            }
+        }
+        Ok(in_place)
+    }
+
+    /// A `Relation` message as it concerns the partition routes: the layout
+    /// is recorded, and every cached table above the relation is checked
+    /// against it. Returns whether the message is fully handled, which it is
+    /// for a partition that is not itself a cached table.
+    async fn stream_relation_observe(
+        &mut self,
+        core: &mut WriterCore,
+        layout: &TableMetadata,
+    ) -> CacheResult<bool> {
+        let stream_oid = layout.relation_oid;
+        core.stream_routes.layout_record(Arc::new(layout.clone()));
+        let cached = core.cache.tables.contains_key1(&stream_oid);
+        let above: Vec<Oid> = core
+            .stream_routes
+            .targets(stream_oid)
+            .unwrap_or_default()
+            .iter()
+            .copied()
+            .filter(|target| *target != stream_oid)
+            .collect();
+        if !above.is_empty() {
+            for target in above {
+                match core.stream_column_map(stream_oid, target) {
+                    Ok(_) => core.replica_identity_narrow(target, layout.replica_identity_full),
+                    Err(mismatch) => {
+                        self.stream_target_forget(core, stream_oid, target, mismatch)
+                            .await?;
+                    }
+                }
+            }
+            return Ok(!cached);
+        }
+        if cached {
+            return Ok(false);
+        }
+        // A partition no create signal announced (attached, or the event
+        // triggers are not installed): the cached tables above it were
+        // populated without it in their tree.
+        let ancestors = core
+            .query_table_ancestors_get(stream_oid)
+            .await
+            .attach_loc("reading the ancestors of an unknown stream relation")?;
+        for ancestor in &ancestors {
+            if !core.cache.tables.contains_key1(ancestor) {
+                continue;
+            }
+            info!(
+                relation_oid = %stream_oid,
+                cached_oid = %ancestor,
+                "an unannounced partition of a cached table is streaming: evicting its queries"
+            );
+            self.cached_relation_forget(core, *ancestor)
+                .await
+                .attach_loc("unannounced partition under a cached table")?;
+        }
+        Ok(!ancestors.is_empty())
     }
 
     /// Append a row event to the frame log, replaying early if it is full.
@@ -299,6 +510,9 @@ impl WriterCdc {
         core.table_metadata_primary_key_resolve(&mut table_metadata)
             .await
             .attach_loc("resolving a Relation message's primary key")?;
+        if self.stream_relation_observe(core, &table_metadata).await? {
+            return Ok(());
+        }
         core.frame_relation_oids.insert(table_metadata.relation_oid);
         let relation_oid = table_metadata.relation_oid;
         // Row-level security switched since registration (PGC-112, PGC-113):
@@ -615,6 +829,7 @@ impl WriterCdc {
             core.forgotten_tables.push(table);
             core.relations_dirty = true;
             core.write_targets_publish();
+            core.stream_relations_publish();
         }
         Ok(())
     }

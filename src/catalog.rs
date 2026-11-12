@@ -199,10 +199,10 @@ pub struct TableMetadata {
     /// the applicable policies inlined (PGC-113).
     pub row_security: bool,
     /// Every partition under this table, leaves and intermediate levels
-    /// alike (`pg_inherits` descendants). Under `publish_via_partition_root`
-    /// a partition's rows stream as this table's, so a schema change signalled
-    /// on a partition (truncate, drop, a sub-partition attached) is resolved
-    /// to this table through the list. Empty for a plain table.
+    /// alike (`pg_inherits` descendants). A partition's rows are this
+    /// table's: they stream under the partition and are routed here through
+    /// the list, and so is a schema change signalled on a partition
+    /// (truncate, drop, a sub-partition attached). Empty for a plain table.
     pub partitions: Vec<Oid>,
     /// Every table above this one (`pg_inherits` ancestors). An `ALTER
     /// TABLE` on a partitioned root reaches its partitions, so a change

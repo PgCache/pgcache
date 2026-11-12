@@ -15,6 +15,7 @@ mod registration;
 mod rls;
 mod staging;
 mod status;
+mod stream_route;
 mod subsumption;
 mod table;
 

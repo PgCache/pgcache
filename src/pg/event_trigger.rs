@@ -7,11 +7,12 @@
 //! changes around them. Nothing else on the stream reports `DROP TABLE`, a
 //! partition attach/detach, or an `ALTER TABLE` not followed by a write.
 //!
-//! `TRUNCATE` is not DDL and fires no event trigger, and under
-//! `publish_via_partition_root` pgoutput skips a truncated partition, so each
-//! partition carries a statement-level `AFTER TRUNCATE` trigger that emits the
-//! same kind of message. The `ddl_command_end` trigger installs it on every
-//! partition created or attached after the install.
+//! `TRUNCATE` is not DDL and fires no event trigger. Each partition carries a
+//! statement-level `AFTER TRUNCATE` trigger that emits the same kind of
+//! message, from when the publication ran under `publish_via_partition_root`
+//! and pgoutput skipped a truncated partition; the stream now reports it, and
+//! the trigger is due for removal. The `ddl_command_end` trigger installs it
+//! on every partition created or attached after the install.
 //!
 //! Creating event triggers needs a superuser (or the managed-PG master role),
 //! which pgcache's own role usually is not: installation is attempted at

@@ -1065,8 +1065,8 @@ async fn test_gate_update_of_unreferenced_column_serves_join_read() -> Result<()
 // ==================== partition and view aliases (PGC-447) ====================
 
 /// PGC-447: a write to a partition child is matched to a cached read of the
-/// partitioned root. The root, not the child, is the relation the read names
-/// and CDC streams under `publish_via_partition_root`. The insert keeps its
+/// partitioned root. The root, not the child, is the relation the read
+/// names. The insert keeps its
 /// row-level precision through the alias: a read disjoint from the inserted
 /// row still serves.
 #[tokio::test]

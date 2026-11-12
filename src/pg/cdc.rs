@@ -61,11 +61,9 @@ pub(crate) async fn replication_provision(settings: &Settings) -> PgCdcResult<()
         .map_into_report::<PgCdcError>()
         .attach_loc("dropping existing publication")?;
 
-    // publish_via_partition_root ensures CDC reports parent table OID for partition changes
-    let create_pub = format!(
-        "CREATE PUBLICATION {} WITH (publish_via_partition_root = true)",
-        publication_name
-    );
+    // Without publish_via_partition_root a partition's rows stream under the
+    // partition itself, whichever of its ancestors are published.
+    let create_pub = format!("CREATE PUBLICATION {publication_name}");
     client
         .execute(&create_pub, &[])
         .await

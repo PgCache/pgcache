@@ -104,8 +104,8 @@ struct TruncatedObject {
 }
 
 /// `pg_event_trigger_ddl_commands().object_type` for plain and partitioned
-/// tables alike; under `publish_via_partition_root` an `ALTER TABLE` on a
-/// partitioned parent reports the parent, the OID pgcache caches under.
+/// tables alike; an `ALTER TABLE` on a partitioned parent reports the
+/// parent.
 const TABLE: &str = "table";
 /// A foreign table can be a partition too.
 const FOREIGN_TABLE: &str = "foreign table";

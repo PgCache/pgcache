@@ -1,7 +1,7 @@
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use postgres_protocol::escape;
+use tokio_postgres::error::SqlState;
 use tracing::debug;
 
 use super::core::WriterCore;
@@ -10,64 +10,47 @@ use crate::oid::Oid;
 
 impl WriterCore {
     /// Increment refcounts for each relation_oid the new cached_query
-    /// touches. On 0→1 transitions, clone-mutate-swap the
-    /// `active_relations` snapshot and set `relations_dirty` so the next
-    /// `publication_dirty_drain` syncs the origin publication.
-    ///
-    /// O(|oids| + |active_set|) per call vs. the previous O(|cached_queries|)
-    /// rebuild — typically a handful of integer ops since most registers
-    /// add no new tables. Returns `true` if the active set changed; a
+    /// touches. On a 0→1 transition the stream relations are republished and
+    /// `relations_dirty` set, so the next `publication_dirty_drain` syncs the
+    /// origin publication. Returns `true` if the active set changed; a
     /// registration then adds the new relations inline
     /// (`publication_relations_add`), since they must be in the publication
     /// before its population snapshots origin.
     pub(super) fn active_relations_acquire(&mut self, oids: &[Oid]) -> bool {
-        let mut newly_active: Vec<Oid> = Vec::new();
+        let mut changed = false;
         for &oid in oids {
             let count = self.relation_refcounts.entry(oid).or_insert(0);
-            if *count == 0 {
-                newly_active.push(oid);
-            }
+            changed |= *count == 0;
             *count += 1;
         }
-        if newly_active.is_empty() {
-            return false;
+        if changed {
+            self.stream_relations_publish();
+            self.relations_dirty = true;
         }
-        let mut new_set = (**self.active_relations.load()).clone();
-        for oid in newly_active {
-            new_set.insert(oid);
-        }
-        self.active_relations.store(Arc::new(new_set));
-        self.relations_dirty = true;
-        true
+        changed
     }
 
-    /// Decrement refcounts. On 1→0 transitions, drop the oid from the
-    /// `active_relations` snapshot and set `relations_dirty`. Removal paths
-    /// don't need to sync the publication inline — stale subscriptions
-    /// to dropped relations are filtered out by the writer ignoring CDC
-    /// events for relations not in `active_relations`. Returns `true` if
-    /// the active set changed.
+    /// Decrement refcounts. On a 1→0 transition the stream relations are
+    /// republished and `relations_dirty` set. Removal paths don't need to
+    /// sync the publication inline: the CDC processor drops the rows of a
+    /// relation that left the stream relations. Returns `true` if the active
+    /// set changed.
     pub(super) fn active_relations_release(&mut self, oids: &[Oid]) -> bool {
-        let mut newly_inactive: Vec<Oid> = Vec::new();
+        let mut changed = false;
         for &oid in oids {
             if let Some(count) = self.relation_refcounts.get_mut(&oid) {
                 *count -= 1;
                 if *count == 0 {
                     self.relation_refcounts.remove(&oid);
-                    newly_inactive.push(oid);
+                    changed = true;
                 }
             }
         }
-        if newly_inactive.is_empty() {
-            return false;
+        if changed {
+            self.stream_relations_publish();
+            self.relations_dirty = true;
         }
-        let mut new_set = (**self.active_relations.load()).clone();
-        for oid in newly_inactive {
-            new_set.remove(&oid);
-        }
-        self.active_relations.store(Arc::new(new_set));
-        self.relations_dirty = true;
-        true
+        changed
     }
 
     /// Add the active relations not yet published, inline at registration.
@@ -77,9 +60,8 @@ impl WriterCore {
     /// (PGC-501). Removals wait for the guarded drain.
     pub(super) async fn publication_relations_add(&mut self) -> CacheResult<()> {
         let added: Vec<Oid> = self
-            .active_relations
-            .load()
-            .iter()
+            .relation_refcounts
+            .keys()
             .copied()
             .filter(|oid| {
                 !self.publication_oids.contains(oid) && self.cache.tables.contains_key1(oid)
@@ -88,17 +70,42 @@ impl WriterCore {
         if added.is_empty() {
             return Ok(());
         }
+        // The statement names tables, and a name may have passed to another
+        // table (dropped and recreated) since its OID was read. The check
+        // runs in the statement's transaction, so a mismatch publishes
+        // nothing and the registration is refused.
+        let oid_list = added
+            .iter()
+            .map(|oid| oid.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
         let sql = format!(
-            "ALTER PUBLICATION {} ADD TABLE {}",
-            self.publication_name,
-            self.oids_to_table_list(&added)
+            "ALTER PUBLICATION {publication} ADD TABLE {tables}; \
+             DO $$ BEGIN \
+             IF (SELECT count(*) FROM pg_publication_rel r \
+                 JOIN pg_publication p ON p.oid = r.prpubid \
+                 WHERE p.pubname = {publication_literal} AND r.prrelid IN ({oid_list})) <> {count} \
+             THEN RAISE EXCEPTION 'pgcache: a relation was replaced before it was published' \
+                 USING ERRCODE = 'undefined_table'; \
+             END IF; END $$",
+            publication = self.publication_name,
+            tables = self.oids_to_table_list(&added),
+            publication_literal = escape::escape_literal(&self.publication_name),
+            count = added.len(),
         );
         debug!("publication add: {sql}");
-        self.db_origin
-            .batch_execute(&sql)
-            .await
-            .map_into_report::<CacheError>()
-            .attach_loc("adding relations to the publication")?;
+        if let Err(error) = self.db_origin.batch_execute(&sql).await {
+            if error.code() == Some(&SqlState::UNDEFINED_TABLE) {
+                return Err(CacheError::UnknownTable {
+                    oid: None,
+                    name: None,
+                }
+                .into());
+            }
+            return Err(error)
+                .map_into_report::<CacheError>()
+                .attach_loc("adding relations to the publication");
+        }
         self.publication_oids.extend(added);
         Ok(())
     }
@@ -108,7 +115,7 @@ impl WriterCore {
     /// (`publication_dirty_drain`) runs this: the drops need locks an open
     /// frame may hold.
     async fn publication_update(&mut self) -> CacheResult<()> {
-        let new_oids: HashSet<Oid> = (**self.active_relations.load()).clone();
+        let new_oids: HashSet<Oid> = self.relation_refcounts.keys().copied().collect();
 
         if new_oids == self.publication_oids {
             // Already in sync. Clear the dirty flag so a deferred drain
@@ -155,7 +162,7 @@ impl WriterCore {
             self.cache_tables_drop(&removed).await;
         }
         self.forgotten_tables_drop().await;
-        // Publication now matches active_relations; any pending drain is
+        // Publication now matches the active relations; any pending drain is
         // satisfied by this call.
         self.relations_dirty = false;
         Ok(())
@@ -209,9 +216,7 @@ fn table_qualified(schema: &str, name: &str) -> String {
 
 impl WriterCore {
     /// Drain the dirty flag: sync the origin publication (which also drops
-    /// orphaned cache tables). `active_relations` is kept up to date
-    /// incrementally via `active_relations_acquire` / `_release`, so the only
-    /// remaining work here is the publication sync itself.
+    /// orphaned cache tables).
     pub(super) async fn publication_dirty_drain(&mut self) -> CacheResult<()> {
         if !self.relations_dirty {
             return Ok(());

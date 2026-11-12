@@ -4,6 +4,8 @@
 Accepted
 
 ## Context
+*Partition handling amended by ADR-070: the publication no longer runs under `publish_via_partition_root`, so a partition's truncate is reported by the stream and the per-partition trigger described below is redundant.*
+
 pgcache learns a table's shape once, at registration, and afterwards relies on the replication stream to tell it about changes. pgoutput's only schema signal is the `Relation` message, which it resends lazily, just before the relation's next row change. So an `ALTER TABLE` with no following write is invisible, `DROP TABLE` is invisible forever (PGC-71), and attaching a non-empty partition under `publish_via_partition_root` never streams the partition's existing rows (PGC-70). The same blind spot covers policies, grants and views, which the RLS and privilege work (PGC-113, PGC-463) will need.
 
 An earlier design (PGC-233) proposed a control table in the publication that origin-side triggers would write to, so the change rode the stream as an ordinary row. It needs an origin table, and a row-level trigger per change.

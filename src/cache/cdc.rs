@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -36,7 +37,7 @@ mod decode;
 mod schema_change;
 
 use super::{
-    CacheError, CacheResult, MapIntoReport, ReportExt, messages::CdcCommand, types::ActiveRelations,
+    CacheError, CacheResult, MapIntoReport, ReportExt, messages::CdcCommand, types::StreamRelations,
 };
 use decode::{
     parse_delete_row_data, parse_insert_row_data, parse_relation_to_table_metadata,
@@ -72,11 +73,11 @@ error_set! {
 /// message, so the writer's apply watermark lags behind origin — exercising the
 /// deferred-Ready gate (a freshly populated query whose snapshot LSN is ahead of
 /// the watermark must forward to origin, not serve a transiently-stale cache).
-/// Gated on `active_relations` so setup (before any cached query) is unaffected.
+/// Gated on `stream_relations` so setup (before any cached query) is unaffected.
 /// Compiled out without the feature.
 #[cfg(feature = "fault-injection")]
-async fn fault_cdc_deliver_delay(active_relations: &ActiveRelations) {
-    if active_relations.load().is_empty() {
+async fn fault_cdc_deliver_delay(stream_relations: &StreamRelations) {
+    if stream_relations.load().is_empty() {
         return;
     }
     if let Some(ms) = std::env::var("PGCACHE_FAULT_CDC_DELIVER_DELAY_MS")
@@ -88,7 +89,7 @@ async fn fault_cdc_deliver_delay(active_relations: &ActiveRelations) {
     }
 }
 #[cfg(not(feature = "fault-injection"))]
-async fn fault_cdc_deliver_delay(_active_relations: &ActiveRelations) {}
+async fn fault_cdc_deliver_delay(_stream_relations: &StreamRelations) {}
 
 /// Handles Change Data Capture (CDC) processing from PostgreSQL logical replication.
 /// Processes replication messages and synchronizes changes with the cache database.
@@ -97,7 +98,7 @@ async fn fault_cdc_deliver_delay(_active_relations: &ActiveRelations) {}
 #[derive(Clone)]
 pub(super) struct CdcProcessorHandles {
     pub(super) cdc_tx: UnboundedSender<CdcCommand>,
-    pub(super) active_relations: ActiveRelations,
+    pub(super) stream_relations: StreamRelations,
     pub(super) watermark_nudge: Arc<Notify>,
     pub(super) received_lsn: Arc<AtomicU64>,
 }
@@ -108,8 +109,12 @@ pub(super) struct CdcProcessor {
     slot_name: EcoString,
 
     cdc_tx: UnboundedSender<CdcCommand>,
-    /// Shared set of relation OIDs with active cached queries (maintained by writer).
-    active_relations: ActiveRelations,
+    /// The relations whose rows the writer applies (maintained by writer).
+    stream_relations: StreamRelations,
+    /// Partitions a create signal on this stream announced. The writer adds
+    /// one to `stream_relations` when it handles the signal, which may be
+    /// after this processor has decoded the partition's first rows.
+    announced_partitions: HashSet<Oid>,
 
     last_received_lsn: Lsn,
     /// Highest LSN whose XLogData has been decoded by this processor and
@@ -139,7 +144,7 @@ impl CdcProcessor {
     ) -> CacheResult<Self> {
         let CdcProcessorHandles {
             cdc_tx,
-            active_relations,
+            stream_relations,
             watermark_nudge,
             received_lsn: received_lsn_shared,
         } = handles;
@@ -160,7 +165,8 @@ impl CdcProcessor {
             publication_name: settings.cdc.publication_name.as_str().into(),
             slot_name: settings.cdc.slot_name.as_str().into(),
             cdc_tx,
-            active_relations,
+            stream_relations,
+            announced_partitions: HashSet::new(),
             last_received_lsn: Lsn::from_raw(0),
             last_decoded_lsn: Lsn::from_raw(0),
             last_flushed_lsn: Lsn::from_raw(0),
@@ -216,7 +222,7 @@ impl CdcProcessor {
                 }
                 // Handle incoming replication messages
                 msg_result = stream.next() => {
-                    fault_cdc_deliver_delay(&self.active_relations).await;
+                    fault_cdc_deliver_delay(&self.stream_relations).await;
                     trace!("cdc stream result {msg_result:?}");
                     match msg_result {
                         Some(Ok(msg)) => {
@@ -601,8 +607,8 @@ impl CdcProcessor {
     /// WAL-flush marker (PGC-290): its transaction frame alone does the work.
     /// Anything else is the event triggers' schema-change signal, forwarded
     /// unfiltered: a drop must reach the writer even for a relation already
-    /// leaving `active_relations`, so the publication bookkeeping stays honest.
-    fn process_message(&self, body: &MessageBody) -> Result<(), CdcEventError> {
+    /// leaving `stream_relations`, so the publication bookkeeping stays honest.
+    fn process_message(&mut self, body: &MessageBody) -> Result<(), CdcEventError> {
         crate::metrics::handles().cdc.messages.increment(1);
         if body.prefix().ok() != Some(MESSAGE_PREFIX) {
             trace!("foreign logical message dropped");
@@ -624,6 +630,12 @@ impl CdcProcessor {
         if change.is_empty() {
             return Ok(());
         }
+        for created in &change.partitions_created {
+            self.announced_partitions.insert(created.partition);
+        }
+        for dropped in &change.dropped_tables {
+            self.announced_partitions.remove(dropped);
+        }
         debug!(
             altered = change.altered_tables.len(),
             dropped = change.dropped_tables.len(),
@@ -636,10 +648,13 @@ impl CdcProcessor {
         writer_command_send(&self.cdc_tx, command)
     }
 
-    /// Check if there are any cached queries for a specific table by relation OID.
-    /// Reads the shared active relations set maintained by the writer — no messaging needed.
+    /// Whether the writer applies the relation's row changes: it is in the
+    /// shared stream relations, or a partition announced on this stream that
+    /// the writer may not have added yet (the writer drops the rows of one
+    /// that belongs to no cached table).
     fn is_relation_active(&self, relation_oid: Oid) -> bool {
-        self.active_relations.load().contains(&relation_oid)
+        self.stream_relations.load().contains(&relation_oid)
+            || self.announced_partitions.contains(&relation_oid)
     }
 }
 

@@ -70,6 +70,7 @@ Conventions: files are `ADR-XXX-brief-title.md` with the next sequential number;
 - [ADR-039](ADR-039-cdc-apply-batching.md) — CDC apply batching + prepared membership-eval *(amended: batches per table reference, ADR-059)*
 - [ADR-045](ADR-045-candidate-narrowed-cdc-bookkeeping.md) — Candidate-narrowed CDC invalidation + memo eviction *(extends ADR-037's shared probe to the invalidation/memo passes)*
 - [ADR-058](ADR-058-schema-change-signal-via-event-triggers.md) — Origin schema-change signal: event triggers emit DDL/drops as transactional logical messages; writer evicts and forgets the relation *(amends ADR-018's never-removed metadata; supersedes the PGC-233 control table)*
+- [ADR-070](ADR-070-leaf-identity-partition-cdc.md) — Leaf-identity CDC for partitions: publish without `publish_via_partition_root`, route a leaf's rows to every cached table holding it; inheritance parents and `ONLY` forwarded *(amends ADR-058's partition handling)*
 
 ## Resource governance
 - [ADR-038](ADR-038-memory-pressure-governance.md) — Memory-pressure governance: count cap from measured marginal cost

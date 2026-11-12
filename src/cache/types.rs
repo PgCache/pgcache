@@ -309,9 +309,11 @@ impl Cache {
     }
 }
 
-/// Shared set of relation OIDs that have active cached queries.
-/// Written by the writer thread, read by the CDC processor.
-pub(super) type ActiveRelations = Arc<ArcSwap<HashSet<Oid>>>;
+/// The relation OIDs whose row changes the writer applies: every table with
+/// active cached queries and every partition under one, since a row streams
+/// under the leaf partition that holds it. Written by the writer thread, read
+/// by the CDC processor.
+pub(super) type StreamRelations = Arc<ArcSwap<HashSet<Oid>>>;
 
 /// A cached relation a forwarded write can land rows in, under one name it
 /// can be written by: the table itself, or one of its write aliases

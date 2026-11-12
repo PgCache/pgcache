@@ -59,9 +59,9 @@ pub(crate) struct SchemaChange {
     pub(crate) altered_tables: Vec<Oid>,
     /// `DROP TABLE`, directly or by cascade.
     pub(crate) dropped_tables: Vec<Oid>,
-    /// `TRUNCATE` of a partition, which pgoutput leaves out under
-    /// `publish_via_partition_root`; signalled by pgcache's per-partition
-    /// trigger, so a partitioned root's own truncate never appears here.
+    /// `TRUNCATE` of a partition, signalled by pgcache's per-partition
+    /// trigger. The stream reports the same truncate by itself, so this is
+    /// a second notice of it.
     pub(crate) truncated_tables: Vec<Oid>,
     /// `CREATE TABLE … PARTITION OF`: a new, empty partition. Nothing to
     /// evict, but the parent's partition list must learn of it.

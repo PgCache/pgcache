@@ -158,9 +158,13 @@ impl WriterCore {
             .await?
             .remove(&relation_oid)
             .unwrap_or_default();
+        // Old tuples are written under the identity of the partition that
+        // holds the row, which a partitioned table's own does not set.
+        let replica_identity_full =
+            identity == ReplicaIdentity::Full && self.partitions_identity_full(&partitions).await?;
 
         Ok(TableMetadata {
-            replica_identity_full: identity == ReplicaIdentity::Full,
+            replica_identity_full,
             row_security,
             name: table.into(),
             schema: schema.into(),
@@ -300,6 +304,24 @@ impl WriterCore {
                  JOIN pg_class c ON c.oid = i.inhrelid \
                  WHERE i.inhparent = $1 AND NOT c.relispartition)",
                 &[&relation_oid],
+            )
+            .await
+            .map_into_report::<CacheError>()?;
+        Ok(row.get(0))
+    }
+
+    /// Whether every partition that holds rows is REPLICA IDENTITY FULL.
+    #[instrument(skip_all)]
+    async fn partitions_identity_full(&self, partitions: &[Oid]) -> CacheResult<bool> {
+        if partitions.is_empty() {
+            return Ok(true);
+        }
+        let row = self
+            .db_origin
+            .query_one(
+                "SELECT coalesce(bool_and(relreplident = 'f'), true) FROM pg_class \
+                 WHERE oid = ANY($1) AND relkind <> 'p'",
+                &[&partitions],
             )
             .await
             .map_into_report::<CacheError>()?;
@@ -780,9 +802,9 @@ impl WriterCore {
     }
 
     /// The cached tables whose own partition tree holds `relation_oid`: the
-    /// relation itself when cached, and every cached table above it (under
-    /// `publish_via_partition_root` a partition's rows are its root's; a
-    /// cached mid-level partition counts too).
+    /// relation itself when cached, and every cached table above it (a
+    /// partition's rows are its root's; a cached mid-level partition counts
+    /// too).
     fn tables_holding_relation(&self, relation_oid: Oid) -> Vec<Oid> {
         self.cache
             .tables
@@ -813,6 +835,7 @@ impl WriterCore {
             table.partitions.push(created.partition);
             self.cache.tables.insert_overwrite(table.into());
         }
+        self.stream_relations_publish();
         self.write_aliases_reload(&owners).await
     }
 }
@@ -877,6 +900,7 @@ impl WriterCore {
 
         self.cache.tables.insert_overwrite(table_metadata.into());
         self.write_targets_publish();
+        self.stream_relations_publish();
 
         Ok(())
     }

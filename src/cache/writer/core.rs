@@ -18,6 +18,7 @@ use super::mv_build::MvBuildPool;
 use super::privileges::roles_digest_read;
 use super::rls::RlsCatalog;
 use super::staging::{PopulationDeletedKeys, PopulationKey, SharedStagingPool};
+use super::stream_route::StreamRoutes;
 use crate::cache::Generation;
 use crate::cache::reference_settings;
 use crate::cache::{
@@ -25,7 +26,7 @@ use crate::cache::{
     messages::{QueryCommand, WriterNotify},
     mv::MvMeta,
     mv_shape::ShapeGate,
-    types::{ActiveRelations, Cache, CacheStateView, CachedQueryState, CachedQueryView, ServingAt},
+    types::{Cache, CacheStateView, CachedQueryState, CachedQueryView, ServingAt, StreamRelations},
 };
 use crate::catalog::{CatalogTable, FunctionCatalog, FunctionRow, SharedFunctionCatalog};
 use crate::oid::{FunctionOid, Oid};
@@ -116,8 +117,8 @@ const CANDIDATE_SCRATCH_MAX: usize = 8;
 /// `WriterCore` at startup.
 pub(crate) struct WriterShared {
     pub(crate) state_view: Arc<CacheStateView>,
-    /// Shared set of relation OIDs with active cached queries (read by CDC processor).
-    pub(crate) active_relations: ActiveRelations,
+    /// The relations whose row changes the writer applies (read by CDC processor).
+    pub(crate) stream_relations: StreamRelations,
     /// Notifications to dispatch for coalescing queue drain.
     pub(crate) notify_tx: UnboundedSender<WriterNotify>,
     /// Prompts the CDC thread for an immediate keepalive when a populated
@@ -147,12 +148,14 @@ pub(super) struct WriterCore {
     pub(super) db_cache: Client,
     pub(super) db_origin: Rc<Client>,
     pub(super) state_view: Arc<CacheStateView>,
-    /// Shared set of relation OIDs with active cached queries (read by CDC processor).
-    pub(super) active_relations: ActiveRelations,
+    /// The relations whose row changes the writer applies (read by CDC
+    /// processor); rebuilt by `stream_relations_publish`.
+    pub(super) stream_relations: StreamRelations,
+    /// Which cached tables a partition's rows land in, and in what layout.
+    pub(super) stream_routes: StreamRoutes,
     /// Per-relation_oid refcount of cached queries that reference each
-    /// relation. Pairs with `active_relations` — the snapshot is only
-    /// updated on 0↔1 transitions instead of rebuilt by walking
-    /// `cached_queries` on every register/evict.
+    /// relation: the active tables. The publication and the stream routes
+    /// follow its 0↔1 transitions.
     pub(super) relation_refcounts: std::collections::HashMap<Oid, usize>,
     /// Publication name for dynamic table management.
     pub(super) publication_name: EcoString,
@@ -522,7 +525,7 @@ impl WriterCore {
         let origin_search_path = origin_search_path_read(&origin_client).await?;
         let WriterShared {
             state_view,
-            active_relations,
+            stream_relations,
             notify_tx,
             watermark_nudge,
             runtime,
@@ -544,7 +547,8 @@ impl WriterCore {
             db_cache: cache_client,
             db_origin: Rc::new(origin_client),
             state_view,
-            active_relations,
+            stream_relations,
+            stream_routes: StreamRoutes::default(),
             relation_refcounts: std::collections::HashMap::new(),
             publication_name: settings.cdc.publication_name.as_str().into(),
             publication_oids: HashSet::new(),
