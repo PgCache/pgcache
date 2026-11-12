@@ -46,6 +46,11 @@ const ANN_UUID_TOKEN_LATER: &str =
     r#"{"sub":"11111111-1111-1111-1111-111111111111","role":"authenticated","exp":1700000999}"#;
 const BOB_UUID_TOKEN: &str =
     r#"{"sub":"22222222-2222-2222-2222-222222222222","role":"authenticated","exp":1700000000}"#;
+/// A valid token of a user who owns nothing.
+const STRANGER_UUID_TOKEN: &str =
+    r#"{"sub":"33333333-3333-3333-3333-333333333333","role":"authenticated","exp":1700000000}"#;
+/// PostgREST's claims for an unauthenticated request.
+const ANON_TOKEN: &str = r#"{"role":"anon"}"#;
 const UID_READ: &str = "SELECT id, body FROM uid_docs ORDER BY id";
 
 /// `public.tenant_of`: on the writer connection's search_path, so a policy
@@ -158,13 +163,22 @@ async fn judged_docs_setup() -> Result<TestContext, Error> {
 /// pgcache started over the `auth` schema and `auth.uid()`, then `uid_docs`,
 /// readable by `uid_user`, under the Supabase policy `owner = auth.uid()`.
 async fn uid_docs_setup() -> Result<TestContext, Error> {
-    let mut ctx = TestContext::setup_before_start(|origin| async move {
-        for sql in ["CREATE SCHEMA auth", AUTH_UID] {
-            origin.simple_query(sql).await.map_err(Error::other)?;
-        }
-        Ok(origin)
-    })
-    .await?;
+    let ctx = TestContext::setup_before_start(auth_schema_create).await?;
+    uid_docs_create(ctx).await
+}
+
+/// The `auth` schema and `auth.uid()` on origin before pgcache starts, so
+/// its function catalog knows the function from the start.
+async fn auth_schema_create(origin: Client) -> Result<Client, Error> {
+    for sql in ["CREATE SCHEMA auth", AUTH_UID] {
+        origin.simple_query(sql).await.map_err(Error::other)?;
+    }
+    Ok(origin)
+}
+
+/// `uid_docs`, readable by `uid_user`, under the Supabase policy
+/// `owner = auth.uid()`, on a context started over the `auth` schema.
+async fn uid_docs_create(mut ctx: TestContext) -> Result<TestContext, Error> {
     for sql in [
         "CREATE TABLE uid_docs (id int primary key, owner uuid, body text)",
         "INSERT INTO uid_docs VALUES \
@@ -990,6 +1004,135 @@ async fn test_postgrest_style_block_over_a_claim_policy_is_served_per_claim() ->
             result,
             &SqlState::INVALID_TEXT_REPRESENTATION,
             "an empty claims setting is not json",
+        );
+    }
+    Ok(())
+}
+
+/// The Supabase request as PostgREST sends it: as `authenticator`, a block
+/// that sets the role and the claims for the block in one statement, reads
+/// under the `owner = auth.uid()` policy for `authenticated`, and commits.
+/// The first request registers; a later token of the same user is a hit;
+/// another user has an entry of its own; a user who owns nothing is served
+/// nothing; an `anon` request on the same connection, which no policy
+/// covers, is default-denied rather than served the `authenticated` entry;
+/// and `authenticator` itself, outside a request, has no SELECT on the
+/// table, through the proxy as directly.
+#[cfg(feature = "fault-injection")]
+#[tokio::test]
+async fn test_supabase_request_as_postgrest_sends_it() -> Result<(), Error> {
+    // In-block serving needs the read-after-write gate the harness turns off.
+    let ctx = TestContext::setup_fault_before_start(
+        &[("PGCACHE_FAULT_READ_YOUR_WRITES_OFF", "0")],
+        auth_schema_create,
+    )
+    .await?;
+    let mut ctx = uid_docs_create(ctx).await?;
+    for sql in [
+        "CREATE ROLE authenticator LOGIN NOINHERIT",
+        "CREATE ROLE authenticated NOLOGIN",
+        "CREATE ROLE anon NOLOGIN",
+        "GRANT authenticated, anon TO authenticator",
+        "GRANT USAGE ON SCHEMA auth TO authenticated, anon",
+        "GRANT SELECT ON uid_docs TO authenticated, anon",
+        "DROP POLICY uid_policy ON uid_docs",
+        "CREATE POLICY uid_policy ON uid_docs FOR SELECT TO authenticated \
+         USING (owner = auth.uid())",
+    ] {
+        ctx.origin_query(sql, &[]).await?;
+    }
+    let (proxied, origin) = sessions_with(&ctx, "authenticator", &[]).await?;
+    let request_begin_as = |role: &str, token: &str| {
+        [
+            "BEGIN".to_owned(),
+            format!(
+                "SELECT set_config('role', '{role}', true), \
+                 set_config('request.jwt.claims', '{token}', true)"
+            ),
+        ]
+    };
+    let request_begin = |token: &str| request_begin_as("authenticated", token);
+    async fn both(clients: [&Client; 2], statements: &[String]) -> Result<(), Error> {
+        for client in clients {
+            for sql in statements {
+                client.simple_query(sql).await.map_err(Error::other)?;
+            }
+        }
+        Ok(())
+    }
+    let commit = ["COMMIT".to_owned()];
+
+    both([&proxied, &origin], &request_begin(ANN_UUID_TOKEN)).await?;
+    let served = read_until(&mut ctx, &proxied, UID_READ, |delta| {
+        delta.queries_cache_hit == 1
+    })
+    .await?;
+    assert_eq!(served, vec![row("1", "a"), row("3", "c")]);
+    assert_eq!(served, rows(&origin, UID_READ).await?);
+    both([&proxied, &origin], &commit).await?;
+
+    both([&proxied, &origin], &request_begin(ANN_UUID_TOKEN_LATER)).await?;
+    let before = ctx.metrics().await?;
+    let later = read_until(&mut ctx, &proxied, UID_READ, |delta| {
+        delta.queries_cache_hit == 1
+    })
+    .await?;
+    assert_eq!(later, served, "a later token of the same user is a hit");
+    let delta = metrics_delta(&before, &ctx.metrics().await?);
+    assert_eq!(
+        delta.queries_cache_miss,
+        delta.queries_privilege_forward_pending + delta.queries_rls_forward_setting_unknown,
+        "served from the entry that already existed\n{delta:#?}"
+    );
+    both([&proxied, &origin], &commit).await?;
+
+    both([&proxied, &origin], &request_begin(BOB_UUID_TOKEN)).await?;
+    let before = ctx.metrics().await?;
+    let served = read_until(&mut ctx, &proxied, UID_READ, |delta| {
+        delta.queries_cache_hit == 1
+    })
+    .await?;
+    assert_eq!(served, vec![row("2", "b")]);
+    assert_eq!(served, rows(&origin, UID_READ).await?);
+    let delta = metrics_delta(&before, &ctx.metrics().await?);
+    assert!(
+        delta.queries_cache_miss
+            > delta.queries_privilege_forward_pending + delta.queries_rls_forward_setting_unknown,
+        "another user registers an entry of its own\n{delta:#?}"
+    );
+    both([&proxied, &origin], &commit).await?;
+
+    both([&proxied, &origin], &request_begin(STRANGER_UUID_TOKEN)).await?;
+    let served = read_until(&mut ctx, &proxied, UID_READ, |delta| {
+        delta.queries_cache_hit == 1
+    })
+    .await?;
+    assert_eq!(
+        served,
+        Rows::new(),
+        "a user owning nothing is served nothing"
+    );
+    assert_eq!(served, rows(&origin, UID_READ).await?);
+    both([&proxied, &origin], &commit).await?;
+
+    both([&proxied, &origin], &request_begin_as("anon", ANON_TOKEN)).await?;
+    let result = rls_forward_assert(&mut ctx, &proxied, UID_READ, |delta| {
+        delta.queries_rls_forward_default_deny
+    })
+    .await?;
+    assert_eq!(
+        result_rows(&result.map_err(Error::other)?),
+        Rows::new(),
+        "no policy covers anon: default deny, not the authenticated entry"
+    );
+    assert_eq!(rows(&origin, UID_READ).await?, Rows::new());
+    both([&proxied, &origin], &commit).await?;
+
+    for client in [&proxied, &origin] {
+        assert_sqlstate(
+            client.simple_query(UID_READ).await,
+            &SqlState::INSUFFICIENT_PRIVILEGE,
+            "authenticator has no SELECT of its own",
         );
     }
     Ok(())

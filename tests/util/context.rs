@@ -216,6 +216,22 @@ impl TestContext {
         Ok(Self::assemble(dbs, origin, connected))
     }
 
+    /// [`Self::setup_fault`] with a `before_start` closure run against origin
+    /// before pgcache spawns, as [`Self::setup_before_start`].
+    pub(crate) async fn setup_fault_before_start<F, Fut>(
+        env: &[(&str, &str)],
+        before_start: F,
+    ) -> Result<Self, Error>
+    where
+        F: FnOnce(Client) -> Fut,
+        Fut: std::future::Future<Output = Result<Client, Error>>,
+    {
+        let (dbs, origin) = start_databases().await?;
+        let origin = before_start(origin).await?;
+        let connected = connect_pgcache_fault(&dbs, env).await?;
+        Ok(Self::assemble(dbs, origin, connected))
+    }
+
     /// [`Self::setup_fault`] under the clock eviction policy, where an
     /// invalidated query is kept for fast readmission.
     pub(crate) async fn setup_fault_clock(env: &[(&str, &str)]) -> Result<Self, Error> {
