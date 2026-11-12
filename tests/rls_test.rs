@@ -650,6 +650,128 @@ async fn test_cdc_changes_on_an_rls_table_apply_in_place() -> Result<(), Error> 
     Ok(())
 }
 
+/// `pattern_docs`, readable by `patterned`, with no policy yet: each test
+/// adds the policy whose operator it exercises.
+async fn pattern_docs_create(ctx: &mut TestContext) -> Result<(), Error> {
+    for sql in [
+        "CREATE TABLE pattern_docs (id int primary key, body text, tag text)",
+        "INSERT INTO pattern_docs VALUES (1, 'alpha', 'hidden'), (2, 'Beta', NULL), \
+         (3, 'alpine', 'shown'), (4, 'gamma', 'shown')",
+        "CREATE ROLE patterned LOGIN",
+        "GRANT SELECT ON pattern_docs TO patterned",
+        "ALTER TABLE pattern_docs ENABLE ROW LEVEL SECURITY",
+    ] {
+        ctx.origin_query(sql, &[]).await?;
+    }
+    Ok(())
+}
+
+const PATTERN_READ: &str = "SELECT id, body FROM pattern_docs ORDER BY id";
+
+/// A policy under `qual` is inlined and cached for `patterned`, serving
+/// origin's rows, and each origin `change` reaches the entry in place.
+async fn pattern_policy_check(
+    qual: &str,
+    expected: Vec<Vec<Option<String>>>,
+    changes: &[(&str, Vec<Vec<Option<String>>>)],
+) -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    pattern_docs_create(&mut ctx).await?;
+    let policy = format!("CREATE POLICY pattern_policy ON pattern_docs FOR SELECT USING ({qual})");
+    ctx.origin_query(policy.as_str(), &[]).await?;
+    ctx.cdc_apply_settle().await?;
+    let (user, origin) = sessions_as(&ctx, "patterned", None).await?;
+    let served = register(&mut ctx, &user, PATTERN_READ).await?;
+    assert_eq!(served, expected, "{qual}");
+    assert_eq!(served, rows(&origin, PATTERN_READ).await?, "{qual}");
+    let m = ctx.metrics().await?;
+    for (change, expected) in changes {
+        ctx.origin_query(*change, &[]).await?;
+        ctx.cdc_apply_settle().await?;
+        let served = rows(&user, PATTERN_READ).await?;
+        assert_eq!(&served, expected, "{qual} after {change}");
+        assert_eq!(
+            served,
+            rows(&origin, PATTERN_READ).await?,
+            "{qual} after {change}"
+        );
+    }
+    let delta = metrics_delta(&m, &assert_cache_hit(&mut ctx, m.clone()).await?);
+    assert_eq!(delta.cache_invalidations, 0, "applied in place: {qual}");
+    Ok(())
+}
+
+/// A `LIKE` policy: `pg_get_expr` spells it with the `~~` operator, which
+/// the converter reads as the keyword form (PGC-606). `ILIKE` likewise.
+#[tokio::test]
+async fn test_like_policy_is_inlined_and_maintained() -> Result<(), Error> {
+    pattern_policy_check(
+        "body LIKE 'al%'",
+        vec![row("1", "alpha"), row("3", "alpine")],
+        &[
+            (
+                "UPDATE pattern_docs SET body = 'alto' WHERE id = 4",
+                vec![row("1", "alpha"), row("3", "alpine"), row("4", "alto")],
+            ),
+            (
+                "UPDATE pattern_docs SET body = 'omega' WHERE id = 1",
+                vec![row("3", "alpine"), row("4", "alto")],
+            ),
+        ],
+    )
+    .await?;
+    pattern_policy_check(
+        "body NOT ILIKE 'b%'",
+        vec![row("1", "alpha"), row("3", "alpine"), row("4", "gamma")],
+        &[(
+            "UPDATE pattern_docs SET body = 'bravo' WHERE id = 4",
+            vec![row("1", "alpha"), row("3", "alpine")],
+        )],
+    )
+    .await
+}
+
+/// A regex policy and a `SIMILAR TO` policy (deparsed as `~` over
+/// `similar_to_escape`) are inlined and maintained like `LIKE`.
+#[tokio::test]
+async fn test_regex_and_similar_to_policies_are_inlined() -> Result<(), Error> {
+    pattern_policy_check(
+        "body ~* '^a'",
+        vec![row("1", "alpha"), row("3", "alpine")],
+        &[(
+            "INSERT INTO pattern_docs VALUES (5, 'Avalon', NULL)",
+            vec![row("1", "alpha"), row("3", "alpine"), row("5", "Avalon")],
+        )],
+    )
+    .await?;
+    pattern_policy_check(
+        "body SIMILAR TO 'g%'",
+        vec![row("4", "gamma")],
+        &[("DELETE FROM pattern_docs WHERE id = 4", Vec::new())],
+    )
+    .await
+}
+
+/// `IS DISTINCT FROM` in a policy keeps NULL as a value: a NULL tag is
+/// distinct from 'hidden' and visible.
+#[tokio::test]
+async fn test_is_distinct_from_policy_is_inlined() -> Result<(), Error> {
+    pattern_policy_check(
+        "tag IS DISTINCT FROM 'hidden'",
+        vec![row("2", "Beta"), row("3", "alpine"), row("4", "gamma")],
+        &[(
+            "UPDATE pattern_docs SET tag = NULL WHERE id = 1",
+            vec![
+                row("1", "alpha"),
+                row("2", "Beta"),
+                row("3", "alpine"),
+                row("4", "gamma"),
+            ],
+        )],
+    )
+    .await
+}
+
 /// A policy created, altered or dropped reaches the cache through the
 /// schema-change signal: the table's entries are evicted and the next read
 /// inlines the new policy set. With no permissive policy left the read
