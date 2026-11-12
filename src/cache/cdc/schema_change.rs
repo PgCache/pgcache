@@ -1,5 +1,5 @@
 //! The event-trigger payload (`pg::event_trigger`): which origin relations a
-//! DDL command altered, dropped, truncated or created as partitions. Every
+//! DDL command altered, dropped or created as partitions. Every
 //! object the trigger saw is listed; only tables matter to the cache today,
 //! the rest is reported for the policy, grant and view consumers to come.
 
@@ -15,7 +15,6 @@ use crate::oid::{FunctionOid, Oid};
 enum Payload {
     Ddl { objects: Vec<DdlObject> },
     Drop { objects: Vec<DroppedObject> },
-    Truncate { objects: Vec<TruncatedObject> },
 }
 
 #[derive(Deserialize)]
@@ -96,11 +95,6 @@ fn identifier_unquote(text: &str) -> EcoString {
         Some(inner) => EcoString::from(inner.replace("\"\"", "\"")),
         None => EcoString::from(text),
     }
-}
-
-#[derive(Deserialize)]
-struct TruncatedObject {
-    oid: Option<u32>,
 }
 
 /// `pg_event_trigger_ddl_commands().object_type` for plain and partitioned
@@ -216,11 +210,6 @@ pub(super) fn schema_change_parse(content: &[u8]) -> Result<SchemaChange, serde_
                 }
             }
         }
-        Payload::Truncate { objects } => {
-            change
-                .truncated_tables
-                .extend(objects.into_iter().filter_map(|o| o.oid).map(Oid::from_raw));
-        }
     }
     Ok(change)
 }
@@ -270,7 +259,7 @@ mod tests {
             {"type":"table","oid":16384,"identity":"public.plain","original":true},
             {"type":"type","oid":16386,"identity":"public.plain","original":false},
             {"type":"index","oid":16390,"identity":"public.plain_pkey","original":false},
-            {"type":"trigger","oid":16391,"identity":"pgcache_truncate on public.child","original":false},
+            {"type":"trigger","oid":16391,"identity":"audit on public.child","original":false},
             {"type":"table","oid":16500,"identity":"public.child","original":false}]}"#;
         let change = schema_change_parse(payload).expect("parse drop payload");
         assert!(change.altered_tables.is_empty());
@@ -307,14 +296,6 @@ mod tests {
             change.privileges_changed,
             "a GRANT reaches the writer to flush verdicts"
         );
-        assert!(!change.is_empty());
-    }
-
-    #[test]
-    fn test_schema_change_parse_collects_truncated_partitions() {
-        let payload = br#"{"kind":"truncate","objects":[{"oid":16500,"identity":"events_p2"}]}"#;
-        let change = schema_change_parse(payload).expect("parse truncate payload");
-        assert_eq!(change.truncated_tables, vec![Oid::from_raw(16500)]);
         assert!(!change.is_empty());
     }
 

@@ -59,10 +59,6 @@ pub(crate) struct SchemaChange {
     pub(crate) altered_tables: Vec<Oid>,
     /// `DROP TABLE`, directly or by cascade.
     pub(crate) dropped_tables: Vec<Oid>,
-    /// `TRUNCATE` of a partition, signalled by pgcache's per-partition
-    /// trigger. The stream reports the same truncate by itself, so this is
-    /// a second notice of it.
-    pub(crate) truncated_tables: Vec<Oid>,
     /// `CREATE TABLE … PARTITION OF`: a new, empty partition. Nothing to
     /// evict, but the parent's partition list must learn of it.
     pub(crate) partitions_created: Vec<PartitionCreated>,
@@ -75,7 +71,7 @@ pub(crate) struct SchemaChange {
     pub(crate) policies_changed: Vec<(EcoString, EcoString)>,
     /// Any DDL or drop at all, a `GRANT` or an owner change included: who
     /// may read what may have changed, so the privilege verdicts are
-    /// flushed (PGC-463). A truncate cannot change privileges.
+    /// flushed (PGC-463).
     pub(crate) privileges_changed: bool,
     /// A function, procedure or aggregate created, replaced, altered or
     /// dropped, by `pg_proc` oid (PGC-578): the queries calling it are
@@ -103,7 +99,6 @@ impl SchemaChange {
     pub(crate) fn is_empty(&self) -> bool {
         self.altered_tables.is_empty()
             && self.dropped_tables.is_empty()
-            && self.truncated_tables.is_empty()
             && self.partitions_created.is_empty()
             && !self.views_changed
             && self.policies_changed.is_empty()

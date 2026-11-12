@@ -40,7 +40,6 @@ enum StreamRoute {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SchemaChangeKind {
     Altered,
-    Truncated,
     Dropped,
 }
 
@@ -48,7 +47,6 @@ impl SchemaChangeKind {
     fn verb(self) -> &'static str {
         match self {
             Self::Altered => "altered",
-            Self::Truncated => "truncated",
             Self::Dropped => "dropped",
         }
     }
@@ -361,21 +359,21 @@ impl WriterCdc {
 
     /// The relations a `TRUNCATE` empties in place. A truncated partition
     /// cached on its own is one; a cached table above it lost part of its
-    /// rows and is forgotten.
+    /// rows and is forgotten, unless the statement truncated it as well.
     async fn truncate_route(
         &mut self,
         core: &mut WriterCore,
         relation_oids: Vec<Oid>,
     ) -> CacheResult<Vec<Oid>> {
         let mut in_place = Vec::with_capacity(relation_oids.len());
-        for relation_oid in relation_oids {
+        for &relation_oid in &relation_oids {
             let above: Vec<Oid> = core
                 .stream_routes
                 .targets(relation_oid)
                 .unwrap_or_default()
                 .iter()
                 .copied()
-                .filter(|target| *target != relation_oid)
+                .filter(|target| !relation_oids.contains(target))
                 .collect();
             for cached_oid in above {
                 // An earlier partition of the same statement may have
@@ -658,12 +656,6 @@ impl WriterCdc {
             .altered_tables
             .iter()
             .map(|oid| (*oid, SchemaChangeKind::Altered))
-            .chain(
-                change
-                    .truncated_tables
-                    .iter()
-                    .map(|oid| (*oid, SchemaChangeKind::Truncated)),
-            )
             .chain(
                 change
                     .dropped_tables

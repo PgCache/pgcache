@@ -18,7 +18,7 @@ Alternatives for partitions: rewriting a partition read into a root read plus th
 - **Rows are carried into each target's column layout by name.** A leaf's tuples arrive in the leaf's own layout, known from its `Relation` message; a target whose columns or key the leaf's tuples do not fit is evicted and registered again from the catalog.
 - **The stream's `Relation` messages are the source of leaf layouts**, kept for the session rather than per registration, since the walsender describes a relation once.
 - **A leaf nobody announced evicts the tables above it.** A partition attached, or created where the event triggers are not installed, was not in the tree those tables were populated with.
-- **A truncated partition empties its own cache table in place and evicts the cached tables above it.**
+- **A truncated partition empties its own cache table in place and evicts the cached tables above it**, unless the statement truncated those as well. The per-partition truncate trigger of ADR-058 is gone.
 - **A table counts as `REPLICA IDENTITY FULL` only while every partition holding its rows is**, since old tuples are written under the leaf's identity.
 - **Inheritance parents and `ONLY` are forwarded.** A table with inheritance children is refused at registration; one that gains a child is evicted. Publication entries are named with `ONLY`.
 
@@ -33,7 +33,7 @@ Alternatives for partitions: rewriting a partition read into a root read plus th
 
 ### Positive
 - A partition and its ancestors can be cached together, in any order, and stay current.
-- Partition truncate no longer depends on the per-partition trigger of ADR-058, which can be removed.
+- No trigger sits on user partitions any more: partition truncate comes from the stream.
 - An attached partition with a different column order is applied correctly rather than by position.
 - Reads of inheritance parents and `ONLY` reads are correct.
 

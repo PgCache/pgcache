@@ -272,9 +272,8 @@ async fn test_partition_drop_resolves_through_sub_partition() -> Result<(), Erro
 }
 
 /// A partition created after the parent was registered: the create signal
-/// extends the parent's partition list and installs the truncate trigger on
-/// the new partition, so its later truncate and drop both resolve to the
-/// parent. Row changes through it apply in place as usual.
+/// extends the parent's partition list, so its later truncate and drop both
+/// resolve to the parent. Row changes through it apply in place as usual.
 #[tokio::test]
 async fn test_partition_created_after_registration_is_tracked() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
