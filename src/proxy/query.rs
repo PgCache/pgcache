@@ -239,16 +239,8 @@ pub(super) fn analyze(
             if let Some(spec) = explain_spec_extract(&query) {
                 Action::Explain(Arc::new(spec))
             } else {
-                match CacheableQuery::cacheable(&query, function_catalog.as_ref()) {
-                    // `cacheable` just passed, so `try_new` (same validation)
-                    // cannot fail; forward conservatively if it ever disagrees.
-                    Ok(()) => match CacheableQuery::try_new(query, function_catalog.as_ref()) {
-                        Ok(cacheable_query) => Action::CacheCheck(Arc::new(cacheable_query)),
-                        Err(_) => Action::Forward(
-                            ForwardReason::UncacheableSelect,
-                            StatementEffects::read_only(isolation, None),
-                        ),
-                    },
+                match CacheableQuery::classify(&query, function_catalog.as_ref()) {
+                    Ok(cacheable_query) => Action::CacheCheck(Arc::new(cacheable_query)),
                     Err(cacheability_error) => {
                         debug!(%cacheability_error, "uncacheable SELECT");
                         // A volatile (or unknown) function anywhere in the query

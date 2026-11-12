@@ -7,8 +7,8 @@ use crate::oid::TypeOid;
 use crate::query::ast::NodeId;
 use crate::query::ast::rope::{Body, QueryTree, Select};
 use crate::query::transform::{
-    AstTransformResult, query_tree_parameters_replace_remapped, query_tree_setting_names,
-    query_tree_term_fragments,
+    AstTransformResult, FunctionInlineError, Inlined, InlinedCall, query_tree_functions_inline,
+    query_tree_parameters_replace_remapped, query_tree_setting_names, query_tree_term_fragments,
 };
 #[cfg(feature = "proxy")]
 use crate::query::transform::{
@@ -69,6 +69,12 @@ error_set! {
         SessionTerm {
             term: EcoString,
         },
+        /// A sql function whose body, inlined, still calls an inlinable
+        /// function after the last pass: recursion (PGC-579).
+        #[display("Function body nests too deeply: {function}")]
+        FunctionInlineDepth {
+            function: EcoString,
+        },
         HasLimit,
         #[display("System catalog reference: {relation}")]
         SystemCatalogReference {
@@ -92,6 +98,10 @@ pub struct CacheableQuery {
     term_fragments: Vec<NodeId>,
     /// The custom settings the fragments read, sorted and distinct.
     setting_names: Vec<EcoString>,
+    /// The sql functions whose bodies replaced their calls (PGC-579), in
+    /// inlining order: the writer checks each resolves on the session's
+    /// search_path to the function inlined and records its oid.
+    inlined_calls: Vec<InlinedCall>,
 }
 
 impl CacheableQuery {
@@ -115,6 +125,11 @@ impl CacheableQuery {
         &self.setting_names
     }
 
+    /// The calls whose bodies were inlined, in inlining order.
+    pub fn inlined_calls(&self) -> &[InlinedCall] {
+        &self.inlined_calls
+    }
+
     /// The query's fragments folded under `context`, in pre-order, for the
     /// key and for the writer's substitution; a term the session cannot
     /// supply is the reason the read forwards.
@@ -132,7 +147,7 @@ impl CacheableQuery {
         Ok(values)
     }
 
-    fn from_tree(tree: QueryTree) -> Self {
+    fn from_tree(tree: QueryTree, inlined_calls: Vec<InlinedCall>) -> Self {
         let term_fragments = query_tree_term_fragments(&tree);
         let mut setting_names: Vec<EcoString> = if term_fragments.is_empty() {
             Vec::new()
@@ -145,6 +160,7 @@ impl CacheableQuery {
             tree,
             term_fragments,
             setting_names,
+            inlined_calls,
         }
     }
 
@@ -176,6 +192,7 @@ impl CacheableQuery {
             tree,
             term_fragments,
             setting_names: self.setting_names.clone(),
+            inlined_calls: self.inlined_calls.clone(),
         })
     }
 }
@@ -199,14 +216,57 @@ impl CacheableQuery {
         query_cacheable(tree.root(), functions)
     }
 
-    /// Build a cacheable query, validating it first. Fails with the same
-    /// verdict as [`Self::cacheable`].
+    /// Build a cacheable query: the inlinable sql function bodies take
+    /// their calls' places first (PGC-579), so the verdict and the term
+    /// fragments are those of what the body computes; what remains is
+    /// validated as [`Self::cacheable`] does.
     pub fn try_new(
         tree: QueryTree,
         functions: &dyn FunctionFacts,
     ) -> Result<Self, CacheabilityError> {
+        let inlined = Self::inline(&tree, functions)?;
+        Self::validated(
+            inlined.unwrap_or(Inlined {
+                tree,
+                calls: Vec::new(),
+            }),
+            functions,
+        )
+    }
+
+    /// [`Self::try_new`] over a borrowed tree, for a caller that keeps the
+    /// tree as written when the verdict refuses it.
+    pub fn classify(
+        tree: &QueryTree,
+        functions: &dyn FunctionFacts,
+    ) -> Result<Self, CacheabilityError> {
+        let inlined = Self::inline(tree, functions)?;
+        Self::validated(
+            inlined.unwrap_or_else(|| Inlined {
+                tree: tree.clone(),
+                calls: Vec::new(),
+            }),
+            functions,
+        )
+    }
+
+    fn inline(
+        tree: &QueryTree,
+        functions: &dyn FunctionFacts,
+    ) -> Result<Option<Inlined>, CacheabilityError> {
+        query_tree_functions_inline(tree, functions).map_err(|e| match e {
+            FunctionInlineError::TooDeep { function, .. } => {
+                CacheabilityError::FunctionInlineDepth { function }
+            }
+        })
+    }
+
+    fn validated(
+        Inlined { tree, calls }: Inlined,
+        functions: &dyn FunctionFacts,
+    ) -> Result<Self, CacheabilityError> {
         Self::cacheable(&tree, functions)?;
-        Ok(CacheableQuery::from_tree(tree))
+        Ok(CacheableQuery::from_tree(tree, calls))
     }
 }
 

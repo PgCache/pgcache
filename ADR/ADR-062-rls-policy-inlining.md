@@ -30,7 +30,7 @@ Two ways to cache under policies were considered. Role-keyed entries populated a
 - Every refusal is a forward with origin's own answer, counted by reason.
 
 ### Negative
-- A policy calling `auth.uid()` itself, rather than its body, stays uninlinable until the SQL body is inlined (PGC-579).
+- A policy calling a sql function takes the function's body when the policy is parsed (ADR-067); a call outside the body rules (plpgsql, STRICT with arguments, `BEGIN ATOMIC`) keeps the policy uninlinable.
 - A secured relation on the nullable side of an outer join forwards; the predicate belongs in the ON clause there, which this decision leaves out. So does a policy whose subquery reads a relation with policies of its own, or the policy table again, or a built-in setting: each is kept as uninlinable rather than modelled.
 - A read of a secured relation keyed before the writer published its name carries no context and forwards once; the writer publishes on discovering it.
 - A role change re-resolves every RLS-keyed read once; a policy change repopulates the table's entries.

@@ -29,7 +29,7 @@ use crate::query::Fingerprint;
 use crate::query::ast::rope::{NodeKind, QueryTree};
 use crate::query::keying_settings::KeyingSettings;
 use crate::query::resolve::{ResolvedQuery, TableSlot};
-use crate::query::transform::query_tree_term_fragments_replace;
+use crate::query::transform::{InlinedCall, query_tree_term_fragments_replace};
 
 /// Resolve schema for a table: use explicit schema if provided, otherwise lookup via search path.
 async fn table_schema_resolve(
@@ -86,14 +86,35 @@ struct CanonicalBinding {
 /// a user or extension function is admissible only when the cache database
 /// holds it with origin's body. The parser's own forms (`coalesce`, ...)
 /// have no row and need none. With the path known, the volatility rule is
-/// applied once more: the proxy judged a call by the catalog alone.
+/// applied once more: the proxy judged a call by the catalog alone. A call
+/// the proxy replaced by its body (PGC-579) is gone from the tree: the path
+/// must resolve it to the function inlined, whose oid the entry records.
 async fn functions_resolve(
     core: &mut WriterCore,
     tree: &QueryTree,
     search_path: &[&str],
+    inlined: &[InlinedCall],
 ) -> CacheResult<Vec<FunctionOid>> {
     let catalog = core.function_catalog.load_full();
     let mut oids = Vec::new();
+    for call in inlined {
+        let mut on_path = catalog.on_path(
+            call.schema.as_deref(),
+            &call.name,
+            call.arg_count,
+            search_path,
+        );
+        match (on_path.next(), on_path.next()) {
+            (Some(row), None) if row.oid == call.oid && catalog.inlined_call_is_current(call) => {
+                oids.push(row.oid);
+            }
+            _ => {
+                return Err(function_refusal(CacheError::FunctionInlinedElsewhere {
+                    function: call.name.clone(),
+                }));
+            }
+        }
+    }
     for node in tree.nodes() {
         let NodeKind::Function {
             schema,
@@ -182,6 +203,8 @@ fn function_refusal(error: CacheError) -> Report<CacheError> {
         &m.query.function_forward_not_on_cache
     } else if matches!(error, CacheError::FunctionNotImmutable { .. }) {
         &m.query.function_forward_not_immutable
+    } else if matches!(error, CacheError::FunctionInlinedElsewhere { .. }) {
+        &m.query.function_forward_inlined_elsewhere
     } else {
         &m.query.function_forward_unknown
     };
@@ -201,6 +224,7 @@ async fn query_bind_canonical(
     // The session terms the proxy folded take their literals first (PGC-580),
     // so the canonical form holds the values the read was keyed on.
     let substituted;
+    let mut inlined_calls = query.inlined_calls().to_vec();
     let query = if keying.term_values.is_empty() && !query.has_session_terms() {
         query.tree()
     } else {
@@ -227,14 +251,35 @@ async fn query_bind_canonical(
     // read's role (PGC-113); the inlined form is the one the query is
     // registered and keyed under, and it may name tables of its own.
     if let Some(inlined) = core.rls_inline(&resolution.bound, keying).await? {
-        cache_tables_ensure(core, &inlined, &keying.search_path).await?;
+        cache_tables_ensure(core, &inlined.tree, &keying.search_path).await?;
         let path = search_path(keying);
-        resolution = query_resolve_canonical(inlined, &core.cache.tables, &path, &keying.literals)
-            .map_err(|e| e.context_transform(CacheError::from))
-            .attach_loc("resolving the query with its policies inlined")?;
+        resolution =
+            query_resolve_canonical(inlined.tree, &core.cache.tables, &path, &keying.literals)
+                .map_err(|e| e.context_transform(CacheError::from))
+                .attach_loc("resolving the query with its policies inlined")?;
+        inlined_calls.extend(inlined.calls);
     }
-    let function_oids =
-        functions_resolve(core, resolution.bound.tree(), &search_path(keying)).await?;
+    // A policy applied at two references records its calls twice.
+    let mut seen = HashSet::new();
+    inlined_calls.retain(|call| seen.insert(call.clone()));
+    let function_oids = functions_resolve(
+        core,
+        resolution.bound.tree(),
+        &search_path(keying),
+        &inlined_calls,
+    )
+    .await?;
+    // An inlined function is called all the same at origin: the hit needs
+    // EXECUTE on it as on a call the tree still shows. The resolution is
+    // this binding's alone until it is returned.
+    if !inlined_calls.is_empty() {
+        let Some(bound) = Arc::get_mut(&mut resolution.bound) else {
+            return Err(Report::from(CacheError::CanonicalUncacheable {
+                reason: "the resolution is shared before its privilege needs are complete".into(),
+            }));
+        };
+        bound.privilege_functions_extend(inlined_calls.iter().map(|call| call.name.clone()));
+    }
     Ok(CanonicalBinding {
         resolution,
         user_max_limit,

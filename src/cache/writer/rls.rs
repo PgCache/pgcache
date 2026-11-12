@@ -31,8 +31,8 @@ use crate::query::ast::{BinaryOp, JoinType, NodeId, query_tree_parse};
 use crate::query::keying_settings::{KeyingSettings, RlsKeying, RlsRelationFold};
 use crate::query::resolve::{ColumnTarget, ResolvedQuery, TableSlot};
 use crate::query::transform::{
-    FoldedTerm, SessionTermError, TermFoldError, query_tree_setting_names,
-    query_tree_term_fragments_replace_remapped,
+    FoldedTerm, InlinedCall, SessionTermError, TermFoldError, query_tree_functions_inline,
+    query_tree_setting_names, query_tree_term_fragments_replace_remapped,
 };
 use crate::result::error_chain_format;
 
@@ -83,6 +83,17 @@ const RLS_APPLICABILITY_SQL: &str = "SELECT c.relrowsecurity, \
 struct ParsedQual {
     terms: Arc<RlsPolicyTerms>,
     own_columns: HashSet<NodeId>,
+    /// The sql functions whose bodies replaced the policy's calls
+    /// (PGC-579): checked on the reading session's path and recorded on
+    /// the entry like the query's own.
+    inlined_calls: Vec<InlinedCall>,
+}
+
+/// A query with its applicable policies inlined, and the calls the policies'
+/// bodies replaced.
+pub(super) struct RlsInlined {
+    pub(super) tree: QueryTree,
+    pub(super) calls: Vec<InlinedCall>,
 }
 
 struct RlsPolicy {
@@ -374,6 +385,16 @@ impl WriterCore {
         sql.push_str(qual);
         let tree = query_tree_parse(&sql).map_err(|e| EcoString::from(e.to_string()))?;
         let qualified = self.rls_names_qualify(&tree).await?;
+        // A call of a sql function takes its body (PGC-579), qualified first
+        // so the body is the function the policy means; a body's own bare
+        // calls and tables resolve on the reading session's path, as at
+        // origin.
+        let (qualified, inlined_calls) =
+            match query_tree_functions_inline(&qualified, &**self.function_catalog.load()) {
+                Ok(Some(inlined)) => (inlined.tree, inlined.calls),
+                Ok(None) => (qualified, Vec::new()),
+                Err(e) => return Err(EcoString::from(e.to_string())),
+            };
         // A second reference to the policy table is a different row set than
         // the one the predicate filters; not modelled here.
         let self_references = qualified
@@ -417,7 +438,12 @@ impl WriterCore {
         {
             return Err(format!("the policy reads the built-in setting {name}").into());
         }
-        Ok(parsed_qual_of(&bound, relation_oid, policy_name))
+        Ok(parsed_qual_of(
+            &bound,
+            relation_oid,
+            policy_name,
+            inlined_calls,
+        ))
     }
 
     /// `tree` with every bare table and function name given the schema it
@@ -570,7 +596,7 @@ impl WriterCore {
         &mut self,
         bound: &ResolvedQuery,
         keying: &KeyingSettings,
-    ) -> CacheResult<Option<QueryTree>> {
+    ) -> CacheResult<Option<RlsInlined>> {
         let secured = secured_references(bound);
         if secured.is_empty() {
             return Ok(None);
@@ -595,6 +621,7 @@ impl WriterCore {
 
         let mut predicates: HashMap<NodeId, ReferencePredicate> = HashMap::new();
         let mut applicability: HashMap<Oid, Applicability> = HashMap::new();
+        let mut calls: Vec<InlinedCall> = Vec::new();
         for (reference, relation_oid) in &secured {
             if !applicability.contains_key(relation_oid) {
                 let applies = self.rls_applicability(role, *relation_oid).await?;
@@ -633,6 +660,7 @@ impl WriterCore {
                 };
                 let inlined = policy_inline(parsed, &fold.values, policy.permissive)
                     .map_err(|e| rls_refusal(fold_error(e)))?;
+                calls.extend(parsed.inlined_calls.iter().cloned());
                 CacheableQuery::cacheable(&inlined.tree, &**self.function_catalog.load()).map_err(
                     |e| {
                         rls_refusal(CacheError::RlsUninlinable {
@@ -652,13 +680,19 @@ impl WriterCore {
         if predicates.is_empty() {
             return Ok(None);
         }
-        rls_rewrite(bound, &predicates).map(Some)
+        let tree = rls_rewrite(bound, &predicates)?;
+        Ok(Some(RlsInlined { tree, calls }))
     }
 }
 
 /// A bound policy qual (`SELECT 1 FROM <table> WHERE <qual>`) with the
 /// positions of the policy table's own column references.
-fn parsed_qual_of(bound: &ResolvedQuery, relation_oid: Oid, policy_name: &str) -> ParsedQual {
+fn parsed_qual_of(
+    bound: &ResolvedQuery,
+    relation_oid: Oid,
+    policy_name: &str,
+    inlined_calls: Vec<InlinedCall>,
+) -> ParsedQual {
     let bindings = bound.bindings();
     let own_columns = bound
         .tree()
@@ -680,6 +714,7 @@ fn parsed_qual_of(bound: &ResolvedQuery, relation_oid: Oid, policy_name: &str) -
             bound.tree().clone(),
         )),
         own_columns,
+        inlined_calls,
     }
 }
 
@@ -1168,7 +1203,7 @@ mod tests {
         tables: &Catalog,
     ) -> InlinedPolicy {
         let bound = bind(&format!("SELECT 1 FROM docs WHERE {qual}"), tables);
-        let parsed = parsed_qual_of(&bound, Oid::from_raw(1001), "policy");
+        let parsed = parsed_qual_of(&bound, Oid::from_raw(1001), "policy", Vec::new());
         policy_inline(&parsed, values, permissive).expect("the values pair with the fragments")
     }
 

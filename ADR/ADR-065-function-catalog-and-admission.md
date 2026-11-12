@@ -6,7 +6,7 @@ Accepted
 ## Context
 A query's function calls were judged by one map from bare `proname` to the worst volatility over every overload in every schema, loaded once at startup by the proxy and once by the writer and never refreshed. Three gaps followed (PGC-578). A qualified call outside `pg_catalog` was refused outright, a user overload of a builtin's name dragged the builtin down for every session, and a function created after startup was unknown for the life of the process. Nothing told the cache that `CREATE OR REPLACE FUNCTION` had changed a body an entry was computed with: the schema-change signal (ADR-058) traced `function` objects as untracked. And the admission rule allowed any function in the SELECT list although the cache database holds only PostgreSQL's own functions, so a user function registered and then failed on every hit, poisoning a serve connection each time (PGC-474); in WHERE it would also have failed every CDC membership evaluation (ADR-027).
 
-Function body inlining (PGC-579) and session-term keying (PGC-580), which the JWT work needs, both resolve calls to `pg_proc` rows and need a change signal to evict what they build.
+Function body inlining (ADR-067) and session-term keying (ADR-066), which the JWT work needs, both resolve calls to `pg_proc` rows and need a change signal to evict what they build.
 
 ## Decision
 - **One shared function catalog.** `FunctionCatalog` holds every `pg_proc` row by schema, name and arity (defaults and variadics included), with volatility, kind, language, return type, an identity (`schema.name(argtypes)`) and a digest of the body. The proxy loads it at startup; the writer reloads it at its start and on every function signal and publishes it through an `ArcSwap` both read. The parser's own forms (`coalesce`, `nullif`, `greatest`, `least`) have no row and count as immutable builtins.
@@ -29,7 +29,7 @@ Function body inlining (PGC-579) and session-term keying (PGC-580), which the JW
 ### Positive
 - `pg_catalog.lower(x)` and the parser's own forms are cacheable in WHERE; a user function in a SELECT list forwards cleanly instead of failing every hit.
 - A function installed on both databases is cached, and its redefinition on origin evicts the entries within the stream's order.
-- PGC-579 inlines from the same rows and records the same oids; PGC-580 judges session-term expressions by the same volatility.
+- Body inlining (ADR-067) inlines from the same rows, carries the bodies on them, and records the same oids; session-term keying (ADR-066) judges session-term expressions by the same volatility.
 
 ### Negative
 - A call that only a user function could answer costs a writer round trip and a cache-database lookup per execution while the function is absent there; the proxy cannot memoise that refusal.

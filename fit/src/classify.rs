@@ -179,6 +179,10 @@ fn cacheability_reason(error: &CacheabilityError) -> (PassthroughReason, Option<
         CacheabilityError::SessionTerm { term } => {
             (PassthroughReason::SessionTerm, Some(term.to_string()))
         }
+        CacheabilityError::FunctionInlineDepth { function } => (
+            PassthroughReason::NonImmutableFunction,
+            Some(function.to_string()),
+        ),
     }
 }
 

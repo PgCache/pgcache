@@ -30,7 +30,7 @@ Three facts shape where the substitution can happen. The cacheability verdict is
 ### Negative
 - A fragment's literal is part of every read's key hash and of the writer's canonical form, so a query over a high-cardinality term (a per-user claim) has an entry per value, like a query over a per-user literal.
 - The fold covers the forms the Supabase helpers use; a term under another function (`lower(current_setting(…))`) is substituted as a bare term and the function runs on the cache database, which is what origin does too.
-- `auth.uid()` itself stays forwarded until its SQL body is inlined (PGC-579); the fold is ready for what the inlining produces.
+- `auth.uid()` itself is a call the fold does not see; ADR-067 inlines its body before the verdict, and the fold keys the read on what the body extracts.
 
 ## Implementation Notes
 - Shape: `query/transform/term_fold.rs` (`scalar_is_term_fragment`, `where_subquery_is_term_fragment`, `query_tree_term_fragments`); cacheability accepts a fragment where a literal is accepted (`cache/query/cacheability.rs`), and `CacheableQuery` records the fragments.

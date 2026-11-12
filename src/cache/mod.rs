@@ -254,6 +254,14 @@ error_set! {
         FunctionNotImmutable {
             function: EcoString,
         },
+        /// The proxy inlined the one function of the name the catalog holds,
+        /// but the session's search_path resolves the call to another
+        /// function, or to none, or the function was redefined since the
+        /// body was inlined (PGC-579).
+        #[display("function {function} resolves on the search_path to other than the inlined body")]
+        FunctionInlinedElsewhere {
+            function: EcoString,
+        },
     }
 
     QueryResolutionError := {

@@ -479,6 +479,20 @@ impl ResolvedQuery {
         &self.privilege_needs
     }
 
+    /// Functions the read calls that the tree no longer shows (their bodies
+    /// inlined, PGC-579): `EXECUTE` on them is needed all the same.
+    pub fn privilege_functions_extend(&mut self, names: impl IntoIterator<Item = EcoString>) {
+        let mut needs = PrivilegeNeeds::clone(&self.privilege_needs);
+        let before = needs.functions.len();
+        needs.functions.extend(names);
+        if needs.functions.len() == before {
+            return;
+        }
+        needs.functions.sort_unstable();
+        needs.functions.dedup();
+        self.privilege_needs = Arc::new(needs);
+    }
+
     /// `sql` parsed and resolved against `tables` on `search_path`.
     #[cfg(test)]
     pub(crate) fn parse_resolve(

@@ -349,14 +349,19 @@ pub(super) fn sublink_type_map(t: pg::SubLinkType) -> Result<SubLinkType, AstErr
 }
 
 /// Parse `sql` straight to the rope through the raw path: the one entry for
-/// every test fixture that starts from SQL, and for the writer's parse of a
-/// policy expression (PGC-113).
-#[cfg(any(test, feature = "proxy"))]
+/// every test fixture that starts from SQL, for the writer's parse of a
+/// policy expression (PGC-113) and for a function body (PGC-579). Text
+/// that does not parse is an error, never a panic: policies and bodies
+/// are user text.
 pub(crate) fn query_tree_parse(sql: &str) -> Result<QueryTree, AstError> {
     pg_query::parse_raw_scoped(sql, |tree| unsafe {
         query_tree_convert_raw(tree, sql.len())
     })
-    .expect("parse SQL")
+    .unwrap_or_else(|e| {
+        Err(AstError::ParseError {
+            message: e.to_string(),
+        })
+    })
 }
 
 /// Parse a `CREATE INDEX` statement straight to the rope. A statement that

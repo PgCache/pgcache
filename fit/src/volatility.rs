@@ -6,8 +6,9 @@
 //! `data/functions_regenerate.sh` rewrites `data/functions.tsv` and
 //! `data/aggregates.tsv` from a current PostgreSQL with the loaders' own
 //! queries, restricted to the schemas PostgreSQL ships and without the
-//! identity and body-digest columns, which only the writer's presence
-//! check on a cache database reads.
+//! identity, body-digest and body columns, which only the writer's
+//! presence check on a cache database and the body inliner read; a
+//! builtin has no body to inline.
 
 use std::collections::HashSet;
 
@@ -76,6 +77,7 @@ fn function_row_parse(line: &str) -> Option<FunctionRow> {
         kind,
         identity: EcoString::from(identity),
         source_digest: EcoString::from(source_digest),
+        source: None,
     })
 }
 

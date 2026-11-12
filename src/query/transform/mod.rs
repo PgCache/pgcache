@@ -1,4 +1,5 @@
 mod constant_fold;
+mod function_inline;
 mod literal_canon;
 mod parameters;
 pub(crate) mod predicate_pushdown;
@@ -34,6 +35,10 @@ error_set! {
 pub type AstTransformResult<T> = Result<T, Report<AstTransformError>>;
 
 pub(crate) use constant_fold::literal_arithmetic_fold;
+pub use function_inline::{
+    FunctionBody, FunctionBodyError, FunctionInlineError, FunctionSource, Inlined, InlinedCall,
+    TypeCasts, function_body_parse, query_tree_functions_inline,
+};
 pub use literal_canon::{LiteralCanonOutcome, query_literals_canonicalise};
 #[cfg(feature = "proxy")]
 pub(crate) use parameters::{
