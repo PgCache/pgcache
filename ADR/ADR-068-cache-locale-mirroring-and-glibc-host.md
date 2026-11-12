@@ -1,4 +1,4 @@
-# ADR-066: Cache database under origin's locale, on a glibc host
+# ADR-068: Cache database under origin's locale, on a glibc host
 
 ## Status
 Accepted
@@ -29,7 +29,7 @@ Nothing installable fixes musl; ICU at `initdb` bypasses libc but matches only a
 
 ### Negative
 - About 110 MB more compressed image, almost all locale data; the Debian package set scans with fewer findings than the Alpine one did.
-- An RDS or Aurora origin needs a cache PostgreSQL on the same glibc lineage; ADR-067 adds one to the image.
+- An RDS or Aurora origin needs a cache PostgreSQL on the same glibc lineage; ADR-069 adds one to the image.
 - Mirroring adds one origin round trip at setup and a second `pg_database` read on the cache; both are startup-only.
 
 ## Implementation Notes

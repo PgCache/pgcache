@@ -1,17 +1,17 @@
-# ADR-067: A second cache PostgreSQL on Amazon Linux 2's glibc
+# ADR-069: A second cache PostgreSQL on Amazon Linux 2's glibc
 
 ## Status
 Accepted
 
 ## Context
-ADR-066 made the startup ordering probe fail closed, and a real RDS origin showed what that costs: RDS and Aurora collate with Amazon Linux 2's glibc (`datcollversion 2.26-59.amzn2`), whose ISO 14651 tables predate the glibc 2.28 rewrite. Under `en_US.UTF-8` RDS ignores spaces and punctuation at the first level (`a` before ` a` and `_a`), while trixie's glibc 2.41 and Amazon Linux 2023's 2.34 do not, so the Debian image and the Marketplace AMI both refused to start behind RDS, their main audience (PGC-587, PGC-594).
+ADR-068 made the startup ordering probe fail closed, and a real RDS origin showed what that costs: RDS and Aurora collate with Amazon Linux 2's glibc (`datcollversion 2.26-59.amzn2`), whose ISO 14651 tables predate the glibc 2.28 rewrite. Under `en_US.UTF-8` RDS ignores spaces and punctuation at the first level (`a` before ` a` and `_a`), while trixie's glibc 2.41 and Amazon Linux 2023's 2.34 do not, so the Debian image and the Marketplace AMI both refused to start behind RDS, their main audience (PGC-587, PGC-594).
 
 Collation is computed by `strcoll` inside the libc a server binary runs against, from that libc's tables. Nothing in PostgreSQL swaps it, and no current distribution ships glibc 2.26.
 
 ## Decision
 - **The image carries two cache PostgreSQL builds.** The Debian one from the base image, and a second PostgreSQL 18 compiled on `amazonlinux:2`, installed under `/opt/pg-al2` together with AL2's loader, libc, the libraries it resolves and every UTF-8 locale as `LOCPATH` directories. Its binaries and modules are `patchelf`ed to that interpreter and library directory (DT_RPATH, so glibc's NSS modules resolve there too), so it runs on the Debian root without a chroot.
 - **The entrypoint picks the flavour before `initdb`.** `pgcache --origin_locale` prints origin's provider, locale and collation version under the resolved settings; a libc origin whose glibc is older than 2.28 gets the AL2 build, everything else the host's own (`native`) build, and `CACHE_PG_FLAVOUR` overrides. A data directory remembers the flavour that initialised it and is re-initialised when the choice changes.
-- **The probe still fails closed.** An origin that neither flavour orders like is refused with the disagreeing pair named, as in ADR-066. There is no per-query degrade.
+- **The probe still fails closed.** An origin that neither flavour orders like is refused with the disagreeing pair named, as in ADR-068. There is no per-query degrade.
 
 ## Rationale
 - **Exact parity beats approximation.** The same glibc lineage gives byte-identical collation tables; the probe confirmed RDS and the AL2 build agree on the whole sample where Debian differs on eleven positions.
