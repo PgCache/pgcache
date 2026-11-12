@@ -235,6 +235,52 @@ async fn test_unset_setting_forwards_with_origins_error() -> Result<(), Error> {
     Ok(())
 }
 
+/// A setting value the cast's type rejects (`abc` as an integer) fails on
+/// origin whatever form the read takes: the read forwards with origin's
+/// error and registers nothing, where a blind fold would register a form
+/// whose population fails on every read (PGC-596). A value the type accepts
+/// is cached as before.
+#[tokio::test]
+async fn test_value_the_cast_rejects_forwards_with_origins_error() -> Result<(), Error> {
+    let mut ctx = setup().await?;
+    let (proxied, origin) = sessions(&ctx, None, &["SET app.tenant = 'abc'"]).await?;
+    let before = ctx.metrics().await?;
+    for client in [&proxied, &origin] {
+        let error = client
+            .simple_query(TENANT_READ)
+            .await
+            .expect_err("abc is not an integer");
+        assert_eq!(
+            error.as_db_error().map(|e| e.code().clone()),
+            Some(SqlState::INVALID_TEXT_REPRESENTATION),
+            "{error}"
+        );
+    }
+    let delta = metrics_delta(&before, &ctx.metrics().await?);
+    assert_eq!(
+        delta.queries_rls_forward_unsupported, 1,
+        "forwarded at the proxy for the rejected value\n{delta:#?}"
+    );
+    assert_eq!(
+        delta.queries_cache_miss, 0,
+        "never dispatched to the writer\n{delta:#?}"
+    );
+    assert_eq!(
+        delta.cache_writer_register_binds, 0,
+        "nothing registered\n{delta:#?}"
+    );
+    for client in [&proxied, &origin] {
+        client
+            .simple_query("SET app.tenant = '1'")
+            .await
+            .map_err(Error::other)?;
+    }
+    let served = register(&mut ctx, &proxied, TENANT_READ).await?;
+    assert_eq!(served, vec![row("1", "a"), row("3", "c")]);
+    assert_eq!(served, rows(&origin, TENANT_READ).await?);
+    Ok(())
+}
+
 /// `current_user` keys the read on the role: each role has its own entry
 /// with its own rows, and a second session of a role shares it.
 #[tokio::test]

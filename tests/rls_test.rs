@@ -365,6 +365,93 @@ async fn test_tenant_setting_policy_is_inlined_and_cached() -> Result<(), Error>
     Ok(())
 }
 
+/// A tenant setting the policy's cast rejects (`abc` as an integer) is a
+/// value origin rejects for every role the policy applies to: the read
+/// forwards with origin's error and registers nothing, where a blind fold
+/// registered a form whose population failed on every read (PGC-596). A
+/// role the policy exempts never evaluates it and is served from cache.
+#[tokio::test]
+async fn test_value_a_policy_cast_rejects_forwards_where_the_policy_applies() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    tenant_docs_create(&mut ctx).await?;
+    for sql in [
+        "CREATE ROLE docs_owner LOGIN",
+        "ALTER TABLE tenant_docs OWNER TO docs_owner",
+    ] {
+        ctx.origin_query(sql, &[]).await?;
+    }
+    ctx.cdc_apply_settle().await?;
+
+    let (user, origin_user) = sessions_as(&ctx, "tenant_user", Some("abc")).await?;
+    let before = ctx.metrics().await?;
+    let result = rls_forward_assert(&mut ctx, &user, TENANT_READ, |d| {
+        d.queries_rls_forward_unsupported
+    })
+    .await?;
+    assert_sqlstate(
+        result,
+        &SqlState::INVALID_TEXT_REPRESENTATION,
+        "abc is not an integer",
+    );
+    assert_sqlstate(
+        origin_user.simple_query(TENANT_READ).await,
+        &SqlState::INVALID_TEXT_REPRESENTATION,
+        "origin's own answer",
+    );
+    let delta = metrics_delta(&before, &ctx.metrics().await?);
+    assert_eq!(
+        delta.cache_writer_register_binds, 0,
+        "nothing registered\n{delta:#?}"
+    );
+
+    let (owner, _) = sessions_as(&ctx, "docs_owner", Some("abc")).await?;
+    assert_eq!(
+        register(&mut ctx, &owner, TENANT_READ).await?,
+        vec![row("1", "a"), row("2", "b"), row("3", "c")]
+    );
+    Ok(())
+}
+
+/// A token whose `sub` is not a uuid under `owner = auth.uid()`: the body's
+/// `::uuid` rejects it on origin for every read the policy applies to, so
+/// the read forwards with origin's error and registers nothing (PGC-596).
+/// The session's first reads may forward while the claim setting beside the
+/// token is probed; every one of them is origin's error all the same.
+#[tokio::test]
+async fn test_claim_a_policy_cast_rejects_forwards_with_origins_error() -> Result<(), Error> {
+    let mut ctx = uid_docs_setup().await?;
+    let (user, origin) = sessions_with(&ctx, "uid_user", &[&token_set(ANN_TOKEN)]).await?;
+    assert_sqlstate(
+        origin.simple_query(UID_READ).await,
+        &SqlState::INVALID_TEXT_REPRESENTATION,
+        "ann is not a uuid",
+    );
+    let before = ctx.metrics().await?;
+    let mut delta = MetricsSnapshot::default();
+    for _ in 0..40 {
+        assert_sqlstate(
+            user.simple_query(UID_READ).await,
+            &SqlState::INVALID_TEXT_REPRESENTATION,
+            "origin's own answer through the proxy",
+        );
+        delta = metrics_delta(&before, &ctx.metrics_after_outcomes(&before, 1).await?);
+        if delta.queries_rls_forward_unsupported >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        delta.queries_rls_forward_unsupported, 1,
+        "forwarded for the rejected claim\n{delta:#?}"
+    );
+    assert_eq!(delta.queries_cache_hit, 0, "{delta:#?}");
+    assert_eq!(
+        delta.cache_writer_register_binds, 0,
+        "nothing registered\n{delta:#?}"
+    );
+    Ok(())
+}
+
 /// Two roles reading as the same tenant produce the same inlined query and
 /// share one entry: the second never registers.
 #[tokio::test]

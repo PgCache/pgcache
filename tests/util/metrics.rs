@@ -29,6 +29,9 @@ pub(crate) struct MetricsSnapshot {
     pub queries_rls_forward_setting_unknown: u64,
     pub queries_rls_forward_default_deny: u64,
     pub queries_rls_forward_row_security_off: u64,
+    /// A session value origin rejects in every form of the read (text that is
+    /// not json, or that the cast's type rejects), at the proxy or the writer.
+    pub queries_rls_forward_unsupported: u64,
     /// Registrations refused on a function call (PGC-578).
     pub queries_function_forward_unknown: u64,
     pub queries_function_forward_not_on_cache: u64,
@@ -185,6 +188,7 @@ const SAMPLES: &[Sample] = samples! {
     "pgcache_queries_rls_forwards{reason=\"setting_unknown\"}" => queries_rls_forward_setting_unknown,
     "pgcache_queries_rls_forwards{reason=\"default_deny\"}" => queries_rls_forward_default_deny,
     "pgcache_queries_rls_forwards{reason=\"row_security_off\"}" => queries_rls_forward_row_security_off,
+    "pgcache_queries_rls_forwards{reason=\"unsupported\"}" => queries_rls_forward_unsupported,
     "pgcache_queries_function_forwards{reason=\"unknown\"}" => queries_function_forward_unknown,
     "pgcache_queries_function_forwards{reason=\"not_on_cache\"}" => queries_function_forward_not_on_cache,
     "pgcache_queries_function_forwards{reason=\"not_immutable\"}" => queries_function_forward_not_immutable,
