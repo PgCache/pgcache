@@ -126,6 +126,169 @@ pub fn cast_target_coerce_text(target: &CastTarget, row_text: &str) -> Option<Li
     }
 }
 
+/// Why the cast of `text` to `target` would fail on origin, for the types
+/// whose input rules are plain enough to apply here: the integers, `numeric`
+/// without a modifier, `bool` and `uuid`. `None` for an accepted value and
+/// for every other type, which is left to origin as before. A rule that has
+/// widened across versions (digit underscores and `0x`/`0o`/`0b` prefixes
+/// since PostgreSQL 16) is applied in its widest form, so a value accepted
+/// here and rejected by an older origin only keeps the behaviour it had.
+pub fn cast_target_rejects_text(target: &CastTarget, text: &str) -> Option<&'static str> {
+    let bits = match target {
+        CastTarget::Int4 => 32,
+        CastTarget::Int8 => 64,
+        CastTarget::Bool => {
+            return bool_literal_parse(text)
+                .is_none()
+                .then_some("text the boolean type rejects");
+        }
+        CastTarget::Other(name) => match name.as_str() {
+            "int2" => 16,
+            "numeric" => {
+                return (!numeric_text_accepts(text)).then_some("text the numeric type rejects");
+            }
+            "uuid" => return (!uuid_text_accepts(text)).then_some("text the uuid type rejects"),
+            _ => return None,
+        },
+        CastTarget::Text | CastTarget::Date => return None,
+    };
+    let Some(value) = integer_text_parse(text) else {
+        return Some("text the integer type rejects");
+    };
+    let limit: i128 = 1 << (bits - 1);
+    (value < -limit || value >= limit).then_some("an integer out of range for the type")
+}
+
+/// The integer `text` denotes as `pg_strtoint` reads it (whitespace around,
+/// a sign, decimal digits or a `0x`/`0o`/`0b` prefixed form, underscores
+/// between digits), or `None` when it denotes none: the caller's "rejected".
+/// Returns `Some(0)` with no digits only for text with digits, never for
+/// empty text. Values beyond i128 are treated as out of range by the caller.
+fn integer_text_parse(text: &str) -> Option<i128> {
+    let trimmed = text.trim_matches(|c: char| c.is_ascii_whitespace() || c == '\x0b');
+    let (negative, unsigned) = match trimmed.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, trimmed.strip_prefix('+').unwrap_or(trimmed)),
+    };
+    let prefixed = |prefixes: [&str; 2]| {
+        prefixes
+            .iter()
+            .find_map(|prefix| unsigned.strip_prefix(prefix))
+    };
+    let (radix, digits) = if let Some(rest) = prefixed(["0x", "0X"]) {
+        (16, rest)
+    } else if let Some(rest) = prefixed(["0o", "0O"]) {
+        (8, rest)
+    } else if let Some(rest) = prefixed(["0b", "0B"]) {
+        (2, rest)
+    } else {
+        (10, unsigned)
+    };
+    let magnitude = digits_with_underscores_parse(digits, radix)?;
+    Some(if negative { -magnitude } else { magnitude })
+}
+
+/// `digits` in `radix` with single underscores between digits, as the
+/// PostgreSQL 16 lexer and input functions allow. `None` when empty, when an
+/// underscore leads, trails or doubles, or when a character is no digit.
+/// Saturates at the i128 limit, which every integer type is far inside.
+fn digits_with_underscores_parse(digits: &str, radix: u32) -> Option<i128> {
+    if digits.is_empty() || digits.starts_with('_') || digits.ends_with('_') {
+        return None;
+    }
+    let mut value: i128 = 0;
+    let mut previous_underscore = false;
+    for c in digits.chars() {
+        if c == '_' {
+            if previous_underscore {
+                return None;
+            }
+            previous_underscore = true;
+            continue;
+        }
+        previous_underscore = false;
+        let digit = c.to_digit(radix)?;
+        value = value
+            .saturating_mul(i128::from(radix))
+            .saturating_add(i128::from(digit));
+    }
+    Some(value)
+}
+
+/// Whether `text` is a `numeric` input: a signed decimal with an optional
+/// fraction and exponent, the integer forms with a prefix or underscores, or
+/// `NaN` and the infinities, whitespace around.
+fn numeric_text_accepts(text: &str) -> bool {
+    let trimmed = text.trim_matches(|c: char| c.is_ascii_whitespace() || c == '\x0b');
+    let unsigned = trimmed
+        .strip_prefix('-')
+        .or_else(|| trimmed.strip_prefix('+'))
+        .unwrap_or(trimmed);
+    if ["nan", "infinity", "inf"]
+        .iter()
+        .any(|special| unsigned.eq_ignore_ascii_case(special))
+    {
+        return true;
+    }
+    if integer_text_parse(unsigned).is_some() {
+        return true;
+    }
+    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (mantissa, Some(exponent)),
+        None => (unsigned, None),
+    };
+    let (whole, fraction) = match mantissa.split_once('.') {
+        Some((whole, fraction)) => (whole, Some(fraction)),
+        None => (mantissa, None),
+    };
+    let digits_ok =
+        |part: &str| part.is_empty() || digits_with_underscores_parse(part, 10).is_some();
+    let has_digit = !whole.is_empty() || fraction.is_some_and(|part| !part.is_empty());
+    has_digit
+        && digits_ok(whole)
+        && fraction.is_none_or(digits_ok)
+        && exponent.is_none_or(|exponent| {
+            let digits = exponent
+                .strip_prefix('-')
+                .or_else(|| exponent.strip_prefix('+'))
+                .unwrap_or(exponent);
+            !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+        })
+}
+
+/// Whether `text` is a `uuid` input as `uuid_in` reads it: 32 hex digits,
+/// optionally in braces, a hyphen allowed after any group of four digits.
+fn uuid_text_accepts(text: &str) -> bool {
+    let inner = match text.strip_prefix('{') {
+        Some(rest) => match rest.strip_suffix('}') {
+            Some(inner) => inner,
+            None => return false,
+        },
+        None => text,
+    };
+    let mut hex_digits = 0usize;
+    let mut previous_hyphen = false;
+    for c in inner.chars() {
+        if c == '-' {
+            if previous_hyphen
+                || hex_digits == 0
+                || !hex_digits.is_multiple_of(4)
+                || hex_digits == 32
+            {
+                return false;
+            }
+            previous_hyphen = true;
+            continue;
+        }
+        previous_hyphen = false;
+        if !c.is_ascii_hexdigit() {
+            return false;
+        }
+        hex_digits += 1;
+    }
+    hex_digits == 32 && !previous_hyphen
+}
+
 /// Extract the `YYYY-MM-DD` prefix of a postgres `timestamp` wire-text
 /// value. Returns the date as an owned String when the input begins with a
 /// canonical 10-char date followed by either end-of-string or a separator
@@ -278,6 +441,145 @@ pub fn comparison_canonicalize<'t>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn other(name: &str) -> CastTarget {
+        CastTarget::Other(EcoString::from(name))
+    }
+
+    /// The integer input rules: whitespace, sign, decimal, prefixed and
+    /// underscored forms accepted; anything else and a value past the type's
+    /// range rejected.
+    #[test]
+    fn test_cast_target_rejects_text_for_integers() {
+        for accepted in [
+            "42", " 42 ", "+7", "-7", "1_000", "0x1A", "0o17", "0b101", "\t9\n",
+        ] {
+            assert_eq!(
+                cast_target_rejects_text(&CastTarget::Int4, accepted),
+                None,
+                "{accepted}"
+            );
+        }
+        for rejected in [
+            "abc", "", " ", "1.5", "1e3", "_1", "1_", "1__0", "0x", "4 2", "٤",
+        ] {
+            assert!(
+                cast_target_rejects_text(&CastTarget::Int4, rejected).is_some(),
+                "{rejected}"
+            );
+        }
+        assert_eq!(
+            cast_target_rejects_text(&CastTarget::Int4, "2147483647"),
+            None
+        );
+        assert!(cast_target_rejects_text(&CastTarget::Int4, "2147483648").is_some());
+        assert_eq!(
+            cast_target_rejects_text(&CastTarget::Int4, "-2147483648"),
+            None
+        );
+        assert!(cast_target_rejects_text(&CastTarget::Int4, "-2147483649").is_some());
+        assert_eq!(cast_target_rejects_text(&other("int2"), "32767"), None);
+        assert!(cast_target_rejects_text(&other("int2"), "32768").is_some());
+        assert_eq!(
+            cast_target_rejects_text(&CastTarget::Int8, "9223372036854775807"),
+            None
+        );
+        assert!(cast_target_rejects_text(&CastTarget::Int8, "9223372036854775808").is_some());
+        assert!(
+            cast_target_rejects_text(
+                &CastTarget::Int8,
+                "99999999999999999999999999999999999999999"
+            )
+            .is_some()
+        );
+    }
+
+    /// `numeric`, `bool` and `uuid` input rules; every other type is left to
+    /// origin.
+    #[test]
+    fn test_cast_target_rejects_text_for_numeric_bool_and_uuid() {
+        for accepted in [
+            "1.5",
+            ".5",
+            "5.",
+            "-0.25",
+            "1e5",
+            "1.5E-3",
+            "NaN",
+            "-Infinity",
+            "inf",
+            " 7 ",
+            "1_000.5",
+        ] {
+            assert_eq!(
+                cast_target_rejects_text(&other("numeric"), accepted),
+                None,
+                "{accepted}"
+            );
+        }
+        for rejected in ["abc", "", "1.2.3", "1e", "e5", ".", "1,5", "1.5 x"] {
+            assert!(
+                cast_target_rejects_text(&other("numeric"), rejected).is_some(),
+                "{rejected}"
+            );
+        }
+        for accepted in ["t", "TRUE", " yes ", "off", "0", "n"] {
+            assert_eq!(
+                cast_target_rejects_text(&CastTarget::Bool, accepted),
+                None,
+                "{accepted}"
+            );
+        }
+        for rejected in ["abc", "", "2", "ja"] {
+            assert!(
+                cast_target_rejects_text(&CastTarget::Bool, rejected).is_some(),
+                "{rejected}"
+            );
+        }
+        for accepted in [
+            "11111111-1111-1111-1111-111111111111",
+            "11111111111111111111111111111111",
+            "{11111111-1111-1111-1111-111111111111}",
+            "1111-1111-1111-1111-1111-1111-1111-1111",
+            "A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11",
+        ] {
+            assert_eq!(
+                cast_target_rejects_text(&other("uuid"), accepted),
+                None,
+                "{accepted}"
+            );
+        }
+        for rejected in [
+            "ann",
+            "",
+            "11111111-1111-1111-1111-11111111111",
+            "11111111-1111-1111-1111-1111111111111",
+            "1111111-11111-1111-1111-111111111111",
+            "11111111--1111-1111-1111-111111111111",
+            "-11111111-1111-1111-1111-111111111111",
+            "11111111-1111-1111-1111-111111111111-",
+            "{11111111-1111-1111-1111-111111111111",
+            " 11111111-1111-1111-1111-111111111111",
+        ] {
+            assert!(
+                cast_target_rejects_text(&other("uuid"), rejected).is_some(),
+                "{rejected}"
+            );
+        }
+        for (target, text) in [
+            (CastTarget::Text, "anything"),
+            (CastTarget::Date, "not a date"),
+            (other("numeric(10,2)"), "abc"),
+            (other("timestamptz"), "abc"),
+            (other("float8"), "abc"),
+        ] {
+            assert_eq!(
+                cast_target_rejects_text(&target, text),
+                None,
+                "{target:?} {text}"
+            );
+        }
+    }
 
     #[test]
     fn test_cast_target_from_canonical_text() {

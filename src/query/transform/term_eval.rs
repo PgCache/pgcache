@@ -20,7 +20,7 @@ use crate::query::ast::rope::{
     TreeBuilder, TypeCast, View, WhereSubquery,
 };
 use crate::query::ast::{JsonOp, LiteralValue, NodeId, ScalarOp};
-use crate::query::cast::{CastTarget, cast_target_deparse};
+use crate::query::cast::{CastTarget, cast_target_deparse, cast_target_rejects_text};
 
 error_set! {
     TermFoldError := {
@@ -265,6 +265,10 @@ fn cast_fold(cast: TypeCast<'_>, context: &SessionTermContext) -> Result<Folded,
                         reason: "a json document origin would reject",
                     })
                 })
+            } else if let Some(reason) = cast_target_rejects_text(target, &text) {
+                Err(TermFoldError::Term(SessionTermError::ValueRejected {
+                    reason,
+                }))
             } else {
                 Ok(Folded::Literal(LiteralValue::StringWithCast(
                     text,
@@ -471,8 +475,9 @@ mod tests {
         LiteralValue::StringWithCast(value.into(), cast.into())
     }
 
-    const CLAIMS: &str =
-        r#"{"sub":"u1","role":"authenticated","aud":["a","b"],"n":7,"x":1.5,"nil":null}"#;
+    const SUB: &str = "11111111-1111-1111-1111-111111111111";
+    const SUB2: &str = "22222222-2222-2222-2222-222222222222";
+    const CLAIMS: &str = r#"{"sub":"11111111-1111-1111-1111-111111111111","role":"authenticated","aud":["a","b"],"n":7,"x":1.5,"nil":null}"#;
 
     #[test]
     fn test_term_and_cast_fold_to_the_sessions_value() {
@@ -553,10 +558,10 @@ mod tests {
     fn test_json_access_extracts_a_claim() {
         let ctx = context(None, &[("request.jwt.claims", known(CLAIMS))]);
         let claims = "current_setting('request.jwt.claims', true)::jsonb";
-        assert_eq!(fold_ok(&format!("{claims} ->> 'sub'"), &ctx), text("u1"));
+        assert_eq!(fold_ok(&format!("{claims} ->> 'sub'"), &ctx), text(SUB));
         assert_eq!(
             fold_ok(&format!("({claims} ->> 'sub')::uuid"), &ctx),
-            text_as("u1", "uuid")
+            text_as(SUB, "uuid")
         );
         assert_eq!(fold_ok(&format!("{claims} ->> 'n'"), &ctx), text("7"));
         assert_eq!(
@@ -596,15 +601,15 @@ mod tests {
                 ("request.jwt.claims", known(CLAIMS)),
             ],
         );
-        assert_eq!(fold_ok(body, &by_claims), text_as("u1", "uuid"));
+        assert_eq!(fold_ok(body, &by_claims), text_as(SUB, "uuid"));
         let by_claim = context(
             None,
             &[
-                ("request.jwt.claim.sub", known("u2")),
+                ("request.jwt.claim.sub", known(SUB2)),
                 ("request.jwt.claims", CustomSettingValue::Unset),
             ],
         );
-        assert_eq!(fold_ok(body, &by_claim), text_as("u2", "uuid"));
+        assert_eq!(fold_ok(body, &by_claim), text_as(SUB2, "uuid"));
         let no_token = context(
             None,
             &[
@@ -769,6 +774,41 @@ mod tests {
             query_tree_term_fragments_replace(&tree, &fragments, &values),
             Err(TermFoldError::Term(SessionTermError::ValueRejected { .. }))
         ));
+    }
+
+    /// Text the cast's type rejects (`abc` as an integer, a `sub` claim that
+    /// is no uuid) fails on origin whatever form the read takes, like text
+    /// that is not json: the fragment is unavailable and the read forwards.
+    /// A type the fold has no rule for is cast blind, as before (PGC-596).
+    #[test]
+    fn test_text_the_cast_rejects_is_unavailable() {
+        let rejected = |expr: &str, ctx: &SessionTermContext| {
+            matches!(
+                folded(expr, ctx),
+                Err(TermFoldError::Term(SessionTermError::ValueRejected { .. }))
+            )
+        };
+        let ctx = context(None, &[("app.a", known("abc"))]);
+        assert!(rejected("current_setting('app.a')::int", &ctx));
+        assert!(rejected("current_setting('app.a')::bigint", &ctx));
+        assert!(rejected("current_setting('app.a')::numeric", &ctx));
+        assert!(rejected("current_setting('app.a')::bool", &ctx));
+        assert!(rejected("current_setting('app.a')::uuid", &ctx));
+        assert!(rejected(
+            "coalesce(nullif(current_setting('app.a', true), ''), 'x')::uuid",
+            &ctx
+        ));
+        assert_eq!(
+            fold_ok("current_setting('app.a')::timestamptz", &ctx),
+            LiteralValue::StringWithCast("abc".into(), "timestamptz".into()),
+            "a type without a rule is cast blind"
+        );
+        let ctx = context(None, &[("app.a", known(" 42 "))]);
+        assert_eq!(
+            fold_ok("current_setting('app.a')::int", &ctx),
+            LiteralValue::StringWithCast(" 42 ".into(), "int4".into()),
+            "the value is kept as written, origin trims it"
+        );
     }
 
     /// A cast over a cast literal converts between types (`'007'::int::text`
