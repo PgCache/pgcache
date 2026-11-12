@@ -188,7 +188,8 @@ fn command_histogram(cmd: &QueryCommand) -> &'static Histogram {
 /// cacheable and is forwarded to origin), not faults — log at debug so
 /// swallowed-error scanners don't treat an expected forward as a fault. A
 /// table with no primary key surfaces as `UnknownTable` (PGC-135, the
-/// documented "forwarded silently" path); a query the resolver can't model
+/// documented "forwarded silently" path); a table with inheritance children
+/// as `InheritanceParent`; a query the resolver can't model
 /// (ambiguous self-join columns, USING/NATURAL qualifiers, etc.) as a
 /// `ResolveError`; a correlated subquery that can't be decorrelated as a
 /// `DecorrelateError`; a table with row-level security enabled as
@@ -202,6 +203,7 @@ fn register_failure_log(key: impl std::fmt::Display, error: &CacheError) {
         CacheError::DecorrelateError(_)
             | CacheError::ResolveError(_)
             | CacheError::UnknownTable { .. }
+            | CacheError::InheritanceParent { .. }
             | CacheError::RlsNoContext
             | CacheError::RlsRoleUnknown
             | CacheError::RlsSettingUnknown { .. }

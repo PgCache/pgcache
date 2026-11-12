@@ -89,6 +89,14 @@ unsafe fn table_emit(
             return Ok(());
         }
 
+        // ONLY leaves out the rows of the table's children; the tree has no
+        // such table reference, and dropping it would read as the plain table.
+        if !(*range_var).inh {
+            return Err(AstError::UnsupportedFeature {
+                feature: format!("ONLY {name}"),
+            });
+        }
+
         let open = builder.open(NodeKind::Table {
             schema,
             name,

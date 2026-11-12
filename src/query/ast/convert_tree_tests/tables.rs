@@ -286,3 +286,11 @@ fn test_where_nodes_in_preorder() {
     assert_eq!(columns_under(where_of(&tree)), [(None, "id")]);
     assert_eq!(multi.exprs().len(), 3);
 }
+
+#[test]
+fn test_table_only_unsupported() {
+    assert!(query_tree_parse("SELECT * FROM ONLY users").is_err());
+    assert!(query_tree_parse("SELECT * FROM a JOIN ONLY b ON a.id = b.id").is_err());
+    assert!(query_tree_parse("SELECT * FROM a WHERE id IN (SELECT id FROM ONLY b)").is_err());
+    assert!(query_tree_parse("SELECT * FROM users *").is_ok());
+}

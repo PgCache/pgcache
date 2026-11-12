@@ -428,6 +428,13 @@ impl WriterCdc {
         if change.privileges_changed {
             core.state_view.privileges.ddl_applied(core.frame_xid);
         }
+        let children: Vec<Oid> = change
+            .partitions_created
+            .iter()
+            .map(|created| created.partition)
+            .chain(change.altered_tables.iter().copied())
+            .collect();
+        self.inheritance_parents_forget(core, &children).await?;
         for created in change.partitions_created {
             core.table_partition_add(created)
                 .await
@@ -547,6 +554,40 @@ impl WriterCdc {
                 .await
                 .attach_loc("a function changed on origin")?;
             core.function_catalog_reload().await?;
+        }
+        Ok(())
+    }
+
+    /// A created or altered table may now be an inheritance child
+    /// (`INHERITS`, `ALTER TABLE … INHERIT`): a cached parent's reads lack
+    /// its rows and will not see its changes, so the parent is forgotten and
+    /// its next registration refused.
+    async fn inheritance_parents_forget(
+        &mut self,
+        core: &mut WriterCore,
+        children: &[Oid],
+    ) -> CacheResult<()> {
+        if core.cache.tables.iter().next().is_none() {
+            return Ok(());
+        }
+        for &child in children {
+            let parents = core
+                .inheritance_parents_get(child)
+                .await
+                .attach_loc("reading the parents of a created or altered table")?;
+            for parent in parents {
+                if !core.cache.tables.contains_key1(&parent) {
+                    continue;
+                }
+                info!(
+                    relation_oid = %child,
+                    cached_oid = %parent,
+                    "a cached table gained an inheritance child: evicting its queries"
+                );
+                self.cached_relation_forget(core, parent)
+                    .await
+                    .attach_loc("inheritance child added to a cached table")?;
+            }
         }
         Ok(())
     }

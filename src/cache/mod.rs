@@ -230,6 +230,14 @@ error_set! {
         },
         UnknownSchema,
         NoPrimaryKey,
+        /// The table has inheritance children: their rows are part of a
+        /// read of it but stream under their own identity, and may repeat
+        /// its primary key.
+        #[display("table {schema}.{name} has inheritance children")]
+        InheritanceParent {
+            schema: EcoString,
+            name: EcoString,
+        },
     }
 
     /// Why a read over a row-level-secured relation cannot be registered

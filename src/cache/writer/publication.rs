@@ -195,9 +195,13 @@ impl WriterCore {
     }
 }
 
+/// One entry of a publication table list. `ONLY`: without it the entry
+/// names the table's inheritance children too, which the publication was
+/// never given (a cached table has none when it is added, and one that
+/// gains a child is dropped from the list after the child exists).
 fn table_qualified(schema: &str, name: &str) -> String {
     format!(
-        "{}.{}",
+        "ONLY {}.{}",
         escape::escape_identifier(schema),
         escape::escape_identifier(name)
     )

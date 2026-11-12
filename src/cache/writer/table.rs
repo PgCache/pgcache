@@ -128,6 +128,13 @@ impl WriterCore {
             None => first.get("table_schema"),
         };
         let row_security: bool = first.get("row_security");
+        if self.inheritance_children_exist(relation_oid).await? {
+            return Err(CacheError::InheritanceParent {
+                schema: schema.into(),
+                name: table.into(),
+            }
+            .into());
+        }
 
         let mut columns: Vec<ColumnMetadata> = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -277,6 +284,40 @@ impl WriterCore {
         let rows = self
             .db_origin
             .query(direction.closure_sql(), &[&relation_oid])
+            .await
+            .map_into_report::<CacheError>()?;
+        Ok(rows.iter().map(|row| row.get::<_, Oid>(0)).collect())
+    }
+
+    /// Whether the relation has children that are not partitions: plain
+    /// table inheritance.
+    #[instrument(skip_all)]
+    async fn inheritance_children_exist(&self, relation_oid: Oid) -> CacheResult<bool> {
+        let row = self
+            .db_origin
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_inherits i \
+                 JOIN pg_class c ON c.oid = i.inhrelid \
+                 WHERE i.inhparent = $1 AND NOT c.relispartition)",
+                &[&relation_oid],
+            )
+            .await
+            .map_into_report::<CacheError>()?;
+        Ok(row.get(0))
+    }
+
+    /// The parents of an inheritance child, as origin holds them now. Empty
+    /// for a partition, a table with no parent, and a relation dropped since.
+    #[instrument(skip_all)]
+    pub(super) async fn inheritance_parents_get(&self, relation_oid: Oid) -> CacheResult<Vec<Oid>> {
+        let rows = self
+            .db_origin
+            .query(
+                "SELECT i.inhparent FROM pg_inherits i \
+                 JOIN pg_class c ON c.oid = i.inhrelid \
+                 WHERE i.inhrelid = $1 AND NOT c.relispartition",
+                &[&relation_oid],
+            )
             .await
             .map_into_report::<CacheError>()?;
         Ok(rows.iter().map(|row| row.get::<_, Oid>(0)).collect())
