@@ -405,6 +405,53 @@ fn test_where_like_cases() {
     where_cases_check(cases);
 }
 
+/// The pattern operators by the symbols `pg_get_expr` prints (a policy's
+/// spelling) convert as the keyword forms do; the regex operators and
+/// `IS [NOT] DISTINCT FROM` convert in either spelling (PGC-606).
+#[test]
+fn test_where_pattern_operator_spellings() {
+    #[rustfmt::skip]
+    let cases: Vec<(&str, &str, Option<Vec<Node>>)> = vec![
+        ("~~",           "SELECT 1 FROM t WHERE (name ~~ 'a%')",         Some(cmp(BinaryOp::Like, col("name"), text("a%")))),
+        ("!~~",          "SELECT 1 FROM t WHERE name !~~ 'a%'",          Some(cmp(BinaryOp::NotLike, col("name"), text("a%")))),
+        ("~~*",          "SELECT 1 FROM t WHERE name ~~* 'a%'",          Some(cmp(BinaryOp::ILike, col("name"), text("a%")))),
+        ("!~~*",         "SELECT 1 FROM t WHERE name !~~* 'a%'",         Some(cmp(BinaryOp::NotILike, col("name"), text("a%")))),
+        ("~",            "SELECT 1 FROM t WHERE name ~ '^a'",            Some(cmp(BinaryOp::RegexMatch, col("name"), text("^a")))),
+        ("~*",           "SELECT 1 FROM t WHERE name ~* '^a'",           Some(cmp(BinaryOp::RegexIMatch, col("name"), text("^a")))),
+        ("!~",           "SELECT 1 FROM t WHERE name !~ '^a'",           Some(cmp(BinaryOp::NotRegexMatch, col("name"), text("^a")))),
+        ("!~*",          "SELECT 1 FROM t WHERE name !~* '^a'",          Some(cmp(BinaryOp::NotRegexIMatch, col("name"), text("^a")))),
+        ("DISTINCT",     "SELECT 1 FROM t WHERE name IS DISTINCT FROM 'x'",      Some(cmp(BinaryOp::IsDistinctFrom, col("name"), text("x")))),
+        ("NOT DISTINCT", "SELECT 1 FROM t WHERE name IS NOT DISTINCT FROM NULL", Some(cmp(BinaryOp::IsNotDistinctFrom, col("name"), null()))),
+    ];
+    where_cases_check(cases);
+    for (sql, rendered) in [
+        (
+            "SELECT 1 FROM t WHERE name SIMILAR TO 'a%'",
+            "name ~ pg_catalog.SIMILAR_TO_ESCAPE('a%')",
+        ),
+        (
+            "SELECT 1 FROM t WHERE name NOT SIMILAR TO 'a%'",
+            "name !~ pg_catalog.SIMILAR_TO_ESCAPE('a%')",
+        ),
+        (
+            "SELECT 1 FROM t WHERE (name ~ similar_to_escape('a%'::text))",
+            "name ~ SIMILAR_TO_ESCAPE(('a%')::text)",
+        ),
+        (
+            "SELECT 1 FROM t WHERE name IS DISTINCT FROM 'x'",
+            "name IS DISTINCT FROM 'x'",
+        ),
+        ("SELECT 1 FROM t WHERE name !~* '^a'", "name !~* '^a'"),
+        (
+            "SELECT 1 FROM t WHERE (name ~~ 'a%'::text)",
+            "name LIKE ('a%')::text",
+        ),
+    ] {
+        let tree = parse(sql);
+        assert!(tree.sql().ends_with(rendered), "{sql} -> {}", tree.sql());
+    }
+}
+
 #[test]
 fn test_where_arithmetic_rhs_cases() {
     #[rustfmt::skip]

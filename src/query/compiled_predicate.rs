@@ -91,9 +91,16 @@ impl CompiledPredicate {
                     );
                     compare.unwrap_or(Self::ConstFalse)
                 }
-                BinaryOp::Like | BinaryOp::ILike | BinaryOp::NotLike | BinaryOp::NotILike => {
-                    Self::ConstFalse
-                }
+                BinaryOp::Like
+                | BinaryOp::ILike
+                | BinaryOp::NotLike
+                | BinaryOp::NotILike
+                | BinaryOp::RegexMatch
+                | BinaryOp::RegexIMatch
+                | BinaryOp::NotRegexMatch
+                | BinaryOp::NotRegexIMatch
+                | BinaryOp::IsDistinctFrom
+                | BinaryOp::IsNotDistinctFrom => Self::ConstFalse,
             },
             WhereKind::Unary(unary) => match unary.op() {
                 UnaryOp::Not => Self::Not(Box::new(Self::compile(bound, unary.expr(), table_name))),

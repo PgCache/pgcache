@@ -696,7 +696,16 @@ async fn pattern_policy_check(
             "{qual} after {change}"
         );
     }
-    let delta = metrics_delta(&m, &assert_cache_hit(&mut ctx, m.clone()).await?);
+    let delta = metrics_delta(&m, &ctx.metrics().await?);
+    assert_eq!(
+        delta.queries_cache_hit,
+        u64::try_from(changes.len()).unwrap_or(u64::MAX),
+        "each read after a change is a hit: {qual}\n{delta:#?}"
+    );
+    assert_eq!(
+        delta.queries_cache_miss, 0,
+        "no re-registration: {qual}\n{delta:#?}"
+    );
     assert_eq!(delta.cache_invalidations, 0, "applied in place: {qual}");
     Ok(())
 }

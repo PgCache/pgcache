@@ -382,7 +382,13 @@ impl TypedLiteral {
             | BinaryOp::Like
             | BinaryOp::ILike
             | BinaryOp::NotLike
-            | BinaryOp::NotILike => return None,
+            | BinaryOp::NotILike
+            | BinaryOp::RegexMatch
+            | BinaryOp::RegexIMatch
+            | BinaryOp::NotRegexMatch
+            | BinaryOp::NotRegexIMatch
+            | BinaryOp::IsDistinctFrom
+            | BinaryOp::IsNotDistinctFrom => return None,
         })
     }
 }

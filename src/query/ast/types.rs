@@ -310,6 +310,20 @@ pub enum BinaryOp {
     NotLike,
     #[strum(to_string = "NOT ILIKE")]
     NotILike,
+    // Regular expressions; `SIMILAR TO` arrives as `~ similar_to_escape(…)`
+    #[strum(to_string = "~")]
+    RegexMatch,
+    #[strum(to_string = "~*")]
+    RegexIMatch,
+    #[strum(to_string = "!~")]
+    NotRegexMatch,
+    #[strum(to_string = "!~*")]
+    NotRegexIMatch,
+    // Null-safe equality
+    #[strum(to_string = "IS DISTINCT FROM")]
+    IsDistinctFrom,
+    #[strum(to_string = "IS NOT DISTINCT FROM")]
+    IsNotDistinctFrom,
 }
 
 impl Deparse for BinaryOp {
@@ -353,7 +367,13 @@ impl BinaryOp {
             | BinaryOp::Like
             | BinaryOp::ILike
             | BinaryOp::NotLike
-            | BinaryOp::NotILike => None,
+            | BinaryOp::NotILike
+            | BinaryOp::RegexMatch
+            | BinaryOp::RegexIMatch
+            | BinaryOp::NotRegexMatch
+            | BinaryOp::NotRegexIMatch
+            | BinaryOp::IsDistinctFrom
+            | BinaryOp::IsNotDistinctFrom => None,
         }
     }
 }

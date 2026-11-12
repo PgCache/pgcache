@@ -133,7 +133,16 @@ pub fn where_expr_supported(bound: &ResolvedQuery, expr: Where<'_>) -> bool {
             | BinaryOp::LessThanOrEqual
             | BinaryOp::GreaterThan
             | BinaryOp::GreaterThanOrEqual => comparison_is_simple(bound, binary),
-            BinaryOp::Like | BinaryOp::ILike | BinaryOp::NotLike | BinaryOp::NotILike => false,
+            BinaryOp::Like
+            | BinaryOp::ILike
+            | BinaryOp::NotLike
+            | BinaryOp::NotILike
+            | BinaryOp::RegexMatch
+            | BinaryOp::RegexIMatch
+            | BinaryOp::NotRegexMatch
+            | BinaryOp::NotRegexIMatch
+            | BinaryOp::IsDistinctFrom
+            | BinaryOp::IsNotDistinctFrom => false,
         },
         WhereKind::Unary(unary) => where_expr_supported(bound, unary.expr()),
         WhereKind::Multi(_) | WhereKind::Subquery(_) => false,

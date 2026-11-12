@@ -316,6 +316,18 @@ unsafe fn a_expr_emit(
                 let op = like_operator_extract((*expr).name)?;
                 binary_emit(builder, expr, op, scope)
             }
+            // `a SIMILAR TO p` is `a ~ similar_to_escape(p)` by the time it is
+            // parsed; the function is a builtin the right operand carries.
+            pg::A_Expr_Kind_AEXPR_SIMILAR => {
+                let op = similar_operator_extract((*expr).name)?;
+                binary_emit(builder, expr, op, scope)
+            }
+            pg::A_Expr_Kind_AEXPR_DISTINCT => {
+                binary_emit(builder, expr, BinaryOp::IsDistinctFrom, scope)
+            }
+            pg::A_Expr_Kind_AEXPR_NOT_DISTINCT => {
+                binary_emit(builder, expr, BinaryOp::IsNotDistinctFrom, scope)
+            }
             pg::A_Expr_Kind_AEXPR_OP_ANY => {
                 let comparison = operator_extract((*expr).name)?;
                 a_expr_any_all_emit(builder, expr, MultiOp::Any { comparison }, scope)
@@ -377,8 +389,12 @@ unsafe fn a_expr_operator_emit(
         if let Some(op) = ScalarOp::from_symbol(op_name) {
             return operator_emit(builder, expr, op, scope).map_err(WhereParseError::from);
         }
-        let op =
-            binary_op_from_str(op_name).ok_or_else(|| WhereParseError::UnsupportedOperator {
+        // `pg_get_expr` spells LIKE and the regex operators by symbol, so a
+        // policy arrives here where a client's keyword form took the kinds
+        // above.
+        let op = binary_op_from_str(op_name)
+            .or_else(|| pattern_op_from_str(op_name))
+            .ok_or_else(|| WhereParseError::UnsupportedOperator {
                 operator: op_name.to_owned(),
             })?;
         binary_emit(builder, expr, op, scope)
@@ -488,6 +504,32 @@ unsafe fn like_operator_extract(name: *const pg::List) -> Result<BinaryOp, Where
             "!~~*" => Some(BinaryOp::NotILike),
             _ => None,
         })
+    }
+}
+
+unsafe fn similar_operator_extract(name: *const pg::List) -> Result<BinaryOp, WhereParseError> {
+    unsafe {
+        operator_map(name, "SIMILAR TO", |op| match op {
+            "~" => Some(BinaryOp::RegexMatch),
+            "!~" => Some(BinaryOp::NotRegexMatch),
+            _ => None,
+        })
+    }
+}
+
+/// The pattern operators by the symbol PostgreSQL stores and `pg_get_expr`
+/// prints: the LIKE family and the regular-expression family.
+fn pattern_op_from_str(op: &str) -> Option<BinaryOp> {
+    match op {
+        "~~" => Some(BinaryOp::Like),
+        "!~~" => Some(BinaryOp::NotLike),
+        "~~*" => Some(BinaryOp::ILike),
+        "!~~*" => Some(BinaryOp::NotILike),
+        "~" => Some(BinaryOp::RegexMatch),
+        "~*" => Some(BinaryOp::RegexIMatch),
+        "!~" => Some(BinaryOp::NotRegexMatch),
+        "!~*" => Some(BinaryOp::NotRegexIMatch),
+        _ => None,
     }
 }
 

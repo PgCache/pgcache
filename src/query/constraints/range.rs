@@ -298,7 +298,13 @@ fn comparison_range_build(comparisons: &[(BinaryOp, &LiteralValue)]) -> ColumnRa
             | BinaryOp::Like
             | BinaryOp::ILike
             | BinaryOp::NotLike
-            | BinaryOp::NotILike => return ColumnRange::Unknown,
+            | BinaryOp::NotILike
+            | BinaryOp::RegexMatch
+            | BinaryOp::RegexIMatch
+            | BinaryOp::NotRegexMatch
+            | BinaryOp::NotRegexIMatch
+            | BinaryOp::IsDistinctFrom
+            | BinaryOp::IsNotDistinctFrom => return ColumnRange::Unknown,
         }
     }
 

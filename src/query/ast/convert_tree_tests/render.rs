@@ -183,10 +183,7 @@ fn test_conversion_errors_name_the_construct() {
             "SELECT a AND b FROM t",
             "AND/OR/NOT expression in a column expression",
         ),
-        (
-            "SELECT a FROM t WHERE a IS DISTINCT FROM b",
-            "IS DISTINCT FROM",
-        ),
+        ("SELECT a FROM t WHERE tags && ARRAY['x']", "&&"),
     ];
     for (sql, expected) in cases {
         let err = query_tree_parse(sql).expect_err(sql).to_string();

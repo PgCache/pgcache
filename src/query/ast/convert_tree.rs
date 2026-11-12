@@ -489,7 +489,7 @@ pub(crate) mod tests {
         "SELECT a FROM t ORDER BY sum(b) OVER w",
         "SELECT sum(a) OVER (w ORDER BY b) FROM t WINDOW w AS (PARTITION BY c)",
         "SELECT a FROM t LIMIT ALL",
-        "SELECT a FROM t WHERE b ~ 'x'",
+        "SELECT a FROM t WHERE tags && ARRAY['x']",
         "SELECT a FROM t WHERE b > ANY (SELECT c FROM u)",
         "SELECT * FROM (VALUES (1 + 1)) v",
         "SELECT a FROM t GROUP BY a + 1",
