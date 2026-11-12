@@ -15,7 +15,7 @@ use super::{
     Allowlist, AllowlistEntry, BoxedError, CachePolicy, CdcSettings, ConfigError, ConfigResult,
     DEFAULT_PUBLICATION_NAME, DEFAULT_SLOT_NAME, ListenSettings, MetricsSettings, PgSettings,
     PgSettingsPartial, PreflightSettings, RunMode, Settings, SettingsToml, SslMode,
-    StaticConfigSnapshot,
+    StaticConfigSnapshot, toml_parse_error,
 };
 use crate::result::MapIntoReport;
 
@@ -494,7 +494,9 @@ fn config_read(
     };
     match read_to_string(path) {
         Ok(file) => Ok(Some(
-            toml::from_str(&file).map_into_report::<ConfigError>()?,
+            toml::from_str(&file)
+                .map_err(|e| toml_parse_error(e.message(), e.span(), &file))
+                .map_into_report::<ConfigError>()?,
         )),
         Err(e) if config_create && e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).map_into_report::<ConfigError>(),

@@ -26,12 +26,43 @@ pub use toml_file::{config_file_dynamic_extract, config_file_dynamic_update};
 error_set! {
     ConfigError := {
         ArgumentError(BoxedError),
-        TomlError(BoxedError),
+        /// The config file does not parse. Carries the parser's message and
+        /// the line, never the document: the file holds passwords, and the
+        /// toml errors render the offending line or the whole input.
+        #[display("config file: {message}")]
+        TomlParse {
+            message: String,
+        },
 
         #[display("Missing argument: {name}")]
         ArgumentMissing{ name: &'static str},
         IoError(io::Error),
     }
+}
+
+/// A config file parse error located in `content` by `span`, as the `toml`
+/// and `toml_edit` parsers report it. A missing top-level field is most
+/// often one written below a `[table]` header, which TOML reads as a key of
+/// that table, so the message says so; its span is the empty document
+/// start, which names no line.
+pub(super) fn toml_parse_error(
+    message: &str,
+    span: Option<std::ops::Range<usize>>,
+    content: &str,
+) -> ConfigError {
+    let line = span.filter(|span| span.end > 0).map(|span| {
+        content
+            .get(..span.start)
+            .map_or(1, |before| before.matches('\n').count() + 1)
+    });
+    let message = match (message.starts_with("missing field"), line) {
+        (true, _) => {
+            format!("{message} (a top-level key must come before the first [table] header)")
+        }
+        (false, Some(line)) => format!("{message} at line {line}"),
+        (false, None) => message.to_owned(),
+    };
+    ConfigError::TomlParse { message }
 }
 
 /// Concrete wrapper around an arbitrary boxed error so it satisfies the
@@ -64,12 +95,6 @@ pub type ConfigResult<T> = Result<T, Report<ConfigError>>;
 impl From<lexopt::Error> for ConfigError {
     fn from(error: lexopt::Error) -> Self {
         Self::ArgumentError(BoxedError::new(error))
-    }
-}
-
-impl From<toml::de::Error> for ConfigError {
-    fn from(error: toml::de::Error) -> Self {
-        Self::TomlError(BoxedError::new(error))
     }
 }
 

@@ -5,7 +5,10 @@ use std::path::Path;
 use rootcause::Report;
 
 use super::dynamic::DynamicConfig;
-use super::{BoxedError, CachePolicy, ConfigError, ConfigResult, DynamicConfigPatch, SettingsToml};
+use super::{
+    BoxedError, CachePolicy, ConfigError, ConfigResult, DynamicConfigPatch, SettingsToml,
+    toml_parse_error,
+};
 use crate::result::MapIntoReport;
 
 /// Extract dynamic config fields from a parsed TOML config file.
@@ -27,7 +30,9 @@ fn dynamic_config_from_toml(config: &SettingsToml) -> DynamicConfig {
 /// Read a TOML config file and extract the dynamic config fields.
 pub fn config_file_dynamic_extract(path: &Path) -> ConfigResult<DynamicConfig> {
     let content = read_to_string(path).map_into_report::<ConfigError>()?;
-    let config: SettingsToml = toml::from_str(&content).map_into_report::<ConfigError>()?;
+    let config: SettingsToml = toml::from_str(&content)
+        .map_err(|e| toml_parse_error(e.message(), e.span(), &content))
+        .map_into_report::<ConfigError>()?;
     Ok(dynamic_config_from_toml(&config))
 }
 
@@ -36,7 +41,7 @@ pub fn config_file_dynamic_update(path: &Path, patch: &DynamicConfigPatch) -> Co
     let content = read_to_string(path).map_into_report::<ConfigError>()?;
     let mut doc: toml_edit::DocumentMut = content
         .parse()
-        .map_err(|e: toml_edit::TomlError| ConfigError::TomlError(BoxedError::new(e)))
+        .map_err(|e: toml_edit::TomlError| toml_parse_error(e.message(), e.span(), &content))
         .map_into_report::<ConfigError>()?;
 
     let edits = [

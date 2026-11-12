@@ -1211,3 +1211,49 @@ fn test_population_workers_bounds_explicit_values_and_clamps() {
     assert_eq!(population_workers_bounds(16, None, Some(4)), (4, 4));
     assert_eq!(population_workers_bounds(2, None, Some(1)), (1, 1));
 }
+
+/// A config file that does not parse is reported by message and line only.
+/// The file holds passwords, and the parsers' own rendering includes the
+/// offending line (`Display`) or the whole document (`Debug`) (PGC-605).
+#[test]
+fn test_config_parse_error_never_echoes_the_file() {
+    let misplaced = "[origin]\nhost = \"h\"\nport = 5432\nuser = \"u\"\npassword = \"s3cret-value\"\n\
+                     database = \"d\"\n\n[cache]\nhost = \"h\"\nport = 5432\nuser = \"u\"\ndatabase = \"d\"\n\n\
+                     [cdc]\npublication_name = \"p\"\nslot_name = \"s\"\n\n[listen]\nsocket = \"127.0.0.1:1\"\n\n\
+                     [metrics]\nsocket = \"127.0.0.1:2\"\nnum_workers = 2\n";
+    let error = toml::from_str::<SettingsToml>(misplaced)
+        .map_err(|e| toml_parse_error(e.message(), e.span(), misplaced))
+        .expect_err("num_workers sits under [metrics]");
+    let rendered = format!("{error} / {error:?}");
+    assert!(
+        rendered.contains("missing field `num_workers`"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("before the first [table] header"),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains("at line"),
+        "a missing field names no line\n{rendered}"
+    );
+    assert!(!rendered.contains("s3cret"), "{rendered}");
+
+    let broken_password_line = "[origin]\nhost = \"h\"\npassword = \"s3cret-value\n";
+    let error = toml::from_str::<SettingsToml>(broken_password_line)
+        .map_err(|e| toml_parse_error(e.message(), e.span(), broken_password_line))
+        .expect_err("unterminated string");
+    let rendered = format!("{error} / {error:?}");
+    assert!(rendered.contains("at line 3"), "{rendered}");
+    assert!(!rendered.contains("s3cret"), "{rendered}");
+
+    let dir = std::env::temp_dir().join("pgcache_test_config_parse_error");
+    fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("broken.toml");
+    fs::write(&path, broken_password_line).expect("write test TOML");
+    let report = config_file_dynamic_extract(&path).expect_err("the file does not parse");
+    let rendered = format!("{report} / {report:?}");
+    assert!(rendered.contains("config file:"), "{rendered}");
+    assert!(!rendered.contains("s3cret"), "{rendered}");
+    fs::remove_dir_all(&dir).expect("remove temp dir");
+}
