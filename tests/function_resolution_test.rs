@@ -22,13 +22,15 @@ const ITEMS: &[&str] = &[
     "INSERT INTO items VALUES (1, 'Ann', 10), (2, 'Bob', 20), (3, NULL, 30)",
 ];
 
+// plpgsql bodies: a sql body would be inlined (PGC-579) and never reach
+// the presence check these tests are about.
 const DOUBLE_IT: &str = "CREATE FUNCTION double_it(x INTEGER) RETURNS INTEGER \
-     LANGUAGE sql IMMUTABLE AS $$ SELECT x * 2 $$";
+     LANGUAGE plpgsql IMMUTABLE AS $$ begin return x * 2; end $$";
 const TRIPLE_IT: &str = "CREATE OR REPLACE FUNCTION double_it(x INTEGER) RETURNS INTEGER \
-     LANGUAGE sql IMMUTABLE AS $$ SELECT x * 3 $$";
+     LANGUAGE plpgsql IMMUTABLE AS $$ begin return x * 3; end $$";
 const DOUBLE_READ: &str = "SELECT id FROM items WHERE double_it(n) = 20 ORDER BY id";
 const APP_DOUBLE_IT: &str = "CREATE FUNCTION app.double_it(x INTEGER) RETURNS INTEGER \
-     LANGUAGE sql IMMUTABLE AS $$ SELECT x * 2 $$";
+     LANGUAGE plpgsql IMMUTABLE AS $$ begin return x * 2; end $$";
 const SHADOW_LOWER: &str = "CREATE FUNCTION app.lower(t TEXT) RETURNS TEXT \
      LANGUAGE sql IMMUTABLE AS $$ SELECT 'shadow' $$";
 
@@ -126,11 +128,12 @@ async fn test_user_function_absent_from_the_cache_database_forwards() -> Result<
     Ok(())
 }
 
-/// A user function with no immutable overload is refused before dispatch.
+/// A user function with no immutable overload and no body to inline is
+/// refused before dispatch.
 #[tokio::test]
 async fn test_stable_user_function_in_where_is_uncacheable() -> Result<(), Error> {
     let mut ctx = setup_with(&["CREATE FUNCTION clock_n(x INTEGER) RETURNS INTEGER \
-         LANGUAGE sql STABLE AS $$ SELECT x $$"])
+         LANGUAGE plpgsql STABLE AS $$ begin return x; end $$"])
     .await?;
     let sql = "SELECT id FROM items WHERE clock_n(n) = 20";
     let before = ctx.metrics().await?;

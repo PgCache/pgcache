@@ -32,6 +32,22 @@ const ANN_TOKEN: &str = r#"{"sub":"ann","role":"authenticated","exp":1700000000}
 const ANN_TOKEN_LATER: &str = r#"{"sub":"ann","role":"authenticated","exp":1700000999}"#;
 const BOB_TOKEN: &str = r#"{"sub":"bob","role":"authenticated","exp":1700000000}"#;
 
+/// Supabase's `auth.uid()`, body as shipped: a STABLE sql function over the
+/// claims setting, inlined into the policies that call it (PGC-579).
+const AUTH_UID: &str = "CREATE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE AS $$ \
+       select coalesce( \
+         nullif(current_setting('request.jwt.claim.sub', true), ''), \
+         (nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'sub') \
+       )::uuid \
+     $$";
+const ANN_UUID_TOKEN: &str =
+    r#"{"sub":"11111111-1111-1111-1111-111111111111","role":"authenticated","exp":1700000000}"#;
+const ANN_UUID_TOKEN_LATER: &str =
+    r#"{"sub":"11111111-1111-1111-1111-111111111111","role":"authenticated","exp":1700000999}"#;
+const BOB_UUID_TOKEN: &str =
+    r#"{"sub":"22222222-2222-2222-2222-222222222222","role":"authenticated","exp":1700000000}"#;
+const UID_READ: &str = "SELECT id, body FROM uid_docs ORDER BY id";
+
 /// `public.tenant_of`: on the writer connection's search_path, so a policy
 /// calling it deparses the bare name.
 const TENANT_OF: &str = "CREATE FUNCTION public.tenant_of(id int) RETURNS int \
@@ -135,6 +151,34 @@ async fn judged_docs_setup() -> Result<TestContext, Error> {
         .simple_query(TENANT_OF)
         .await
         .map_err(Error::other)?;
+    ctx.cdc_apply_settle().await?;
+    Ok(ctx)
+}
+
+/// pgcache started over the `auth` schema and `auth.uid()`, then `uid_docs`,
+/// readable by `uid_user`, under the Supabase policy `owner = auth.uid()`.
+async fn uid_docs_setup() -> Result<TestContext, Error> {
+    let mut ctx = TestContext::setup_before_start(|origin| async move {
+        for sql in ["CREATE SCHEMA auth", AUTH_UID] {
+            origin.simple_query(sql).await.map_err(Error::other)?;
+        }
+        Ok(origin)
+    })
+    .await?;
+    for sql in [
+        "CREATE TABLE uid_docs (id int primary key, owner uuid, body text)",
+        "INSERT INTO uid_docs VALUES \
+           (1, '11111111-1111-1111-1111-111111111111', 'a'), \
+           (2, '22222222-2222-2222-2222-222222222222', 'b'), \
+           (3, '11111111-1111-1111-1111-111111111111', 'c')",
+        "CREATE ROLE uid_user LOGIN",
+        "GRANT USAGE ON SCHEMA auth TO uid_user",
+        "GRANT SELECT ON uid_docs TO uid_user",
+        "ALTER TABLE uid_docs ENABLE ROW LEVEL SECURITY",
+        "CREATE POLICY uid_policy ON uid_docs FOR SELECT USING (owner = auth.uid())",
+    ] {
+        ctx.origin_query(sql, &[]).await?;
+    }
     ctx.cdc_apply_settle().await?;
     Ok(ctx)
 }
@@ -844,6 +888,59 @@ async fn test_jwt_claim_policy_is_keyed_on_the_claim() -> Result<(), Error> {
     let served = register(&mut ctx, &bob, CLAIMED_READ).await?;
     assert_eq!(served, vec![row("2", "b")]);
     assert_eq!(served, rows(&origin_bob, CLAIMED_READ).await?);
+    Ok(())
+}
+
+/// A policy calling `auth.uid()` is inlined with the function's body and
+/// keyed on the claim the body extracts (PGC-579): a later token of the same
+/// user hits the entry, another user's token has its own, and each serves
+/// origin's rows. The body reads a claim setting beside the token that no
+/// session sets, so a session's first read is refused by the writer while
+/// the setting is probed (ADR-066: a policy's term is judged where the
+/// policy's applicability is known), and the reads after serve.
+#[tokio::test]
+async fn test_auth_uid_policy_is_inlined_and_keyed_on_the_claim() -> Result<(), Error> {
+    let mut ctx = uid_docs_setup().await?;
+    let (ann, origin_ann) = sessions_with(&ctx, "uid_user", &[&token_set(ANN_UUID_TOKEN)]).await?;
+    let served = read_until(&mut ctx, &ann, UID_READ, |delta| {
+        delta.queries_cache_hit == 1
+    })
+    .await?;
+    assert_eq!(served, vec![row("1", "a"), row("3", "c")]);
+    assert_eq!(served, rows(&origin_ann, UID_READ).await?);
+
+    let (ann_later, _) =
+        sessions_with(&ctx, "uid_user", &[&token_set(ANN_UUID_TOKEN_LATER)]).await?;
+    let before = ctx.metrics().await?;
+    let later = read_until(&mut ctx, &ann_later, UID_READ, |delta| {
+        delta.queries_cache_hit == 1
+    })
+    .await?;
+    assert_eq!(
+        later, served,
+        "a later token of the same user shares the entry"
+    );
+    let delta = metrics_delta(&before, &ctx.metrics().await?);
+    assert_eq!(
+        delta.queries_cache_miss,
+        delta.queries_privilege_forward_pending + delta.queries_rls_forward_setting_unknown,
+        "served from the entry that already existed\n{delta:#?}"
+    );
+
+    let (bob, origin_bob) = sessions_with(&ctx, "uid_user", &[&token_set(BOB_UUID_TOKEN)]).await?;
+    let before = ctx.metrics().await?;
+    let served = read_until(&mut ctx, &bob, UID_READ, |delta| {
+        delta.queries_cache_hit == 1
+    })
+    .await?;
+    assert_eq!(served, vec![row("2", "b")]);
+    assert_eq!(served, rows(&origin_bob, UID_READ).await?);
+    let delta = metrics_delta(&before, &ctx.metrics().await?);
+    assert!(
+        delta.queries_cache_miss
+            > delta.queries_privilege_forward_pending + delta.queries_rls_forward_setting_unknown,
+        "another user registers an entry of its own\n{delta:#?}"
+    );
     Ok(())
 }
 

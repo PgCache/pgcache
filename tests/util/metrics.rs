@@ -33,6 +33,9 @@ pub(crate) struct MetricsSnapshot {
     pub queries_function_forward_unknown: u64,
     pub queries_function_forward_not_on_cache: u64,
     pub queries_function_forward_not_immutable: u64,
+    /// An inlined body's function the session's search_path resolves to
+    /// another function, or not at all (PGC-579).
+    pub queries_function_forward_inlined_elsewhere: u64,
     pub cache_subsumptions: u64,
     /// Subsumptions that needed an in-set column split to cover (PGC-494).
     pub cache_subsumptions_split: u64,
@@ -185,6 +188,7 @@ const SAMPLES: &[Sample] = samples! {
     "pgcache_queries_function_forwards{reason=\"unknown\"}" => queries_function_forward_unknown,
     "pgcache_queries_function_forwards{reason=\"not_on_cache\"}" => queries_function_forward_not_on_cache,
     "pgcache_queries_function_forwards{reason=\"not_immutable\"}" => queries_function_forward_not_immutable,
+    "pgcache_queries_function_forwards{reason=\"inlined_elsewhere\"}" => queries_function_forward_inlined_elsewhere,
     "pgcache_raw_writes_recorded" => raw_writes_recorded,
     "pgcache_raw_probes" => raw_probes,
     "pgcache_raw_forwards{scope=\"table\"}" => raw_forwards_table,
