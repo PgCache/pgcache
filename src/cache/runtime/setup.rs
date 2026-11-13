@@ -30,7 +30,7 @@ use crate::cache::{
 };
 use crate::catalog::SharedFunctionCatalog;
 use crate::pg;
-use crate::pg::cdc::replication_provision;
+use crate::pg::cdc::{PgCdcError, replication_provision};
 use crate::result::error_chain_format;
 use crate::settings::Settings;
 
@@ -68,7 +68,17 @@ pub(super) fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
     // retries instead of bringing up a generation with dead CDC.
     handle
         .block_on(replication_provision(settings))
-        .map_err(|r| r.context_transform(|_| CacheError::CdcFailure))
+        .map_err(|r| {
+            // The context is collapsed below; the cause is only known here.
+            error!(
+                "provisioning replication on origin failed: {}",
+                error_chain_format(r.current_context()),
+            );
+            r.context_transform(|error| match error {
+                PgCdcError::SchemaSignal { defect } => CacheError::SchemaSignal { defect },
+                PgCdcError::IoError(_) | PgCdcError::PgError(_) => CacheError::CdcFailure,
+            })
+        })
         .attach_loc("provisioning replication on origin")?;
 
     // One origin session reads what setup needs from origin: the database

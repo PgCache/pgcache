@@ -87,6 +87,30 @@ async fn test_check_passes_on_prepared_origin() -> Result<(), Error> {
     Ok(())
 }
 
+/// A role that may not create event triggers, on an origin without them:
+/// pgcache would refuse to start, so the check fails and prints the SQL.
+#[tokio::test]
+async fn test_check_fails_without_event_triggers_for_a_plain_role() -> Result<(), Error> {
+    let (db, client) = origin_start("logical").await?;
+    client
+        .batch_execute("CREATE ROLE app LOGIN REPLICATION")
+        .await
+        .map_err(Error::other)?;
+
+    let (ok, report) = check_run(&db, &["--origin_user", "app"])?;
+    assert!(!ok, "expected exit 1:\n{report}");
+    assert!(report.contains("  FAIL  schema-change signal"), "{report}");
+    assert!(
+        report.contains("event triggers are not installed"),
+        "{report}"
+    );
+    assert!(
+        report.contains("CREATE EVENT TRIGGER pgcache_sql_drop"),
+        "{report}"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_check_reports_every_defect_on_unprepared_origin() -> Result<(), Error> {
     let (db, client) = origin_start("replica").await?;

@@ -7,6 +7,8 @@ use rootcause::Report;
 use tokio_postgres::Error;
 
 use crate::oid::{Oid, TypeOid};
+#[cfg(feature = "proxy")]
+use crate::pg::event_trigger::SignalDefect;
 use crate::query::{
     decorrelate::DecorrelateError, resolve::ResolveError, transform::AstTransformError,
 };
@@ -132,6 +134,14 @@ error_set! {
         #[cfg(feature = "proxy")]
         PgError(Error),
         CdcFailure,
+        /// Origin lacks the schema-change signal. At startup pgcache
+        /// refuses to run; found by the writer's poll, schema changes may
+        /// have gone unreported, so the cache is torn down and rebuilt.
+        #[cfg(feature = "proxy")]
+        #[display("the schema-change event triggers on origin are {defect}; `pgcache --check` prints the SQL for an administrator to run")]
+        SchemaSignal {
+            defect: SignalDefect,
+        },
         WriterFailure,
         TooManyModifiedRows,
     }

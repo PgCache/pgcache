@@ -17,7 +17,7 @@ Alternatives for partitions: rewriting a partition read into a root read plus th
 - **The writer routes a leaf's rows to every cached table whose partition tree holds the leaf.** The routes are derived from the active tables and the partition trees their metadata already carries, and rebuilt whenever either changes. A table with no partitions takes no route.
 - **Rows are carried into each target's column layout by name.** A leaf's tuples arrive in the leaf's own layout, known from its `Relation` message; a target whose columns or key the leaf's tuples do not fit is evicted and registered again from the catalog.
 - **The stream's `Relation` messages are the source of leaf layouts**, kept for the session rather than per registration, since the walsender describes a relation once.
-- **A leaf nobody announced evicts the tables above it.** A partition attached, or created where the event triggers are not installed, was not in the tree those tables were populated with.
+- **A leaf nobody announced evicts the tables above it.** An attached partition was not in the tree those tables were populated with.
 - **A truncated partition empties its own cache table in place and evicts the cached tables above it**, unless the statement truncated those as well. The per-partition truncate trigger of ADR-058 is gone.
 - **A table counts as `REPLICA IDENTITY FULL` only while every partition holding its rows is**, since old tuples are written under the leaf's identity.
 - **Inheritance parents and `ONLY` are forwarded.** A table with inheritance children is refused at registration; one that gains a child is evicted. Publication entries are named with `ONLY`.
@@ -41,7 +41,7 @@ Alternatives for partitions: rewriting a partition read into a root read plus th
 - A row in a tree cached at several levels is applied once per level.
 - Every `Relation` message is retained for the session, and one for a relation the writer does not know costs a catalog read.
 - A created or altered table costs a catalog read to learn whether it became an inheritance child.
-- Without the event triggers, a child added to a cached table by inheritance goes unnoticed: it is not in the publication, so nothing on the stream reports it.
+- A child added to a cached table by inheritance is learned of from the schema-change signal alone: it is not in the publication, so nothing else on the stream reports it.
 
 ## Implementation Notes
 Routes, layouts and column maps live in `cache/writer/stream_route.rs`; the writer consults them at command intake in `writer/cdc/dispatch.rs`, before a row enters the frame, so everything downstream sees cached-table OIDs only. The CDC processor filters on the shared stream-relation set and passes a partition a create signal announced until the writer has added it. Tests: `tests/partition_test.rs`, `tests/inheritance_test.rs`.

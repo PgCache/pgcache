@@ -8,7 +8,9 @@ use tokio_postgres::{Client, Error};
 use tracing::{debug, error};
 
 use super::connect::{config_build, config_connect, connect};
-use super::event_trigger::{event_triggers_install, event_triggers_shutdown_note};
+use super::event_trigger::{
+    SignalDefect, event_triggers_install, event_triggers_shutdown_note, event_triggers_state_load,
+};
 use crate::pg::Lsn;
 use crate::result::{MapIntoReport, ReportExt, error_chain_format};
 use crate::settings::{PgSettings, Settings};
@@ -17,6 +19,11 @@ error_set! {
     PgCdcError := {
         IoError(io::Error),
         PgError(Error),
+        /// pgcache does not run without the schema-change signal.
+        #[display("the schema-change event triggers on origin are {defect}")]
+        SchemaSignal {
+            defect: SignalDefect,
+        },
     }
 }
 
@@ -75,6 +82,13 @@ pub(crate) async fn replication_provision(settings: &Settings) -> PgCdcResult<()
         .await
         .map_into_report::<PgCdcError>()
         .attach_loc("installing schema-change event triggers")?;
+    let signal = event_triggers_state_load(&client)
+        .await
+        .map_into_report::<PgCdcError>()
+        .attach_loc("reading the schema-change event triggers")?;
+    if let Some(defect) = signal.defect() {
+        return Err(PgCdcError::SchemaSignal { defect }.into());
+    }
 
     // Check if replication slot exists
     let slot_exists = client

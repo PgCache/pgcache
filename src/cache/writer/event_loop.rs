@@ -114,12 +114,19 @@ struct WriterLoop {
     gauges_interval: Interval,
     /// The role catalog poll (PGC-548); `None` when disabled.
     role_poll_interval: Option<Interval>,
+    /// The poll of the schema-change event triggers on origin.
+    signal_poll_interval: Interval,
     /// Until the stream settles past the writer's startup position, a
     /// keepalive is requested on every tick so an idle origin does not
     /// leave cacheable reads forwarding for the walsender's own cadence;
     /// `None` once caught up.
     catchup_interval: Option<Interval>,
 }
+
+/// How often the writer checks that origin still holds the schema-change
+/// event triggers. Dropping or disabling an event trigger fires none, so
+/// nothing on the stream reports it.
+const SCHEMA_SIGNAL_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How often the writer asks the CDC thread for a keepalive while the stream
 /// has not settled past the startup position.
@@ -178,6 +185,12 @@ impl WriterLoop {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             interval
         });
+        // Provisioning verified the triggers moments ago.
+        let mut signal_poll_interval = tokio::time::interval_at(
+            Instant::now() + SCHEMA_SIGNAL_POLL_INTERVAL,
+            SCHEMA_SIGNAL_POLL_INTERVAL,
+        );
+        signal_poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut catchup_interval = tokio::time::interval(STARTUP_CATCHUP_NUDGE_INTERVAL);
         catchup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -201,6 +214,7 @@ impl WriterLoop {
             cancel,
             gauges_interval,
             role_poll_interval,
+            signal_poll_interval,
             catchup_interval: Some(catchup_interval),
         })
     }
@@ -218,6 +232,17 @@ impl WriterLoop {
                 }
                 () = interval_tick(&mut self.role_poll_interval) => {
                     self.core.roles_poll().await;
+                    LoopStep::Continue
+                }
+                _ = self.signal_poll_interval.tick() => {
+                    // Propagate: schema changes may have gone unreported, so
+                    // the cache is rebuilt from a clean reset.
+                    self.core.schema_signal_poll().await.inspect_err(|e| {
+                        error!(
+                            "schema-change signal lost, resetting cache: {}",
+                            error_chain_format(e.current_context()),
+                        );
+                    })?;
                     LoopStep::Continue
                 }
                 () = interval_tick(&mut self.catchup_interval) => {

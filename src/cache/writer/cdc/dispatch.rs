@@ -432,9 +432,8 @@ impl WriterCdc {
         if cached {
             return Ok(false);
         }
-        // A partition no create signal announced (attached, or the event
-        // triggers are not installed): the cached tables above it were
-        // populated without it in their tree.
+        // A partition no create signal announced (attached): the cached
+        // tables above it were populated without it in their tree.
         let ancestors = core
             .query_table_ancestors_get(stream_oid)
             .await

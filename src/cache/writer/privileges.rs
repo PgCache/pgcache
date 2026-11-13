@@ -19,6 +19,7 @@ use crate::cache::privileges::{
 };
 use crate::cache::{CacheError, CacheResult, Report};
 use crate::oid::Oid;
+use crate::pg::event_trigger::event_triggers_state_load;
 use crate::query::resolve::PrivilegeNeeds;
 use crate::result::{MapIntoReport, ReportExt};
 
@@ -114,6 +115,21 @@ impl WriterCore {
         // to a role, and so which inlined form its reads resolve to.
         self.rls_aliases_clear();
         crate::metrics::handles().cache.role_changes.increment(1);
+    }
+
+    /// One poll of the schema-change event triggers. A signal that is gone,
+    /// disabled or another version's fails the writer, and so does a poll
+    /// that cannot be read: an unobservable interval may hide a schema
+    /// change as well as a lost one does.
+    pub(super) async fn schema_signal_poll(&self) -> CacheResult<()> {
+        let state = event_triggers_state_load(&self.db_origin)
+            .await
+            .map_into_report::<CacheError>()
+            .attach_loc("polling the schema-change event triggers")?;
+        match state.defect() {
+            Some(defect) => Err(CacheError::SchemaSignal { defect }.into()),
+            None => Ok(()),
+        }
     }
 
     /// Fetch the verdicts `role` lacks for `needs`, if any, before the

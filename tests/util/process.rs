@@ -430,7 +430,7 @@ fn pipe_drain<R: Read + Send + 'static>(pipe: Option<R>) -> JoinHandle<Vec<u8>> 
 
 /// Connect to pgcache with extra CLI args appended after the default
 /// `--cache_policy fifo` (e.g. per-test gate thresholds).
-pub(super) async fn connect_pgcache_args(
+pub(crate) async fn connect_pgcache_args(
     dbs: &TempDBs,
     extra_args: &[&str],
 ) -> Result<(PgCacheProcess, u16, u16, Client), Error> {

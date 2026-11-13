@@ -6,6 +6,8 @@ Accepted
 ## Context
 *Partition handling amended by ADR-070: the publication no longer runs under `publish_via_partition_root`, so the stream reports a partition's truncate itself and the per-partition trigger is gone.*
 
+*Amended: the signal is a requirement, not an option. The install script records its version on origin; pgcache refuses to start unless both triggers fire at the version its binary carries, and the writer polls for the same while running, tearing the cache down when the signal is gone so the supervisor (ADR-034) rebuilds it from a clean reset. While it is down every read is forwarded.*
+
 pgcache learns a table's shape once, at registration, and afterwards relies on the replication stream to tell it about changes. pgoutput's only schema signal is the `Relation` message, which it resends lazily, just before the relation's next row change. So an `ALTER TABLE` with no following write is invisible, `DROP TABLE` is invisible forever (PGC-71), and attaching a non-empty partition under `publish_via_partition_root` never streams the partition's existing rows (PGC-70). The same blind spot covers policies, grants and views, which the RLS and privilege work (PGC-113, PGC-463) will need.
 
 An earlier design (PGC-233) proposed a control table in the publication that origin-side triggers would write to, so the change rode the stream as an ordinary row. It needs an origin table, and a row-level trigger per change.
@@ -36,9 +38,9 @@ Two event triggers on origin, on `ddl_command_end` and `sql_drop`, emit each com
 ### Positive
 - `DROP TABLE`, a quiet `ALTER TABLE`, partition attach/detach, and a partition's truncate or drop now invalidate at the right point in the stream.
 - The same channel carries policy, grant and view objects for later consumers. View objects already have one: any change to a view reloads the write-alias lists the read-after-write gate matches on (ADR-048). Policy and grant objects are parsed and ignored.
-- Degrades gracefully: no triggers, no change in behaviour, and preflight says so.
 
 ### Negative
+- pgcache does not start on an origin where neither it nor an administrator has installed the triggers, and a schema change made between the loss of a trigger and the writer's next poll can still be served stale.
 - Every DDL in the database, cached or not, now produces a row-less frame in the writer. DDL is rare and the frame is cheap, but a migration storm is visible as frames.
 - A DDL whose message arrives after a query has already registered on the post-DDL catalog is evicted needlessly. Correct, but one wasted repopulation per such race.
 - Creating event triggers needs a superuser or the managed-PG master role, so for most deployments the install is an admin step.

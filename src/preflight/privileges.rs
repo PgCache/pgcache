@@ -206,31 +206,24 @@ pub(super) async fn schema_signal_check(
     }
 }
 
-/// Without the event triggers pgcache still runs, but learns of `ALTER TABLE`,
-/// `DROP TABLE` and partition attach/detach on a cached table only from the
-/// next write to it: a warning, not a failure.
+/// pgcache refuses to start without the event triggers at its own version:
+/// nothing else reports `DROP TABLE`, a quiet `ALTER TABLE` or a partition
+/// attach/detach on a cached table. A superuser installs them at startup.
 fn schema_signal_evaluate(
     state: EventTriggerState,
     superuser: bool,
     environment: Environment,
 ) -> CheckResult {
     let name = "schema-change signal";
-    if state.installed() {
+    let Some(defect) = state.defect() else {
         return CheckResult::pass(name, "event triggers are installed");
-    }
+    };
     if superuser {
         return CheckResult::pass(name, "event triggers will be installed at startup");
     }
-    let finding = if state.any_present() {
-        "event triggers are incomplete or disabled; schema changes on cached tables are \
-         observed only at the next write to the table"
-    } else {
-        "event triggers are not installed; schema changes on cached tables are observed \
-         only at the next write to the table"
-    };
-    CheckResult::warn(
+    CheckResult::fail(
         name,
-        finding,
+        format!("event triggers are {defect}; pgcache will not start without them"),
         format!("{}\n{}", admin_role_hint(environment), INSTALL_SQL.trim()),
     )
 }
@@ -292,12 +285,12 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_signal_evaluate_warns_with_install_sql_unless_superuser() {
-        use crate::pg::event_trigger::TriggerPresence;
+    fn test_schema_signal_evaluate_fails_with_install_sql_unless_superuser() {
+        use crate::pg::event_trigger::{SIGNAL_VERSION, TriggerPresence};
 
         let missing = EventTriggerState::default();
         let result = schema_signal_evaluate(missing, false, Environment::Rds);
-        assert_eq!(result.verdict, Verdict::Warn);
+        assert_eq!(result.verdict, Verdict::Fail);
         let remediation = result.remediation.expect("install sql");
         assert!(remediation.starts_with("Run as the master user:"));
         assert!(remediation.contains("CREATE EVENT TRIGGER pgcache_sql_drop"));
@@ -309,14 +302,24 @@ mod tests {
         let half = EventTriggerState {
             ddl_command_end: TriggerPresence::Enabled,
             sql_drop: TriggerPresence::Disabled,
+            version: Some(SIGNAL_VERSION),
         };
         assert_eq!(
             schema_signal_evaluate(half, false, Environment::SelfHosted).verdict,
-            Verdict::Warn
+            Verdict::Fail
         );
-        let installed = EventTriggerState {
+        let stale = EventTriggerState {
             ddl_command_end: TriggerPresence::Enabled,
             sql_drop: TriggerPresence::Enabled,
+            version: None,
+        };
+        assert_eq!(
+            schema_signal_evaluate(stale, false, Environment::SelfHosted).verdict,
+            Verdict::Fail
+        );
+        let installed = EventTriggerState {
+            version: Some(SIGNAL_VERSION),
+            ..stale
         };
         assert_eq!(
             schema_signal_evaluate(installed, false, Environment::SelfHosted).verdict,
