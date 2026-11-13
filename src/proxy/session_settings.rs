@@ -111,6 +111,12 @@ impl SettingState {
     /// a block is also the block's, while the session value is left to a
     /// probe after the block, since a rollback would undo it.
     fn value_set(&mut self, value: EcoString, local: bool, in_block: bool, seq: u64) {
+        if local {
+            self.placeholder_define(seq);
+            if !in_block {
+                return;
+            }
+        }
         if local || in_block {
             self.block = Some(SettingValue::Known(value.clone()));
             self.block_since = seq;
@@ -128,6 +134,15 @@ impl SettingState {
     fn session_unknown_mark(&mut self, seq: u64) {
         self.session = SettingValue::Unknown;
         self.session_since = seq;
+    }
+
+    /// A block-scoped change defines a custom setting the session had no
+    /// value for: origin reads it as the empty string from then on, after the
+    /// block too, not as absent. The probe samples it rather than assume so.
+    fn placeholder_define(&mut self, seq: u64) {
+        if !matches!(self.session, SettingValue::Known(_)) {
+            self.session_unknown_mark(seq);
+        }
     }
 
     /// No block value to track means nothing to mark: a block-scoped change
@@ -149,6 +164,12 @@ impl SettingState {
     fn effect_mark(&mut self, local: bool, in_block: bool, seq: u64) {
         if self.reported {
             return;
+        }
+        if local {
+            self.placeholder_define(seq);
+            if !in_block {
+                return;
+            }
         }
         if local || in_block {
             self.block_unknown_mark(seq);
@@ -637,17 +658,12 @@ impl SessionSettings {
 
     /// Forwarded statements changed custom settings (`SET app.x`,
     /// `set_config('app.x', …)`, `RESET app.x`). A literal value is known at
-    /// once; anything else is unknown until probed.
+    /// once; anything else is unknown until probed. A block-scoped change
+    /// outside a block changes no value, but defines the setting all the same.
     pub(crate) fn custom_effects_apply(&mut self, effects: &[CustomSettingEffect], in_block: bool) {
-        if effects.iter().all(|effect| effect.local && !in_block) {
-            return;
-        }
         self.mutation_seq += 1;
         let seq = self.mutation_seq;
         for effect in effects {
-            if effect.local && !in_block {
-                continue;
-            }
             let state = self
                 .custom
                 .entry(effect.name.clone())
@@ -1413,5 +1429,82 @@ mod tests {
         assert_eq!(resolved(&settings), vec!["bob", "public"]);
         settings.block_exit();
         assert_eq!(resolved(&settings), vec!["alice", "public"]);
+    }
+
+    /// A block-scoped set of a custom setting the session had no value for
+    /// defines it: after the block, and after a `SET LOCAL` outside one,
+    /// origin reads the empty string where it read NULL, so the session value
+    /// is left to a probe. A session value already known is not touched.
+    #[test]
+    fn test_local_set_of_an_absent_custom_setting_is_probed_after() {
+        let tenant = EcoString::from("app.tenant");
+        let absent = |settings: &mut SessionSettings| {
+            settings.custom_require(std::slice::from_ref(&tenant));
+            let mut columns = sample("public");
+            columns.push(None);
+            settings.probe_sql();
+            settings.probe_apply(&columns, TransactionStatus::Idle, settings.probe_seq());
+        };
+        let value_at = |settings: &SessionSettings, in_block: bool| {
+            settings
+                .session_term_context(std::slice::from_ref(&tenant), in_block)
+                .settings
+                .remove(0)
+                .1
+        };
+        let set_local = CustomSettingEffect {
+            name: tenant.clone(),
+            value: Some("acme".into()),
+            parameter: None,
+            local: true,
+        };
+
+        let mut settings = all_known(TransactionStatus::Idle);
+        absent(&mut settings);
+        assert_eq!(value_at(&settings, false), CustomSettingValue::Unset);
+        settings.custom_effects_apply(std::slice::from_ref(&set_local), true);
+        assert_eq!(
+            value_at(&settings, true),
+            CustomSettingValue::Known("acme".into())
+        );
+        settings.block_exit();
+        assert_eq!(value_at(&settings, false), CustomSettingValue::Unknown);
+        assert!(settings.probe_needed(false));
+        let mut columns = sample("public");
+        columns.push(Some("".into()));
+        settings.probe_apply(&columns, TransactionStatus::Idle, settings.probe_seq());
+        assert_eq!(
+            value_at(&settings, false),
+            CustomSettingValue::Known("".into())
+        );
+
+        let mut settings = all_known(TransactionStatus::Idle);
+        absent(&mut settings);
+        settings.custom_effects_apply(std::slice::from_ref(&set_local), false);
+        assert_eq!(
+            value_at(&settings, false),
+            CustomSettingValue::Unknown,
+            "outside a block"
+        );
+        assert!(settings.probe_needed(false));
+
+        let mut settings = all_known(TransactionStatus::Idle);
+        settings.custom_effects_apply(
+            &[CustomSettingEffect {
+                name: tenant.clone(),
+                value: Some("7".into()),
+                parameter: None,
+                local: false,
+            }],
+            false,
+        );
+        settings.custom_effects_apply(std::slice::from_ref(&set_local), true);
+        settings.block_exit();
+        assert_eq!(
+            value_at(&settings, false),
+            CustomSettingValue::Known("7".into()),
+            "a known session value stays"
+        );
+        assert!(!settings.probe_needed(false));
     }
 }

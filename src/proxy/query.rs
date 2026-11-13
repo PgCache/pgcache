@@ -7,7 +7,9 @@ use super::ParseError;
 use super::cacheability_memo::{CacheabilityCache, SqlTextHash};
 use super::explain::{ExplainSpec, explain_spec_extract};
 use crate::{
-    cache::query::{CacheableQuery, query_tree_has_volatile_function_except},
+    cache::query::{
+        CacheableQuery, query_tree_has_user_function, query_tree_has_volatile_function_except,
+    },
     catalog::{FunctionCatalog, schema_is_builtin},
     query::ast::rope::{Function, NodeKind, QueryTree, View},
     query::ast::{AstError, LiteralValue, RawStatement, statement_convert_raw},
@@ -216,6 +218,9 @@ pub(super) fn analyze(
     // A SELECT whose `set_config` calls all name their setting is tracked by
     // those names; such a call is then no write (it changes no table).
     let mut set_config_tracked = false;
+    // An uncacheable SELECT whose volatile calls are all PostgreSQL's own
+    // (`now()`, `nextval()`) runs no user code.
+    let mut builtin_volatile_only = false;
 
     let mut action = match convert_result {
         Ok(RawStatement::Select {
@@ -254,6 +259,8 @@ pub(super) fn analyze(
                             function_catalog,
                             exempt,
                         ) {
+                            builtin_volatile_only =
+                                !query_tree_has_user_function(&query, function_catalog);
                             StatementEffects::write(WriteClass::Connection, isolation)
                         } else {
                             StatementEffects::read_only(isolation, None)
@@ -320,6 +327,15 @@ pub(super) fn analyze(
         }
     };
     if let Action::Forward(_, effects) = &mut action {
+        // A write the proxy cannot attribute to tables (CALL, DO, a user's
+        // volatile function, a batch, DDL) may run code that changes the
+        // session's settings or role, and nothing in the statement text says so.
+        if matches!(effects.write, Some(WriteClass::Connection)) && !builtin_volatile_only {
+            effects.settings = SettingsEffect::all();
+            if effects.isolation == IsolationEffect::None {
+                effects.isolation = IsolationEffect::SessionUnknown;
+            }
+        }
         effects.settings = effects.settings.union(settings);
         effects.custom_settings.extend(custom_settings);
     }
@@ -548,10 +564,18 @@ mod tests {
     }
 
     fn settings_of(sql: &str) -> SettingsEffect {
-        match analyze_fresh(sql, &empty_catalog()) {
+        match analyze_fresh(sql, &now_catalog()) {
             Action::Forward(_, effects) => effects.settings,
             _ => panic!("expected a forward for {sql:?}"),
         }
+    }
+
+    /// A catalog knowing `now()` as the volatile builtin it is.
+    fn now_catalog() -> Arc<FunctionCatalog> {
+        Arc::new(FunctionCatalog::test_builtins([(
+            "now",
+            FunctionVolatility::Volatile,
+        )]))
     }
 
     /// PGC-287: a literal `set_config` names the setting it changes and its
@@ -783,5 +807,51 @@ mod tests {
             Action::CacheCheck(_) => "CacheCheck",
             Action::Explain(_) => "Explain",
         }
+    }
+
+    /// A write the proxy cannot attribute to tables may run code that changes
+    /// the session's settings or role, so it leaves every tracked setting to
+    /// the probe: a volatile function, `DO`, `CALL`, a batch, DDL. A
+    /// table-scoped write does not.
+    #[test]
+    fn test_analyze_connection_writes_leave_every_setting_unknown() {
+        let fv = now_catalog();
+        for sql in [
+            "SELECT app_login(2)",
+            "SELECT app.login(2)",
+            "SELECT now(), app_login(2)",
+            "DO $$ BEGIN PERFORM become('bob'); END $$",
+            "CALL login(2)",
+            "SELECT 1; SET ROLE bob",
+            "CREATE TABLE t (id int)",
+        ] {
+            let Action::Forward(_, effects) = analyze_fresh(sql, &fv) else {
+                panic!("{sql:?} is forwarded");
+            };
+            assert!(
+                matches!(effects.write, Some(WriteClass::Connection)),
+                "for {sql:?}"
+            );
+            assert!(effects.settings.all, "for {sql:?}");
+            assert!(effects.settings.touches(Guc::Role), "for {sql:?}");
+            assert_eq!(
+                effects.isolation,
+                IsolationEffect::SessionUnknown,
+                "for {sql:?}"
+            );
+        }
+        let Action::Forward(_, effects) = analyze_fresh("INSERT INTO t (a) VALUES (1)", &fv) else {
+            panic!("a write is forwarded");
+        };
+        assert!(effects.write.is_some());
+        assert!(!effects.settings.all, "a table-scoped write");
+        let Action::Forward(_, effects) = analyze_fresh("SELECT now()", &fv) else {
+            panic!("a volatile builtin is forwarded");
+        };
+        assert!(matches!(effects.write, Some(WriteClass::Connection)));
+        assert!(
+            !effects.settings.all,
+            "a volatile builtin runs no user code"
+        );
     }
 }

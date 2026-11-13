@@ -432,6 +432,20 @@ impl FunctionCatalog {
     pub fn name_worst_volatility(&self, name: &str) -> Option<FunctionVolatility> {
         self.named(name).map(|row| row.volatility).max()
     }
+
+    /// Whether a call of `name` may run code that is not PostgreSQL's own: a
+    /// schema other than `pg_catalog`, an overload that is no builtin, or a
+    /// name this catalog does not know.
+    pub fn call_may_run_user_code(&self, schema: Option<&str>, name: &str) -> bool {
+        if !schema_is_builtin(schema) {
+            return true;
+        }
+        if is_sql_form(name) {
+            return false;
+        }
+        let mut rows = self.named(name).peekable();
+        rows.peek().is_none() || rows.any(|row| !row.oid.is_builtin())
+    }
 }
 
 /// Whether a call's schema names PostgreSQL's own functions: unqualified

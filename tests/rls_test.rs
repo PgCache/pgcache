@@ -951,39 +951,6 @@ async fn test_enabling_rls_evicts_cached_queries() -> Result<(), Error> {
     Ok(())
 }
 
-/// Without the schema-change signal, enabling row-level security reaches
-/// pgcache through the re-sent Relation message of the next write, which
-/// evicts the table's queries.
-#[tokio::test]
-async fn test_enabling_rls_without_signal_evicts_on_next_write() -> Result<(), Error> {
-    let mut ctx = TestContext::setup().await?;
-    for trigger in ["pgcache_ddl_command_end", "pgcache_sql_drop"] {
-        ctx.origin_query(&format!("DROP EVENT TRIGGER {trigger}"), &[])
-            .await?;
-    }
-    for sql in [
-        "CREATE TABLE plain_docs (id int primary key, body text)",
-        "INSERT INTO plain_docs VALUES (1, 'a')",
-    ] {
-        ctx.origin_query(sql, &[]).await?;
-    }
-    ctx.cache_settle().await?;
-    let sql = "SELECT id, body FROM plain_docs WHERE id = 1";
-    query_warm(&mut ctx, sql).await?;
-
-    for change in [
-        "ALTER TABLE plain_docs ENABLE ROW LEVEL SECURITY",
-        "UPDATE plain_docs SET body = 'a' WHERE id = 1",
-    ] {
-        ctx.origin_query(change, &[]).await?;
-    }
-    ctx.cdc_apply_settle().await?;
-    let superuser = ctx.proxy_client_connect().await?;
-    let served = register(&mut ctx, &superuser, sql).await?;
-    assert_eq!(served, vec![row("1", "a")]);
-    Ok(())
-}
-
 /// A policy's subquery may alias its own table like the client aliases the
 /// secured one. The inlined predicate must still correlate to the client's
 /// table, not to the policy's: with the alias captured, the membership
@@ -1381,5 +1348,343 @@ async fn test_unfoldable_policy_fragment_substitutes_its_term() -> Result<(), Er
         "nullif gives NULL"
     );
     assert_eq!(served, rows(&origin, NULLED_READ).await?);
+    Ok(())
+}
+
+const DEFAULTED_READ: &str = "SELECT id, body FROM defaulted_docs ORDER BY id";
+
+/// `defaulted_docs`, readable by `defaulted_user`, under a policy that falls
+/// back to the `public` tenant while `app.tenant_name` is absent: the shape
+/// that tells an absent setting from an empty one.
+async fn defaulted_docs_create(ctx: &mut TestContext) -> Result<(), Error> {
+    for sql in [
+        "CREATE TABLE defaulted_docs (id int primary key, tenant text, body text)",
+        "INSERT INTO defaulted_docs VALUES (1, 'public', 'p'), (2, 'acme', 'a')",
+        "CREATE ROLE defaulted_user LOGIN",
+        "GRANT SELECT ON defaulted_docs TO defaulted_user",
+        "ALTER TABLE defaulted_docs ENABLE ROW LEVEL SECURITY",
+        "CREATE POLICY defaulted_policy ON defaulted_docs FOR SELECT \
+         USING (tenant = coalesce(current_setting('app.tenant_name', true), 'public'))",
+    ] {
+        ctx.origin_query(sql, &[]).await?;
+    }
+    ctx.cdc_apply_settle().await
+}
+
+/// A function whose body switches the tenant with `set_config`: the client
+/// statement names no setting.
+const APP_LOGIN: &str = "CREATE FUNCTION app_login(t int) RETURNS text LANGUAGE sql VOLATILE \
+     AS $$ SELECT set_config('app.tenant_id', $1::text, false) $$";
+
+/// Read `sql` through `client` until a read is a cache hit, however many
+/// forwards (a probe, a verdict) and the registration come first, and return
+/// what the hit served.
+async fn hit_eventually(ctx: &mut TestContext, client: &Client, sql: &str) -> Result<Rows, Error> {
+    read_until(ctx, client, sql, |delta| delta.queries_cache_hit == 1).await
+}
+
+/// Run `sql` on both sessions.
+async fn both_run(proxied: &Client, origin: &Client, sql: &str) -> Result<(), Error> {
+    for client in [proxied, origin] {
+        client.simple_query(sql).await.map_err(Error::other)?;
+    }
+    Ok(())
+}
+
+/// The tenant switched by a server-side function calling `set_config`: the
+/// next read is keyed on the new tenant, as origin reads it.
+#[tokio::test]
+async fn test_tenant_set_by_a_function_is_tracked() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    tenant_docs_create(&mut ctx).await?;
+    ctx.origin_query(APP_LOGIN, &[]).await?;
+    ctx.cdc_apply_settle().await?;
+    let (user, origin) = sessions_as(&ctx, "tenant_user", Some("1")).await?;
+    let served = hit_eventually(&mut ctx, &user, TENANT_READ).await?;
+    assert_eq!(served, vec![row("1", "a"), row("3", "c")]);
+
+    both_run(&user, &origin, "SELECT app_login(2)").await?;
+    let expected = rows(&origin, TENANT_READ).await?;
+    assert_eq!(expected, vec![row("2", "b")], "origin reads as tenant 2");
+    let served = rows(&user, TENANT_READ).await?;
+    assert_eq!(served, expected, "pgcache reads as tenant 2 like origin");
+    Ok(())
+}
+
+/// As above with the read-after-write gate on, as in production: the first
+/// read after the call may forward for the write; the cache hit that
+/// follows is the new tenant's.
+#[cfg(feature = "fault-injection")]
+#[tokio::test]
+async fn test_tenant_set_by_a_function_is_tracked_under_the_write_gate() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&[("PGCACHE_FAULT_READ_YOUR_WRITES_OFF", "0")]).await?;
+    tenant_docs_create(&mut ctx).await?;
+    ctx.origin_query(APP_LOGIN, &[]).await?;
+    ctx.cdc_apply_settle().await?;
+    let (user, origin) = sessions_as(&ctx, "tenant_user", Some("1")).await?;
+    let served = hit_eventually(&mut ctx, &user, TENANT_READ).await?;
+    assert_eq!(served, vec![row("1", "a"), row("3", "c")]);
+
+    both_run(&user, &origin, "SELECT app_login(2)").await?;
+    let expected = rows(&origin, TENANT_READ).await?;
+    let served = hit_eventually(&mut ctx, &user, TENANT_READ).await?;
+    assert_eq!(
+        served, expected,
+        "the first cache hit after the call is tenant 2's"
+    );
+    Ok(())
+}
+
+/// The role switched by a plpgsql function (`EXECUTE 'SET ROLE …'`): `role`
+/// is not a reported setting, and the statement names none, yet the next
+/// read is keyed on the new role.
+#[tokio::test]
+async fn test_role_set_by_a_function_is_tracked() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    owned_docs_create(&mut ctx).await?;
+    let before = ctx.metrics().await?;
+    for sql in [
+        "GRANT bob TO alice",
+        "CREATE FUNCTION become(r text) RETURNS void LANGUAGE plpgsql \
+         AS $$ BEGIN EXECUTE 'SET ROLE ' || quote_ident(r); END $$",
+    ] {
+        ctx.origin_query(sql, &[]).await?;
+    }
+    role_change_wait(&mut ctx, &before).await?;
+    let (user, origin) = sessions_as(&ctx, "alice", None).await?;
+    let served = hit_eventually(&mut ctx, &user, OWNED_READ).await?;
+    assert_eq!(served, vec![row("1", "a1"), row("3", "a2")]);
+
+    both_run(&user, &origin, "SELECT become('bob')").await?;
+    let expected = rows(&origin, OWNED_READ).await?;
+    assert_eq!(expected, vec![row("2", "b1")], "origin reads as bob");
+    let served = rows(&user, OWNED_READ).await?;
+    assert_eq!(served, expected, "pgcache reads as bob like origin");
+    Ok(())
+}
+
+/// `SET LOCAL` of a setting the session never had defines it at origin: after
+/// the block `current_setting(name, true)` is the empty string, not NULL, and
+/// a policy defaulting the absent setting no longer applies its default.
+#[tokio::test]
+async fn test_set_local_of_an_absent_setting_leaves_origins_placeholder() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    defaulted_docs_create(&mut ctx).await?;
+    let (user, origin) = sessions_as(&ctx, "defaulted_user", None).await?;
+    let served = hit_eventually(&mut ctx, &user, DEFAULTED_READ).await?;
+    assert_eq!(served, rows(&origin, DEFAULTED_READ).await?);
+    assert_eq!(
+        served,
+        vec![row("1", "p")],
+        "the default tenant while absent"
+    );
+
+    for sql in ["BEGIN", "SET LOCAL app.tenant_name = 'acme'", "COMMIT"] {
+        both_run(&user, &origin, sql).await?;
+    }
+    let expected = rows(&origin, DEFAULTED_READ).await?;
+    assert_eq!(
+        expected,
+        Rows::new(),
+        "origin compares against the empty placeholder"
+    );
+    let served = rows(&user, DEFAULTED_READ).await?;
+    assert_eq!(served, expected, "pgcache matches origin after the block");
+    Ok(())
+}
+
+/// `SET LOCAL` outside a block (a warning at origin, no effect on the value)
+/// defines the placeholder all the same.
+#[tokio::test]
+async fn test_set_local_outside_a_block_leaves_origins_placeholder() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    defaulted_docs_create(&mut ctx).await?;
+    let (user, origin) = sessions_as(&ctx, "defaulted_user", None).await?;
+    let served = hit_eventually(&mut ctx, &user, DEFAULTED_READ).await?;
+    assert_eq!(served, vec![row("1", "p")]);
+
+    both_run(&user, &origin, "SET LOCAL app.tenant_name = 'acme'").await?;
+    let expected = rows(&origin, DEFAULTED_READ).await?;
+    assert_eq!(
+        expected,
+        Rows::new(),
+        "origin compares against the empty placeholder"
+    );
+    let served = rows(&user, DEFAULTED_READ).await?;
+    assert_eq!(
+        served, expected,
+        "pgcache matches origin after the statement"
+    );
+    Ok(())
+}
+
+/// Ownership is checked through role membership at origin: a member of the
+/// owning role is exempt from the table's policies and reads every row.
+#[tokio::test]
+async fn test_owner_through_membership_is_exempt() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    tenant_docs_create(&mut ctx).await?;
+    for sql in [
+        "CREATE ROLE docs_owners",
+        "CREATE ROLE owner_member LOGIN IN ROLE docs_owners",
+        "ALTER TABLE tenant_docs OWNER TO docs_owners",
+    ] {
+        ctx.origin_query(sql, &[]).await?;
+    }
+    ctx.cdc_apply_settle().await?;
+    let (user, origin) = sessions_as(&ctx, "owner_member", Some("1")).await?;
+    let expected = rows(&origin, TENANT_READ).await?;
+    assert_eq!(expected, vec![row("1", "a"), row("2", "b"), row("3", "c")]);
+    let served = hit_eventually(&mut ctx, &user, TENANT_READ).await?;
+    assert_eq!(served, expected, "pgcache exempts the member like origin");
+    Ok(())
+}
+
+/// A policy created while the schema-change signal is gone is unreported;
+/// the writer's poll finds the signal missing and tears the cache down, and
+/// the rebuilt cache (its triggers reinstalled) reads under the new policy.
+#[tokio::test]
+async fn test_policy_change_while_the_signal_is_lost_is_honoured_after_the_rebuild()
+-> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    tenant_docs_create(&mut ctx).await?;
+    let (user, origin) = sessions_as(&ctx, "tenant_user", Some("1")).await?;
+    let served = hit_eventually(&mut ctx, &user, TENANT_READ).await?;
+    assert_eq!(served, vec![row("1", "a"), row("3", "c")]);
+
+    for sql in [
+        "DROP EVENT TRIGGER pgcache_ddl_command_end",
+        "DROP EVENT TRIGGER pgcache_sql_drop",
+        "CREATE POLICY deny_all ON tenant_docs AS RESTRICTIVE FOR SELECT USING (false)",
+        "UPDATE tenant_docs SET body = body WHERE id = 1",
+    ] {
+        ctx.origin_query(sql, &[]).await?;
+    }
+    let expected = rows(&origin, TENANT_READ).await?;
+    assert_eq!(expected, Rows::new(), "origin denies everything");
+
+    let mut restarted = false;
+    for _ in 0..120 {
+        if ctx.metrics().await?.cache_restarts_total > 0 {
+            restarted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(restarted, "the poll tears the cache down");
+    let served = rows(&user, TENANT_READ).await?;
+    assert_eq!(served, expected, "pgcache denies everything like origin");
+    let served = hit_eventually(&mut ctx, &user, TENANT_READ).await?;
+    assert_eq!(served, expected, "and so does the rebuilt cache's entry");
+    Ok(())
+}
+
+/// pgcache connected to origin as `caretaker`, a superuser of the test's
+/// making, so the test can take its attributes away. The bootstrap superuser
+/// cannot lose `SUPERUSER`.
+async fn pgcache_as_caretaker(extra_args: &[&str]) -> Result<TestContext, Error> {
+    let mut args = vec!["--origin_user", "caretaker"];
+    args.extend_from_slice(extra_args);
+    TestContext::setup_before_start_with_args(
+        |origin| async move {
+            origin
+                .simple_query("CREATE ROLE caretaker SUPERUSER LOGIN")
+                .await
+                .map_err(Error::other)?;
+            Ok(origin)
+        },
+        &args,
+    )
+    .await
+}
+
+/// `ALTER ROLE` on pgcache's own role takes effect without a restart: the
+/// role poll sees the attribute change and reads the bypass again. Without
+/// it every read over a secured relation forwards under `rls_skipped`; with
+/// it back, the reads serve again.
+#[tokio::test]
+async fn test_bypass_revoked_and_granted_at_runtime_is_seen_by_the_role_poll() -> Result<(), Error>
+{
+    let mut ctx = pgcache_as_caretaker(&[]).await?;
+    tenant_docs_create(&mut ctx).await?;
+    let (user, origin) = sessions_as(&ctx, "tenant_user", Some("1")).await?;
+    let expected = rows(&origin, TENANT_READ).await?;
+    assert_eq!(register(&mut ctx, &user, TENANT_READ).await?, expected);
+
+    let m = ctx.metrics().await?;
+    ctx.origin_query("ALTER ROLE caretaker NOSUPERUSER NOBYPASSRLS", &[])
+        .await?;
+    role_change_wait(&mut ctx, &m).await?;
+    let mut skipped = false;
+    for _ in 0..40 {
+        let before = ctx.metrics().await?;
+        assert_eq!(rows(&user, TENANT_READ).await?, expected);
+        let delta = metrics_delta(&before, &ctx.metrics_after_outcomes(&before, 1).await?);
+        assert_eq!(
+            delta.queries_cache_hit, 0,
+            "nothing served without the bypass"
+        );
+        if delta.queries_rls_skipped == 1 {
+            skipped = true;
+            break;
+        }
+    }
+    assert!(skipped, "the read forwards under rls_skipped");
+
+    let m = ctx.metrics().await?;
+    ctx.origin_query("ALTER ROLE caretaker BYPASSRLS", &[])
+        .await?;
+    role_change_wait(&mut ctx, &m).await?;
+    assert_eq!(
+        hit_eventually(&mut ctx, &user, TENANT_READ).await?,
+        expected
+    );
+    Ok(())
+}
+
+/// A population by a role that cannot bypass row-level security fails
+/// instead of loading the rows origin leaves that role: the population
+/// sessions run with `row_security` off. With the role poll disabled the
+/// writer keeps believing it bypasses after the revocation and inlines the
+/// policy; the owner under `FORCE` would otherwise load an empty table for
+/// `alice` and serve it.
+#[tokio::test]
+async fn test_population_without_the_bypass_fails_closed() -> Result<(), Error> {
+    let mut ctx = pgcache_as_caretaker(&["--role_poll_interval", "0"]).await?;
+    owned_docs_create(&mut ctx).await?;
+    // The caretaker must own the table to publish it, and `FORCE` puts the
+    // owner under the policies like any other role.
+    for sql in [
+        "ALTER TABLE owned_docs OWNER TO caretaker",
+        "ALTER TABLE owned_docs FORCE ROW LEVEL SECURITY",
+        "ALTER ROLE caretaker NOSUPERUSER NOBYPASSRLS",
+    ] {
+        ctx.origin_query(sql, &[]).await?;
+    }
+    ctx.cdc_apply_settle().await?;
+    let (alice, origin) = sessions_as(&ctx, "alice", None).await?;
+    let expected = rows(&origin, OWNED_READ).await?;
+    assert_eq!(expected, vec![row("1", "a1"), row("3", "a2")]);
+
+    let start = ctx.metrics().await?;
+    for _ in 0..20 {
+        let before = ctx.metrics().await?;
+        assert_eq!(rows(&alice, OWNED_READ).await?, expected);
+        let delta = metrics_delta(&before, &ctx.metrics_after_outcomes(&before, 1).await?);
+        assert_eq!(
+            delta.queries_cache_hit, 0,
+            "a filtered population is never served"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let delta = metrics_delta(&start, &ctx.metrics().await?);
+    assert_eq!(
+        delta.queries_rls_skipped, 0,
+        "the writer inlined, believing it bypasses"
+    );
+    assert!(
+        delta.queries_cache_miss >= 2,
+        "each failed population registers again"
+    );
     Ok(())
 }

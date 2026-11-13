@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ecow::EcoString;
 use tokio_postgres::Row;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::core::WriterCore;
 use crate::cache::query::CacheableQuery;
@@ -57,22 +57,27 @@ const RLS_POLICIES_SQL: &str = "SELECT p.polname::text, p.polpermissive, \
      ORDER BY p.polname";
 
 /// Whether `$1` is exempt from `$2`'s policies (superuser, `BYPASSRLS`, or
-/// the owner without `FORCE`), and the policies whose role list it has the
-/// privileges of, as origin decides (`has_privs_of_role`). No row: no such
-/// role or relation.
+/// the privileges of the owner without `FORCE`: origin's `object_ownercheck`
+/// is `has_privs_of_role`, so a member of the owning role is exempt too), and
+/// the policies whose role list it has the privileges of, as origin decides
+/// (`has_privs_of_role`). No row: no such role or relation.
 /// The version the next loaded table takes. Process-wide, not per writer:
 /// a restarted writer loads every table afresh, and a fold the proxy took
 /// under the previous writer's publication must pair with nothing.
 static RLS_VERSIONS: AtomicU64 = AtomicU64::new(1);
 
 const RLS_APPLICABILITY_SQL: &str = "SELECT c.relrowsecurity, \
-            r.rolsuper OR r.rolbypassrls OR (c.relowner = r.oid AND NOT c.relforcerowsecurity), \
-            ARRAY(SELECT p.polname::text FROM pg_policy p \
-                   WHERE p.polrelid = c.oid \
-                     AND (0 = ANY(p.polroles) \
-                          OR EXISTS (SELECT 1 FROM unnest(p.polroles) AS pr(oid) \
-                                      WHERE pg_has_role(r.oid, pr.oid, 'USAGE')))) \
-     FROM pg_roles r, pg_class c WHERE r.rolname = $1 AND c.oid = $2";
+            r.rolsuper OR r.rolbypassrls \
+              OR (pg_has_role(r.oid, c.relowner, 'USAGE') AND NOT c.relforcerowsecurity), \
+            p.polname::text, p.polpermissive, pg_get_expr(p.polqual, p.polrelid) \
+     FROM pg_roles r CROSS JOIN pg_class c \
+          LEFT JOIN pg_policy p ON p.polrelid = c.oid \
+               AND p.polqual IS NOT NULL AND p.polcmd IN ('r', '*') \
+               AND (0 = ANY(p.polroles) \
+                    OR EXISTS (SELECT 1 FROM unnest(p.polroles) AS pr(oid) \
+                                WHERE pg_has_role(r.oid, pr.oid, 'USAGE'))) \
+     WHERE r.rolname = $1 AND c.oid = $2 \
+     ORDER BY p.polname";
 
 /// A policy's USING expression, parsed as the WHERE of `SELECT 1 FROM
 /// <table>` with every table it names schema-qualified and its term
@@ -99,6 +104,9 @@ pub(super) struct RlsInlined {
 struct RlsPolicy {
     name: EcoString,
     permissive: bool,
+    /// The USING expression as deparsed at the load, compared with origin's
+    /// at each resolution: a change whose signal is still in flight.
+    qual_text: EcoString,
     /// The parsed qual, or why it cannot be inlined.
     qual: Result<ParsedQual, EcoString>,
 }
@@ -121,12 +129,19 @@ pub(super) struct RlsCatalog {
     population_bypasses: bool,
 }
 
+/// One policy origin applies to a role's SELECT, as its catalog holds it now.
+struct ApplicablePolicy {
+    name: EcoString,
+    permissive: bool,
+    qual: EcoString,
+}
+
 /// What origin does with a role's read of a secured relation.
 enum Applicability {
     /// Not secured after all, or the role bypasses the policies.
     Exempt,
-    /// The policies, by name, whose role list the role has the privileges of.
-    Policies(Vec<EcoString>),
+    /// The SELECT policies whose role list the role has the privileges of.
+    Policies(Vec<ApplicablePolicy>),
 }
 
 /// One policy's predicate, ready to inline under a reference's qualifier.
@@ -164,13 +179,7 @@ impl WriterCore {
     /// session values the policies read. A relation that fails to load is
     /// skipped and loaded again at its first registration.
     pub(super) async fn rls_startup_load(&mut self) -> CacheResult<()> {
-        let bypass = self
-            .db_origin
-            .query_one(RLS_BYPASS_SQL, &[])
-            .await
-            .map_into_report::<CacheError>()
-            .attach_loc("reading whether the writer's role bypasses row-level security")?;
-        self.rls.population_bypasses = bypass.try_get(0).map_into_report::<CacheError>()?;
+        self.rls.population_bypasses = self.rls_bypass_read().await?;
         let rows = self
             .db_origin
             .query(RLS_TABLES_SQL, &[])
@@ -196,6 +205,43 @@ impl WriterCore {
         }
         self.rls_relations_publish();
         Ok(())
+    }
+
+    async fn rls_bypass_read(&self) -> CacheResult<bool> {
+        let bypass = self
+            .db_origin
+            .query_one(RLS_BYPASS_SQL, &[])
+            .await
+            .map_into_report::<CacheError>()
+            .attach_loc("reading whether the writer's role bypasses row-level security")?;
+        bypass.try_get(0).map_into_report::<CacheError>()
+    }
+
+    /// Read the writer's bypass again after the role poll saw the role
+    /// catalog change: an `ALTER ROLE` on pgcache's own role takes effect
+    /// without a restart. A read that fails keeps the last value; a
+    /// population under a role that lost its bypass fails on its own.
+    pub(super) async fn rls_bypass_refresh(&mut self) {
+        match self.rls_bypass_read().await {
+            Ok(bypasses) if bypasses == self.rls.population_bypasses => {}
+            Ok(true) => {
+                info!(
+                    "pgcache's role now bypasses row-level security: secured relations are cached"
+                );
+                self.rls.population_bypasses = true;
+            }
+            Ok(false) => {
+                warn!(
+                    "pgcache's role no longer bypasses row-level security: reads over secured \
+                     relations forward until it is a superuser or has BYPASSRLS"
+                );
+                self.rls.population_bypasses = false;
+            }
+            Err(e) => debug!(
+                "reading the writer's row-level security bypass failed, kept as before: {}",
+                error_chain_format(e.current_context())
+            ),
+        }
     }
 
     /// A secured relation's policies changed, or it stopped or started being
@@ -345,6 +391,7 @@ impl WriterCore {
         let policy_name: &str = row.try_get(0).map_into_report::<CacheError>()?;
         let permissive: bool = row.try_get(1).map_into_report::<CacheError>()?;
         let qual: &str = row.try_get(2).map_into_report::<CacheError>()?;
+        let qual_text = EcoString::from(qual);
         let qual = self
             .rls_qual_parse(qual, policy_name, relation_oid, schema, name)
             .await
@@ -359,6 +406,7 @@ impl WriterCore {
         Ok(RlsPolicy {
             name: EcoString::from(policy_name),
             permissive,
+            qual_text,
             qual,
         })
     }
@@ -568,24 +616,37 @@ impl WriterCore {
     }
 
     async fn rls_applicability(&self, role: &str, relation_oid: Oid) -> CacheResult<Applicability> {
-        let Some(row) = self
+        let rows = self
             .db_origin
-            .query_opt(RLS_APPLICABILITY_SQL, &[&role, &relation_oid])
+            .query(RLS_APPLICABILITY_SQL, &[&role, &relation_oid])
             .await
             .map_into_report::<CacheError>()
-            .attach_loc("reading a role's policy applicability")?
-        else {
+            .attach_loc("reading a role's policy applicability")?;
+        let Some(first) = rows.first() else {
             return Err(rls_refusal(CacheError::RlsRoleUnknown));
         };
-        let secured: bool = row.try_get(0).map_into_report::<CacheError>()?;
-        let exempt: bool = row.try_get(1).map_into_report::<CacheError>()?;
+        let secured: bool = first.try_get(0).map_into_report::<CacheError>()?;
+        let exempt: bool = first.try_get(1).map_into_report::<CacheError>()?;
         if !secured || exempt {
             return Ok(Applicability::Exempt);
         }
-        let names: Vec<String> = row.try_get(2).map_into_report::<CacheError>()?;
-        Ok(Applicability::Policies(
-            names.into_iter().map(EcoString::from).collect(),
-        ))
+        let mut policies = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let Some(name) = row
+                .try_get::<_, Option<&str>>(2)
+                .map_into_report::<CacheError>()?
+            else {
+                continue;
+            };
+            let permissive: bool = row.try_get(3).map_into_report::<CacheError>()?;
+            let qual: &str = row.try_get(4).map_into_report::<CacheError>()?;
+            policies.push(ApplicablePolicy {
+                name: EcoString::from(name),
+                permissive,
+                qual: EcoString::from(qual),
+            });
+        }
+        Ok(Applicability::Policies(policies))
     }
 
     /// `bound` with the policies that apply to the read's role inlined onto
@@ -627,11 +688,23 @@ impl WriterCore {
                 let applies = self.rls_applicability(role, *relation_oid).await?;
                 applicability.insert(*relation_oid, applies);
             }
-            let Some(Applicability::Policies(names)) = applicability.get(relation_oid) else {
+            let Some(Applicability::Policies(applicable)) = applicability.get(relation_oid) else {
                 continue;
             };
             if rls.row_security == Some(false) {
                 return Err(rls_refusal(CacheError::RlsRowSecurityOff));
+            }
+            // A policy created or altered since the load, its signal still in
+            // flight, would inline the old form: reload now, and the read is
+            // keyed afresh under the new publication.
+            let loaded = self
+                .rls
+                .tables
+                .get(relation_oid)
+                .is_some_and(|table| policies_loaded(table, applicable));
+            if !loaded {
+                self.rls_table_reload(*relation_oid).await?;
+                return Err(rls_refusal(CacheError::RlsNoContext));
             }
             let Some(table) = self.rls.tables.get(relation_oid) else {
                 return Err(rls_refusal(CacheError::RlsUnsupported {
@@ -646,7 +719,7 @@ impl WriterCore {
             };
             let mut policies = Vec::new();
             for policy in &table.policies {
-                if !names.contains(&policy.name) {
+                if !applicable.iter().any(|applies| applies.name == policy.name) {
                     continue;
                 }
                 let parsed = policy.qual.as_ref().map_err(|reason| {
@@ -866,6 +939,18 @@ fn fold_error(error: TermFoldError) -> CacheError {
         TermFoldError::Term(SessionTermError::ValueRejected { reason })
         | TermFoldError::Unfoldable { reason } => CacheError::RlsUnsupported { reason },
     }
+}
+
+/// Whether every policy origin applies is among the loaded ones, unchanged in
+/// kind and expression. The loaded set may hold more: policies of other roles.
+fn policies_loaded(table: &RlsTable, applicable: &[ApplicablePolicy]) -> bool {
+    applicable.iter().all(|applies| {
+        table.policies.iter().any(|policy| {
+            policy.name == applies.name
+                && policy.permissive == applies.permissive
+                && policy.qual_text == applies.qual
+        })
+    })
 }
 
 /// Count a refusal by reason and wrap it as the registration's error.

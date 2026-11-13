@@ -24,7 +24,7 @@ use crate::cache::reference_settings;
 use crate::cache::writer::deadlock::{SQLSTATE_DEADLOCK, cache_error_sqlstate};
 use crate::cache::writer::merge_queue::StagingDiscard;
 use crate::cache::writer::staging::SharedStagingPool;
-use crate::cache::{CacheError, CacheResult, MapIntoReport};
+use crate::cache::{CacheError, CacheResult, MapIntoReport, ReportExt};
 use crate::oid::Oid;
 use crate::pg;
 use crate::result::error_chain_format;
@@ -151,11 +151,24 @@ pub(crate) async fn population_worker_connect(
     // Each worker reads from origin on its own connection so the origin
     // executes population SELECTs concurrently rather than serializing
     // them on one shared backend.
-    let origin = pg::connect(&ctx.origin_settings, &format!("population origin {id}"))
+    let origin = population_origin_connect(&ctx.origin_settings, id).await?;
+    Ok(PopulationConnections { origin, cache })
+}
+
+/// Connect a worker's origin session. `row_security` is off so a population
+/// by a role that can no longer bypass row-level security fails (42501)
+/// instead of silently loading the rows its own policies leave it.
+async fn population_origin_connect(settings: &PgSettings, id: usize) -> CacheResult<Client> {
+    let origin = pg::connect(settings, &format!("population origin {id}"))
         .await
         .map_into_report::<CacheError>()?;
     reference_settings::pin(&origin, "population origin").await?;
-    Ok(PopulationConnections { origin, cache })
+    origin
+        .batch_execute("SET row_security = off")
+        .await
+        .map_into_report::<CacheError>()
+        .attach_loc("turning row_security off on a population origin session")?;
+    Ok(origin)
 }
 
 /// Run one persistent population worker to completion: register an idle slot
@@ -373,22 +386,16 @@ impl PopulationWorker {
             return true;
         }
         let id = self.id;
-        match pg::connect(&self.origin_settings, &format!("population origin {id}")).await {
-            Ok(c) => match reference_settings::pin(&c, "population origin").await {
-                Ok(()) => {
-                    self.connections.origin = c;
-                    true
-                }
-                Err(e) => {
-                    error!(
-                        "population worker {id}: origin session pin failed: {}",
-                        error_chain_format(e.current_context())
-                    );
-                    false
-                }
-            },
+        match population_origin_connect(&self.origin_settings, id).await {
+            Ok(c) => {
+                self.connections.origin = c;
+                true
+            }
             Err(e) => {
-                error!("population worker {id}: origin reconnect failed: {e}");
+                error!(
+                    "population worker {id}: origin reconnect failed: {}",
+                    error_chain_format(e.current_context())
+                );
                 false
             }
         }

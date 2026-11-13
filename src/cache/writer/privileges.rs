@@ -114,6 +114,7 @@ impl WriterCore {
         // A membership or attribute change can change which policies apply
         // to a role, and so which inlined form its reads resolve to.
         self.rls_aliases_clear();
+        self.rls_bypass_refresh().await;
         crate::metrics::handles().cache.role_changes.increment(1);
     }
 

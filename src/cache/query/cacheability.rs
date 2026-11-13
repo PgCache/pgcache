@@ -451,6 +451,19 @@ pub(crate) fn query_tree_has_volatile_function_except(
     })
 }
 
+/// Whether any call in the tree may run code that is not PostgreSQL's own
+/// (see [`FunctionCatalog::call_may_run_user_code`]): such code can change the
+/// session's settings or role without the statement text saying so.
+#[cfg(feature = "proxy")]
+pub(crate) fn query_tree_has_user_function(tree: &QueryTree, functions: &FunctionCatalog) -> bool {
+    tree.nodes().any(|node| {
+        let NodeKind::Function { schema, name, .. } = &node.kind else {
+            return false;
+        };
+        functions.call_may_run_user_code(schema.as_deref(), name)
+    })
+}
+
 #[cfg(test)]
 mod tests {
 
