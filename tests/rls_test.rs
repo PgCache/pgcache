@@ -1094,9 +1094,8 @@ async fn test_jwt_claim_policy_is_keyed_on_the_claim() -> Result<(), Error> {
 /// keyed on the claim the body extracts (PGC-579): a later token of the same
 /// user hits the entry, another user's token has its own, and each serves
 /// origin's rows. The body reads a claim setting beside the token that no
-/// session sets, so a session's first read is refused by the writer while
-/// the setting is probed (ADR-066: a policy's term is judged where the
-/// policy's applicability is known), and the reads after serve.
+/// session sets; the connection tracks it from its start, so the startup
+/// probe samples it before the first read (PGC-599).
 #[tokio::test]
 async fn test_auth_uid_policy_is_inlined_and_keyed_on_the_claim() -> Result<(), Error> {
     let mut ctx = uid_docs_setup().await?;
@@ -1685,6 +1684,101 @@ async fn test_population_without_the_bypass_fails_closed() -> Result<(), Error> 
     assert!(
         delta.queries_cache_miss >= 2,
         "each failed population registers again"
+    );
+    Ok(())
+}
+
+/// A connection tracks the settings the published policies read from its
+/// start, so its startup probe samples them (PGC-599). Once a user's entry
+/// exists, a new connection's first request as PostgREST sends it is a hit:
+/// no writer refusal while the never-set `request.jwt.claim.sub` is probed,
+/// and no forward. A user without an entry registers on the first read
+/// instead of forwarding first.
+#[cfg(feature = "fault-injection")]
+#[tokio::test]
+async fn test_a_new_connections_first_request_over_a_claim_policy_is_served() -> Result<(), Error> {
+    let ctx = TestContext::setup_fault_before_start(
+        &[("PGCACHE_FAULT_READ_YOUR_WRITES_OFF", "0")],
+        auth_schema_create,
+    )
+    .await?;
+    let mut ctx = uid_docs_create(ctx).await?;
+    for sql in [
+        "CREATE ROLE authenticator LOGIN NOINHERIT",
+        "CREATE ROLE authenticated NOLOGIN",
+        "GRANT authenticated TO authenticator",
+        "GRANT USAGE ON SCHEMA auth TO authenticated",
+        "GRANT SELECT ON uid_docs TO authenticated",
+        "DROP POLICY uid_policy ON uid_docs",
+        "CREATE POLICY uid_policy ON uid_docs FOR SELECT TO authenticated \
+         USING (owner = auth.uid())",
+    ] {
+        ctx.origin_query(sql, &[]).await?;
+    }
+    ctx.cdc_apply_settle().await?;
+    // Two statements, as PostgREST sends them: a batch would be a connection
+    // write the read-after-write gate forwards behind.
+    let request_begin = |token: &str| {
+        [
+            "BEGIN".to_owned(),
+            format!(
+                "SELECT set_config('role', 'authenticated', true), \
+                 set_config('request.jwt.claims', '{token}', true)"
+            ),
+        ]
+    };
+    async fn request_open(client: &Client, statements: [String; 2]) -> Result<(), Error> {
+        for sql in statements {
+            client.simple_query(&sql).await.map_err(Error::other)?;
+        }
+        Ok(())
+    }
+
+    let (warm, origin) = sessions_with(&ctx, "authenticator", &[]).await?;
+    for client in [&warm, &origin] {
+        request_open(client, request_begin(ANN_UUID_TOKEN)).await?;
+    }
+    let served = read_until(&mut ctx, &warm, UID_READ, |delta| {
+        delta.queries_cache_hit == 1
+    })
+    .await?;
+    assert_eq!(served, vec![row("1", "a"), row("3", "c")]);
+    assert_eq!(served, rows(&origin, UID_READ).await?);
+
+    let fresh = ctx.proxy_client_connect_as("authenticator").await?;
+    request_open(&fresh, request_begin(ANN_UUID_TOKEN_LATER)).await?;
+    let before = ctx.metrics().await?;
+    assert_eq!(rows(&fresh, UID_READ).await?, served);
+    let delta = metrics_delta(&before, &ctx.metrics_after_outcomes(&before, 1).await?);
+    assert_eq!(
+        delta.queries_cache_hit, 1,
+        "a new connection's first request is a hit\n{delta:#?}"
+    );
+    assert_eq!(
+        delta.queries_rls_forward_setting_unknown, 0,
+        "nothing was unknown\n{delta:#?}"
+    );
+    assert_eq!(
+        delta.conn_settings_probes, 0,
+        "sampled at startup, not at the read\n{delta:#?}"
+    );
+
+    let fresh_bob = ctx.proxy_client_connect_as("authenticator").await?;
+    request_open(&fresh_bob, request_begin(BOB_UUID_TOKEN)).await?;
+    let before = ctx.metrics().await?;
+    assert_eq!(rows(&fresh_bob, UID_READ).await?, vec![row("2", "b")]);
+    let delta = metrics_delta(&before, &ctx.metrics_after_outcomes(&before, 1).await?);
+    assert_eq!(
+        delta.queries_cache_miss, 1,
+        "a user without an entry registers at once\n{delta:#?}"
+    );
+    assert_eq!(
+        delta.queries_rls_forward_setting_unknown, 0,
+        "nothing was unknown\n{delta:#?}"
+    );
+    assert_eq!(
+        delta.conn_settings_probes, 0,
+        "sampled at startup, not at the read\n{delta:#?}"
     );
     Ok(())
 }

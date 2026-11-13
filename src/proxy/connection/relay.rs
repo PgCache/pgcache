@@ -894,6 +894,15 @@ impl ConnectionState {
             // would only accrue dead weight.
             self.write_log.disable();
         }
+        if !self.cache_disabled
+            && let Some(relations) = self.dispatch_handle.rls_relations()
+            && !relations.settings().is_empty()
+        {
+            // Tracked from the start, the policies' settings are sampled by
+            // the probe at the startup ReadyForQuery, so a first read over a
+            // secured relation is not refused while they are unknown (PGC-599).
+            self.session_settings.custom_require(relations.settings());
+        }
 
         // The handshake's responses are the first client-bound slot; opening
         // it here (rather than lazily on the first byte back) keeps a request

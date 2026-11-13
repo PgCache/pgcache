@@ -139,22 +139,35 @@ impl RlsPolicyTerms {
 #[derive(Debug, Default)]
 pub struct RlsRelations {
     by_name: HashMap<EcoString, Vec<Arc<RlsRelationTerms>>>,
+    settings: Vec<EcoString>,
 }
 
 impl RlsRelations {
     pub fn new(relations: impl IntoIterator<Item = Arc<RlsRelationTerms>>) -> Self {
         let mut by_name: HashMap<EcoString, Vec<Arc<RlsRelationTerms>>> = HashMap::new();
+        let mut settings = Vec::new();
         for relation in relations {
+            settings.extend(relation.settings().iter().cloned());
             by_name
                 .entry(relation.name.clone())
                 .or_default()
                 .push(relation);
         }
-        Self { by_name }
+        settings.sort();
+        settings.dedup();
+        Self { by_name, settings }
     }
 
     pub fn is_empty(&self) -> bool {
         self.by_name.is_empty()
+    }
+
+    /// Every custom setting a published policy reads, each once, sorted. A
+    /// connection tracks them from its start, so its startup probe samples
+    /// them and its first read over a secured relation is keyed without a
+    /// writer refusal (PGC-599).
+    pub fn settings(&self) -> &[EcoString] {
+        &self.settings
     }
 
     /// The secured relations named `name`, in any schema, or `None` when no
