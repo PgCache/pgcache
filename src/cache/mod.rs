@@ -248,6 +248,14 @@ error_set! {
             schema: EcoString,
             name: EcoString,
         },
+        /// A partition's replica identity does not carry the table's key:
+        /// its updates and deletes stream without the columns that find the
+        /// cached row.
+        #[display("table {schema}.{name} has a partition whose replica identity lacks the table's key")]
+        PartitionIdentity {
+            schema: EcoString,
+            name: EcoString,
+        },
     }
 
     /// Why a read over a row-level-secured relation cannot be registered

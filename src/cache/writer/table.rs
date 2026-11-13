@@ -160,6 +160,16 @@ impl WriterCore {
             .unwrap_or_default();
         // Old tuples are written under the identity of the partition that
         // holds the row, which a partitioned table's own does not set.
+        if !self
+            .partitions_carry_key(&partitions, &primary_key_columns)
+            .await?
+        {
+            return Err(CacheError::PartitionIdentity {
+                schema: schema.into(),
+                name: table.into(),
+            }
+            .into());
+        }
         let replica_identity_full =
             identity == ReplicaIdentity::Full && self.partitions_identity_full(&partitions).await?;
 
@@ -304,6 +314,40 @@ impl WriterCore {
                  JOIN pg_class c ON c.oid = i.inhrelid \
                  WHERE i.inhparent = $1 AND NOT c.relispartition)",
                 &[&relation_oid],
+            )
+            .await
+            .map_into_report::<CacheError>()?;
+        Ok(row.get(0))
+    }
+
+    /// Whether every partition that holds rows writes old tuples carrying
+    /// `key`: REPLICA IDENTITY FULL, or an identity (the primary key by
+    /// default, or the index named) whose columns include it.
+    #[instrument(skip_all)]
+    async fn partitions_carry_key(
+        &self,
+        partitions: &[Oid],
+        key: &[EcoString],
+    ) -> CacheResult<bool> {
+        if partitions.is_empty() {
+            return Ok(true);
+        }
+        let key: Vec<&str> = key.iter().map(EcoString::as_str).collect();
+        let row = self
+            .db_origin
+            .query_one(
+                "SELECT NOT EXISTS ( \
+                     SELECT 1 FROM pg_class c \
+                     WHERE c.oid = ANY($1) AND c.relkind <> 'p' AND c.relreplident <> 'f' \
+                       AND NOT $2::text[] <@ coalesce(( \
+                           SELECT array_agg(a.attname::text) \
+                           FROM pg_index i \
+                           JOIN pg_attribute a \
+                             ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
+                           WHERE i.indrelid = c.oid \
+                             AND ((c.relreplident = 'd' AND i.indisprimary) \
+                               OR (c.relreplident = 'i' AND i.indisreplident))), '{}'))",
+                &[&partitions, &key],
             )
             .await
             .map_into_report::<CacheError>()?;

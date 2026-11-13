@@ -243,3 +243,56 @@ async fn test_sub_partition_write_reaches_every_level() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// A partition whose replica identity is an index without the root's key:
+/// its updates and deletes do not say which cached row they concern, so a
+/// read of the root is forwarded. With the identity back on the primary key
+/// the read caches.
+#[tokio::test]
+async fn test_partition_identity_without_root_key_forwards_root_read() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    for statement in [
+        "create table pi (id int, k int, v int not null, primary key (id, k)) \
+         partition by range (k)",
+        "create table pi1 partition of pi for values from (0) to (10)",
+        "create table pi2 partition of pi for values from (10) to (20)",
+        "create unique index pi2_v on pi2 (v)",
+        "alter table pi2 replica identity using index pi2_v",
+        "insert into pi values (1, 15, 1), (2, 5, 2)",
+    ] {
+        ctx.query(statement, &[]).await?;
+    }
+
+    let root = "select id, k, v from pi order by id";
+    let before = ctx.metrics().await?;
+    ctx.simple_query(root).await?;
+    ctx.cache_settle().await?;
+    ctx.simple_query(root).await?;
+
+    ctx.query("update pi set v = 9 where id = 1", &[]).await?;
+    ctx.query("delete from pi where id = 2", &[]).await?;
+    ctx.cdc_apply_settle().await?;
+    assert_proxy_rows_match_origin(&mut ctx, root).await?;
+    let after = ctx.metrics().await?;
+    assert_eq!(
+        after.queries_cache_hit, before.queries_cache_hit,
+        "the root read is forwarded"
+    );
+    assert_eq!(
+        after.cache_invalidations, before.cache_invalidations,
+        "refused at registration, not cached and evicted"
+    );
+
+    // A partition read on its own is unaffected.
+    warm(&mut ctx, "select id, k, v from pi1 order by id").await?;
+
+    ctx.query("alter table pi2 replica identity default", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+    warm(&mut ctx, root).await?;
+    ctx.query("update pi set v = 7 where id = 1", &[]).await?;
+    ctx.cdc_apply_settle().await?;
+    assert_hit_matches_origin(&mut ctx, root).await?;
+
+    Ok(())
+}

@@ -15,7 +15,8 @@ Alternatives for partitions: rewriting a partition read into a root read plus th
 ## Decision
 - **Publish without `publish_via_partition_root`.** A row change always streams under the leaf partition that holds the row, whatever else is published.
 - **The writer routes a leaf's rows to every cached table whose partition tree holds the leaf.** The routes are derived from the active tables and the partition trees their metadata already carries, and rebuilt whenever either changes. A table with no partitions takes no route.
-- **Rows are carried into each target's column layout by name.** A leaf's tuples arrive in the leaf's own layout, known from its `Relation` message; a target whose columns or key the leaf's tuples do not fit is evicted and registered again from the catalog.
+- **Rows are carried into each target's column layout by name.** A leaf's tuples arrive in the leaf's own layout, known from its `Relation` message; a target whose columns the leaf's tuples do not fit is evicted and registered again from the catalog.
+- **A table is cached only if every partition's replica identity carries its key.** Old tuples follow the leaf's identity, so a partition whose identity index lacks the table's key cannot say which cached row an update or delete concerns; the table is refused at registration and its reads forwarded.
 - **The stream's `Relation` messages are the source of leaf layouts**, kept for the session rather than per registration, since the walsender describes a relation once.
 - **A leaf nobody announced evicts the tables above it.** An attached partition was not in the tree those tables were populated with.
 - **A truncated partition empties its own cache table in place and evicts the cached tables above it**, unless the statement truncated those as well. The per-partition truncate trigger of ADR-058 is gone.
