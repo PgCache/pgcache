@@ -278,7 +278,8 @@ mod classify_tests {
     use super::*;
     use crate::cache::query::CacheableQuery;
     use crate::catalog::{
-        Catalog, ColumnMetadata, ColumnPosition, FunctionCatalog, FunctionVolatility, TableMetadata,
+        Catalog, ColumnCollation, ColumnMetadata, ColumnPosition, FunctionCatalog,
+        FunctionVolatility, TableMetadata,
     };
     use crate::oid::{Oid, TypeOid};
     use crate::query::ast::query_tree_parse;
@@ -295,6 +296,7 @@ mod classify_tests {
                 type_name: if is_pk { "int4" } else { "text" }.into(),
                 cache_type_name: if is_pk { "int4" } else { "text" }.into(),
                 is_primary_key: is_pk,
+                collation: ColumnCollation::BYTES,
             }
         });
         TableMetadata::for_test(name, oid.get(), cols)

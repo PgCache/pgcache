@@ -11,7 +11,7 @@ use postgres_types::Type;
 use super::bindings::{
     Bindings, BoundView, ColumnBinding, ColumnTarget, ResolvedQuery, StarItem, TableSlot,
 };
-use crate::catalog::TableMetadata;
+use crate::catalog::{ColumnMetadata, TableMetadata};
 use crate::oid::Oid;
 use crate::query::ast::NodeId;
 use crate::query::ast::rope::{
@@ -70,6 +70,10 @@ impl<'a> BoundView<'a> {
     pub fn column_type_at(self, id: NodeId) -> Option<&'a Type> {
         binding_type(self.bindings(), self.column_binding_at(id)?)
     }
+
+    pub fn column_metadata_at(self, id: NodeId) -> Option<&'a ColumnMetadata> {
+        self.bindings().binding_column(&self.column_binding_at(id)?)
+    }
 }
 
 impl ResolvedQuery {
@@ -104,6 +108,10 @@ impl ResolvedQuery {
 
     pub fn column_type_at(&self, id: NodeId) -> Option<&Type> {
         self.view().column_type_at(id)
+    }
+
+    pub fn column_metadata_at(&self, id: NodeId) -> Option<&ColumnMetadata> {
+        self.view().column_metadata_at(id)
     }
 
     /// The output names of `query`, one per output position with stars

@@ -11,11 +11,12 @@ use tracing::{debug, error, info, instrument, warn};
 use super::cache_index::index_sql_retarget;
 use super::core::WriterCore;
 use crate::cache::messages::PartitionCreated;
+use crate::cache::runtime::collation_probe::sample_sorted_under;
 use crate::cache::types::WriteTargetMap;
-use crate::cache::{CacheError, CacheResult, MapIntoReport};
+use crate::cache::{CacheError, CacheResult, MapIntoReport, ReportExt};
 use crate::catalog::{
-    CatalogTable, ColumnMetadata, ColumnPosition, ColumnStore, IndexMetadata, RelationName,
-    TableMetadata, WriteAlias, cache_type_name_resolve,
+    CatalogTable, CollationName, ColumnCollation, ColumnMetadata, ColumnPosition, ColumnStore,
+    IndexMetadata, RelationName, TableMetadata, TextOrder, WriteAlias, cache_type_name_resolve,
 };
 use crate::oid::{Oid, TypeOid};
 use crate::result::error_chain_format;
@@ -173,7 +174,7 @@ impl WriterCore {
         let replica_identity_full =
             identity == ReplicaIdentity::Full && self.partitions_identity_full(&partitions).await?;
 
-        Ok(TableMetadata {
+        let table_metadata = TableMetadata {
             replica_identity_full,
             row_security,
             name: table.into(),
@@ -185,7 +186,9 @@ impl WriterCore {
             partitions,
             ancestors,
             write_aliases,
-        })
+        };
+        self.table_collations_check(&table_metadata).await?;
+        Ok(table_metadata)
     }
 
     /// One column's metadata from a [`Self::query_table_columns_get`] row.
@@ -209,7 +212,154 @@ impl WriterCore {
             type_name: type_info.type_name,
             cache_type_name: type_info.cache_type_name,
             is_primary_key: row.get("is_primary_key"),
+            collation: self.column_collation_read(row),
         })
+    }
+
+    /// A column's collation from the `collation_*` columns of a catalog row:
+    /// the one it declares, else the database default.
+    fn column_collation_read(&self, row: &Row) -> ColumnCollation {
+        let (Some(provider), Some(schema), Some(name)) = (
+            row.get::<_, Option<&str>>("collation_provider"),
+            row.get::<_, Option<&str>>("collation_schema"),
+            row.get::<_, Option<&str>>("collation_name"),
+        ) else {
+            return ColumnCollation::database_default(self.database_text_order);
+        };
+        let collate: Option<&str> = row.get("collation_collate");
+        let deterministic: bool = row.get("collation_deterministic");
+        ColumnCollation {
+            name: Some(CollationName {
+                schema: schema.into(),
+                name: name.into(),
+            }),
+            text_order: TextOrder::of_collation(provider, collate, deterministic),
+        }
+    }
+
+    /// Refuse a table with a column whose declared collation the cache
+    /// database lacks or orders differently from origin: the cache table is
+    /// created under it, and a served `ORDER BY` or range reads its order.
+    /// The database default was checked at startup.
+    pub(super) async fn table_collations_check(&self, metadata: &TableMetadata) -> CacheResult<()> {
+        for column in &metadata.columns {
+            let Some(collation) = &column.collation.name else {
+                continue;
+            };
+            let known = self.collation_verdicts.borrow().get(collation).copied();
+            let verdict = match known {
+                Some(verdict) => verdict,
+                None => {
+                    let verdict = self
+                        .collation_verdict(collation, column.collation.text_order)
+                        .await?;
+                    self.collation_verdicts
+                        .borrow_mut()
+                        .insert(collation.clone(), verdict);
+                    verdict
+                }
+            };
+            if let Some(reason) = verdict {
+                return Err(CacheError::CollationUnavailable {
+                    schema: metadata.schema.clone(),
+                    name: metadata.name.clone(),
+                    column: column.name.clone(),
+                    collation: format!("{}.{}", collation.schema, collation.name).into(),
+                    reason,
+                }
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Why the cache database cannot stand in for origin under `collation`,
+    /// or `None` when it can. A byte-ordered collation only has to exist;
+    /// any other has to sort the probe sample as origin does.
+    async fn collation_verdict(
+        &self,
+        collation: &CollationName,
+        text_order: TextOrder,
+    ) -> CacheResult<Option<&'static str>> {
+        // Asked of the catalog first: a failed statement would abort a CDC
+        // transaction open on the cache session.
+        let present = self
+            .db_cache
+            .query_opt(
+                COLLATION_PRESENT_SQL,
+                &[&collation.schema.as_str(), &collation.name.as_str()],
+            )
+            .await
+            .map_into_report::<CacheError>()
+            .attach_loc("looking a collation up on the cache database")?
+            .is_some();
+        if !present {
+            return Ok(Some("does not have"));
+        }
+        if text_order == TextOrder::Bytes {
+            return Ok(None);
+        }
+        let cache_order = sample_sorted_under(&self.db_cache, collation)
+            .await
+            .attach_loc("sorting the collation sample on the cache database")?;
+        let origin_order = sample_sorted_under(&self.db_origin, collation)
+            .await
+            .attach_loc("sorting the collation sample on origin")?;
+        Ok((origin_order != cache_order).then_some("orders differently from origin"))
+    }
+
+    /// Fill the collations a Relation message does not carry from the
+    /// catalog, so `schema_eq` compares like against like and a collation
+    /// changed without the schema-change signal is seen. If the catalog can't
+    /// be read, the registered table's collations stand in rather than
+    /// failing the stream.
+    pub(super) async fn table_metadata_collations_resolve(
+        &self,
+        metadata: &mut TableMetadata,
+    ) -> CacheResult<()> {
+        let read = self
+            .db_origin
+            .query(RELATION_COLLATIONS_SQL, &[&metadata.relation_oid])
+            .await
+            .map_into_report::<CacheError>();
+        let collations: HashMap<EcoString, ColumnCollation> = match read {
+            Ok(rows) => rows
+                .iter()
+                .map(|row| {
+                    let name: &str = row.get("column_name");
+                    (name.into(), self.column_collation_read(row))
+                })
+                .collect(),
+            Err(e) => {
+                let Some(table) = self.cache.tables.get1(&metadata.relation_oid) else {
+                    return Err(e);
+                };
+                warn!(
+                    "reading the collations of {}.{} failed, keeping the registered ones: {}",
+                    metadata.schema,
+                    metadata.name,
+                    error_chain_format(e.current_context())
+                );
+                table
+                    .columns
+                    .iter()
+                    .map(|column| (column.name.clone(), column.collation.clone()))
+                    .collect()
+            }
+        };
+        let columns: Vec<ColumnMetadata> = metadata
+            .columns
+            .iter()
+            .map(|column| ColumnMetadata {
+                collation: collations
+                    .get(&column.name)
+                    .cloned()
+                    .unwrap_or(ColumnCollation::UNRESOLVED),
+                ..column.clone()
+            })
+            .collect();
+        metadata.columns = ColumnStore::new(columns);
+        Ok(())
     }
 
     /// The key the cache keys on under REPLICA IDENTITY USING INDEX: a CDC
@@ -971,14 +1121,48 @@ const TABLE_COLUMNS_SELECT: &str = r"
         a.atttypid AS type_oid,
         pg_catalog.format_type(a.atttypid, a.atttypmod) as type_name,
         a.attnum = any(pgc.conkey) as is_primary_key,
-        c.relrowsecurity AS row_security
+        c.relrowsecurity AS row_security,
+        co.collprovider::text AS collation_provider,
+        co.collcollate AS collation_collate,
+        co.collisdeterministic AS collation_deterministic,
+        con.nspname AS collation_schema,
+        co.collname AS collation_name
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
     JOIN pg_attribute a ON a.attrelid = c.oid
     JOIN pg_type t ON t.oid = a.atttypid
     JOIN pg_constraint pgc ON pgc.conrelid = c.oid
+    LEFT JOIN pg_collation co ON co.oid = a.attcollation AND a.attcollation <> 100
+    LEFT JOIN pg_namespace con ON con.oid = co.collnamespace
     WHERE c.relname = $1
     AND ";
+
+/// Each live column's declared collation, for a relation named by oid. The
+/// join leaves the `pg_collation` columns NULL for the database default
+/// (oid 100) and for a type without a collation, as [`TABLE_COLUMNS_SELECT`]
+/// does.
+const RELATION_COLLATIONS_SQL: &str = r"
+    SELECT
+        a.attname AS column_name,
+        co.collprovider::text AS collation_provider,
+        co.collcollate AS collation_collate,
+        co.collisdeterministic AS collation_deterministic,
+        con.nspname AS collation_schema,
+        co.collname AS collation_name
+    FROM pg_attribute a
+    LEFT JOIN pg_collation co ON co.oid = a.attcollation AND a.attcollation <> 100
+    LEFT JOIN pg_namespace con ON con.oid = co.collnamespace
+    WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped";
+
+/// A row when the connected database has collation `$1.$2` for its encoding.
+const COLLATION_PRESENT_SQL: &str = r"
+    SELECT 1
+    FROM pg_collation co
+    JOIN pg_namespace n ON n.oid = co.collnamespace
+    WHERE n.nspname = $1 AND co.collname = $2
+    AND co.collencoding IN (
+        -1, (SELECT encoding FROM pg_database WHERE datname = current_database())
+    )";
 
 /// The table in the schema given as `$2`.
 const TABLE_COLUMNS_NAMED_SCHEMA: &str = "n.nspname = $2";
@@ -1098,8 +1282,15 @@ fn cache_table_ddl_build(table_metadata: &TableMetadata) -> CacheTableDdl {
         .columns
         .iter()
         .map(|c| {
+            let collate = c.collation.name.as_ref().map_or_else(String::new, |n| {
+                format!(
+                    " COLLATE {}.{}",
+                    escape::escape_identifier(&n.schema),
+                    escape::escape_identifier(&n.name)
+                )
+            });
             format!(
-                "    {} {}",
+                "    {} {}{collate}",
                 escape::escape_identifier(&c.name),
                 c.cache_type_name
             )
@@ -1139,6 +1330,7 @@ mod tests {
             type_name: "int4".into(),
             cache_type_name: "int4".into(),
             is_primary_key,
+            collation: ColumnCollation::BYTES,
         };
         let metadata =
             TableMetadata::for_test("Posts", 1, [column("id", true), column("order", false)]);
@@ -1152,6 +1344,41 @@ mod tests {
         assert_eq!(
             ddl.enable_tracking,
             "SELECT pgcache_enable_tracking('\"public\".\"Posts\"'::regclass::oid)"
+        );
+    }
+
+    /// A column that declares a collation is created under it; one on the
+    /// database default names none.
+    #[test]
+    fn test_cache_table_ddl_build_names_declared_collations() {
+        let column = |name: &str, collation: ColumnCollation| ColumnMetadata {
+            name: name.into(),
+            position: ColumnPosition::from_raw(1),
+            type_oid: TypeOid::from_raw(25),
+            data_type: Type::TEXT,
+            type_name: "text".into(),
+            cache_type_name: "text".into(),
+            is_primary_key: name == "id",
+            collation,
+        };
+        let declared = ColumnCollation {
+            name: Some(CollationName {
+                schema: "pg_catalog".into(),
+                name: "C".into(),
+            }),
+            text_order: TextOrder::Bytes,
+        };
+        let metadata = TableMetadata::for_test(
+            "t",
+            1,
+            [
+                column("id", ColumnCollation::LINGUISTIC),
+                column("code", declared),
+            ],
+        );
+        assert_eq!(
+            cache_table_ddl_build(&metadata).create_table,
+            "CREATE UNLOGGED TABLE \"public\".\"t\" (\n    \"id\" text,\n    \"code\" text COLLATE \"pg_catalog\".\"C\",\n\tPRIMARY KEY(\"id\")\n)"
         );
     }
 }

@@ -631,7 +631,7 @@ mod tests {
 
     use super::*;
     use crate::cache::admission::{AdmissionDepth, AdmissionQuery, query_admission_analyze};
-    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
+    use crate::catalog::{Catalog, ColumnCollation, ColumnMetadata, ColumnPosition, TableMetadata};
     use crate::id_hash::BuildIdHasher;
     use crate::oid::TypeOid;
     use crate::pg::protocol::ByteString;
@@ -650,6 +650,7 @@ mod tests {
             type_name: type_name.into(),
             cache_type_name: type_name.into(),
             is_primary_key: position == 1,
+            collation: ColumnCollation::BYTES,
         }
     }
 

@@ -3,9 +3,11 @@
 
 use std::cmp::Ordering;
 
+use ecow::EcoString;
 use smallvec::{SmallVec, smallvec};
 
 use super::{ColumnConstraint, ConjunctForm};
+use crate::catalog::{ColumnMetadata, TextOrder};
 use crate::query::ast::rope::{
     Binary, Column, Literal, Multi, NodeRef, Run, Scalar, ScalarKind, Unary, View, Where, WhereKind,
 };
@@ -16,6 +18,7 @@ use crate::query::constraints::{
     literal_value_order,
 };
 use crate::query::resolve::{BoundView, ColumnBinding};
+use crate::query::typed_compare::{ColumnCompare, ValueKind};
 
 /// One AND-ed part of a predicate: its form and the operand subtrees it
 /// reads. A `BETWEEN` or `NOT IN` is several parts over shared operands.
@@ -92,9 +95,113 @@ fn column_constraint_form(
     kind: ColumnConstraintKind,
 ) -> ConjunctForm {
     match bound.column_binding_at(column.id()) {
-        Some(column) => ConjunctForm::Constraint(ColumnConstraint { column, kind }),
+        Some(column) => binding_constraint_form(bound, column, kind),
         None => ConjunctForm::Opaque,
     }
+}
+
+/// The one place a read's constraint takes its column's type and collation
+/// into account, so everything derived from it (ranges, index keys, row
+/// matches) agrees on what a literal's bytes decide.
+fn binding_constraint_form(
+    bound: BoundView<'_>,
+    column: ColumnBinding,
+    kind: ColumnConstraintKind,
+) -> ConjunctForm {
+    let typed = match bound.bindings().binding_column(&column) {
+        Some(metadata) => constraint_kind_typed(metadata, kind),
+        None => Some(kind),
+    };
+    match typed {
+        Some(kind) => ConjunctForm::Constraint(ColumnConstraint { column, kind }),
+        None => ConjunctForm::Opaque,
+    }
+}
+
+/// What a string literal compared to a column becomes in its constraint.
+enum StringForm {
+    /// Bytes decide equality: linguistically collated text, an enum label.
+    Plain,
+    /// Bytes decide equality and order: byte-ordered text.
+    Ordered,
+    /// Two spellings can be one value (`'10.50'` and `'10.5'`, `'a '` and
+    /// `'a'` as `bpchar`), so the literal carries its type and compares only
+    /// with another of that type, never with a write's bare string.
+    Typed(EcoString),
+    /// Nondeterministically collated text: no constraint at all.
+    Undecidable,
+}
+
+fn string_form(column: &ColumnMetadata) -> StringForm {
+    let compare = ColumnCompare::of_column(column);
+    let cast = match compare.kind() {
+        ValueKind::Text => {
+            return match column.collation.text_order {
+                TextOrder::Bytes => StringForm::Ordered,
+                TextOrder::Linguistic => StringForm::Plain,
+                TextOrder::Nondeterministic => StringForm::Undecidable,
+            };
+        }
+        ValueKind::Bpchar if column.collation.text_order == TextOrder::Nondeterministic => {
+            return StringForm::Undecidable;
+        }
+        ValueKind::Enum => return StringForm::Plain,
+        ValueKind::Bpchar => "bpchar",
+        ValueKind::Integer => "int8",
+        ValueKind::Decimal => "numeric",
+        ValueKind::Bool => "bool",
+        ValueKind::Date => "date",
+        ValueKind::Timestamp => "timestamp",
+        ValueKind::TimestampTz => "timestamptz",
+        ValueKind::Uuid => "uuid",
+        ValueKind::Unsupported => return StringForm::Typed(column.type_name.clone()),
+    };
+    StringForm::Typed(cast.into())
+}
+
+/// `kind` with its string literals in the form the column gives them. A
+/// cast comparison lives in the cast's domain and a null test reads no
+/// value, so both stand whatever the column.
+fn constraint_kind_typed(
+    column: &ColumnMetadata,
+    kind: ColumnConstraintKind,
+) -> Option<ColumnConstraintKind> {
+    let form = string_form(column);
+    match kind {
+        ColumnConstraintKind::Comparison { op, value } => Some(ColumnConstraintKind::Comparison {
+            op,
+            value: literal_formed(&form, value)?,
+        }),
+        ColumnConstraintKind::AnyOf(values) => Some(ColumnConstraintKind::AnyOf(
+            values
+                .into_iter()
+                .map(|value| literal_formed(&form, value))
+                .collect::<Option<_>>()?,
+        )),
+        kind
+        @ (ColumnConstraintKind::CastComparison { .. } | ColumnConstraintKind::NullTest(_)) => {
+            Some(kind)
+        }
+    }
+}
+
+/// `value` under `form`; `None` when the column decides nothing from it. A
+/// string already cast keeps the type it names, except a text cast on
+/// byte-ordered text, which is the ordered text itself.
+fn literal_formed(form: &StringForm, value: LiteralValue) -> Option<LiteralValue> {
+    Some(match (form, value) {
+        (StringForm::Undecidable, _) => return None,
+        (StringForm::Ordered, LiteralValue::String(text)) => LiteralValue::OrderedText(text),
+        (StringForm::Ordered, LiteralValue::StringWithCast(text, cast))
+            if ValueKind::of_cast_name(&cast) == ValueKind::Text =>
+        {
+            LiteralValue::OrderedText(text)
+        }
+        (StringForm::Typed(cast), LiteralValue::String(text)) => {
+            LiteralValue::StringWithCast(text, cast.clone())
+        }
+        (StringForm::Plain | StringForm::Ordered | StringForm::Typed(_), value) => value,
+    })
 }
 
 /// `column op value`, `column::cast op value` under a supported coercion,
@@ -172,14 +279,14 @@ fn multi_parts_collect<'t>(
         MultiOp::NotIn => return not_in_parts_collect(bound, expr, multi, parts),
         MultiOp::In => column_and_literals(bound, multi.exprs())
             .map_or(ConjunctForm::Opaque, |(column, values)| {
-                any_of_form(column, values)
+                any_of_form(bound, column, values)
             }),
         // `col = ANY(<array literal>)` is `col IN (<elements>)` for set
         // membership (PGC-106); other comparisons under ANY are not.
         MultiOp::Any {
             comparison: BinaryOp::Equal,
         } => any_eq_array(bound, multi.exprs()).map_or(ConjunctForm::Opaque, |(column, values)| {
-            any_of_form(column, values)
+            any_of_form(bound, column, values)
         }),
         MultiOp::NotBetween
         | MultiOp::NotBetweenSymmetric
@@ -189,13 +296,14 @@ fn multi_parts_collect<'t>(
     parts.push(ConjunctPart::whole(form, expr));
 }
 
-fn any_of_form(column: ColumnBinding, mut values: Vec<LiteralValue>) -> ConjunctForm {
+fn any_of_form(
+    bound: BoundView<'_>,
+    column: ColumnBinding,
+    mut values: Vec<LiteralValue>,
+) -> ConjunctForm {
     values.sort_by(literal_value_canonical_order);
     values.dedup();
-    ConjunctForm::Constraint(ColumnConstraint {
-        column,
-        kind: ColumnConstraintKind::AnyOf(values),
-    })
+    binding_constraint_form(bound, column, ColumnConstraintKind::AnyOf(values))
 }
 
 /// `x BETWEEN low AND high` as `x >= low` and `x <= high`. A SYMMETRIC one
@@ -337,6 +445,7 @@ fn array_literal_values(rhs: Scalar<'_>) -> Option<Vec<LiteralValue>> {
             LiteralValue::Array(values, _) => Some(values.clone()),
             LiteralValue::String(_)
             | LiteralValue::StringWithCast(..)
+            | LiteralValue::OrderedText(_)
             | LiteralValue::Integer(_)
             | LiteralValue::Float(_)
             | LiteralValue::Boolean(_)

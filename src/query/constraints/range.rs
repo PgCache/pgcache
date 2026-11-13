@@ -505,11 +505,13 @@ pub(super) fn column_range_subsumes(cached: &ColumnRange, new: &ColumnRange) -> 
 }
 
 /// Compare two literal values for ordering. Returns None if the values are
-/// not comparable (different types, Parameters, Nulls) — and always for
+/// not comparable (different types, Parameters, Nulls) — and for plain
 /// strings: byte order does not mirror PostgreSQL collation order (`'a' >
 /// 'B'` in bytes but `'a' < 'B'` under en_US), so an ordering claim over text
-/// could prove a false exclusion and serve stale data (PGC-446). String
-/// *equality* is decided by `range_overlap::literal_value_eq` instead.
+/// could prove a false exclusion and serve stale data (PGC-446). Only
+/// [`LiteralValue::OrderedText`], a bound on a byte-ordered column, orders by
+/// bytes, also against the plain string a write to that column carries.
+/// String *equality* is decided by `range_overlap::literal_value_eq` instead.
 pub(crate) fn literal_value_order(
     a: &LiteralValue,
     b: &LiteralValue,
@@ -517,6 +519,11 @@ pub(crate) fn literal_value_order(
     match (a, b) {
         (LiteralValue::Integer(a), LiteralValue::Integer(b)) => Some(a.cmp(b)),
         (LiteralValue::Float(a), LiteralValue::Float(b)) => Some(a.cmp(b)),
+        (LiteralValue::OrderedText(a), LiteralValue::OrderedText(b))
+        | (LiteralValue::OrderedText(a), LiteralValue::String(b))
+        | (LiteralValue::String(a), LiteralValue::OrderedText(b)) => {
+            Some(a.as_bytes().cmp(b.as_bytes()))
+        }
         _ => None,
     }
 }
@@ -529,7 +536,8 @@ pub(crate) fn literal_value_canonical_order(a: &LiteralValue, b: &LiteralValue) 
     match (a, b) {
         (LiteralValue::Integer(a), LiteralValue::Integer(b)) => a.cmp(b),
         (LiteralValue::Float(a), LiteralValue::Float(b)) => a.cmp(b),
-        (LiteralValue::String(a), LiteralValue::String(b)) => a.cmp(b),
+        (LiteralValue::String(a), LiteralValue::String(b))
+        | (LiteralValue::OrderedText(a), LiteralValue::OrderedText(b)) => a.cmp(b),
         (LiteralValue::StringWithCast(a, _), LiteralValue::StringWithCast(b, _)) => a.cmp(b),
         _ => Ordering::Equal,
     }

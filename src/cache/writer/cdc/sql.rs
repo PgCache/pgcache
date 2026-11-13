@@ -353,7 +353,7 @@ mod tests {
     use tokio_postgres::types::Type;
 
     use super::*;
-    use crate::catalog::{ColumnMetadata, ColumnPosition};
+    use crate::catalog::{ColumnCollation, ColumnMetadata, ColumnPosition};
     use crate::oid::TypeOid;
 
     /// A table exercising every identifier hazard: mixed-case name,
@@ -367,6 +367,7 @@ mod tests {
             type_name: "text".into(),
             cache_type_name: "text".into(),
             is_primary_key,
+            collation: ColumnCollation::BYTES,
         };
         TableMetadata::for_test(
             "Order",

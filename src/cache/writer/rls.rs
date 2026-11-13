@@ -1243,7 +1243,7 @@ mod tests {
     use postgres_types::Type;
 
     use super::*;
-    use crate::catalog::{ColumnMetadata, ColumnPosition, TableMetadata};
+    use crate::catalog::{ColumnCollation, ColumnMetadata, ColumnPosition, TableMetadata};
     use crate::oid::TypeOid;
     use crate::query::ast::LiteralValue;
     use crate::query::keying_settings::RlsPolicyFold;
@@ -1267,6 +1267,7 @@ mod tests {
                     type_name: "text".into(),
                     cache_type_name: "text".into(),
                     is_primary_key: i == 0,
+                    collation: ColumnCollation::BYTES,
                 });
             let mut metadata = TableMetadata::for_test(name, oid, store);
             metadata.row_security = secured;

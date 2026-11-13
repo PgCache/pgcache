@@ -1,5 +1,3 @@
-use postgres_types::Type;
-
 use crate::cache::update_query::{ColumnChange, OrderByKey, RowChanges, UpdateQuery};
 use crate::catalog::TableMetadata;
 use crate::pg::protocol::ByteString;
@@ -7,7 +5,7 @@ use crate::query::ast::BinaryOp;
 use crate::query::cast::cast_target_coerce_text;
 use crate::query::constraints::{ColumnConstraintKind, NullTest, TableConstraint};
 use crate::query::evaluate::literal_compare;
-use crate::query::typed_compare::typed_compare;
+use crate::query::typed_compare::{ColumnCompare, typed_compare};
 
 /// Check that every filter of an update query's reference matches
 /// `row_data`. True when there are none (a full-scan reference).
@@ -79,9 +77,11 @@ fn constraint_row_matches(
         return true;
     };
     match row_value {
-        Some(row_str) => {
-            constraint_value_matches(&constraint.kind, &column_meta.data_type, row_str)
-        }
+        Some(row_str) => constraint_value_matches(
+            &constraint.kind,
+            ColumnCompare::of_column(column_meta),
+            row_str,
+        ),
         // NULL satisfies no comparison, only the null test for it.
         None => matches!(
             constraint.kind,
@@ -93,14 +93,18 @@ fn constraint_row_matches(
 /// Every consumer of a constraint match invalidates, evicts or includes on a
 /// match, so a value the comparator cannot decide counts as matching: over-
 /// returning costs work, under-returning serves stale data (PGC-478).
-fn constraint_value_matches(kind: &ColumnConstraintKind, data_type: &Type, row_str: &str) -> bool {
+fn constraint_value_matches(
+    kind: &ColumnConstraintKind,
+    column: ColumnCompare,
+    row_str: &str,
+) -> bool {
     match kind {
         ColumnConstraintKind::Comparison { op, value } => {
-            typed_compare(data_type, value, row_str, *op).unwrap_or(true)
+            typed_compare(column, value, row_str, *op).unwrap_or(true)
         }
         ColumnConstraintKind::AnyOf(values) => values
             .iter()
-            .any(|v| typed_compare(data_type, v, row_str, BinaryOp::Equal).unwrap_or(true)),
+            .any(|v| typed_compare(column, v, row_str, BinaryOp::Equal).unwrap_or(true)),
         // Coercion failure (e.g. `'abc'::int4`): the row would error at origin
         // and never match — safe to treat as non-matching here.
         ColumnConstraintKind::CastComparison { cast, op, value } => {
@@ -248,7 +252,7 @@ mod tests {
     use tokio_postgres::types::Type;
 
     use super::*;
-    use crate::catalog::{ColumnMetadata, ColumnPosition};
+    use crate::catalog::{ColumnCollation, ColumnMetadata, ColumnPosition};
     use crate::oid::TypeOid;
     use crate::query::ast::LiteralValue;
     use crate::query::cast::CastTarget;
@@ -263,6 +267,7 @@ mod tests {
             type_name: type_name.into(),
             cache_type_name: type_name.into(),
             is_primary_key: position == 1,
+            collation: ColumnCollation::BYTES,
         };
         TableMetadata::for_test(
             "users",

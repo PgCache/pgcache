@@ -324,7 +324,7 @@ mod tests {
     use postgres_types::Type;
 
     use super::*;
-    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition};
+    use crate::catalog::{Catalog, ColumnCollation, ColumnMetadata, ColumnPosition};
     use crate::oid::TypeOid;
     use crate::query::ast::rope::Source;
     use crate::query::resolve::ResolvedQuery;
@@ -342,6 +342,7 @@ mod tests {
             type_name: type_name.into(),
             cache_type_name: type_name.into(),
             is_primary_key: index == 0,
+            collation: ColumnCollation::BYTES,
         }
     }
 

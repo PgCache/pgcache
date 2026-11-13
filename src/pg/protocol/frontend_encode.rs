@@ -91,7 +91,9 @@ pub(crate) fn bind_text_write(buf: &mut BytesMut, bytes: &[u8]) -> CacheResult<(
 /// logic error and binds empty under a debug assertion.
 pub(crate) fn bind_value_write(buf: &mut BytesMut, literal: &LiteralValue) -> CacheResult<()> {
     match literal {
-        LiteralValue::String(s) => bind_text_write(buf, s.as_bytes()),
+        LiteralValue::String(s) | LiteralValue::OrderedText(s) => {
+            bind_text_write(buf, s.as_bytes())
+        }
         LiteralValue::Integer(i) => {
             let mut itoa_buf = itoa::Buffer::new();
             bind_text_write(buf, itoa_buf.format(*i).as_bytes())

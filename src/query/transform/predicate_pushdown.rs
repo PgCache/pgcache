@@ -567,7 +567,7 @@ pub(crate) mod tests {
     use postgres_types::Type;
 
     use super::*;
-    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
+    use crate::catalog::{Catalog, ColumnCollation, ColumnMetadata, ColumnPosition, TableMetadata};
     use crate::oid::TypeOid;
     use crate::query::resolve::query_tree_resolve;
 
@@ -587,6 +587,7 @@ pub(crate) mod tests {
                     type_name: "text".into(),
                     cache_type_name: "text".into(),
                     is_primary_key: i == 0,
+                    collation: ColumnCollation::BYTES,
                 });
             tables.insert_overwrite(TableMetadata::for_test(name, oid, store).into());
         }

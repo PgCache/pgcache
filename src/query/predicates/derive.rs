@@ -13,6 +13,7 @@ use crate::catalog::{ColumnPosition, TableMetadata};
 use crate::query::constraint_index::table_constraints_keyed;
 use crate::query::constraints::{ColumnConstraintKind, NullTest, TableRanges};
 use crate::query::resolve::{Bindings, ColumnBinding, SlotId, TableSlot};
+use crate::query::typed_compare::ColumnCompare;
 
 impl FromJoin {
     /// Whether this join's ON restricts the rows of `side`: both sides of an
@@ -283,7 +284,7 @@ impl QueryBranchPredicates {
         &self,
         bindings: &Bindings,
     ) -> Vec<TableReferencePredicates> {
-        let filters = self.filters_derive();
+        let filters = self.filters_derive(bindings);
         self.table_references
             .iter()
             .zip(filters)
@@ -311,9 +312,9 @@ impl QueryBranchPredicates {
     /// Each reference's constraints from the conjuncts that filter it,
     /// closed under the equalities: an equality carries a constraint to a
     /// column whose reference it filters.
-    fn filters_derive(&self) -> Vec<Vec<ColumnConstraint>> {
+    fn filters_derive(&self, bindings: &Bindings) -> Vec<Vec<ColumnConstraint>> {
         let (filters, edges) = self.filter_edges_collect();
-        self.filters_close(filters, edges)
+        self.filters_close(bindings, filters, edges)
     }
 
     /// Each reference's directly stated filters, and the equalities that
@@ -343,12 +344,25 @@ impl QueryBranchPredicates {
     }
 
     /// `filters` closed under `edges`: a constraint on an edge's `from`
-    /// column is restated on its `to` column until nothing new appears.
+    /// column is restated on its `to` column until nothing new appears. A
+    /// constraint's literals are in the form its own column gives them, so
+    /// it only carries to a column that compares the same way: same kind,
+    /// same text order.
     fn filters_close(
         &self,
+        bindings: &Bindings,
         mut filters: Vec<Vec<ColumnConstraint>>,
         edges: Vec<FilterEdge>,
     ) -> Vec<Vec<ColumnConstraint>> {
+        let compare = |column: &ColumnBinding| {
+            bindings
+                .binding_column(column)
+                .map(ColumnCompare::of_column)
+        };
+        let edges: Vec<FilterEdge> = edges
+            .into_iter()
+            .filter(|(from, to)| compare(from) == compare(to))
+            .collect();
         loop {
             let carried: Vec<ColumnConstraint> = edges
                 .iter()
@@ -568,7 +582,7 @@ mod tests {
     use postgres_types::Type;
 
     use super::*;
-    use crate::catalog::{Catalog, ColumnMetadata, TableMetadata};
+    use crate::catalog::{Catalog, ColumnCollation, ColumnMetadata, TableMetadata};
     use crate::oid::TypeOid;
     use crate::query::ast::NodeId;
     use crate::query::ast::rope::{NodeKind, View};
@@ -587,6 +601,7 @@ mod tests {
             type_name: "int4".into(),
             cache_type_name: "int4".into(),
             is_primary_key: position == 1,
+            collation: ColumnCollation::BYTES,
         };
         let mut tables = BiHashMap::new();
         for (oid, name) in (1001..).zip(["a", "b", "c"]) {

@@ -13,7 +13,8 @@ use tracing::error;
 use super::CdcDecodeError;
 use crate::cache::messages::CdcValue;
 use crate::catalog::{
-    ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata, cache_type_name_resolve,
+    ColumnCollation, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata,
+    cache_type_name_resolve,
 };
 use crate::oid::{Oid, TypeOid};
 use crate::pg::protocol::ByteString;
@@ -58,6 +59,7 @@ pub(super) fn parse_relation_to_table_metadata(relation_body: &RelationBody) -> 
             type_name: type_name.into(),
             cache_type_name: cache_type_name.into(),
             is_primary_key,
+            collation: ColumnCollation::UNRESOLVED,
         };
 
         if is_primary_key {

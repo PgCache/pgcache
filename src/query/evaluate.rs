@@ -11,7 +11,7 @@ use crate::query::cast::{
     is_canonical_date_literal,
 };
 use crate::query::resolve::ResolvedQuery;
-use crate::query::typed_compare::literal_locally_comparable;
+use crate::query::typed_compare::{ColumnCompare, literal_locally_comparable};
 
 /// Compare two typed `LiteralValue`s. Used by the cast-coercion path: the
 /// row's text has been coerced to a typed `LiteralValue` and now needs to be
@@ -156,13 +156,13 @@ pub fn comparison_is_simple(bound: &ResolvedQuery, binary: Binary<'_>) -> bool {
     let Some((column, target, op, literal)) = comparison_canonicalize(bound.view(), binary) else {
         return false;
     };
-    let Some(base) = bound.column_type_at(column.id()) else {
+    let Some(metadata) = bound.column_metadata_at(column.id()) else {
         return false;
     };
     let Some(target) = target else {
-        return literal_locally_comparable(base, literal, op);
+        return literal_locally_comparable(ColumnCompare::of_column(metadata), literal, op);
     };
-    if !cast_target_is_coercion_supported(target, base) {
+    if !cast_target_is_coercion_supported(target, &metadata.data_type) {
         return false;
     }
     if *target == CastTarget::Date {

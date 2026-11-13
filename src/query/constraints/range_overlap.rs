@@ -240,7 +240,10 @@ pub(super) fn literal_value_eq(a: &LiteralValue, b: &LiteralValue) -> Option<boo
         | (LiteralValue::Float(f), LiteralValue::Integer(i)) => {
             Some(int_float_cmp(*i, (*f).into_inner()) == Ordering::Equal)
         }
-        (LiteralValue::String(a), LiteralValue::String(b)) => Some(a == b),
+        (
+            LiteralValue::String(a) | LiteralValue::OrderedText(a),
+            LiteralValue::String(b) | LiteralValue::OrderedText(b),
+        ) => Some(a == b),
         (LiteralValue::StringWithCast(a, _), LiteralValue::StringWithCast(b, _)) => Some(a == b),
         _ => None,
     }
@@ -601,6 +604,38 @@ mod tests {
             not_equal: vec![],
         };
         assert_eq!(column_range_contains(&range, &a), None);
+    }
+
+    /// Ordered text is a bound on a byte-ordered column: its bytes order
+    /// it, against another such bound and against the plain string a write
+    /// to the same column carries.
+    #[test]
+    fn test_ordered_text_orders_by_bytes() {
+        let ordered = |s: &str| LiteralValue::OrderedText(s.into());
+        let plain = |s: &str| LiteralValue::String(s.into());
+        assert_eq!(
+            literal_value_order(&ordered("a"), &ordered("B")),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            literal_value_order(&plain("A"), &ordered("B")),
+            Some(Ordering::Less)
+        );
+        assert_eq!(literal_value_eq(&ordered("a"), &plain("a")), Some(true));
+        let range = ColumnRange::Range {
+            lower: None,
+            upper: Some(RangeBound {
+                value: ordered("B"),
+                inclusive: false,
+            }),
+            not_equal: vec![],
+        };
+        assert_eq!(column_range_contains(&range, &plain("a")), Some(false));
+        assert_eq!(column_range_contains(&range, &plain("A")), Some(true));
+        assert!(column_range_disjoint(
+            &range,
+            &ColumnRange::Equal(plain("a"))
+        ));
     }
 
     /// String equality stays decidable by bytes (sound for deterministic

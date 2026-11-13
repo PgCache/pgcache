@@ -80,6 +80,7 @@ fn fragment_shape(expr: Scalar<'_>) -> Option<bool> {
             }
             LiteralValue::String(_)
             | LiteralValue::StringWithCast(..)
+            | LiteralValue::OrderedText(_)
             | LiteralValue::Integer(_)
             | LiteralValue::Float(_)
             | LiteralValue::Boolean(_)

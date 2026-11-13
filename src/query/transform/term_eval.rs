@@ -177,6 +177,7 @@ fn fold(expr: Scalar<'_>, context: &SessionTermContext) -> Result<Folded, TermFo
             LiteralValue::Parameter(_) | LiteralValue::Array(..) => Err(unfoldable("a parameter")),
             value @ (LiteralValue::String(_)
             | LiteralValue::StringWithCast(..)
+            | LiteralValue::OrderedText(_)
             | LiteralValue::Integer(_)
             | LiteralValue::Float(_)
             | LiteralValue::Boolean(_)
@@ -280,7 +281,8 @@ fn cast_fold(cast: TypeCast<'_>, context: &SessionTermContext) -> Result<Folded,
             LiteralValue::NullWithCast(cast_target_deparse(target).into()),
         )),
         Folded::Literal(
-            LiteralValue::Integer(_)
+            LiteralValue::OrderedText(_)
+            | LiteralValue::Integer(_)
             | LiteralValue::Float(_)
             | LiteralValue::Boolean(_)
             | LiteralValue::Parameter(_)

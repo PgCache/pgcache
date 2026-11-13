@@ -8,12 +8,14 @@
 //! `ORDER BY` in the wrong order is a correctness failure, so a mismatch
 //! refuses startup instead of being logged.
 
+use postgres_protocol::escape::escape_identifier;
 use rootcause::Report;
 use tokio_postgres::Client;
 use tracing::warn;
 
 use super::database_locale::DatabaseLocale;
 use crate::cache::{CacheError, CacheResult, MapIntoReport, ReportExt, SetupError};
+use crate::catalog::CollationName;
 
 /// Strings whose relative order separates the known collation families:
 /// case pairs, digits against letters, leading and embedded spaces, hyphens,
@@ -37,6 +39,25 @@ async fn sample_sorted(client: &Client) -> CacheResult<Vec<String>> {
         .await
         .map_into_report::<CacheError>()
         .attach_loc("sorting the collation sample")?;
+    Ok(rows.into_iter().map(|row| row.get(0)).collect())
+}
+
+/// `SAMPLE` as the named collation orders it, ties (a nondeterministic
+/// collation has them) broken by bytes so two servers agree on them. Errors
+/// when the database has no such collation.
+pub(crate) async fn sample_sorted_under(
+    client: &Client,
+    collation: &CollationName,
+) -> CacheResult<Vec<String>> {
+    let sql = format!(
+        "SELECT s FROM unnest($1::text[]) AS t(s) ORDER BY s COLLATE {}.{}, s COLLATE \"C\"",
+        escape_identifier(&collation.schema),
+        escape_identifier(&collation.name),
+    );
+    let rows = client
+        .query(&sql, &[&SAMPLE])
+        .await
+        .map_into_report::<CacheError>()?;
     Ok(rows.into_iter().map(|row| row.get(0)).collect())
 }
 

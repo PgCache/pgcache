@@ -7,7 +7,7 @@ use postgres_types::Type;
 use std::sync::Arc;
 
 use super::*;
-use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
+use crate::catalog::{Catalog, ColumnCollation, ColumnMetadata, ColumnPosition, TableMetadata};
 use crate::oid::{Oid, TypeOid};
 use crate::query::ast::rope::{
     Binary, Body, Column, Function, Join, JoinQual, NodeKind, ScalarKind, Select, SelectItem,
@@ -34,6 +34,7 @@ fn test_table_metadata(name: &str, relation_oid: Oid) -> TableMetadata {
             type_name: "int4".into(),
             cache_type_name: "int4".into(),
             is_primary_key: true,
+            collation: ColumnCollation::BYTES,
         },
         ColumnMetadata {
             name: "name".into(),
@@ -43,6 +44,7 @@ fn test_table_metadata(name: &str, relation_oid: Oid) -> TableMetadata {
             type_name: "text".into(),
             cache_type_name: "text".into(),
             is_primary_key: false,
+            collation: ColumnCollation::BYTES,
         },
     ];
 
@@ -76,6 +78,7 @@ fn test_table_metadata_with_columns(
             type_name: "text".into(),
             cache_type_name: "text".into(),
             is_primary_key: i == 0,
+            collation: ColumnCollation::BYTES,
         });
     TableMetadata::for_test(name, relation_oid.get(), columns)
 }

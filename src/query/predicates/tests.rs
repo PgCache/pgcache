@@ -9,7 +9,7 @@ use ecow::EcoString;
 
 use super::*;
 use crate::cache::UpdateQuerySource;
-use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
+use crate::catalog::{Catalog, ColumnCollation, ColumnMetadata, ColumnPosition, TableMetadata};
 use crate::oid::{Oid, TypeOid};
 use crate::query::ast::rope::Select;
 use crate::query::ast::{BinaryOp, LiteralValue};
@@ -33,6 +33,7 @@ fn test_table_metadata(name: &str, relation_oid: Oid) -> TableMetadata {
             type_name: "int4".into(),
             cache_type_name: "int4".into(),
             is_primary_key: true,
+            collation: ColumnCollation::LINGUISTIC,
         },
         ColumnMetadata {
             name: "name".into(),
@@ -42,6 +43,7 @@ fn test_table_metadata(name: &str, relation_oid: Oid) -> TableMetadata {
             type_name: "text".into(),
             cache_type_name: "text".into(),
             is_primary_key: false,
+            collation: ColumnCollation::LINGUISTIC,
         },
     ];
 
@@ -174,7 +176,7 @@ const CONSTRAINTS_EXPECTED: &[(&str, &str, bool)] = &[
      "[]",
      false),
     ("SELECT id FROM users WHERE id::text = '1' AND name::int4 = 2 AND id::date = '2020-01-01'",
-     r#"[("users", ["CastComparison(\"name\", Int4, Equal, Integer(2))", "Comparison(\"id\", Equal, String(\"1\"))"])]"#,
+     r#"[("users", ["CastComparison(\"name\", Int4, Equal, Integer(2))", "Comparison(\"id\", Equal, StringWithCast(\"1\", \"int8\"))"])]"#,
      false),
     ("SELECT id FROM users WHERE id = 1 OR name = 'a'",
      "[]",
@@ -785,6 +787,140 @@ fn test_subsumption_cases() {
     }
 }
 
+/// A `users` catalog whose `name` column compares under `collation`.
+fn catalog_name_collated(collation: ColumnCollation) -> Catalog {
+    let table = test_table_metadata("users", Oid::from_raw(1001));
+    let columns = table.columns.iter().cloned().map(|column| ColumnMetadata {
+        collation: if column.name == "name" {
+            collation.clone()
+        } else {
+            column.collation.clone()
+        },
+        ..column
+    });
+    let mut tables = BiHashMap::new();
+    tables.insert_overwrite(TableMetadata::for_test("users", 1001, columns).into());
+    tables
+}
+
+/// A text bound orders by bytes only on a byte-ordered column; under a
+/// linguistic collation equality still decides and order does not.
+#[test]
+fn test_text_constraints_follow_column_collation() {
+    use crate::catalog::TextOrder::{Bytes, Linguistic};
+    // (cached SQL, new SQL, subsumed under Bytes, subsumed under Linguistic)
+    #[rustfmt::skip]
+    let cases = [
+        ("SELECT * FROM users WHERE name < 'M'", "SELECT * FROM users WHERE name < 'B'", true, false),
+        ("SELECT * FROM users WHERE name < 'B'", "SELECT * FROM users WHERE name < 'M'", false, false),
+        ("SELECT * FROM users WHERE name < 'M'", "SELECT * FROM users WHERE name = 'B'", true, false),
+        // 'a' sorts after 'M' in bytes, before it under en_US.
+        ("SELECT * FROM users WHERE name < 'M'", "SELECT * FROM users WHERE name = 'a'", false, false),
+        ("SELECT * FROM users WHERE name >= 'A' AND name < 'M'", "SELECT * FROM users WHERE name BETWEEN 'B' AND 'C'", true, false),
+        ("SELECT * FROM users WHERE name IN ('a', 'b')", "SELECT * FROM users WHERE name = 'a'", true, true),
+    ];
+    for (order, pick) in [(Bytes, 0), (Linguistic, 1)] {
+        let tables = catalog_name_collated(ColumnCollation::database_default(order));
+        for (cached_sql, new_sql, bytes, linguistic) in cases {
+            let cached = constraints_of(cached_sql, &tables);
+            let new = constraints_of(new_sql, &tables);
+            assert_eq!(
+                table_constraints_subsumed(
+                    table_constraints_of(&new, "users"),
+                    table_constraints_of(&cached, "users")
+                ),
+                [bytes, linguistic][pick],
+                "{order:?}: cached {cached_sql:?} subsumes new {new_sql:?}"
+            );
+        }
+    }
+}
+
+/// Under a nondeterministic collation unequal bytes can be equal, so a
+/// value comparison is no constraint: the conjunct is unrecognized, which
+/// keeps the query from parenting a subsumption.
+#[test]
+fn test_nondeterministic_text_comparison_is_no_constraint() {
+    let tables = catalog_name_collated(ColumnCollation::database_default(
+        crate::catalog::TextOrder::Nondeterministic,
+    ));
+    for sql in [
+        "SELECT * FROM users WHERE name = 'a' AND id = 1 AND name IS NOT NULL",
+        "SELECT * FROM users WHERE name < 'a' AND id = 1 AND name IS NOT NULL",
+        "SELECT * FROM users WHERE name IN ('a', 'b') AND id = 1 AND name IS NOT NULL",
+    ] {
+        let constraints = constraints_of(sql, &tables);
+        let lines: Vec<String> = table_constraints_sorted(&constraints)
+            .into_iter()
+            .flat_map(|(_, lines)| lines)
+            .collect();
+        assert_eq!(lines.len(), 2, "{sql}: {lines:?}");
+        assert!(
+            lines.iter().all(|line| !line.contains("String")),
+            "{sql}: {lines:?}"
+        );
+        assert!(!constraints.where_recognized, "{sql}");
+    }
+}
+
+/// A string compared to a column where two spellings can be one value
+/// carries the column's type, so the read-after-write check never proves it
+/// different from a write's bare string by bytes. Text and enum labels,
+/// where bytes are the value, stay plain.
+#[test]
+fn test_string_literal_carries_non_text_column_type() {
+    use crate::query::constraints::column_range_contains;
+
+    let tables = catalog(&["users"]);
+    let constraints = constraints_of("SELECT * FROM users WHERE id = '7' AND name = 'x'", &tables);
+    let filters = table_constraints_of(&constraints, "users");
+    let typed = LiteralValue::StringWithCast("7".into(), "int8".into());
+    assert!(filters.contains(&comparison("id", BinaryOp::Equal, typed.clone())));
+    assert!(filters.contains(&comparison("name", BinaryOp::Equal, text("x"))));
+
+    // `id = '07'` in a write names the same row: undecidable, not disjoint.
+    let read = ColumnRange::Equal(typed);
+    assert_eq!(column_range_contains(&read, &text("07")), None);
+    assert_eq!(column_range_contains(&read, &text("7")), None);
+    assert_eq!(
+        column_range_contains(&ColumnRange::Equal(text("x")), &text("y")),
+        Some(false),
+        "text bytes are the value"
+    );
+}
+
+/// A constraint's literal is in the form its own column gives it, so it is
+/// restated on an equal column only when that column compares the same way:
+/// a byte-ordered bound must not become a range on a linguistic column.
+#[test]
+fn test_constraint_restated_only_on_column_comparing_alike() {
+    use crate::catalog::TextOrder::{Bytes, Linguistic};
+    let sql = "SELECT u.id FROM users u JOIN orders o ON o.name = u.name WHERE u.name < 'M'";
+    for (orders_order, carried) in [(Bytes, true), (Linguistic, false)] {
+        let mut tables = catalog_name_collated(ColumnCollation::database_default(Bytes));
+        let orders = test_table_metadata("orders", Oid::from_raw(1002));
+        let columns = orders.columns.iter().cloned().map(|column| ColumnMetadata {
+            collation: ColumnCollation::database_default(orders_order),
+            ..column
+        });
+        tables.insert_overwrite(TableMetadata::for_test("orders", 1002, columns).into());
+        let bound = resolve_sql(sql, &tables);
+        let lines = reference_filter_lines(&bound, bound.select().expect("a SELECT"));
+        let bound_line = r#"Comparison("name", LessThan, OrderedText("M"))"#.to_owned();
+        assert_eq!(
+            lines,
+            [
+                ("u".to_owned(), vec![bound_line.clone()]),
+                (
+                    "o".to_owned(),
+                    if carried { vec![bound_line] } else { vec![] }
+                ),
+            ],
+            "orders.name under {orders_order:?}"
+        );
+    }
+}
+
 // ========== Existing equality tests (updated for new tuple format) ==========
 
 #[test]
@@ -830,6 +966,7 @@ fn test_transitive_propagation() {
                 type_name: "int4".into(),
                 cache_type_name: "int4".into(),
                 is_primary_key: true,
+                collation: ColumnCollation::LINGUISTIC,
             }],
         )
         .into(),
@@ -1254,7 +1391,7 @@ fn test_cast_extraction_cases() {
         ("identity text cast on text column", "SELECT * FROM users WHERE name::text = 'alice'", true,
          Some(comparison("name", BinaryOp::Equal, text("alice")))),
         ("identity text cast on int column",  "SELECT * FROM users WHERE id::text = '42'", true,
-         Some(comparison("id", BinaryOp::Equal, text("42")))),
+         Some(comparison("id", BinaryOp::Equal, LiteralValue::StringWithCast("42".into(), "int8".into())))),
         ("text to int4",                      "SELECT * FROM users WHERE name::int4 = 42", true,
          Some(cast_comparison("name", CastTarget::Int4, BinaryOp::Equal, int(42)))),
         ("text to numeric",                   "SELECT * FROM users WHERE name::numeric = 42", false, None),

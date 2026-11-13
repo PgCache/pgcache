@@ -331,7 +331,7 @@ mod tests {
     use postgres_types::Type;
 
     use super::*;
-    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
+    use crate::catalog::{Catalog, ColumnCollation, ColumnMetadata, ColumnPosition, TableMetadata};
     use crate::oid::TypeOid;
     use crate::query::constraints::ColumnConstraintKind;
 
@@ -344,6 +344,7 @@ mod tests {
             type_name: type_name.into(),
             cache_type_name: type_name.into(),
             is_primary_key: position == 1,
+            collation: ColumnCollation::LINGUISTIC,
         }
     }
 

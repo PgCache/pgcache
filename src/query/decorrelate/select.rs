@@ -18,7 +18,7 @@ use super::scope::{
     Correlations, Scope, correlated_subquery, query_is_correlated, scalar_has_correlation,
     where_correlation_partition, where_has_correlation, where_scalar_subquery,
 };
-use crate::catalog::{ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
+use crate::catalog::{ColumnCollation, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
 use crate::oid::{Oid, TypeOid};
 use crate::query::ast::rope::{
     Body, Column, NodeKind, Query, Replacement, Scalar, ScalarKind, Select, SelectItem, Star, View,
@@ -771,6 +771,8 @@ impl<'t> Planner<'t> {
             type_name: EcoString::from("text"),
             cache_type_name: EcoString::from("text"),
             is_primary_key: false,
+            // An expression's collation is not derived: no order claimed.
+            collation: ColumnCollation::LINGUISTIC,
         });
         let derived = self.derived_push(TableMetadata {
             replica_identity_full: false,

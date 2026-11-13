@@ -986,7 +986,7 @@ mod point {
     use postgres_types::Type;
 
     use super::*;
-    use crate::catalog::{ColumnMetadata, ColumnPosition, TableMetadata};
+    use crate::catalog::{ColumnCollation, ColumnMetadata, ColumnPosition, TableMetadata};
     use crate::oid::TypeOid;
     use crate::pg::protocol::ByteString;
     use crate::query::constraint_index::point::{ColumnForms, row_value_forms};
@@ -1007,6 +1007,7 @@ mod point {
                 type_name: "integer".into(),
                 cache_type_name: "int4".into(),
                 is_primary_key: true,
+                collation: ColumnCollation::BYTES,
             },
             ColumnMetadata {
                 name: "name".into(),
@@ -1016,6 +1017,7 @@ mod point {
                 type_name: "text".into(),
                 cache_type_name: "text".into(),
                 is_primary_key: false,
+                collation: ColumnCollation::BYTES,
             },
             ColumnMetadata {
                 name: "active".into(),
@@ -1025,6 +1027,7 @@ mod point {
                 type_name: "boolean".into(),
                 cache_type_name: "bool".into(),
                 is_primary_key: false,
+                collation: ColumnCollation::BYTES,
             },
         ];
         TableMetadata::for_test("t", 1, columns)
@@ -1125,6 +1128,7 @@ mod point {
             type_name: type_name.into(),
             cache_type_name: type_name.into(),
             is_primary_key: position == 1,
+            collation: ColumnCollation::BYTES,
         };
         TableMetadata::for_test(
             "typed",
@@ -1293,24 +1297,37 @@ mod point {
         );
     }
 
+    /// A plain string bound's order is its collation's, not its bytes'
+    /// (PGC-446): the range is opaque to the probe, so a row on either side
+    /// of the bound in byte order stays a candidate for the precise check.
     #[test]
-    fn test_point_probe_numeric_column_string_literal_range() {
-        // A String-keyed range walks the lexicographic `Str` region; a '42'
-        // row must satisfy `> '10'` lexicographically and not be under-returned.
+    fn test_point_probe_string_range_is_never_excluded_by_bytes() {
         let t = point_table();
         let mut idx = ConstraintIndex::<Fingerprint>::new();
-        idx.insert(fp(1), &ranges(&[gt("id", text("10"))])); // id::text > '10'
+        idx.insert(fp(1), &ranges(&[lt("name", text("B"))])); // name < 'B'
 
-        let row = [bs("42"), bs("alice"), bs("t")];
+        for name in ["A", "a", "C"] {
+            let row = [bs("1"), bs(name), bs("t")];
+            let got = idx.candidates_point(|c| row_value_forms(&t, &row, c));
+            assert!(got.contains(&fp(1)), "{name:?} must stay a candidate");
+        }
+    }
+
+    /// An ordered-text bound sits on a byte-ordered column, so the probe
+    /// walks the `Str` region and excludes by bytes.
+    #[test]
+    fn test_point_probe_ordered_text_range_excludes_by_bytes() {
+        let t = point_table();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
+        let bound = LiteralValue::OrderedText("B".into());
+        idx.insert(fp(1), &ranges(&[lt("name", bound)])); // name < 'B'
+
+        let row = [bs("1"), bs("A"), bs("t")];
         let got = idx.candidates_point(|c| row_value_forms(&t, &row, c));
-        assert!(
-            got.contains(&fp(1)),
-            "'42' > '10' lexicographically — must be a candidate"
-        );
+        assert!(got.contains(&fp(1)), "'A' < 'B' in bytes");
 
-        // A row whose text is lexicographically below '10' must be excluded.
-        let row_lo = [bs("09"), bs("alice"), bs("t")];
-        let got_lo = idx.candidates_point(|c| row_value_forms(&t, &row_lo, c));
-        assert!(!got_lo.contains(&fp(1)), "'09' < '10' lexicographically");
+        let row_hi = [bs("1"), bs("a"), bs("t")];
+        let got_hi = idx.candidates_point(|c| row_value_forms(&t, &row_hi, c));
+        assert!(!got_hi.contains(&fp(1)), "'a' > 'B' in bytes");
     }
 }

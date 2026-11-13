@@ -181,7 +181,7 @@ mod tests {
     use postgres_types::Type;
 
     use super::*;
-    use crate::catalog::{ColumnMetadata, ColumnPosition, TableMetadata};
+    use crate::catalog::{ColumnCollation, ColumnMetadata, ColumnPosition, TableMetadata};
     use crate::oid::TypeOid;
     use crate::query::constraints::{ColumnConstraintKind, table_ranges_subsumed};
 
@@ -194,6 +194,7 @@ mod tests {
             type_name: "int4".into(),
             cache_type_name: "int4".into(),
             is_primary_key: position == 1,
+            collation: ColumnCollation::BYTES,
         };
         let mut tables = BiHashMap::new();
         for (oid, (schema, name)) in

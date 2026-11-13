@@ -194,7 +194,7 @@ mod tests {
     use tokio_postgres::types::Type;
 
     use super::*;
-    use crate::catalog::{ColumnMetadata, ColumnPosition};
+    use crate::catalog::{ColumnCollation, ColumnMetadata, ColumnPosition};
     use crate::oid::TypeOid;
     use crate::pg::protocol::ByteString;
 
@@ -210,6 +210,7 @@ mod tests {
                 type_name: data_type.name().into(),
                 cache_type_name: data_type.name().into(),
                 is_primary_key: *key,
+                collation: ColumnCollation::BYTES,
             });
         TableMetadata::for_test("t", oid, columns)
     }

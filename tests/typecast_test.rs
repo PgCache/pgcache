@@ -2,7 +2,10 @@
 
 use std::io::Error;
 
-use crate::util::{TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, metrics_delta};
+use crate::util::{
+    TestContext, assert_cache_hit, assert_cache_miss, assert_proxy_rows_match_origin,
+    assert_row_at, metrics_delta,
+};
 
 mod util;
 
@@ -438,5 +441,47 @@ async fn test_domain_column_update_with_change_dependent_query() -> Result<(), E
     assert_row_at(&served, 1, &[("id", "1"), ("v", "11")])?;
     let _m = assert_cache_hit(&mut ctx, m).await?;
 
+    Ok(())
+}
+
+/// An integer column cast to text compares as text at origin (`'9' > '10'`,
+/// `'42' <> '042'`), so only an equality against the integer's own spelling
+/// may be decided as an integer comparison. Rows that enter each query's
+/// result only under text comparison are served after their insert.
+#[tokio::test]
+async fn test_typecast_int_to_text_compares_as_text() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    ctx.query(
+        "create table tc_int_text (id integer primary key, val integer)",
+        &[],
+    )
+    .await?;
+    ctx.query("insert into tc_int_text values (1, 20)", &[])
+        .await?;
+
+    let queries = [
+        "select id from tc_int_text where val::text > '10' order by id",
+        "select id from tc_int_text where val::text < '5' order by id",
+        "select id from tc_int_text where val::text <> '042' order by id",
+        "select id from tc_int_text where val::text = '42' order by id",
+    ];
+    for query in queries {
+        ctx.simple_query(query).await?;
+        ctx.cache_settle().await?;
+        assert_proxy_rows_match_origin(&mut ctx, query).await?;
+    }
+
+    // 9 sorts above '10' as text, 100 below '5', and 42 is not '042'.
+    ctx.origin_query(
+        "insert into tc_int_text values (2, 9), (3, 42), (4, 100)",
+        &[],
+    )
+    .await?;
+    ctx.cdc_apply_settle().await?;
+    for query in queries {
+        let m = ctx.metrics().await?;
+        assert_proxy_rows_match_origin(&mut ctx, query).await?;
+        let _ = assert_cache_hit(&mut ctx, m).await?;
+    }
     Ok(())
 }

@@ -8,6 +8,7 @@ use postgres_protocol::escape::escape_literal;
 use tokio_postgres::Client;
 
 use crate::cache::{CacheError, CacheResult, MapIntoReport, ReportExt};
+use crate::catalog::TextOrder;
 use crate::pg;
 use crate::settings::PgSettings;
 
@@ -91,6 +92,17 @@ fn probe_sql(server_version_num: i32) -> &'static str {
 }
 
 impl DatabaseLocale {
+    /// What bytes decide under this database's default collation. A database
+    /// default is always deterministic.
+    pub(super) fn text_order(&self) -> TextOrder {
+        let provider = match self.provider {
+            LocaleProvider::Libc => "c",
+            LocaleProvider::Icu => "i",
+            LocaleProvider::Builtin => "b",
+        };
+        TextOrder::of_collation(provider, Some(&self.collate), true)
+    }
+
     /// Read the connected database's locale.
     pub(super) async fn probe(client: &Client) -> CacheResult<Self> {
         let version = server_version_num(client).await?;

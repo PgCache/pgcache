@@ -132,7 +132,7 @@ mod tests {
     use postgres_types::Type;
 
     use super::*;
-    use crate::catalog::{ColumnMetadata, ColumnPosition, TableMetadata};
+    use crate::catalog::{ColumnCollation, ColumnMetadata, ColumnPosition, TableMetadata};
     use crate::oid::TypeOid;
     use crate::query::join_region::query_join_region;
     use crate::query::resolve::ResolvedQuery;
@@ -146,6 +146,7 @@ mod tests {
             type_name: "int4".into(),
             cache_type_name: "int4".into(),
             is_primary_key: position == 1,
+            collation: ColumnCollation::BYTES,
         };
         let mut tables = BiHashMap::new();
         for (oid, name) in (1001..).zip(["a", "b"]) {

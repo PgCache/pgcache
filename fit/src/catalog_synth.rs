@@ -9,7 +9,9 @@ use std::collections::{HashMap, HashSet};
 
 use ecow::EcoString;
 use iddqd::BiHashMap;
-use pgcache_lib::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
+use pgcache_lib::catalog::{
+    Catalog, ColumnCollation, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata,
+};
 use pgcache_lib::oid::{Oid, TypeOid};
 use pgcache_lib::query::ast::LiteralValue;
 use postgres_types::Type;
@@ -246,6 +248,7 @@ impl Synthesizer {
                     type_name: type_name.into(),
                     cache_type_name: type_name.into(),
                     is_primary_key,
+                    collation: ColumnCollation::LINGUISTIC,
                 }
             }));
 

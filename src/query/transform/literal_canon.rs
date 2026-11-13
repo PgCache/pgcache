@@ -320,7 +320,8 @@ impl Pass<'_> {
                     self.literal(elem, element);
                 }
             }
-            LiteralValue::Integer(_)
+            LiteralValue::OrderedText(_)
+            | LiteralValue::Integer(_)
             | LiteralValue::Float(_)
             | LiteralValue::Boolean(_)
             | LiteralValue::Null
@@ -437,7 +438,7 @@ mod tests {
     use postgres_types::Type;
 
     use super::*;
-    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
+    use crate::catalog::{Catalog, ColumnCollation, ColumnMetadata, ColumnPosition, TableMetadata};
     use crate::oid::TypeOid;
     use crate::query::ast::query_tree_parse;
     use crate::query::resolve::{ResolvedQuery, query_tree_resolve};
@@ -451,6 +452,7 @@ mod tests {
             cache_type_name: ty.name().into(),
             data_type: ty,
             is_primary_key: position == 1,
+            collation: ColumnCollation::BYTES,
         };
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(

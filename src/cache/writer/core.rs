@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -28,7 +29,9 @@ use crate::cache::{
     mv_shape::ShapeGate,
     types::{Cache, CacheStateView, CachedQueryState, CachedQueryView, ServingAt, StreamRelations},
 };
-use crate::catalog::{CatalogTable, FunctionCatalog, FunctionRow, SharedFunctionCatalog};
+use crate::catalog::{
+    CatalogTable, CollationName, FunctionCatalog, FunctionRow, SharedFunctionCatalog, TextOrder,
+};
 use crate::oid::{FunctionOid, Oid};
 use crate::pg;
 use crate::pg::Lsn;
@@ -129,6 +132,8 @@ pub(crate) struct WriterShared {
     /// The origin's functions as the proxy reads them too (PGC-578); the
     /// writer stores a fresh catalog at start and on every function signal.
     pub(crate) function_catalog: SharedFunctionCatalog,
+    /// What bytes decide under origin's database default collation.
+    pub(crate) database_text_order: TextOrder,
 }
 
 /// The cache volume, as read once at startup (PGC-251 Slice 2).
@@ -403,6 +408,12 @@ pub(super) struct WriterCore {
     pub(super) rls: RlsCatalog,
     /// The origin's functions (PGC-578), shared with the proxy.
     pub(super) function_catalog: SharedFunctionCatalog,
+    /// What bytes decide under origin's database default collation; a column
+    /// that declares no collation of its own compares under it.
+    pub(super) database_text_order: TextOrder,
+    /// Column collations already checked against the cache database, with
+    /// why one is unusable. Lives as long as the cache database does.
+    pub(super) collation_verdicts: RefCell<HashMap<CollationName, Option<&'static str>>>,
     /// Functions the cache database was found to hold with origin's body,
     /// by origin oid. Only presence is kept: an absence may end at any time
     /// (the operator installs the function), a presence ends with a signal.
@@ -530,6 +541,7 @@ impl WriterCore {
             watermark_nudge,
             runtime,
             function_catalog,
+            database_text_order,
         } = shared;
         // The proxy loaded its copy before this generation; functions created
         // since are known from here on. An unchanged catalog is not
@@ -607,6 +619,8 @@ impl WriterCore {
             roles_digest,
             rls: RlsCatalog::default(),
             function_catalog,
+            database_text_order,
+            collation_verdicts: RefCell::new(HashMap::new()),
             function_presence: HashSet::new(),
             origin_search_path,
         };

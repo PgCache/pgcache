@@ -1576,3 +1576,48 @@ async fn test_gate_read_ranges_per_relation_across_schemas() -> Result<(), Error
     assert_eq!(delta.raw_forwards_table, 1, "unfiltered side must forward");
     Ok(())
 }
+
+/// A write that names a row by another spelling of the read's value is not
+/// disjoint from it: `'10.50'` is `10.5` as `numeric`, `'a '` is `'a'` as
+/// `char(n)`. The gate compares a read's string literal only as its column's
+/// type allows, so each read after such a write is forwarded and sees it.
+#[tokio::test]
+async fn test_gate_forwards_write_spelled_differently_from_read() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&RAW_LAG).await?;
+    ctx.query(
+        "CREATE TABLE spelled (id int primary key, v int, price numeric, code char(3), \
+         u uuid, n int, ts timestamp, b bool)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO spelled VALUES \
+         (1, 0, 10.5, 'a', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 7, '2024-03-01 00:00', true)",
+        &[],
+    )
+    .await?;
+    ctx.cdc_apply_settle().await?;
+
+    // (read predicate, write predicate naming the same value another way)
+    let cases = [
+        ("price = '10.5'", "price = '10.50'"),
+        ("code = 'a'", "code = 'a '"),
+        (
+            "u = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'",
+            "u = 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'",
+        ),
+        ("n = '7'", "n = '07'"),
+        ("ts = '2024-03-01 00:00:00'", "ts = '2024-03-01'"),
+        ("b = 't'", "b = 'yes'"),
+    ];
+    for (version, (read, write)) in (1..).zip(cases) {
+        let sql = format!("SELECT v FROM spelled WHERE {read}");
+        register(&mut ctx, &sql).await?;
+        ctx.simple_query(&format!("UPDATE spelled SET v = {version} WHERE {write}"))
+            .await?;
+        let res = ctx.simple_query(&sql).await?;
+        assert_row_at(&res, 1, &[("v", &version.to_string())])?;
+        ctx.cdc_apply_settle().await?;
+    }
+    Ok(())
+}

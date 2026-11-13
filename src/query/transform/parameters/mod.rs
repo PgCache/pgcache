@@ -49,6 +49,7 @@ pub(crate) fn literal_is_parameterizable(literal: &LiteralValue) -> bool {
         | LiteralValue::Float(_)
         | LiteralValue::Boolean(_) => true,
         LiteralValue::StringWithCast(_, _)
+        | LiteralValue::OrderedText(_)
         | LiteralValue::Array(_, _)
         | LiteralValue::Null
         | LiteralValue::NullWithCast(_)

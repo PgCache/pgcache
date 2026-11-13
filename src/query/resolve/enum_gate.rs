@@ -409,7 +409,7 @@ mod tests {
     use postgres_types::{Kind, Type};
 
     use super::*;
-    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
+    use crate::catalog::{Catalog, ColumnCollation, ColumnMetadata, ColumnPosition, TableMetadata};
     use crate::oid::TypeOid;
 
     fn severity_type() -> Type {
@@ -437,6 +437,7 @@ mod tests {
                 _ => data_type.name().into(),
             },
             is_primary_key,
+            collation: ColumnCollation::BYTES,
         }
     }
 

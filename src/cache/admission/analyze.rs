@@ -421,7 +421,7 @@ mod tests {
         CandidateState, SubsumerCandidate, SubsumerSource, SubsumptionReference,
         subsumption_covered, subsumption_pending_parent, subsumption_references,
     };
-    use crate::catalog::{ColumnMetadata, ColumnPosition, TableMetadata};
+    use crate::catalog::{ColumnCollation, ColumnMetadata, ColumnPosition, TableMetadata};
     use crate::oid::TypeOid;
     use crate::query::constraints::{TableRanges, table_constraints_subsumed};
     use crate::query::join_region::query_join_region;
@@ -435,6 +435,7 @@ mod tests {
             type_name: "int4".into(),
             cache_type_name: "int4".into(),
             is_primary_key: position == 1,
+            collation: ColumnCollation::BYTES,
         };
         let mut tables = BiHashMap::new();
         for (oid, name) in (1001..).zip(["a", "b", "c"]) {

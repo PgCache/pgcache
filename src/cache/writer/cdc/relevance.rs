@@ -51,7 +51,7 @@ mod tests {
 
     use super::*;
     use crate::cache::update_query::ColumnChange;
-    use crate::catalog::{ColumnMetadata, ColumnPosition};
+    use crate::catalog::{ColumnCollation, ColumnMetadata, ColumnPosition};
     use crate::oid::TypeOid;
     use crate::pg::protocol::ByteString;
 
@@ -65,6 +65,7 @@ mod tests {
             type_name: "text".into(),
             cache_type_name: "text".into(),
             is_primary_key: i == 0,
+            collation: ColumnCollation::BYTES,
         });
         TableMetadata::for_test("t", 1001, columns)
     }

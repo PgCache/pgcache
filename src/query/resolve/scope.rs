@@ -13,7 +13,8 @@ use super::bindings::{BindingsBuilder, ColumnBinding, SlotId, TableSlot};
 use super::entry::query_resolve_scoped;
 use super::join_using::MergedJoinColumn;
 use crate::catalog::{
-    Catalog, CatalogTable, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata,
+    Catalog, CatalogTable, ColumnCollation, ColumnMetadata, ColumnPosition, ColumnStore,
+    TableMetadata,
 };
 use crate::oid::{Oid, TypeOid};
 use crate::query::ast::NodeId;
@@ -336,6 +337,8 @@ pub(super) fn derived_table_columns(
                 type_name: EcoString::from("text"),
                 cache_type_name: EcoString::from("text"),
                 is_primary_key: false,
+                // An expression's collation is not derived: no order claimed.
+                collation: ColumnCollation::LINGUISTIC,
             },
         });
     }

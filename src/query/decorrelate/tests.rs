@@ -7,7 +7,7 @@ use iddqd::BiHashMap;
 use postgres_types::Type;
 
 use super::*;
-use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
+use crate::catalog::{Catalog, ColumnCollation, ColumnMetadata, ColumnPosition, TableMetadata};
 use crate::oid::{Oid, TypeOid};
 use crate::query::ast::rope::deparse::where_deparse_with;
 use crate::query::ast::rope::{
@@ -29,6 +29,7 @@ fn test_table(name: &str, relation_oid: Oid, column_names: &[&str]) -> TableMeta
             type_name: if is_pk { "int4" } else { "text" }.into(),
             cache_type_name: if is_pk { "int4" } else { "text" }.into(),
             is_primary_key: is_pk,
+            collation: ColumnCollation::BYTES,
         }
     });
     TableMetadata::for_test(name, relation_oid.get(), columns)

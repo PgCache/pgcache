@@ -358,6 +358,73 @@ impl ColumnPosition {
     }
 }
 
+/// How far a text column's values compare without its collation library.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TextOrder {
+    /// The collation orders by bytes (`C`, `POSIX`, the builtin provider):
+    /// equality and order are both decidable locally.
+    Bytes,
+    /// A deterministic collation with its own order: byte equality is
+    /// equality, order is the collation library's to decide.
+    Linguistic,
+    /// A nondeterministic collation: unequal bytes can be equal, so neither
+    /// equality nor order is decidable locally.
+    Nondeterministic,
+}
+
+impl TextOrder {
+    /// The order of a collation from its `pg_collation` facts: `provider` is
+    /// `collprovider` (`c` libc, `i` ICU, `b` builtin) and `collate` the libc
+    /// `collcollate`. Mirrors PostgreSQL's own collate-is-C test, so a libc
+    /// `C.UTF-8` stays linguistic.
+    pub fn of_collation(provider: &str, collate: Option<&str>, deterministic: bool) -> Self {
+        if !deterministic {
+            return Self::Nondeterministic;
+        }
+        match (provider, collate) {
+            ("b", _) | ("c", Some("C" | "POSIX")) => Self::Bytes,
+            _ => Self::Linguistic,
+        }
+    }
+}
+
+/// A collation's schema-qualified name.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CollationName {
+    pub schema: EcoString,
+    pub name: EcoString,
+}
+
+/// The collation a column's values compare under.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ColumnCollation {
+    /// The collation the column declares when it is not the database
+    /// default; the cache table's column is created under it. `None` for the
+    /// database default and for a type that has no collation.
+    pub name: Option<CollationName>,
+    /// What bytes decide under the effective collation. A type without a
+    /// collation carries the database default's, which nothing reads.
+    pub text_order: TextOrder,
+}
+
+impl ColumnCollation {
+    /// A fixture column under a byte-ordered database default.
+    pub const BYTES: Self = Self::database_default(TextOrder::Bytes);
+    /// A fixture column under a linguistic database default; also what an
+    /// analysis build without an origin assumes.
+    pub const LINGUISTIC: Self = Self::database_default(TextOrder::Linguistic);
+    /// A column decoded from a Relation message, which names no collation:
+    /// nothing is decidable until the catalog is read.
+    pub const UNRESOLVED: Self = Self::database_default(TextOrder::Nondeterministic);
+
+    pub const fn database_default(text_order: TextOrder) -> Self {
+        Self {
+            name: None,
+            text_order,
+        }
+    }
+}
+
 /// Metadata about a table column.
 ///
 /// Contains type information and position data for a single column
@@ -383,6 +450,8 @@ pub struct ColumnMetadata {
     pub cache_type_name: EcoString,
     /// Whether this column is part of the primary key
     pub is_primary_key: bool,
+    /// The collation text in this column compares under
+    pub collation: ColumnCollation,
 }
 
 impl ColumnMetadata {
@@ -446,6 +515,7 @@ impl std::hash::Hash for ColumnMetadata {
         self.type_name.hash(state);
         self.cache_type_name.hash(state);
         self.is_primary_key.hash(state);
+        self.collation.hash(state);
     }
 }
 
@@ -580,6 +650,30 @@ mod tests {
         assert!(all.is_subset_of(&ColumnMask::all(&table)));
     }
 
+    #[test]
+    fn test_text_order_of_collation() {
+        use TextOrder::{Bytes, Linguistic, Nondeterministic};
+        // (provider, libc collate, deterministic, expected)
+        let cases = [
+            ("c", Some("C"), true, Bytes),
+            ("c", Some("POSIX"), true, Bytes),
+            ("b", None, true, Bytes),
+            ("b", Some("C.UTF-8"), true, Bytes),
+            ("c", Some("C.UTF-8"), true, Linguistic),
+            ("c", Some("en_US.UTF-8"), true, Linguistic),
+            ("i", None, true, Linguistic),
+            ("i", None, false, Nondeterministic),
+            ("c", Some("C"), false, Nondeterministic),
+        ];
+        for (provider, collate, deterministic, expected) in cases {
+            assert_eq!(
+                TextOrder::of_collation(provider, collate, deterministic),
+                expected,
+                "{provider} {collate:?} deterministic={deterministic}"
+            );
+        }
+    }
+
     fn column_fixture(name: &str, position: i16, is_primary_key: bool) -> ColumnMetadata {
         ColumnMetadata {
             name: name.into(),
@@ -589,6 +683,7 @@ mod tests {
             type_name: "text".into(),
             cache_type_name: "text".into(),
             is_primary_key,
+            collation: ColumnCollation::BYTES,
         }
     }
 }

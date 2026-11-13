@@ -256,6 +256,16 @@ error_set! {
             schema: EcoString,
             name: EcoString,
         },
+        /// A column's collation is one the cache database lacks or orders
+        /// differently from origin, so cached text of it would misorder.
+        #[display("table {schema}.{name} has column {column} under collation {collation}, which the cache database {reason}")]
+        CollationUnavailable {
+            schema: EcoString,
+            name: EcoString,
+            column: EcoString,
+            collation: EcoString,
+            reason: &'static str,
+        },
     }
 
     /// Why a read over a row-level-secured relation cannot be registered

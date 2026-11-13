@@ -102,6 +102,7 @@ pub(super) fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
     let (origin_client, origin_locale, reference) =
         origin_facts.attach_loc("reading origin's locale and reference settings")?;
     info!("origin database locale: {}", origin_locale.describe());
+    let database_text_order = origin_locale.text_order();
 
     cache_database_reset(settings, &origin_locale).attach_loc("resetting cache database")?;
 
@@ -173,6 +174,7 @@ pub(super) fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
                 watermark_nudge: watermark_nudge_writer,
                 runtime: shared_runtime_writer,
                 function_catalog,
+                database_text_order,
             };
             let result = writer_run(&settings_writer, channels, shared);
             if let Err(ref e) = result {

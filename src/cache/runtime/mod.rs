@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 use crate::cache::CacheResult;
 
 mod cdc_driver;
-mod collation_probe;
+pub(crate) mod collation_probe;
 mod cpu_monitor;
 mod database_locale;
 mod memory_monitor;

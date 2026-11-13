@@ -32,7 +32,9 @@ use iddqd::BiHashMap;
 use postgres_types::Type;
 
 use pgcache_lib::cache::admission::{AdmissionDepth, AdmissionQuery, query_admission_analyze};
-use pgcache_lib::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
+use pgcache_lib::catalog::{
+    Catalog, ColumnCollation, ColumnMetadata, ColumnPosition, TableMetadata,
+};
 use pgcache_lib::oid::TypeOid;
 use pgcache_lib::pg::ByteString;
 use pgcache_lib::query::Fingerprint;
@@ -115,6 +117,7 @@ fn column(name: &str, index: usize, data_type: Type, is_primary_key: bool) -> Co
         cache_type_name: data_type.name().into(),
         data_type,
         is_primary_key,
+        collation: ColumnCollation::BYTES,
     }
 }
 

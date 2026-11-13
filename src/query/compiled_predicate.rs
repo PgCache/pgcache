@@ -17,7 +17,7 @@ use crate::query::ast::{BinaryOp, LiteralValue, UnaryOp};
 use crate::query::cast::{CastTarget, cast_target_coerce_text, comparison_canonicalize};
 use crate::query::evaluate::literal_compare;
 use crate::query::resolve::ResolvedQuery;
-use crate::query::typed_compare::TypedLiteral;
+use crate::query::typed_compare::{ColumnCompare, TypedLiteral};
 
 /// Pre-canonicalized form of a LocalEval WHERE clause. Built once at registration
 /// from a `ResolvedWhereExpr`; evaluated per CDC row. A total mapping of every
@@ -78,14 +78,17 @@ impl CompiledPredicate {
                         |(column, target, op, value)| {
                             let binding = bound.column_binding_at(column.id())?;
                             let table = bound.column_table_at(column.id())?;
-                            let data_type = bound.column_type_at(column.id())?;
+                            let metadata = bound.column_metadata_at(column.id())?;
                             Some(Self::Compare {
                                 col: binding.position.index(),
                                 in_table: table.name.as_str() == table_name,
                                 target: target.cloned(),
                                 op,
                                 value: value.clone(),
-                                literal: TypedLiteral::new(data_type, value),
+                                literal: TypedLiteral::new(
+                                    ColumnCompare::of_column(metadata),
+                                    value,
+                                ),
                             })
                         },
                     );
@@ -200,7 +203,7 @@ mod tests {
     use postgres_types::Type;
 
     use super::*;
-    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
+    use crate::catalog::{Catalog, ColumnCollation, ColumnMetadata, ColumnPosition, TableMetadata};
     use crate::oid::TypeOid;
     use crate::query::evaluate::where_expr_supported;
     use crate::query::resolve::ResolvedQuery;
@@ -223,6 +226,7 @@ mod tests {
             cache_type_name: ty.name().into(),
             data_type: ty,
             is_primary_key: index == 0,
+            collation: ColumnCollation::BYTES,
         };
         let table = |name: &str, oid: u32, columns: Vec<ColumnMetadata>| {
             TableMetadata::for_test(name, oid, columns)

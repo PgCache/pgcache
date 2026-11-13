@@ -23,6 +23,7 @@ use crate::catalog::TableMetadata;
 use crate::oid::{FunctionOid, Oid};
 use crate::pg;
 use crate::pg::Lsn;
+use crate::result::error_chain_format;
 use crate::settings::Settings;
 
 /// Where a row change lands, by the relation it streams under.
@@ -507,6 +508,9 @@ impl WriterCdc {
         core.table_metadata_primary_key_resolve(&mut table_metadata)
             .await
             .attach_loc("resolving a Relation message's primary key")?;
+        core.table_metadata_collations_resolve(&mut table_metadata)
+            .await
+            .attach_loc("resolving a Relation message's collations")?;
         if self.stream_relation_observe(core, &table_metadata).await? {
             return Ok(());
         }
@@ -537,6 +541,21 @@ impl WriterCdc {
             core.rls_table_reload(relation_oid)
                 .await
                 .attach_loc("reloading a relation's policies after its Relation message")?;
+            return Ok(());
+        }
+        // A collation changed to one the cache database cannot reproduce:
+        // the table stops being cacheable, as at registration.
+        if let Err(e) = core.table_collations_check(&table_metadata).await {
+            info!(
+                relation_oid = %relation_oid,
+                "origin changed a column collation on a streamed table: {}",
+                error_chain_format(e.current_context())
+            );
+            if core.cache.tables.contains_key1(&relation_oid) {
+                self.cached_relation_forget(core, relation_oid)
+                    .await
+                    .attach_loc("column collation changed on a cached table")?;
+            }
             return Ok(());
         }
         // A mid-frame Relation message whose metadata CHANGED (intra-txn

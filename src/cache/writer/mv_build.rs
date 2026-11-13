@@ -565,7 +565,7 @@ mod tests {
     use tokio_postgres::types::Type;
 
     use super::*;
-    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
+    use crate::catalog::{Catalog, ColumnCollation, ColumnMetadata, ColumnPosition, TableMetadata};
     use crate::oid::{Oid, TypeOid};
     use crate::query::ast::rope::{NodeKind, QueryTree};
     use crate::query::ast::{SetOpType, query_tree_parse};
@@ -581,6 +581,7 @@ mod tests {
                 type_name: if is_pk { "int4" } else { "text" }.into(),
                 cache_type_name: if is_pk { "int4" } else { "text" }.into(),
                 is_primary_key: is_pk,
+                collation: ColumnCollation::BYTES,
             }
         });
         TableMetadata::for_test(name, oid.get(), columns)

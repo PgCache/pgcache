@@ -38,21 +38,24 @@ pub(super) fn placement(range: &ColumnRange) -> Placement {
             .map(ValueKey::try_new)
             .collect::<Option<Vec<_>>>()
             .map_or(Placement::Opaque, Placement::InSet),
-        ColumnRange::Range { lower, upper, .. } => match (lower, upper) {
-            (Some(lb), None) => {
-                ValueKey::try_new(&lb.value).map_or(Placement::Opaque, Placement::RangeLower)
-            }
-            (None, Some(ub)) => {
-                ValueKey::try_new(&ub.value).map_or(Placement::Opaque, Placement::RangeUpper)
-            }
-            (Some(lb), Some(ub)) => {
-                match (ValueKey::try_new(&lb.value), ValueKey::try_new(&ub.value)) {
-                    (Some(lower), Some(upper)) => Placement::RangeBoth { lower, upper },
-                    _ => Placement::Opaque,
+        ColumnRange::Range { lower, upper, .. } => {
+            match (lower, upper) {
+                (Some(lb), None) => ValueKey::try_new_bound(&lb.value)
+                    .map_or(Placement::Opaque, Placement::RangeLower),
+                (None, Some(ub)) => ValueKey::try_new_bound(&ub.value)
+                    .map_or(Placement::Opaque, Placement::RangeUpper),
+                (Some(lb), Some(ub)) => {
+                    match (
+                        ValueKey::try_new_bound(&lb.value),
+                        ValueKey::try_new_bound(&ub.value),
+                    ) {
+                        (Some(lower), Some(upper)) => Placement::RangeBoth { lower, upper },
+                        _ => Placement::Opaque,
+                    }
                 }
+                (None, None) => Placement::Opaque,
             }
-            (None, None) => Placement::Opaque,
-        },
+        }
         ColumnRange::Unknown
         | ColumnRange::Unconstrained
         | ColumnRange::Empty
@@ -67,7 +70,9 @@ pub(super) fn placement(range: &ColumnRange) -> Placement {
 /// share one `f64`, which only ever over-returns (the caller's precise check
 /// rejects); it never drops a true match.
 ///
-/// `String` and `StringWithCast` both key by their string content; non-keyable
+/// `String`, `StringWithCast` and `OrderedText` all key by their string
+/// content, so equality lookups meet whatever form the other side took; only
+/// a range bound has to be ordered text ([`ValueKey::try_new_bound`]). Non-keyable
 /// values (`Null`, `Parameter`, `Array`) route to the `opaque` fallback.
 /// Derived `Ord` orders by variant first (`Num` < `Str` < `Bool`), then by
 /// value — `Bool` never reaches a range `BTreeMap`, and a single column never
@@ -87,15 +92,34 @@ impl ValueKey {
             #[allow(clippy::cast_precision_loss)]
             LiteralValue::Integer(n) => NotNan::new(*n as f64).ok().map(ValueKey::Num),
             LiteralValue::Float(f) => Some(ValueKey::Num(*f)),
-            LiteralValue::String(s) | LiteralValue::StringWithCast(s, _) => {
-                Some(ValueKey::Str(s.clone()))
-            }
+            LiteralValue::String(s)
+            | LiteralValue::StringWithCast(s, _)
+            | LiteralValue::OrderedText(s) => Some(ValueKey::Str(s.clone())),
             LiteralValue::Boolean(b) => Some(ValueKey::Bool(*b)),
             LiteralValue::Null
             | LiteralValue::NullWithCast(_)
             | LiteralValue::Parameter(_)
             | LiteralValue::SessionTerm(_)
             | LiteralValue::Array(..) => None,
+        }
+    }
+
+    /// The key of a range bound, for the ordered range maps. A plain string
+    /// has none: the maps walk `Str` keys in byte order, which is the order
+    /// of the column's values only for ordered text (PGC-446), so such a
+    /// range goes to the opaque fallback and the precise check decides.
+    pub(super) fn try_new_bound(v: &LiteralValue) -> Option<Self> {
+        match v {
+            LiteralValue::String(_) | LiteralValue::StringWithCast(..) => None,
+            LiteralValue::OrderedText(_)
+            | LiteralValue::Integer(_)
+            | LiteralValue::Float(_)
+            | LiteralValue::Boolean(_)
+            | LiteralValue::Null
+            | LiteralValue::NullWithCast(_)
+            | LiteralValue::Parameter(_)
+            | LiteralValue::SessionTerm(_)
+            | LiteralValue::Array(..) => Self::try_new(v),
         }
     }
 }

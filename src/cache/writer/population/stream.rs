@@ -497,7 +497,7 @@ mod tests {
 
     /// An int4 table whose leading `pk_count` columns form the primary key.
     fn table_metadata(name: &str, oid: u32, columns: &[&str], pk_count: usize) -> TableMetadata {
-        use crate::catalog::{ColumnMetadata, ColumnPosition};
+        use crate::catalog::{ColumnCollation, ColumnMetadata, ColumnPosition};
         use crate::oid::TypeOid;
         use postgres_types::Type;
         let store = columns
@@ -511,6 +511,7 @@ mod tests {
                 type_name: "int4".into(),
                 cache_type_name: "int4".into(),
                 is_primary_key: i < pk_count,
+                collation: ColumnCollation::BYTES,
             });
         TableMetadata::for_test(name, oid, store)
     }

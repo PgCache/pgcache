@@ -23,6 +23,7 @@ use jiff::{Timestamp, Zoned};
 use ordered_float::NotNan;
 use postgres_types::{Kind, Type};
 
+use crate::catalog::{ColumnMetadata, TextOrder};
 use crate::query::ast::{BinaryOp, Deparse, LiteralValue};
 use crate::query::cast::bool_literal_parse;
 use crate::query::literal_settings::{DateOrder, LiteralSettings};
@@ -40,10 +41,10 @@ pub enum ValueKind {
     Timestamp,
     /// `timestamp with time zone`: an instant.
     TimestampTz,
-    /// `text`, `varchar`, `name`: bytes, every operator (ordering is byte
-    /// order, as it was; collation-aware ordering is PGC-459).
+    /// `text`, `varchar`, `name`: bytes, as far as the column's collation
+    /// lets bytes decide ([`ColumnCompare`]).
     Text,
-    /// `bpchar`: bytes with trailing spaces ignored.
+    /// `bpchar`: bytes with trailing spaces ignored, under the same limit.
     Bpchar,
     /// `uuid`: case-insensitive hex.
     Uuid,
@@ -89,6 +90,60 @@ impl ValueKind {
             "bpchar" => Self::Bpchar,
             "uuid" => Self::Uuid,
             _ => Self::Unsupported,
+        }
+    }
+}
+
+/// A column as the comparator sees it: its type's kind, and for text what
+/// bytes decide under its collation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColumnCompare {
+    kind: ValueKind,
+    text_order: TextOrder,
+}
+
+impl ColumnCompare {
+    pub fn new(ty: &Type, text_order: TextOrder) -> Self {
+        Self {
+            kind: ValueKind::of_type(ty),
+            text_order,
+        }
+    }
+
+    pub fn of_column(column: &ColumnMetadata) -> Self {
+        Self::new(&column.data_type, column.collation.text_order)
+    }
+
+    pub fn kind(self) -> ValueKind {
+        self.kind
+    }
+
+    /// The column's text order when its kind compares under a collation;
+    /// `None` for every other kind.
+    pub fn collated_text_order(self) -> Option<TextOrder> {
+        matches!(self.kind, ValueKind::Text | ValueKind::Bpchar).then_some(self.text_order)
+    }
+
+    /// Whether `op` over this column is decided by comparing parsed values:
+    /// an enum's labels and linguistically collated text only tell equal
+    /// from unequal, and nondeterministically collated text not even that.
+    fn op_decidable(self, op: BinaryOp) -> bool {
+        let equality = matches!(op, BinaryOp::Equal | BinaryOp::NotEqual);
+        match self.kind {
+            ValueKind::Unsupported => false,
+            ValueKind::Enum => equality,
+            ValueKind::Text | ValueKind::Bpchar => match self.text_order {
+                TextOrder::Bytes => true,
+                TextOrder::Linguistic => equality,
+                TextOrder::Nondeterministic => false,
+            },
+            ValueKind::Integer
+            | ValueKind::Decimal
+            | ValueKind::Bool
+            | ValueKind::Date
+            | ValueKind::Timestamp
+            | ValueKind::TimestampTz
+            | ValueKind::Uuid => true,
         }
     }
 }
@@ -284,17 +339,18 @@ impl PartialOrd for Decimal {
     }
 }
 
-/// Whether the classifier may keep `column op literal` local for a column of
-/// `ty`: the literal parses as that kind, and the operator is one the kind
-/// orders under.
-pub fn literal_locally_comparable(ty: &Type, literal: &LiteralValue, op: BinaryOp) -> bool {
-    let kind = ValueKind::of_type(ty);
-    if kind == ValueKind::Unsupported {
+/// Whether the classifier may keep `column op literal` local: the literal
+/// parses as the column's kind, and the operator is one the kind, under the
+/// column's collation, decides.
+pub fn literal_locally_comparable(
+    column: ColumnCompare,
+    literal: &LiteralValue,
+    op: BinaryOp,
+) -> bool {
+    if !column.op_decidable(op) {
         return false;
     }
-    if matches!(kind, ValueKind::Enum) && !matches!(op, BinaryOp::Equal | BinaryOp::NotEqual) {
-        return false;
-    }
+    let kind = column.kind;
     match literal {
         // NULL and parameters never match a non-null row; the evaluator
         // decides them without parsing.
@@ -305,29 +361,31 @@ pub fn literal_locally_comparable(ty: &Type, literal: &LiteralValue, op: BinaryO
         LiteralValue::Array(..) => false,
         LiteralValue::String(_)
         | LiteralValue::StringWithCast(..)
+        | LiteralValue::OrderedText(_)
         | LiteralValue::Integer(_)
         | LiteralValue::Float(_)
         | LiteralValue::Boolean(_) => literal_parse(kind, literal).is_some(),
     }
 }
 
-/// Compare `literal` against a row's wire text for a column of `ty`. `None`
-/// when either side does not parse as the type (the classifier keeps such
-/// literals off this path; a malformed row never matches).
+/// Compare `literal` against a row's wire text for `column`. `None` when
+/// either side does not parse as the column's kind, or the column's
+/// collation leaves `op` undecided (the classifier keeps both off the local
+/// path; other callers take the conservative side).
 pub fn typed_compare(
-    ty: &Type,
+    column: ColumnCompare,
     literal: &LiteralValue,
     row_text: &str,
     op: BinaryOp,
 ) -> Option<bool> {
-    TypedLiteral::new(ty, literal).row_compare(row_text, op)
+    TypedLiteral::new(column, literal).row_compare(row_text, op)
 }
 
 /// A comparison's literal parsed once for its column's kind, so a predicate
 /// evaluated per CDC row parses only the row's text ([`Self::row_compare`]).
 #[derive(Debug, Clone)]
 pub struct TypedLiteral {
-    kind: ValueKind,
+    column: ColumnCompare,
     parsed: LiteralParse,
 }
 
@@ -341,8 +399,8 @@ enum LiteralParse {
 }
 
 impl TypedLiteral {
-    pub fn new(ty: &Type, literal: &LiteralValue) -> Self {
-        let kind = ValueKind::of_type(ty);
+    pub fn new(column: ColumnCompare, literal: &LiteralValue) -> Self {
+        let kind = column.kind;
         let parsed = match literal {
             LiteralValue::Null
             | LiteralValue::NullWithCast(_)
@@ -351,13 +409,14 @@ impl TypedLiteral {
             LiteralValue::Array(..) => LiteralParse::Undecidable,
             LiteralValue::String(_)
             | LiteralValue::StringWithCast(..)
+            | LiteralValue::OrderedText(_)
             | LiteralValue::Integer(_)
             | LiteralValue::Float(_)
             | LiteralValue::Boolean(_) => {
                 literal_parse(kind, literal).map_or(LiteralParse::Undecidable, LiteralParse::Value)
             }
         };
-        Self { kind, parsed }
+        Self { column, parsed }
     }
 
     /// `row_text op literal` for a present (non-NULL) row value; `None` when
@@ -368,7 +427,10 @@ impl TypedLiteral {
             LiteralParse::Undecidable => return None,
             LiteralParse::Value(value) => value,
         };
-        let row = text_parse(self.kind, row_text)?;
+        if !self.column.op_decidable(op) {
+            return None;
+        }
+        let row = text_parse(self.column.kind, row_text)?;
         let ordering = row.cmp_same_kind(filter)?;
         Some(match op {
             BinaryOp::Equal => ordering == Ordering::Equal,
@@ -623,7 +685,7 @@ fn civil_parse_date(date: Date, time: Option<&str>) -> Option<DateTime> {
 /// name the same kind as the column.
 fn literal_parse(kind: ValueKind, literal: &LiteralValue) -> Option<TypedValue> {
     match literal {
-        LiteralValue::String(s) => text_parse(kind, s),
+        LiteralValue::String(s) | LiteralValue::OrderedText(s) => text_parse(kind, s),
         LiteralValue::StringWithCast(s, cast) => {
             if ValueKind::of_cast_name(cast) != kind {
                 return None;
@@ -879,11 +941,16 @@ mod tests {
         ];
         for (ty, literal, row, op) in cases {
             assert_eq!(
-                TypedLiteral::new(ty, literal).row_compare(row, *op),
-                typed_compare(ty, literal, row, *op),
+                TypedLiteral::new(bytes(ty), literal).row_compare(row, *op),
+                typed_compare(bytes(ty), literal, row, *op),
                 "{ty:?} {literal:?} {row} {op:?}"
             );
         }
+    }
+
+    /// A column of `ty` under a byte-ordered collation.
+    fn bytes(ty: &Type) -> ColumnCompare {
+        ColumnCompare::new(ty, TextOrder::Bytes)
     }
 
     fn text(s: &str) -> LiteralValue {
@@ -891,7 +958,7 @@ mod tests {
     }
 
     fn cmp(ty: &Type, literal: LiteralValue, row: &str, op: BinaryOp) -> Option<bool> {
-        typed_compare(ty, &literal, row, op)
+        typed_compare(bytes(ty), &literal, row, op)
     }
 
     #[test]
@@ -908,7 +975,7 @@ mod tests {
         assert_eq!(cmp(&Type::INT4, text("10.0"), "10", Equal), Some(true));
         assert_eq!(cmp(&Type::INT4, text("abc"), "10", Equal), None);
         assert!(!literal_locally_comparable(
-            &Type::INT4,
+            bytes(&Type::INT4),
             &text("abc"),
             Equal
         ));
@@ -1050,7 +1117,7 @@ mod tests {
             None
         );
         assert!(!literal_locally_comparable(
-            &Type::TIMESTAMPTZ,
+            bytes(&Type::TIMESTAMPTZ),
             &text("2024-01-15"),
             Equal
         ));
@@ -1161,10 +1228,78 @@ mod tests {
         assert_eq!(canon(ValueKind::Integer, "1", &mdy), None);
     }
 
+    /// Linguistically collated text tells equal from unequal by bytes and
+    /// leaves order to the collation; `'a' < 'B'` there, `'a' > 'B'` in bytes.
+    #[test]
+    fn test_linguistic_text_decides_equality_only() {
+        for ty in [Type::TEXT, Type::VARCHAR, Type::BPCHAR] {
+            let column = ColumnCompare::new(&ty, TextOrder::Linguistic);
+            assert_eq!(typed_compare(column, &text("B"), "a", Equal), Some(false));
+            assert_eq!(typed_compare(column, &text("B"), "B", Equal), Some(true));
+            assert_eq!(typed_compare(column, &text("B"), "a", NotEqual), Some(true));
+            assert!(literal_locally_comparable(column, &text("B"), Equal));
+            for op in [
+                LessThan,
+                GreaterThan,
+                BinaryOp::LessThanOrEqual,
+                BinaryOp::GreaterThanOrEqual,
+            ] {
+                assert_eq!(
+                    typed_compare(column, &text("B"), "a", op),
+                    None,
+                    "{ty} {op:?}"
+                );
+                assert!(!literal_locally_comparable(column, &text("B"), op));
+            }
+        }
+    }
+
+    /// Under a nondeterministic collation unequal bytes can be equal, so
+    /// nothing about a present value is decided locally.
+    #[test]
+    fn test_nondeterministic_text_decides_nothing() {
+        let column = ColumnCompare::new(&Type::TEXT, TextOrder::Nondeterministic);
+        for op in [Equal, NotEqual, LessThan, GreaterThan] {
+            assert_eq!(typed_compare(column, &text("a"), "A", op), None, "{op:?}");
+            assert!(!literal_locally_comparable(column, &text("a"), op));
+        }
+        assert_eq!(
+            typed_compare(column, &LiteralValue::Null, "A", Equal),
+            Some(false),
+            "a present value never equals NULL"
+        );
+    }
+
+    /// Only text kinds read the collation: a uuid or a number orders the
+    /// same whatever the column's text order says.
+    #[test]
+    fn test_text_order_only_limits_text_kinds() {
+        let int = ColumnCompare::new(&Type::INT4, TextOrder::Nondeterministic);
+        assert_eq!(typed_compare(int, &text("5"), "4", LessThan), Some(true));
+        let uuid = ColumnCompare::new(&Type::UUID, TextOrder::Linguistic);
+        assert!(literal_locally_comparable(
+            uuid,
+            &text("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"),
+            LessThan
+        ));
+        assert_eq!(int.collated_text_order(), None);
+        let name = ColumnCompare::new(&Type::TEXT, TextOrder::Bytes);
+        assert_eq!(name.collated_text_order(), Some(TextOrder::Bytes));
+        assert_eq!(
+            typed_compare(
+                name,
+                &LiteralValue::OrderedText("B".into()),
+                "a",
+                GreaterThan
+            ),
+            Some(true)
+        );
+    }
+
     #[test]
     fn test_unsupported_types_and_null_literals() {
         assert!(!literal_locally_comparable(
-            &Type::JSONB,
+            bytes(&Type::JSONB),
             &text("{}"),
             Equal
         ));
@@ -1174,7 +1309,7 @@ mod tests {
             Some(false)
         );
         assert!(literal_locally_comparable(
-            &Type::INT4,
+            bytes(&Type::INT4),
             &LiteralValue::Null,
             Equal
         ));

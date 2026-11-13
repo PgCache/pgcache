@@ -63,13 +63,21 @@ fn literal_keyed(kind: ValueKind, value: &LiteralValue) -> LiteralValue {
         | LiteralValue::Array(..) => value.clone(),
         LiteralValue::String(_)
         | LiteralValue::StringWithCast(..)
+        | LiteralValue::OrderedText(_)
         | LiteralValue::Integer(_)
         | LiteralValue::Float(_)
         | LiteralValue::Boolean(_) => {
             if kind == ValueKind::Unsupported {
                 return value.clone();
             }
-            literal_index_key(kind, value).unwrap_or(LiteralValue::Null)
+            // A text key stays ordered when its literal was, and a uuid's
+            // normalised hex always orders as the uuid does.
+            let ordered = matches!(value, LiteralValue::OrderedText(_)) || kind == ValueKind::Uuid;
+            match literal_index_key(kind, value) {
+                Some(LiteralValue::String(text)) if ordered => LiteralValue::OrderedText(text),
+                Some(key) => key,
+                None => LiteralValue::Null,
+            }
         }
     }
 }

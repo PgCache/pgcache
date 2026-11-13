@@ -469,7 +469,9 @@ mod tests {
     use crate::cache::SubqueryKind;
     use crate::cache::UpdateQuerySource::{FromClause, OuterJoinOptional, OuterJoinTerminal};
     use crate::cache::query::CacheableQuery;
-    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, FunctionCatalog, TableMetadata};
+    use crate::catalog::{
+        Catalog, ColumnCollation, ColumnMetadata, ColumnPosition, FunctionCatalog, TableMetadata,
+    };
     use crate::oid::TypeOid;
     #[cfg(feature = "proxy")]
     use crate::query::ast::LiteralValue;
@@ -496,6 +498,7 @@ mod tests {
             type_name: "int4".into(),
             cache_type_name: "int4".into(),
             is_primary_key: position == 1,
+            collation: ColumnCollation::BYTES,
         };
         let mut tables = BiHashMap::new();
         for (oid, name) in [(1001, "t"), (1002, "u")] {
@@ -633,6 +636,7 @@ mod tests {
             type_name: "int4".into(),
             cache_type_name: "int4".into(),
             is_primary_key: position == 1,
+            collation: ColumnCollation::BYTES,
         };
         let mut tables = BiHashMap::new();
         for (oid, schema) in [(2001, "s1"), (2002, "s2")] {
@@ -694,6 +698,7 @@ mod tests {
                 type_name: if is_pk { "int4" } else { "text" }.into(),
                 cache_type_name: if is_pk { "int4" } else { "text" }.into(),
                 is_primary_key: is_pk,
+                collation: ColumnCollation::BYTES,
             }
         });
         TableMetadata::for_test(name, relation_oid.get(), columns)

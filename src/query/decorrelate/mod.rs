@@ -233,7 +233,7 @@ pub(crate) mod fixtures {
     use iddqd::BiHashMap;
     use postgres_types::Type;
 
-    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
+    use crate::catalog::{Catalog, ColumnCollation, ColumnMetadata, ColumnPosition, TableMetadata};
     use crate::oid::TypeOid;
     use crate::query::resolve::ResolvedQuery;
 
@@ -248,6 +248,7 @@ pub(crate) mod fixtures {
                 type_name: if is_pk { "int4" } else { "text" }.into(),
                 cache_type_name: if is_pk { "int4" } else { "text" }.into(),
                 is_primary_key: is_pk,
+                collation: ColumnCollation::BYTES,
             }
         });
         TableMetadata::for_test(name, relation_oid, columns)

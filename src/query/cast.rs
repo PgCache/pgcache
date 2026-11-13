@@ -70,19 +70,16 @@ pub fn cast_target_deparse(target: &CastTarget) -> &str {
 /// wire-text representation of `column`? When true, evaluator and classifier
 /// can strip the cast and treat the comparison as `column op literal`.
 ///
-/// `::text` identity covers:
-/// * `text` / `varchar` — trivially the same bytes.
-/// * `int2` / `int4` / `int8` — wire-text is decimal digits (with optional
-///   leading `-`), exactly what `::text` produces. No locale, no separators.
+/// `::text` identity covers `text` / `varchar` — trivially the same bytes.
+/// An integer column's `::text` has the same bytes too, but compares as text
+/// (`'9' > '10'`), so it is an identity only inside an equality against the
+/// integer's own spelling ([`comparison_canonicalize`]).
 ///
 /// `::int4` / `::int8` identity covers self-casts (`int4_col::int4` etc.) —
 /// the cast is a no-op an ORM sometimes still emits.
 pub fn cast_target_is_identity_on(target: &CastTarget, base: &Type) -> bool {
     match target {
-        CastTarget::Text => matches!(
-            *base,
-            Type::TEXT | Type::VARCHAR | Type::INT2 | Type::INT4 | Type::INT8
-        ),
+        CastTarget::Text => matches!(*base, Type::TEXT | Type::VARCHAR),
         CastTarget::Int4 => matches!(*base, Type::INT4),
         CastTarget::Int8 => matches!(*base, Type::INT8),
         CastTarget::Bool => matches!(*base, Type::BOOL),
@@ -424,18 +421,39 @@ pub fn comparison_canonicalize<'t>(
         | ScalarKind::Array(_)
         | ScalarKind::TypeCast(_) => None,
     };
-    if let (Some(left), Some(value)) = (lleaf, literal(rleaf))
+    let (column, target, op, value) = if let (Some(left), Some(value)) = (lleaf, literal(rleaf))
         && let Some((column, target)) = column_target(left)
     {
-        return Some((column, target, binary.op(), value));
-    }
-    if let (Some(value), Some(right)) = (literal(lleaf), rleaf)
+        (column, target, binary.op(), value)
+    } else if let (Some(value), Some(right)) = (literal(lleaf), rleaf)
         && let Some((column, target)) = column_target(right)
     {
-        let flipped = binary.op().op_flip()?;
-        return Some((column, target, flipped, value));
-    }
-    None
+        (column, target, binary.op().op_flip()?, value)
+    } else {
+        return None;
+    };
+    let target = target.filter(|target| {
+        !integer_text_equality(bound.column_type_at(column.id()), target, op, value)
+    });
+    Some((column, target, op, value))
+}
+
+/// Whether `integer_column::text op value` holds exactly when
+/// `integer_column op value` does: an equality or inequality against the
+/// spelling `::text` gives that integer. Text order (`'9' > '10'`) and any
+/// other spelling (`'042'` is no integer's text) differ from the integer
+/// comparison, and stay a cast.
+fn integer_text_equality(
+    base: Option<&Type>,
+    target: &CastTarget,
+    op: BinaryOp,
+    value: &LiteralValue,
+) -> bool {
+    matches!(base, Some(&(Type::INT2 | Type::INT4 | Type::INT8)))
+        && *target == CastTarget::Text
+        && matches!(op, BinaryOp::Equal | BinaryOp::NotEqual)
+        && matches!(value, LiteralValue::String(text)
+            if text.parse::<i64>().is_ok_and(|n| n.to_string() == text.as_str()))
 }
 
 #[cfg(test)]
@@ -617,19 +635,37 @@ mod tests {
         ));
     }
 
+    /// An integer's `::text` compares as text, so it is no identity on its
+    /// own; only an equality against the integer's own spelling is the
+    /// integer comparison.
     #[test]
-    fn test_identity_text_cast_on_int4_column() {
-        assert!(cast_target_is_identity_on(&CastTarget::Text, &Type::INT4));
-    }
-
-    #[test]
-    fn test_identity_text_cast_on_int2_column() {
-        assert!(cast_target_is_identity_on(&CastTarget::Text, &Type::INT2));
-    }
-
-    #[test]
-    fn test_identity_text_cast_on_int8_column() {
-        assert!(cast_target_is_identity_on(&CastTarget::Text, &Type::INT8));
+    fn test_integer_text_cast_is_identity_only_in_exact_equality() {
+        let text = |s: &str| LiteralValue::String(s.into());
+        for base in [Type::INT2, Type::INT4, Type::INT8] {
+            assert!(!cast_target_is_identity_on(&CastTarget::Text, &base));
+            let holds = |op, value: &LiteralValue| {
+                integer_text_equality(Some(&base), &CastTarget::Text, op, value)
+            };
+            assert!(holds(BinaryOp::Equal, &text("42")));
+            assert!(holds(BinaryOp::NotEqual, &text("-7")));
+            assert!(!holds(BinaryOp::GreaterThan, &text("10")));
+            assert!(!holds(BinaryOp::Equal, &text("042")));
+            assert!(!holds(BinaryOp::Equal, &text("+42")));
+            assert!(!holds(BinaryOp::Equal, &text(" 42")));
+            assert!(!holds(BinaryOp::Equal, &LiteralValue::Integer(42)));
+        }
+        assert!(!integer_text_equality(
+            Some(&Type::NUMERIC),
+            &CastTarget::Text,
+            BinaryOp::Equal,
+            &text("42")
+        ));
+        assert!(!integer_text_equality(
+            Some(&Type::INT4),
+            &CastTarget::Int4,
+            BinaryOp::Equal,
+            &text("42")
+        ));
     }
 
     #[test]
