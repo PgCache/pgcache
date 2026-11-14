@@ -13,12 +13,9 @@ use super::ColumnConstraintKind;
 use super::TableConstraint;
 #[cfg(test)]
 use super::range::column_range_build;
-use super::range::{
-    BoundSide, ColumnRange, RangeBound, RangeView, literal_value_is_incomparable,
-    literal_value_order,
-};
+use super::range::{BoundSide, ColumnRange, RangeBound, RangeView};
 use super::subsume::TableRanges;
-use crate::query::ast::LiteralValue;
+use super::value::{ConstraintValue, ValueRef};
 
 /// Reduce a table's constraints to a per-column [`ColumnRange`]: a
 /// reference's filters on the read side of read-after-write disjointness
@@ -35,49 +32,6 @@ pub(crate) fn table_column_ranges(filters: &[TableConstraint]) -> HashMap<EcoStr
         .collect()
 }
 
-/// Exact three-way comparison between an integer and a float value, without the
-/// lossy rounding of `i as f64`. `floor(f)` is recovered exactly as an `i64`
-/// whenever `|f| < 2^63`, so the result never claims a false inequality — which
-/// for read-after-write exclusion (PGC-124) would drop a matching inserted row
-/// and serve stale data.
-#[allow(clippy::cast_possible_truncation)] // floor is integral and |f| < 2^63 → the cast is exact
-fn int_float_cmp(i: i64, f: f64) -> Ordering {
-    // Outside the i64 range `floor(f) as i64` would saturate; resolve by sign.
-    // 2^63 is exactly representable in f64.
-    let two_pow_63 = 2.0_f64.powi(63);
-    if f >= two_pow_63 {
-        return Ordering::Less; // i < f
-    }
-    if f < -two_pow_63 {
-        return Ordering::Greater; // i > f
-    }
-    let floor = f.floor();
-    let floor_int = floor as i64; // exact: integral and within i64 range
-    match i.cmp(&floor_int) {
-        Ordering::Greater => Ordering::Greater,
-        Ordering::Less => Ordering::Less,
-        // i == floor(f): equal only if f has no fractional part, else floor(f) < f.
-        Ordering::Equal if f == floor => Ordering::Equal,
-        Ordering::Equal => Ordering::Less,
-    }
-}
-
-/// Like [`literal_value_order`] but also orders `Integer`/`Float` spellings of
-/// the same value against each other (`10` vs `10.0`), exactly. Scoped to the
-/// read-after-write exclusion path so subsumption's stricter same-type ordering
-/// is unaffected (its precision extension is tracked separately).
-fn literal_value_order_numeric(a: &LiteralValue, b: &LiteralValue) -> Option<Ordering> {
-    match (a, b) {
-        (LiteralValue::Integer(i), LiteralValue::Float(f)) => {
-            Some(int_float_cmp(*i, (*f).into_inner()))
-        }
-        (LiteralValue::Float(f), LiteralValue::Integer(i)) => {
-            Some(int_float_cmp(*i, (*f).into_inner()).reverse())
-        }
-        _ => literal_value_order(a, b),
-    }
-}
-
 /// Whether a concrete `value` falls within a column's `range`.
 ///
 /// `Some(true)` = in range, `Some(false)` = provably excluded, `None` =
@@ -86,12 +40,12 @@ fn literal_value_order_numeric(a: &LiteralValue, b: &LiteralValue) -> Option<Ord
 /// (PGC-124): a `Some(false)` on any predicate column proves an inserted row
 /// can't match the read, so the read may be served despite the pending insert.
 ///
-/// Comparisons go through [`literal_value_order_numeric`], so an integer read
-/// literal and a float inserted value (or vice-versa) are compared by numeric
-/// value rather than by `LiteralValue` variant — a `= 10` read is neither
-/// wrongly excluded from nor wrongly forwarded past a pending `10.0`.
-pub(crate) fn column_range_contains(range: &ColumnRange, value: &LiteralValue) -> Option<bool> {
-    if literal_value_is_incomparable(value) {
+/// A read's typed value reads a write's literal as a value of its own
+/// column ([`ValueRef::value_eq`]), so the two are compared by value however
+/// each was spelled: a `= 10` read is neither wrongly excluded from nor
+/// wrongly forwarded past a pending `10.0` or `'10'`.
+pub(crate) fn column_range_contains(range: &ColumnRange, value: ValueRef<'_>) -> Option<bool> {
+    if value.is_incomparable() {
         return None;
     }
     match range {
@@ -100,7 +54,7 @@ pub(crate) fn column_range_contains(range: &ColumnRange, value: &LiteralValue) -
         ColumnRange::Unknown => None,
         // A non-NULL value never satisfies `IS NULL`; a NULL one returned above.
         ColumnRange::Null => Some(false),
-        ColumnRange::Equal(v) => literal_value_eq(v, value),
+        ColumnRange::Equal(v) => v.as_ref().value_eq(value),
         ColumnRange::InSet(set) => in_set_contains(set, value),
         ColumnRange::Range {
             lower,
@@ -112,10 +66,10 @@ pub(crate) fn column_range_contains(range: &ColumnRange, value: &LiteralValue) -
 
 /// Excluded only if provably unequal to *every* element; an element
 /// incomparable to `value` leaves the membership undecidable.
-fn in_set_contains(set: &HashSet<LiteralValue>, value: &LiteralValue) -> Option<bool> {
+fn in_set_contains(set: &HashSet<ConstraintValue>, value: ValueRef<'_>) -> Option<bool> {
     let mut all_unequal = true;
     for elem in set {
-        match literal_value_eq(elem, value) {
+        match elem.as_ref().value_eq(value) {
             Some(true) => return Some(true),
             Some(false) => {}
             None => all_unequal = false,
@@ -126,18 +80,18 @@ fn in_set_contains(set: &HashSet<LiteralValue>, value: &LiteralValue) -> Option<
 
 /// An explicit exclusion rules the value out; otherwise it must satisfy both
 /// bounds, and a bound incomparable to it leaves containment undecidable.
-fn range_contains(range: RangeView<'_>, value: &LiteralValue) -> Option<bool> {
+fn range_contains(range: RangeView<'_>, value: ValueRef<'_>) -> Option<bool> {
     if range
         .not_equal
         .iter()
-        .any(|nv| literal_value_eq(nv, value) == Some(true))
+        .any(|nv| nv.as_ref().value_eq(value) == Some(true))
     {
         return Some(false);
     }
     let mut admitted = true;
     for side in BoundSide::BOTH {
         if let Some(bound) = range.bound(side) {
-            let ord = literal_value_order_numeric(value, &bound.value)?;
+            let ord = value.value_order(bound.value.as_ref())?;
             admitted &= side.admits(ord, bound.inclusive);
         }
     }
@@ -157,11 +111,13 @@ fn column_range_disjoint(a: &ColumnRange, b: &ColumnRange) -> bool {
         // Can't reason about an opaque range.
         (Unknown, _) | (_, Unknown) => false,
         // A single point is disjoint iff the other range provably excludes it.
-        (Equal(x), other) | (other, Equal(x)) => column_range_contains(other, x) == Some(false),
+        (Equal(x), other) | (other, Equal(x)) => {
+            column_range_contains(other, x.as_ref()) == Some(false)
+        }
         // A set is disjoint iff every member is provably excluded by the other.
         (InSet(set), other) | (other, InSet(set)) => set
             .iter()
-            .all(|v| column_range_contains(other, v) == Some(false)),
+            .all(|v| column_range_contains(other, v.as_ref()) == Some(false)),
         (Null, Null) => false,
         // Any value satisfies an unconstrained range, so it overlaps every
         // non-empty range (the `Empty` cases returned above).
@@ -193,7 +149,7 @@ fn bound_below(upper: &Option<RangeBound>, lower: &Option<RangeBound>) -> bool {
     let (Some(u), Some(l)) = (upper, lower) else {
         return false;
     };
-    match literal_value_order_numeric(&u.value, &l.value) {
+    match u.value.value_order(&l.value) {
         Some(Ordering::Less) => true,
         // Touch at a single value: disjoint unless both sides include it.
         Some(Ordering::Equal) => !(u.inclusive && l.inclusive),
@@ -227,28 +183,6 @@ pub(crate) fn column_ranges_disjoint(
     })
 }
 
-/// Whether two literal values are provably equal (`Some(true)`), provably
-/// unequal (`Some(false)`), or undecidable (`None`). Strings compare by
-/// bytes: PostgreSQL guarantees byte equality ⇔ collation equality for
-/// deterministic collations; explicitly-created nondeterministic collations
-/// (which PG itself heavily restricts) are a documented exclusion (PGC-446).
-pub(super) fn literal_value_eq(a: &LiteralValue, b: &LiteralValue) -> Option<bool> {
-    match (a, b) {
-        (LiteralValue::Integer(a), LiteralValue::Integer(b)) => Some(a == b),
-        (LiteralValue::Float(a), LiteralValue::Float(b)) => Some(a == b),
-        (LiteralValue::Integer(i), LiteralValue::Float(f))
-        | (LiteralValue::Float(f), LiteralValue::Integer(i)) => {
-            Some(int_float_cmp(*i, (*f).into_inner()) == Ordering::Equal)
-        }
-        (
-            LiteralValue::String(a) | LiteralValue::OrderedText(a),
-            LiteralValue::String(b) | LiteralValue::OrderedText(b),
-        ) => Some(a == b),
-        (LiteralValue::StringWithCast(a, _), LiteralValue::StringWithCast(b, _)) => Some(a == b),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::wildcard_enum_match_arm)]
@@ -257,8 +191,14 @@ mod tests {
 
     use super::*;
     use crate::query::ast::BinaryOp;
+    use postgres_types::Type;
 
-    fn range_from_comparisons(comparisons: &[(BinaryOp, LiteralValue)]) -> ColumnRange {
+    use crate::catalog::TextOrder;
+    use crate::query::ast::LiteralValue;
+    use crate::query::constraints::value::int_float_cmp;
+    use crate::query::typed_compare::ColumnCompare;
+
+    fn range_from_comparisons(comparisons: &[(BinaryOp, ConstraintValue)]) -> ColumnRange {
         let tcs: Vec<TableConstraint> = comparisons
             .iter()
             .map(|(op, val)| TableConstraint {
@@ -275,19 +215,37 @@ mod tests {
 
     // ========== column_range_contains: numeric-aware exclusion (PGC-124) ==========
 
-    fn int(v: i64) -> LiteralValue {
-        LiteralValue::Integer(v)
+    /// Whether `range` holds `value`, a literal as a write carries it.
+    fn contains(range: &ColumnRange, value: &ConstraintValue) -> Option<bool> {
+        column_range_contains(range, value.as_ref())
     }
 
-    fn float(v: f64) -> LiteralValue {
-        LiteralValue::Float(NotNan::new(v).expect("finite float"))
+    /// A literal as a write carries it.
+    fn int(v: i64) -> ConstraintValue {
+        LiteralValue::Integer(v).into()
+    }
+
+    fn float(v: f64) -> ConstraintValue {
+        LiteralValue::Float(NotNan::new(v).expect("finite float")).into()
+    }
+
+    fn plain(s: &str) -> ConstraintValue {
+        LiteralValue::String(s.into()).into()
+    }
+
+    /// `s` read as a value of a text column whose collation is `order`.
+    fn text_value(s: &str, order: TextOrder) -> ConstraintValue {
+        ConstraintValue::of_column(
+            ColumnCompare::new(&Type::TEXT, order),
+            LiteralValue::String(s.into()),
+        )
     }
 
     #[test]
     fn test_contains_equal_same_type() {
         let range = ColumnRange::Equal(int(10));
-        assert_eq!(column_range_contains(&range, &int(10)), Some(true));
-        assert_eq!(column_range_contains(&range, &int(20)), Some(false));
+        assert_eq!(contains(&range, &int(10)), Some(true));
+        assert_eq!(contains(&range, &int(20)), Some(false));
     }
 
     #[test]
@@ -295,11 +253,11 @@ mod tests {
         // `WHERE id = 10` against a pending `10.0` must read as equal, so the
         // row is NOT excluded (the read intersects and forwards).
         assert_eq!(
-            column_range_contains(&ColumnRange::Equal(int(10)), &float(10.0)),
+            contains(&ColumnRange::Equal(int(10)), &float(10.0)),
             Some(true)
         );
         assert_eq!(
-            column_range_contains(&ColumnRange::Equal(float(10.0)), &int(10)),
+            contains(&ColumnRange::Equal(float(10.0)), &int(10)),
             Some(true)
         );
     }
@@ -308,21 +266,21 @@ mod tests {
     fn test_contains_equal_int_float_disjoint() {
         // Provably unequal across the type mismatch → excluded (read serves).
         assert_eq!(
-            column_range_contains(&ColumnRange::Equal(int(10)), &float(20.0)),
+            contains(&ColumnRange::Equal(int(10)), &float(20.0)),
             Some(false)
         );
         assert_eq!(
-            column_range_contains(&ColumnRange::Equal(int(10)), &float(10.5)),
+            contains(&ColumnRange::Equal(int(10)), &float(10.5)),
             Some(false)
         );
         // A fractional value near the integer is still provably unequal, both
         // directions (`10` vs `10.1` and `10.1` vs `10`).
         assert_eq!(
-            column_range_contains(&ColumnRange::Equal(int(10)), &float(10.1)),
+            contains(&ColumnRange::Equal(int(10)), &float(10.1)),
             Some(false)
         );
         assert_eq!(
-            column_range_contains(&ColumnRange::Equal(float(10.1)), &int(10)),
+            contains(&ColumnRange::Equal(float(10.1)), &int(10)),
             Some(false)
         );
         assert_eq!(int_float_cmp(10, 10.1), Ordering::Less);
@@ -332,38 +290,32 @@ mod tests {
     #[test]
     fn test_contains_equal_cross_type_undecidable() {
         // A text literal vs an integer value can't be proven equal or unequal.
-        assert_eq!(
-            column_range_contains(
-                &ColumnRange::Equal(LiteralValue::String("2".into())),
-                &int(2)
-            ),
-            None
-        );
+        assert_eq!(contains(&ColumnRange::Equal(plain("2")), &int(2)), None);
     }
 
     #[test]
     fn test_contains_inset_int_float() {
         let set = ColumnRange::InSet(HashSet::from([int(1), int(2), int(3)]));
-        assert_eq!(column_range_contains(&set, &float(2.0)), Some(true));
-        assert_eq!(column_range_contains(&set, &float(5.0)), Some(false));
-        assert_eq!(column_range_contains(&set, &int(3)), Some(true));
+        assert_eq!(contains(&set, &float(2.0)), Some(true));
+        assert_eq!(contains(&set, &float(5.0)), Some(false));
+        assert_eq!(contains(&set, &int(3)), Some(true));
     }
 
     #[test]
     fn test_contains_inset_incomparable_element_undecidable() {
         // A mixed-type set with an element incomparable to the value leaves
         // membership undecidable rather than falsely excluding.
-        let set = ColumnRange::InSet(HashSet::from([LiteralValue::String("x".into()), int(1)]));
-        assert_eq!(column_range_contains(&set, &float(9.0)), None);
+        let set = ColumnRange::InSet(HashSet::from([plain("x"), int(1)]));
+        assert_eq!(contains(&set, &float(9.0)), None);
     }
 
     #[test]
     fn test_contains_range_int_float_bounds() {
         // `WHERE price > 5`, integer bound, float inserted values.
         let range = range_from_comparisons(&[(BinaryOp::GreaterThan, int(5))]);
-        assert_eq!(column_range_contains(&range, &float(4.5)), Some(false));
-        assert_eq!(column_range_contains(&range, &float(5.5)), Some(true));
-        assert_eq!(column_range_contains(&range, &float(5.0)), Some(false)); // exclusive
+        assert_eq!(contains(&range, &float(4.5)), Some(false));
+        assert_eq!(contains(&range, &float(5.5)), Some(true));
+        assert_eq!(contains(&range, &float(5.0)), Some(false)); // exclusive
     }
 
     #[test]
@@ -372,8 +324,8 @@ mod tests {
             (BinaryOp::GreaterThanOrEqual, int(0)),
             (BinaryOp::NotEqual, int(7)),
         ]);
-        assert_eq!(column_range_contains(&range, &float(7.0)), Some(false));
-        assert_eq!(column_range_contains(&range, &float(8.0)), Some(true));
+        assert_eq!(contains(&range, &float(7.0)), Some(false));
+        assert_eq!(contains(&range, &float(8.0)), Some(true));
     }
 
     #[test]
@@ -542,12 +494,9 @@ mod tests {
     /// arrives, stays undecidable (PGC-533).
     #[test]
     fn test_null_range_contains_and_disjoint() {
+        assert_eq!(contains(&ColumnRange::Null, &int(5)), Some(false));
         assert_eq!(
-            column_range_contains(&ColumnRange::Null, &int(5)),
-            Some(false)
-        );
-        assert_eq!(
-            column_range_contains(&ColumnRange::Null, &LiteralValue::Null),
+            contains(&ColumnRange::Null, &LiteralValue::Null.into()),
             None
         );
         assert!(column_range_disjoint(
@@ -566,11 +515,11 @@ mod tests {
         ));
         assert!(!column_range_disjoint(
             &ColumnRange::Null,
-            &ColumnRange::Equal(LiteralValue::Null)
+            &ColumnRange::Equal(LiteralValue::Null.into())
         ));
         assert!(!column_range_disjoint(
             &ColumnRange::Null,
-            &ColumnRange::InSet(HashSet::from([int(1), LiteralValue::Null]))
+            &ColumnRange::InSet(HashSet::from([int(1), LiteralValue::Null.into()]))
         ));
         // `IS NOT NULL` is the unbounded range: it overlaps every value.
         let not_null = ColumnRange::Range {
@@ -578,7 +527,7 @@ mod tests {
             upper: None,
             not_equal: vec![],
         };
-        assert_eq!(column_range_contains(&not_null, &int(5)), Some(true));
+        assert_eq!(contains(&not_null, &int(5)), Some(true));
         assert!(!column_range_disjoint(
             &not_null,
             &ColumnRange::Equal(int(5))
@@ -586,42 +535,44 @@ mod tests {
         assert!(column_range_disjoint(&not_null, &ColumnRange::Null));
     }
 
-    /// PGC-446: byte order is not collation order, so ordering claims over
-    /// strings must be undecidable — a false exclusion would serve stale data.
+    /// PGC-446: byte order is not collation order, so a string's order is
+    /// undecided unless it is a value of a byte-ordered column — a false
+    /// exclusion would serve stale data.
     #[test]
     fn test_string_ordering_is_undecidable() {
-        let a = LiteralValue::String("a".into());
-        let b = LiteralValue::String("B".into());
-        assert_eq!(literal_value_order(&a, &b), None);
-        // A text range bound cannot exclude a pending value ('a' < 'B' under
-        // en_US even though 'a' > 'B' in bytes).
-        let range = ColumnRange::Range {
-            lower: None,
-            upper: Some(RangeBound {
-                value: b,
-                inclusive: false,
-            }),
-            not_equal: vec![],
-        };
-        assert_eq!(column_range_contains(&range, &a), None);
+        for (a, b) in [
+            (plain("a"), plain("B")),
+            (
+                text_value("a", TextOrder::Linguistic),
+                text_value("B", TextOrder::Linguistic),
+            ),
+            (plain("a"), text_value("B", TextOrder::Linguistic)),
+        ] {
+            assert_eq!(a.value_order(&b), None);
+            // A text range bound cannot exclude a pending value ('a' < 'B'
+            // under en_US even though 'a' > 'B' in bytes).
+            let range = ColumnRange::Range {
+                lower: None,
+                upper: Some(RangeBound {
+                    value: b,
+                    inclusive: false,
+                }),
+                not_equal: vec![],
+            };
+            assert_eq!(contains(&range, &a), None);
+        }
     }
 
-    /// Ordered text is a bound on a byte-ordered column: its bytes order
-    /// it, against another such bound and against the plain string a write
-    /// to the same column carries.
+    /// A value of a byte-ordered column orders by its bytes, against another
+    /// such value and against the plain string a write to the column carries.
     #[test]
-    fn test_ordered_text_orders_by_bytes() {
-        let ordered = |s: &str| LiteralValue::OrderedText(s.into());
-        let plain = |s: &str| LiteralValue::String(s.into());
+    fn test_byte_ordered_text_orders_by_bytes() {
+        let ordered = |s: &str| text_value(s, TextOrder::Bytes);
         assert_eq!(
-            literal_value_order(&ordered("a"), &ordered("B")),
+            ordered("a").value_order(&ordered("B")),
             Some(Ordering::Greater)
         );
-        assert_eq!(
-            literal_value_order(&plain("A"), &ordered("B")),
-            Some(Ordering::Less)
-        );
-        assert_eq!(literal_value_eq(&ordered("a"), &plain("a")), Some(true));
+        assert_eq!(plain("A").value_order(&ordered("B")), Some(Ordering::Less));
         let range = ColumnRange::Range {
             lower: None,
             upper: Some(RangeBound {
@@ -630,30 +581,78 @@ mod tests {
             }),
             not_equal: vec![],
         };
-        assert_eq!(column_range_contains(&range, &plain("a")), Some(false));
-        assert_eq!(column_range_contains(&range, &plain("A")), Some(true));
+        assert_eq!(contains(&range, &plain("a")), Some(false));
+        assert_eq!(contains(&range, &plain("A")), Some(true));
         assert!(column_range_disjoint(
             &range,
             &ColumnRange::Equal(plain("a"))
         ));
     }
 
-    /// String equality stays decidable by bytes (sound for deterministic
-    /// collations), so text-PK point disjointness is preserved.
+    /// Text equality stays decidable by bytes (sound for deterministic
+    /// collations), so text-PK point disjointness is preserved: between a
+    /// read's value and a write's string, and between two raw strings.
     #[test]
     fn test_string_equality_still_decides() {
-        let a = LiteralValue::String("a".into());
-        let a2 = LiteralValue::String("a".into());
-        let b = LiteralValue::String("b".into());
-        assert_eq!(literal_value_eq(&a, &a2), Some(true));
-        assert_eq!(literal_value_eq(&a, &b), Some(false));
+        for read in [plain("a"), text_value("a", TextOrder::Linguistic)] {
+            let range = ColumnRange::Equal(read);
+            assert_eq!(contains(&range, &plain("a")), Some(true));
+            assert_eq!(contains(&range, &plain("b")), Some(false));
+        }
+    }
+
+    /// A read's value reads a write's literal as a value of its own column:
+    /// spellings of one value are equal, and types that order do so by value.
+    #[test]
+    fn test_typed_value_reads_write_literal_by_value() {
+        let value = |ty: &Type, s: &str| {
+            ConstraintValue::of_column(
+                ColumnCompare::new(ty, TextOrder::Linguistic),
+                LiteralValue::String(s.into()),
+            )
+        };
+        // (column type, read literal, write literal naming the same value, one that differs)
+        let cases = [
+            (Type::NUMERIC, "10.5", "10.50", "10.51"),
+            (Type::INT4, "7", "07", "8"),
+            (Type::BPCHAR, "a", "a  ", "b"),
+            (
+                Type::UUID,
+                "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+                "A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11",
+                "b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+            ),
+            (
+                Type::TIMESTAMP,
+                "2024-03-01 00:00:00",
+                "2024-03-01",
+                "2024-03-02",
+            ),
+            (Type::BOOL, "t", "yes", "no"),
+        ];
+        for (ty, read, same, other) in cases {
+            let range = ColumnRange::Equal(value(&ty, read));
+            assert_eq!(contains(&range, &plain(same)), Some(true), "{ty} {same}");
+            assert_eq!(contains(&range, &plain(other)), Some(false), "{ty} {other}");
+        }
+        let range = ColumnRange::Equal(value(&Type::INT4, "7"));
+        assert_eq!(contains(&range, &int(7)), Some(true));
+        assert_eq!(contains(&range, &float(7.5)), Some(false));
         assert_eq!(
-            column_range_contains(&ColumnRange::Equal(a.clone()), &a2),
-            Some(true)
+            contains(&range, &plain("seven")),
+            None,
+            "unparseable is undecided"
         );
-        assert_eq!(
-            column_range_contains(&ColumnRange::Equal(a), &b),
-            Some(false)
-        );
+
+        let after = ColumnRange::Range {
+            lower: Some(RangeBound {
+                value: value(&Type::DATE, "2024-01-01"),
+                inclusive: false,
+            }),
+            upper: None,
+            not_equal: vec![],
+        };
+        assert_eq!(contains(&after, &plain("2024-06-01")), Some(true));
+        assert_eq!(contains(&after, &plain("2023-06-01")), Some(false));
     }
 }

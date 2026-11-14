@@ -9,7 +9,6 @@ use ecow::EcoString;
 
 use crate::oid::Oid;
 use crate::query::ast::rope::{NodeKind, View};
-use crate::query::constraint_index::table_constraints_keyed;
 use crate::query::constraints::{TableConstraint, TableRanges};
 use crate::query::predicates::{ConjunctForm, ConjunctScope, QueryBranchPredicates};
 use crate::query::resolve::{BoundView, ColumnTarget, ResolvedQuery, SlotId, TableSlot};
@@ -37,9 +36,6 @@ pub struct JoinRegion {
     pub constraints: Vec<SlotConstraint>,
     /// `constraints` as one table's ranges, each column keyed by its slot.
     pub ranges: TableRanges,
-    /// `ranges` with every literal in its index-key form for its column's
-    /// type (PGC-478), as the shape index is built and probed.
-    pub keyed_ranges: TableRanges,
     /// Every WHERE conjunct is one of `constraints`, so the region is
     /// exactly what population loaded and the query can parent a join of
     /// its shape. A WHERE the model can't read whole still probes.
@@ -133,29 +129,10 @@ pub(crate) fn join_region_build(
         });
     }
     let ranges = slot_constraints_ranges(constraints.iter().map(|c| (c.slot, &c.constraint)));
-    let keyed: Vec<(SlotId, TableConstraint)> = constraints
-        .iter()
-        .map(|constraint| {
-            let keyed = bindings
-                .slot(constraint.slot)
-                .and_then(|slot| match slot {
-                    TableSlot::Base { table, .. } => {
-                        table_constraints_keyed(std::slice::from_ref(&constraint.constraint), table)
-                            .pop()
-                    }
-                    TableSlot::Derived { .. } => None,
-                })
-                .unwrap_or_else(|| constraint.constraint.clone());
-            (constraint.slot, keyed)
-        })
-        .collect();
-    let keyed_ranges =
-        slot_constraints_ranges(keyed.iter().map(|(slot, constraint)| (*slot, constraint)));
     Some(JoinRegion {
         shape,
         constraints,
         ranges,
-        keyed_ranges,
         exact,
     })
 }
@@ -433,10 +410,10 @@ mod tests {
         }
     }
 
-    /// The keyed ranges rewrite each literal for its own slot's column
-    /// type, so a child spelled differently still probes the same key.
+    /// Each literal is its own slot's column value, so a child that spells
+    /// one differently is still covered.
     #[test]
-    fn test_join_region_keyed_ranges_per_slot() {
+    fn test_join_region_ranges_compare_values_per_slot() {
         let tables = catalog();
         let region = |sql: &str| {
             let bound = ResolvedQuery::parse_resolve(sql, &tables, &["public"]).expect("resolve");
@@ -444,9 +421,6 @@ mod tests {
         };
         let parent = region("SELECT * FROM a JOIN b ON b.id = a.id WHERE a.x = 1 AND b.y = 2");
         let child = region("SELECT * FROM a JOIN b ON b.id = a.id WHERE a.x = '1' AND b.y = 2");
-        assert!(table_ranges_subsumed(
-            &child.keyed_ranges,
-            &parent.keyed_ranges
-        ));
+        assert!(table_ranges_subsumed(&child.ranges, &parent.ranges));
     }
 }

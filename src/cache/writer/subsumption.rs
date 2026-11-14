@@ -20,8 +20,6 @@ use crate::cache::messages::SubsumptionResult;
 use crate::cache::types::{Cache, QueryServing, ServingAt};
 use crate::cache::{CacheError, CacheResult, MapIntoReport};
 use crate::query::Fingerprint;
-use crate::query::constraint_index::table_constraints_keyed;
-use crate::query::constraints::TableRanges;
 use crate::query::join_region::JoinRegion;
 use crate::query::resolve::ResolvedQuery;
 use crate::result::error_chain_format;
@@ -58,15 +56,6 @@ impl SubsumerSource for WriterSubsumerSource<'_> {
         reference: &SubsumptionReference,
     ) -> impl Iterator<Item = SubsumerCandidate<'_>> {
         let relation_oid = reference.relation_oid;
-        // Probe with the new query's constraints in their key forms, the way
-        // the index was built (PGC-478): as the model keyed them, or keyed
-        // here for a split piece.
-        let keyed = reference.keyed_ranges.clone().unwrap_or_else(|| {
-            TableRanges::build(&self.cache.tables.get1(&relation_oid).map_or_else(
-                || reference.filters.to_vec(),
-                |t| table_constraints_keyed(&reference.filters, t),
-            ))
-        });
         self.cache
             .update_queries
             .get(&relation_oid)
@@ -76,7 +65,7 @@ impl SubsumerSource for WriterSubsumerSource<'_> {
                 // index; the fine-grained gates run per candidate in
                 // `subsumption_covered`.
                 update_queries
-                    .subsumption_candidates(&keyed)
+                    .subsumption_candidates(&reference.ranges)
                     .into_iter()
                     .filter_map(move |key| {
                         let region = update_queries.subsumer_region(key)?;
@@ -97,7 +86,7 @@ impl SubsumerSource for WriterSubsumerSource<'_> {
     fn join_candidates(&self, join: &JoinRegion) -> impl Iterator<Item = SubsumerCandidate<'_>> {
         self.cache
             .join_subsumers
-            .candidates(join.shape, &join.keyed_ranges)
+            .candidates(join.shape, &join.ranges)
             .map(|(fingerprint, candidate)| SubsumerCandidate {
                 fingerprint,
                 region: candidate.region,

@@ -15,11 +15,12 @@ use crate::query::ast::rope::Select;
 use crate::query::ast::{BinaryOp, LiteralValue};
 use crate::query::cast::CastTarget;
 use crate::query::constraints::{
-    ColumnConstraintKind, ColumnRange, TableConstraint, column_range_build,
+    ColumnConstraintKind, ColumnRange, ConstraintValue, TableConstraint, column_range_build,
     table_constraints_subsumed,
 };
 use crate::query::decorrelate::query_decorrelate;
 use crate::query::resolve::{ResolvedQuery, TableSlot};
+use crate::query::typed_compare::ColumnCompare;
 use crate::query::update::select_branches_with_source;
 
 // Helper function to create test table metadata
@@ -146,8 +147,28 @@ fn constraint(column: &str, kind: ColumnConstraintKind) -> TableConstraint {
     }
 }
 
+/// `literal` as the value it is in a `test_table_metadata` column: an
+/// integer in `id`, linguistically collated text in `name`.
+fn column_value(column: &str, literal: LiteralValue) -> ConstraintValue {
+    let ty = match column {
+        "id" => Type::INT4,
+        "name" => Type::TEXT,
+        _ => return literal.into(),
+    };
+    ConstraintValue::of_column(
+        ColumnCompare::new(&ty, crate::catalog::TextOrder::Linguistic),
+        literal,
+    )
+}
+
 fn comparison(column: &str, op: BinaryOp, value: LiteralValue) -> TableConstraint {
-    constraint(column, ColumnConstraintKind::Comparison { op, value })
+    constraint(
+        column,
+        ColumnConstraintKind::Comparison {
+            op,
+            value: column_value(column, value),
+        },
+    )
 }
 
 /// What each shape yields: the per-table filters and whether every WHERE
@@ -158,13 +179,13 @@ const CONSTRAINTS_EXPECTED: &[(&str, &str, bool)] = &[
      r#"[("users", ["Comparison(\"id\", Equal, Integer(1))"])]"#,
      true),
     ("SELECT id FROM users WHERE 1 = id AND name = 'a'",
-     r#"[("users", ["Comparison(\"id\", Equal, Integer(1))", "Comparison(\"name\", Equal, String(\"a\"))"])]"#,
+     r#"[("users", ["Comparison(\"id\", Equal, Integer(1))", "Comparison(\"name\", Equal, Text(\"a\"))"])]"#,
      true),
     ("SELECT id FROM users WHERE id > 1 AND id <= 9 AND name <> 'x'",
-     r#"[("users", ["Comparison(\"id\", GreaterThan, Integer(1))", "Comparison(\"id\", LessThanOrEqual, Integer(9))", "Comparison(\"name\", NotEqual, String(\"x\"))"])]"#,
+     r#"[("users", ["Comparison(\"id\", GreaterThan, Integer(1))", "Comparison(\"id\", LessThanOrEqual, Integer(9))", "Comparison(\"name\", NotEqual, Text(\"x\"))"])]"#,
      true),
     ("SELECT id FROM users WHERE id IN (3, 1, 2, 1) AND name NOT IN ('a', 'b')",
-     r#"[("users", ["AnyOf(\"id\", [Integer(1), Integer(2), Integer(3)])", "Comparison(\"name\", NotEqual, String(\"a\"))", "Comparison(\"name\", NotEqual, String(\"b\"))"])]"#,
+     r#"[("users", ["AnyOf(\"id\", [Integer(1), Integer(2), Integer(3)])", "Comparison(\"name\", NotEqual, Text(\"a\"))", "Comparison(\"name\", NotEqual, Text(\"b\"))"])]"#,
      true),
     ("SELECT id FROM users WHERE id BETWEEN 1 AND 5 AND name BETWEEN SYMMETRIC 'z' AND 'a'",
      r#"[("users", ["Comparison(\"id\", GreaterThanOrEqual, Integer(1))", "Comparison(\"id\", LessThanOrEqual, Integer(5))"])]"#,
@@ -176,7 +197,7 @@ const CONSTRAINTS_EXPECTED: &[(&str, &str, bool)] = &[
      "[]",
      false),
     ("SELECT id FROM users WHERE id::text = '1' AND name::int4 = 2 AND id::date = '2020-01-01'",
-     r#"[("users", ["CastComparison(\"name\", Int4, Equal, Integer(2))", "Comparison(\"id\", Equal, StringWithCast(\"1\", \"int8\"))"])]"#,
+     r#"[("users", ["CastComparison(\"name\", Int4, Equal, Integer(2))", "Comparison(\"id\", Equal, Integer(1))"])]"#,
      false),
     ("SELECT id FROM users WHERE id = 1 OR name = 'a'",
      "[]",
@@ -188,7 +209,7 @@ const CONSTRAINTS_EXPECTED: &[(&str, &str, bool)] = &[
      "[]",
      false),
     ("SELECT u.id FROM users u JOIN orders o ON u.id = o.id AND o.name = 'x' WHERE u.name = 'y'",
-     r#"[("orders", ["Comparison(\"name\", Equal, String(\"x\"))"]), ("users", ["Comparison(\"name\", Equal, String(\"y\"))"])]"#,
+     r#"[("orders", ["Comparison(\"name\", Equal, Text(\"x\"))"]), ("users", ["Comparison(\"name\", Equal, Text(\"y\"))"])]"#,
      true),
     ("SELECT u.id FROM users u JOIN orders o USING (id) WHERE id = 1",
      r#"[("orders", ["Comparison(\"id\", Equal, Integer(1))"]), ("users", ["Comparison(\"id\", Equal, Integer(1))"])]"#,
@@ -274,7 +295,10 @@ fn has_in_constraint(constraints: &TableFilters, spec: &InSetSpec) -> bool {
     table_constraint_any(constraints, spec.table, |tc| {
         matches!(&tc.kind, ColumnConstraintKind::AnyOf(vs)
             if tc.column == spec.column
-                && spec.values.iter().all(|v| vs.contains(v))
+                && spec
+                    .values
+                    .iter()
+                    .all(|v| vs.contains(&column_value(spec.column, v.clone())))
                 && vs.len() == spec.values.len())
     })
 }
@@ -863,30 +887,23 @@ fn test_nondeterministic_text_comparison_is_no_constraint() {
     }
 }
 
-/// A string compared to a column where two spellings can be one value
-/// carries the column's type, so the read-after-write check never proves it
-/// different from a write's bare string by bytes. Text and enum labels,
-/// where bytes are the value, stay plain.
+/// A literal is held as its column's value, so two spellings of one value
+/// are one constraint; one that is no value of the column is opaque, and
+/// nothing is claimed about it.
 #[test]
-fn test_string_literal_carries_non_text_column_type() {
-    use crate::query::constraints::column_range_contains;
-
+fn test_literal_spellings_are_one_column_value() {
     let tables = catalog(&["users"]);
-    let constraints = constraints_of("SELECT * FROM users WHERE id = '7' AND name = 'x'", &tables);
-    let filters = table_constraints_of(&constraints, "users");
-    let typed = LiteralValue::StringWithCast("7".into(), "int8".into());
-    assert!(filters.contains(&comparison("id", BinaryOp::Equal, typed.clone())));
-    assert!(filters.contains(&comparison("name", BinaryOp::Equal, text("x"))));
-
-    // `id = '07'` in a write names the same row: undecidable, not disjoint.
-    let read = ColumnRange::Equal(typed);
-    assert_eq!(column_range_contains(&read, &text("07")), None);
-    assert_eq!(column_range_contains(&read, &text("7")), None);
+    let spelled = constraints_of("SELECT * FROM users WHERE id = '07'", &tables);
+    let plain = constraints_of("SELECT * FROM users WHERE id = 7", &tables);
     assert_eq!(
-        column_range_contains(&ColumnRange::Equal(text("x")), &text("y")),
-        Some(false),
-        "text bytes are the value"
+        table_constraints_of(&spelled, "users"),
+        table_constraints_of(&plain, "users")
     );
+    let unparseable = constraints_of("SELECT * FROM users WHERE id = 'seven'", &tables);
+    assert!(!table_constraints_subsumed(
+        table_constraints_of(&unparseable, "users"),
+        table_constraints_of(&unparseable, "users")
+    ));
 }
 
 /// A constraint's literal is in the form its own column gives it, so it is
@@ -906,7 +923,7 @@ fn test_constraint_restated_only_on_column_comparing_alike() {
         tables.insert_overwrite(TableMetadata::for_test("orders", 1002, columns).into());
         let bound = resolve_sql(sql, &tables);
         let lines = reference_filter_lines(&bound, bound.select().expect("a SELECT"));
-        let bound_line = r#"Comparison("name", LessThan, OrderedText("M"))"#.to_owned();
+        let bound_line = r#"Comparison("name", LessThan, Text("M"))"#.to_owned();
         assert_eq!(
             lines,
             [
@@ -1060,7 +1077,7 @@ fn test_repeated_table_filters_per_reference() {
     let mut other = test_table_metadata("users", Oid::from_raw(1101));
     other.schema = "other".into();
     tables.insert_overwrite(other.into());
-    let name_x = r#"Comparison("name", Equal, String("x"))"#;
+    let name_x = r#"Comparison("name", Equal, Text("x"))"#;
     let id_5 = r#"Comparison("id", Equal, Integer(5))"#;
     #[rustfmt::skip]
     let cases: &[(&str, &[(&str, &[&str])])] = &[
@@ -1104,7 +1121,7 @@ fn test_repeated_table_filters_per_reference() {
 #[test]
 fn test_correlated_outer_conjunct_filters_nothing() {
     let tables = catalog(&["users", "orders"]);
-    let name_y = r#"Comparison("name", Equal, String("y"))"#;
+    let name_y = r#"Comparison("name", Equal, Text("y"))"#;
     #[rustfmt::skip]
     let cases: &[(&str, &[(&str, &[&str])])] = &[
         ("SELECT a.id FROM users a WHERE EXISTS \
@@ -1178,7 +1195,12 @@ fn test_in_with_parameter_skipped() {
 fn id_in(values: &[i64]) -> TableConstraint {
     constraint(
         "id",
-        ColumnConstraintKind::AnyOf(values.iter().copied().map(int).collect()),
+        ColumnConstraintKind::AnyOf(
+            values
+                .iter()
+                .map(|value| column_value("id", int(*value)))
+                .collect(),
+        ),
     )
 }
 
@@ -1188,9 +1210,12 @@ fn id_is(op: BinaryOp, value: i64) -> TableConstraint {
 
 /// A narrowed range spelled for comparison, its IN members sorted.
 fn range_described(range: &ColumnRange) -> String {
-    let short = |value: &LiteralValue| match value {
-        LiteralValue::Integer(n) => n.to_string(),
-        other => format!("{other:?}"),
+    let short = |value: &ConstraintValue| {
+        let debug = format!("{value:?}");
+        debug
+            .strip_prefix("Integer(")
+            .and_then(|rest| rest.strip_suffix(')'))
+            .map_or(debug.clone(), str::to_owned)
     };
     match range {
         ColumnRange::Empty => "empty".to_owned(),
@@ -1376,7 +1401,11 @@ fn cast_comparison(
 ) -> TableConstraint {
     constraint(
         column,
-        ColumnConstraintKind::CastComparison { cast, op, value },
+        ColumnConstraintKind::CastComparison {
+            cast,
+            op,
+            value: value.into(),
+        },
     )
 }
 
@@ -1490,8 +1519,8 @@ fn test_outer_join_constraints() {
         // Reduced: a preserved-side ON literal filters too.
         ("SELECT u.id FROM users u LEFT JOIN orders o ON u.id = o.id AND u.name = 'x' \
           WHERE o.name = 'y'",
-         &[("orders", &[r#"Comparison("name", Equal, String("y"))"#]),
-           ("users", &[r#"Comparison("name", Equal, String("x"))"#])]),
+         &[("orders", &[r#"Comparison("name", Equal, Text("y"))"#]),
+           ("users", &[r#"Comparison("name", Equal, Text("x"))"#])]),
         // IS NULL keeps NULL-padded rows: no reduction.
         ("SELECT u.id FROM users u LEFT JOIN orders o ON u.id = o.id AND o.id = 5 \
           WHERE o.name IS NULL",

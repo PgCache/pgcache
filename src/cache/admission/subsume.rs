@@ -10,10 +10,9 @@ use ecow::EcoString;
 use super::{CandidateState, SubsumerCandidate, SubsumerSource};
 use crate::oid::Oid;
 use crate::query::Fingerprint;
-use crate::query::ast::{BinaryOp, LiteralValue};
+use crate::query::ast::BinaryOp;
 use crate::query::constraints::{
-    ColumnConstraintKind, TableConstraint, TableRanges, literal_value_canonical_order,
-    table_ranges_subsumed,
+    ColumnConstraintKind, ConstraintValue, TableConstraint, TableRanges, table_ranges_subsumed,
 };
 use crate::query::join_region::JoinRegion;
 use crate::query::resolve::ResolvedQuery;
@@ -27,9 +26,6 @@ pub struct SubsumptionReference {
     pub relation_oid: Oid,
     pub filters: Arc<[TableConstraint]>,
     pub ranges: TableRanges,
-    /// `ranges` in their index-key forms as the model keyed them (PGC-478);
-    /// `None` for a split piece, whose filters the source keys itself.
-    pub keyed_ranges: Option<TableRanges>,
 }
 
 /// Every base table reference of `bound` across its SELECT branches (root,
@@ -54,7 +50,6 @@ pub fn subsumption_references(bound: &ResolvedQuery) -> Option<Vec<SubsumptionRe
                 relation_oid: reference.table.relation_oid,
                 filters: Arc::clone(&relation.filters),
                 ranges: relation.ranges.clone(),
-                keyed_ranges: Some(relation.keyed_ranges.clone()),
             })
         })
         .collect()
@@ -199,7 +194,7 @@ fn candidate_holds<'a>(
 }
 
 /// One in-set column a split fixes, with its values in a stable order.
-type SplitColumn<'a> = (&'a EcoString, Vec<&'a LiteralValue>);
+type SplitColumn<'a> = (&'a EcoString, Vec<&'a ConstraintValue>);
 
 /// Whether the reference is covered value by value: split on some of its
 /// in-set columns, every piece held by a candidate. Splitting on more
@@ -212,8 +207,8 @@ fn reference_covered_split(reference: &SubsumptionReference, source: &impl Subsu
         .set_columns()
         .filter(|(_, values)| values.len() > 1)
         .map(|(column, values)| {
-            let mut values: Vec<&LiteralValue> = values.iter().collect();
-            values.sort_by(|a, b| literal_value_canonical_order(a, b));
+            let mut values: Vec<&ConstraintValue> = values.iter().collect();
+            values.sort_by(|a, b| a.canonical_order(b));
             (column, values)
         })
         .collect();
@@ -278,7 +273,7 @@ fn reference_pieces<'a>(
     let count: usize = split.iter().map(|(_, values)| values.len()).product();
     (0..count).map(move |index| {
         let mut rest = index;
-        let assignment: Vec<(&EcoString, &LiteralValue)> = split
+        let assignment: Vec<(&EcoString, &ConstraintValue)> = split
             .iter()
             .filter_map(|(column, values)| {
                 let value = values.get(rest % values.len())?;
@@ -293,7 +288,7 @@ fn reference_pieces<'a>(
 /// The reference with each column of `assignment` fixed to its value.
 fn reference_piece(
     reference: &SubsumptionReference,
-    assignment: &[(&EcoString, &LiteralValue)],
+    assignment: &[(&EcoString, &ConstraintValue)],
 ) -> SubsumptionReference {
     // The column's bare constraints reduce to the set, so the equality
     // replaces them; cast constraints stay in their domain.
@@ -321,7 +316,6 @@ fn reference_piece(
         relation_oid: reference.relation_oid,
         ranges: TableRanges::build(&filters),
         filters: filters.into(),
-        keyed_ranges: None,
     }
 }
 
@@ -404,7 +398,7 @@ mod tests {
         let t = format!("{:?}", Oid::from_raw(1001));
         let u = format!("{:?}", Oid::from_raw(1002));
         let other_t = format!("{:?}", Oid::from_raw(1003));
-        let name = |value: &str| format!(r#"[Comparison("name", Equal, String("{value}"))]"#);
+        let name = |value: &str| format!(r#"[Comparison("name", Equal, Text("{value}"))]"#);
         let cases: Vec<(&str, Vec<String>)> = vec![
             (
                 "SELECT id FROM t WHERE name = 'x'",
@@ -451,7 +445,7 @@ mod tests {
     fn test_subsumption_references_set_operation_per_arm() {
         let t = format!("{:?}", Oid::from_raw(1001));
         let u = format!("{:?}", Oid::from_raw(1002));
-        let name = |value: &str| format!(r#"[Comparison("name", Equal, String("{value}"))]"#);
+        let name = |value: &str| format!(r#"[Comparison("name", Equal, Text("{value}"))]"#);
         assert_eq!(
             reference_lines(
                 "SELECT id FROM t WHERE name = 'x' UNION SELECT id FROM u WHERE name = 'y'"

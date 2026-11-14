@@ -1,8 +1,8 @@
 use std::io::Error;
 
 use crate::util::{
-    TestContext, assert_cache_hit, assert_cache_miss, assert_not_subsumed, assert_row_at,
-    assert_subsume_hit,
+    TestContext, assert_cache_hit, assert_cache_miss, assert_not_subsumed,
+    assert_proxy_rows_match_origin, assert_row_at, assert_subsume_hit,
 };
 
 mod util;
@@ -412,5 +412,58 @@ async fn test_in_set_cdc_insert_non_matching() -> Result<(), Error> {
         .await?;
     let _m = assert_cache_hit(&mut ctx, m).await?;
 
+    Ok(())
+}
+
+/// A range is compared by its column's values, not by how its literals are
+/// spelled: a narrower date, timestamp or numeric range is subsumed by a
+/// wider cached one whether the bounds are written as strings, integers or
+/// decimals.
+#[tokio::test]
+async fn test_range_subsumption_compares_typed_values() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    ctx.query(
+        "CREATE TABLE test_rsub_typed (id integer PRIMARY KEY, d date, ts timestamp, \
+         price numeric)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO test_rsub_typed VALUES \
+         (1, '2023-01-01', '2023-01-01 00:00', 1.0), \
+         (2, '2024-03-01', '2024-03-01 00:00', 10.5), \
+         (3, '2024-09-01', '2024-09-01 12:30', 20)",
+        &[],
+    )
+    .await?;
+
+    // (wider cached predicate, narrower predicate it holds)
+    let cases = [
+        ("d > '2024-01-01'", "d > '2024-06-01'"),
+        ("ts > '2024-01-01'", "ts >= '2024-09-01 12:00'"),
+        ("price > '5'", "price > '15'"),
+        ("price < 15", "price < 10.75"),
+        (
+            "d BETWEEN '2024-01-01' AND '2024-12-31'",
+            "d = '2024-09-01'",
+        ),
+    ];
+    for (wide, narrow) in cases {
+        let m = ctx.metrics().await?;
+        ctx.simple_query(&format!("SELECT id FROM test_rsub_typed WHERE {wide}"))
+            .await?;
+        let m = assert_cache_miss(&mut ctx, m).await?;
+        ctx.cache_settle().await?;
+
+        let sql = format!("SELECT id FROM test_rsub_typed WHERE {narrow} ORDER BY id");
+        assert_proxy_rows_match_origin(&mut ctx, &sql).await?;
+        let _ = assert_subsume_hit(&mut ctx, m).await?;
+    }
+
+    // A wider range is not held by a narrower cached one.
+    let m = ctx.metrics().await?;
+    ctx.simple_query("SELECT id FROM test_rsub_typed WHERE d > '2022-01-01'")
+        .await?;
+    let _ = assert_not_subsumed(&mut ctx, m).await?;
     Ok(())
 }

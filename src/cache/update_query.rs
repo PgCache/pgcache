@@ -291,7 +291,7 @@ pub struct UpdateQueries {
     queries: FingerprintMap<Vec<UpdateQuery>>,
     /// Typed index over subsumption parents' regions, for sub-linear
     /// candidate lookup (PGC-119). Holds each exact reference of a
-    /// fingerprint without a LIMIT, under its keyed ranges: population loads
+    /// fingerprint without a LIMIT, under its ranges: population loads
     /// that region in full whatever the fingerprint's other references on
     /// the relation load (PGC-511).
     subsumption: ConstraintIndex<UpdateQueryKey>,
@@ -390,10 +390,10 @@ impl UpdateQueries {
         self.eval_index.columns()
     }
 
-    /// Update queries whose region might cover `keyed`, the new query's
-    /// ranges in their key forms. Each exact reference is a parent on its own.
-    pub fn subsumption_candidates(&self, keyed: &TableRanges) -> Vec<UpdateQueryKey> {
-        self.subsumption.candidates(keyed).into_iter().collect()
+    /// Update queries whose region might cover `ranges`, the new query's.
+    /// Each exact reference is a parent on its own.
+    pub fn subsumption_candidates(&self, ranges: &TableRanges) -> Vec<UpdateQueryKey> {
+        self.subsumption.candidates(ranges).into_iter().collect()
     }
 
     /// The region the update query `key` holds in full, when it can parent
@@ -540,16 +540,16 @@ impl UpdateQueries {
         for (ordinal, update_query) in entries.iter_mut().enumerate() {
             update_query.fingerprint = fingerprint;
             update_query.ordinal = ordinal;
-            // Indexed under each literal's key form for its column's type,
-            // so the row probe and the region probe match on value (PGC-478).
+            // Each literal is its column's value, so the row probe and the
+            // region probe match on value (PGC-478).
             self.eval_index
-                .insert(update_query.key(), &update_query.predicates.keyed_ranges);
+                .insert(update_query.key(), &update_query.predicates.ranges);
             self.change_dependent_account(update_query.change_dependent, true);
         }
         if entries.iter().all(|entry| !entry.has_limit) {
             for entry in entries.iter().filter(|entry| entry.predicates.exact) {
                 self.subsumption
-                    .insert(entry.key(), &entry.predicates.keyed_ranges);
+                    .insert(entry.key(), &entry.predicates.ranges);
             }
         }
         self.carveout_account(fingerprint, &entries, true);
@@ -592,7 +592,7 @@ impl UpdateQueries {
             let key = entry.key();
             self.subsumption.remove(key);
             if !has_limit && entry.predicates.exact {
-                self.subsumption.insert(key, &entry.predicates.keyed_ranges);
+                self.subsumption.insert(key, &entry.predicates.ranges);
             }
         }
         self.queries.insert(fingerprint, entries);
@@ -719,7 +719,7 @@ mod tests {
                 column: "kind".into(),
                 kind: crate::query::constraints::ColumnConstraintKind::Comparison {
                     op: crate::query::ast::BinaryOp::Equal,
-                    value: crate::query::ast::LiteralValue::String(kind.into()),
+                    value: crate::query::ast::LiteralValue::String(kind.into()).into(),
                 },
             }]))
             .iter()

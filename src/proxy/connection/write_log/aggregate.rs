@@ -10,7 +10,8 @@ use smallvec::SmallVec;
 
 use crate::query::ast::{BinaryOp, LiteralValue};
 use crate::query::constraints::{
-    ColumnConstraintKind, ColumnRange, TableConstraint, column_range_contains, table_column_ranges,
+    ColumnConstraintKind, ColumnRange, TableConstraint, ValueRef, column_range_contains,
+    table_column_ranges,
 };
 use crate::query::update::ReferenceRanges;
 use crate::query::write::{InsertRow, InsertStatement, UpdateStatement};
@@ -224,7 +225,7 @@ impl InsertAggregate {
             constrained.iter().any(|(position, range)| {
                 matches!(
                     row.get(*position),
-                    Some(Some(value)) if column_range_contains(range, value) == Some(false)
+                    Some(Some(value)) if column_range_contains(range, ValueRef::Raw(value)) == Some(false)
                 )
             })
         })
@@ -258,7 +259,8 @@ pub(super) fn equality_tuple_build(
         else {
             return None;
         };
-        pairs.push((&constraint.column, value));
+        // A write's values are kept as written.
+        pairs.push((&constraint.column, value.as_raw()?));
     }
     pairs.sort_by(|a, b| a.0.cmp(b.0));
     if pairs.windows(2).any(|w| matches!(w, [a, b] if a.0 == b.0)) {
@@ -292,7 +294,7 @@ pub(super) fn merged_tuples_disjoint(merged: &MergedTuples, read_ranges: &Refere
             constrained.iter().any(|(position, range)| {
                 matches!(
                     tuple.get(*position),
-                    Some(value) if column_range_contains(range, value) == Some(false)
+                    Some(value) if column_range_contains(range, ValueRef::Raw(value)) == Some(false)
                 )
             })
         })
@@ -436,7 +438,7 @@ fn merged_update_shape_disjoint(
         let where_excluded = where_constrained.iter().any(|(position, range)| {
             matches!(
                 where_values.get(*position),
-                Some(value) if column_range_contains(range, value) == Some(false)
+                Some(value) if column_range_contains(range, ValueRef::Raw(value)) == Some(false)
             )
         });
         if !where_excluded {
@@ -445,12 +447,12 @@ fn merged_update_shape_disjoint(
         where_in_image.iter().any(|(position, range)| {
             matches!(
                 where_values.get(*position),
-                Some(value) if column_range_contains(range, value) == Some(false)
+                Some(value) if column_range_contains(range, ValueRef::Raw(value)) == Some(false)
             )
         }) || set_constrained.iter().any(|(position, range)| {
             matches!(
                 set_values.get(*position),
-                Some(Some(value)) if column_range_contains(range, value) == Some(false)
+                Some(Some(value)) if column_range_contains(range, ValueRef::Raw(value)) == Some(false)
             )
         })
     })
@@ -523,7 +525,7 @@ pub(super) fn update_predicate_build(update: &UpdateStatement) -> UpdatePredicat
     for (column, value) in &update.set {
         match value {
             Some(literal) => {
-                image_ranges.insert(column.clone(), ColumnRange::Equal(literal.clone()));
+                image_ranges.insert(column.clone(), ColumnRange::Equal(literal.clone().into()));
             }
             None => {
                 image_ranges.remove(column);

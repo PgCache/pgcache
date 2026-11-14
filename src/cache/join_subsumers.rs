@@ -16,10 +16,9 @@ use crate::query::{Fingerprint, FingerprintMap};
 #[derive(Debug)]
 struct JoinParent {
     shape: JoinShape,
-    /// As the parent's WHERE reads, for the precise coverage check.
+    /// As the parent's WHERE reads: what the shape index is built from and
+    /// the precise coverage check compares.
     ranges: TableRanges,
-    /// In their key forms, for the shape index (PGC-478).
-    keyed_ranges: TableRanges,
     has_limit: bool,
 }
 
@@ -48,14 +47,13 @@ impl JoinSubsumers {
         let parent = JoinParent {
             shape: region.shape,
             ranges: region.ranges.clone(),
-            keyed_ranges: region.keyed_ranges.clone(),
             has_limit,
         };
         if !has_limit {
             self.by_shape
                 .entry(region.shape)
                 .or_default()
-                .insert(fingerprint, &parent.keyed_ranges);
+                .insert(fingerprint, &parent.ranges);
         }
         self.parents.insert(fingerprint, parent);
     }
@@ -91,22 +89,22 @@ impl JoinSubsumers {
             self.by_shape
                 .entry(parent.shape)
                 .or_default()
-                .insert(fingerprint, &parent.keyed_ranges);
+                .insert(fingerprint, &parent.ranges);
         }
     }
 
-    /// The parents of `shape` whose region might hold every row `keyed`
-    /// admits, `keyed` being the probe's ranges in their key forms.
+    /// The parents of `shape` whose region might hold every row the probe's
+    /// ranges admit.
     pub fn candidates<'a>(
         &'a self,
         shape: JoinShape,
-        keyed: &TableRanges,
+        ranges: &TableRanges,
     ) -> impl Iterator<Item = (Fingerprint, JoinCandidate<'a>)> + use<'a> {
         let found: Vec<Fingerprint> = self
             .by_shape
             .get(&shape)
             .into_iter()
-            .flat_map(|index| index.candidates(keyed))
+            .flat_map(|index| index.candidates(ranges))
             .collect();
         found.into_iter().filter_map(move |fingerprint| {
             let parent = self.parents.get(&fingerprint)?;
@@ -167,7 +165,7 @@ mod tests {
     fn offered(subsumers: &JoinSubsumers, tables: &Catalog, sql: &str) -> Vec<u64> {
         let probe = region(tables, sql);
         let mut found: Vec<u64> = subsumers
-            .candidates(probe.shape, &probe.keyed_ranges)
+            .candidates(probe.shape, &probe.ranges)
             .map(|(fingerprint, _)| fingerprint.get())
             .collect();
         found.sort_unstable();

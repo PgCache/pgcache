@@ -24,7 +24,6 @@ use crate::id_hash::{BuildIdHasher, IdHashable};
 mod classify;
 mod column_index;
 mod index;
-mod keyed;
 #[cfg(feature = "proxy")]
 mod point;
 #[cfg(test)]
@@ -32,7 +31,6 @@ mod tests;
 mod value_key;
 
 use index::{Membership, SubsumptionClass};
-pub(crate) use keyed::table_constraints_keyed;
 
 #[cfg(feature = "proxy")]
 pub(crate) use point::{ColumnForms, row_value_forms};

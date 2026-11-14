@@ -15,7 +15,7 @@ use super::where_clause::{
 };
 use crate::query::ast::LiteralValue;
 use crate::query::ast::raw::{NodePtr, cast, cstr, list_is_empty, list_nodes, node_tag};
-use crate::query::constraints::{ColumnConstraintKind, TableConstraint};
+use crate::query::constraints::{ColumnConstraintKind, ConstraintValue, TableConstraint};
 use crate::query::guc::Guc;
 use crate::query::write::{
     CustomSettingEffect, CustomSettingEffects, DeleteStatement, INSERT_MAX_ROWS, InsertRow,
@@ -763,7 +763,10 @@ unsafe fn comparison_extract(expr: *const pg::A_Expr) -> Option<TableConstraint>
         };
         Some(TableConstraint {
             column,
-            kind: ColumnConstraintKind::Comparison { op, value },
+            kind: ColumnConstraintKind::Comparison {
+                op,
+                value: ConstraintValue::Raw(value),
+            },
         })
     }
 }

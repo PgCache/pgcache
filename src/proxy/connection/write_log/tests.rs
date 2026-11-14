@@ -23,7 +23,10 @@ use crate::query::write::{
 fn comparison(column: &str, op: BinaryOp, value: LiteralValue) -> TableConstraint {
     TableConstraint {
         column: column.into(),
-        kind: ColumnConstraintKind::Comparison { op, value },
+        kind: ColumnConstraintKind::Comparison {
+            op,
+            value: value.into(),
+        },
     }
 }
 
@@ -222,7 +225,7 @@ fn relation_ranges(table: &str, references: Vec<ReferenceRanges>) -> ReadRelatio
 fn id_equal(value: i64) -> ReferenceRanges {
     ReferenceRanges::from_bare([(
         EcoString::from("id"),
-        ColumnRange::Equal(LiteralValue::Integer(value)),
+        ColumnRange::Equal(LiteralValue::Integer(value).into()),
     )])
 }
 
@@ -234,7 +237,7 @@ fn test_intersects_insert_row_level_disjointness() {
 
     // Read on id = 5 is disjoint from the inserted id = 2 → serve, and the
     // row-level proof is recorded.
-    let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5)));
+    let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5).into()));
     assert_eq!(
         log.decide(&q, Some(&r5)),
         RawDecision::ServeDisjoint(DisjointKinds {
@@ -244,7 +247,7 @@ fn test_intersects_insert_row_level_disjointness() {
     );
 
     // Read on id = 2 matches the inserted row → forward (no disjoint proof).
-    let r2 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(2)));
+    let r2 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(2).into()));
     assert_eq!(
         log.decide(&q, Some(&r2)),
         RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
@@ -264,7 +267,7 @@ fn test_intersects_insert_multi_row() {
     let q = query("SELECT * FROM orders");
 
     // 5 is outside every inserted value → disjoint.
-    let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5)));
+    let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5).into()));
     assert_eq!(
         log.decide(&q, Some(&r5)),
         RawDecision::ServeDisjoint(DisjointKinds {
@@ -274,7 +277,7 @@ fn test_intersects_insert_multi_row() {
     );
 
     // 3 matches one inserted row → intersects.
-    let r3 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(3)));
+    let r3 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(3).into()));
     assert_eq!(
         log.decide(&q, Some(&r3)),
         RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
@@ -306,7 +309,7 @@ fn test_intersects_insert_int_float_numeric() {
     let q = query("SELECT * FROM orders WHERE id = 10");
 
     // id = 10 vs inserted 20.0 → provably disjoint → serve.
-    let r10 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(10)));
+    let r10 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(10).into()));
     assert_eq!(
         log.decide(&q, Some(&r10)),
         RawDecision::ServeDisjoint(DisjointKinds {
@@ -316,7 +319,7 @@ fn test_intersects_insert_int_float_numeric() {
     );
 
     // id = 20 vs inserted 20.0 → numerically equal → intersects.
-    let r20 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(20)));
+    let r20 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(20).into()));
     assert_eq!(
         log.decide(&q, Some(&r20)),
         RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
@@ -340,7 +343,7 @@ fn test_intersects_insert_unknown_cell_forwards() {
         None,
         None,
     );
-    let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5)));
+    let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5).into()));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders"), Some(&r5)),
         RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
@@ -355,7 +358,7 @@ fn test_insert_overflow_degrades_to_opaque() {
     log.record(&insert_int("orders", "id", &first), None, None);
     log.record(&insert_int("orders", "id", &second), None, None);
     // Degraded to opaque: even a disjoint read forwards.
-    let r = ranges("id", ColumnRange::Equal(LiteralValue::Integer(9999)));
+    let r = ranges("id", ColumnRange::Equal(LiteralValue::Integer(9999).into()));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders"), Some(&r)),
         RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
@@ -391,7 +394,7 @@ fn test_insert_wide_rows_hit_cells_cap() {
     let mut log = WriteLog::with_enabled(true);
     log.record(&wide_insert(300), None, None);
     // Still precise below the budget.
-    let r = ranges("c0", ColumnRange::Equal(LiteralValue::Integer(-1)));
+    let r = ranges("c0", ColumnRange::Equal(LiteralValue::Integer(-1).into()));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders WHERE c0 = -1"), Some(&r)),
         RawDecision::ServeDisjoint(DisjointKinds {
@@ -417,7 +420,7 @@ fn test_insert_row_at_a_time_stays_precise() {
         log.record(&insert_int("orders", "id", &[i]), None, None);
     }
     let q = query("SELECT * FROM orders WHERE id = 9999");
-    let disjoint = ranges("id", ColumnRange::Equal(LiteralValue::Integer(9999)));
+    let disjoint = ranges("id", ColumnRange::Equal(LiteralValue::Integer(9999).into()));
     assert_eq!(
         log.decide(&q, Some(&disjoint)),
         RawDecision::ServeDisjoint(DisjointKinds {
@@ -425,7 +428,7 @@ fn test_insert_row_at_a_time_stays_precise() {
             ..Default::default()
         })
     );
-    let hit = ranges("id", ColumnRange::Equal(LiteralValue::Integer(250)));
+    let hit = ranges("id", ColumnRange::Equal(LiteralValue::Integer(250).into()));
     assert_eq!(
         log.decide(&q, Some(&hit)),
         RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
@@ -443,7 +446,7 @@ fn test_insert_diverging_column_lists() {
     let q = query("SELECT * FROM orders WHERE a = 5");
     // Read on a = 5: the a-row is excluded (1 ≠ 5) but the b-row's `a` cell
     // is unknown → forward.
-    let ra = ranges("a", ColumnRange::Equal(LiteralValue::Integer(5)));
+    let ra = ranges("a", ColumnRange::Equal(LiteralValue::Integer(5).into()));
     assert_eq!(
         log.decide(&q, Some(&ra)),
         RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
@@ -454,11 +457,11 @@ fn test_insert_diverging_column_lists() {
         vec![ReferenceRanges::from_bare([
             (
                 EcoString::from("a"),
-                ColumnRange::Equal(LiteralValue::Integer(5)),
+                ColumnRange::Equal(LiteralValue::Integer(5).into()),
             ),
             (
                 EcoString::from("b"),
-                ColumnRange::Equal(LiteralValue::Integer(5)),
+                ColumnRange::Equal(LiteralValue::Integer(5).into()),
             ),
         ])],
     );
@@ -478,7 +481,7 @@ fn test_non_insert_write_dominates_inserts() {
     let mut log = WriteLog::with_enabled(true);
     log.record(&insert_int("orders", "id", &[2]), None, None);
     log.record(&table("orders"), None, None);
-    let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5)));
+    let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5).into()));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders"), Some(&r5)),
         RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
@@ -506,7 +509,7 @@ fn test_decide_delete_predicate_disjointness() {
     let q = query("SELECT * FROM orders WHERE id = 1");
 
     // Read on id = 1 is disjoint from the delete's id = 5 → serve.
-    let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
+    let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1).into()));
     assert_eq!(
         log.decide(&q, Some(&r1)),
         RawDecision::ServeDisjoint(DisjointKinds {
@@ -516,7 +519,7 @@ fn test_decide_delete_predicate_disjointness() {
     );
 
     // Read on id = 5 overlaps the delete predicate → forward.
-    let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5)));
+    let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5).into()));
     assert_eq!(
         log.decide(&q, Some(&r5)),
         RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
@@ -565,7 +568,7 @@ fn test_delete_row_at_a_time_stays_precise() {
         log.record(&delete_eq("orders", "id", i), None, None);
     }
     let q = query("SELECT * FROM orders WHERE id = 9999");
-    let disjoint = ranges("id", ColumnRange::Equal(LiteralValue::Integer(9999)));
+    let disjoint = ranges("id", ColumnRange::Equal(LiteralValue::Integer(9999).into()));
     assert_eq!(
         log.decide(&q, Some(&disjoint)),
         RawDecision::ServeDisjoint(DisjointKinds {
@@ -573,7 +576,7 @@ fn test_delete_row_at_a_time_stays_precise() {
             ..Default::default()
         })
     );
-    let hit = ranges("id", ColumnRange::Equal(LiteralValue::Integer(250)));
+    let hit = ranges("id", ColumnRange::Equal(LiteralValue::Integer(250).into()));
     assert_eq!(
         log.decide(&q, Some(&hit)),
         RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
@@ -591,7 +594,10 @@ fn test_delete_merged_overflow_degrades_to_opaque() {
         );
     }
     // Past the merged cap the table is opaque: even a disjoint read forwards.
-    let r = ranges("id", ColumnRange::Equal(LiteralValue::Integer(999_999)));
+    let r = ranges(
+        "id",
+        ColumnRange::Equal(LiteralValue::Integer(999_999).into()),
+    );
     assert_eq!(
         log.decide(&query("SELECT * FROM orders"), Some(&r)),
         RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
@@ -609,7 +615,10 @@ fn test_delete_legacy_overflow_degrades_to_opaque() {
             None,
         );
     }
-    let r = ranges("id", ColumnRange::Equal(LiteralValue::Integer(999_999)));
+    let r = ranges(
+        "id",
+        ColumnRange::Equal(LiteralValue::Integer(999_999).into()),
+    );
     assert_eq!(
         log.decide(&query("SELECT * FROM orders"), Some(&r)),
         RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
@@ -625,7 +634,7 @@ fn test_delete_mixed_merged_and_legacy_shapes() {
     log.record(&delete_range("orders", "id", 3), None, None); // id < 3
     let q = query("SELECT * FROM orders WHERE id = 10");
     // id = 10 clears both the id = 5 tuple and the id < 3 range.
-    let r10 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(10)));
+    let r10 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(10).into()));
     assert_eq!(
         log.decide(&q, Some(&r10)),
         RawDecision::ServeDisjoint(DisjointKinds {
@@ -634,7 +643,7 @@ fn test_delete_mixed_merged_and_legacy_shapes() {
         })
     );
     // id = 2 clears the tuple but overlaps the range → forward.
-    let r2 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(2)));
+    let r2 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(2).into()));
     assert_eq!(
         log.decide(&q, Some(&r2)),
         RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
@@ -668,11 +677,11 @@ fn test_delete_multi_column_equality_tuples() {
         vec![ReferenceRanges::from_bare([
             (
                 EcoString::from("a"),
-                ColumnRange::Equal(LiteralValue::Integer(2)),
+                ColumnRange::Equal(LiteralValue::Integer(2).into()),
             ),
             (
                 EcoString::from("b"),
-                ColumnRange::Equal(LiteralValue::Integer(10)),
+                ColumnRange::Equal(LiteralValue::Integer(10).into()),
             ),
         ])],
     );
@@ -689,11 +698,11 @@ fn test_delete_multi_column_equality_tuples() {
         vec![ReferenceRanges::from_bare([
             (
                 EcoString::from("a"),
-                ColumnRange::Equal(LiteralValue::Integer(2)),
+                ColumnRange::Equal(LiteralValue::Integer(2).into()),
             ),
             (
                 EcoString::from("b"),
-                ColumnRange::Equal(LiteralValue::Integer(20)),
+                ColumnRange::Equal(LiteralValue::Integer(20).into()),
             ),
         ])],
     );
@@ -722,7 +731,7 @@ fn test_delete_duplicate_column_routes_legacy() {
         None,
         None,
     );
-    let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
+    let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1).into()));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders WHERE id = 1"), Some(&r1)),
         RawDecision::ServeDisjoint(DisjointKinds {
@@ -739,7 +748,7 @@ fn test_opaque_write_dominates_delete() {
     let mut log = WriteLog::with_enabled(true);
     log.record(&delete_eq("orders", "id", 5), None, None);
     log.record(&table("orders"), None, None);
-    let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
+    let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1).into()));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders WHERE id = 1"), Some(&r1)),
         RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
@@ -779,7 +788,7 @@ fn test_decide_update_disjoint_serves() {
         None,
         None,
     );
-    let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
+    let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1).into()));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders WHERE id = 1"), Some(&r1)),
         RawDecision::ServeDisjoint(DisjointKinds {
@@ -788,7 +797,7 @@ fn test_decide_update_disjoint_serves() {
         })
     );
     // A read on the matched rows (id = 5) overlaps the WHERE → forward.
-    let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5)));
+    let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5).into()));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders WHERE id = 5"), Some(&r5)),
         RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
@@ -805,7 +814,7 @@ fn test_decide_update_grow_forwards() {
         None,
         None,
     );
-    let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
+    let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1).into()));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders WHERE id = 1"), Some(&r1)),
         RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
@@ -821,7 +830,7 @@ fn test_decide_update_value_change_forwards() {
         None,
         None,
     );
-    let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
+    let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1).into()));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders WHERE id = 1"), Some(&r1)),
         RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
@@ -833,7 +842,7 @@ fn test_decide_update_unknown_set_disjoint_serves() {
     // A non-literal SET (unknown image) on id = 5 rows doesn't touch id = 1.
     let mut log = WriteLog::with_enabled(true);
     log.record(&update_eq("orders", "id", 5, &[("v", None)]), None, None);
-    let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
+    let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1).into()));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders WHERE id = 1"), Some(&r1)),
         RawDecision::ServeDisjoint(DisjointKinds {
@@ -859,7 +868,7 @@ fn test_update_merged_survives_tier_collision() {
         log.stamp(seq, Lsn::from_raw(id.unsigned_abs() * 100));
     }
     // The 9th stamp folded {9} into the 800-tier under bound 900.
-    let r9 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(9)));
+    let r9 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(9).into()));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders WHERE id = 9"), Some(&r9)),
         RawDecision::Forward(
@@ -868,7 +877,7 @@ fn test_update_merged_survives_tier_collision() {
         ),
         "the id = 9 UPDATE is still pending (folded under the later bound) and must forward"
     );
-    let r8 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(8)));
+    let r8 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(8).into()));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders WHERE id = 8"), Some(&r8)),
         RawDecision::Forward(
@@ -890,7 +899,7 @@ fn test_delete_merged_survives_tier_collision() {
         let seq = log.stamp_seq().expect("bound pending");
         log.stamp(seq, Lsn::from_raw(id.unsigned_abs() * 100));
     }
-    let r9 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(9)));
+    let r9 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(9).into()));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders WHERE id = 9"), Some(&r9)),
         RawDecision::Forward(
@@ -899,7 +908,7 @@ fn test_delete_merged_survives_tier_collision() {
         ),
         "the id = 9 DELETE is still pending (folded under the later bound) and must forward"
     );
-    let r8 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(8)));
+    let r8 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(8).into()));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders WHERE id = 8"), Some(&r8)),
         RawDecision::Forward(
@@ -920,7 +929,7 @@ fn test_update_row_at_a_time_stays_precise() {
         log.record(&update_eq("orders", "id", i, &[("v", Some(i))]), None, None);
     }
     let q = query("SELECT * FROM orders WHERE id = 9999");
-    let disjoint = ranges("id", ColumnRange::Equal(LiteralValue::Integer(9999)));
+    let disjoint = ranges("id", ColumnRange::Equal(LiteralValue::Integer(9999).into()));
     assert_eq!(
         log.decide(&q, Some(&disjoint)),
         RawDecision::ServeDisjoint(DisjointKinds {
@@ -928,7 +937,7 @@ fn test_update_row_at_a_time_stays_precise() {
             ..Default::default()
         })
     );
-    let hit = ranges("id", ColumnRange::Equal(LiteralValue::Integer(250)));
+    let hit = ranges("id", ColumnRange::Equal(LiteralValue::Integer(250).into()));
     assert_eq!(
         log.decide(&q, Some(&hit)),
         RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
@@ -948,7 +957,7 @@ fn test_update_merged_grow_forwards() {
         None,
         None,
     );
-    let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
+    let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1).into()));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders WHERE id = 1"), Some(&r1)),
         RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
@@ -977,7 +986,7 @@ fn test_update_set_order_shares_one_shape() {
         .sum();
     assert_eq!(shapes, 1, "reordered SET lists must share one shape");
     // The image check still tracks each tuple's own values.
-    let ra = ranges("a", ColumnRange::Equal(LiteralValue::Integer(4)));
+    let ra = ranges("a", ColumnRange::Equal(LiteralValue::Integer(4).into()));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders WHERE a = 4"), Some(&ra)),
         RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped),
@@ -996,7 +1005,10 @@ fn test_update_delete_share_merged_cap() {
         log.record(&update_eq("orders", "id", i, &[("v", Some(0))]), None, None);
     }
     // 600 + 425 = 1025 > cap → opaque: even a disjoint read forwards.
-    let r = ranges("id", ColumnRange::Equal(LiteralValue::Integer(999_999)));
+    let r = ranges(
+        "id",
+        ColumnRange::Equal(LiteralValue::Integer(999_999).into()),
+    );
     assert_eq!(
         log.decide(&query("SELECT * FROM orders"), Some(&r)),
         RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
@@ -1017,13 +1029,13 @@ fn test_update_duplicate_set_column_routes_legacy() {
     // Read on v = 1 (the overwritten value) is disjoint from the image
     // v = 2 and the WHERE id = 5 leaves v unconstrained... the read must
     // still check id: unconstrained on id → WHERE not excluded → forward.
-    let rv1 = ranges("v", ColumnRange::Equal(LiteralValue::Integer(1)));
+    let rv1 = ranges("v", ColumnRange::Equal(LiteralValue::Integer(1).into()));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders WHERE v = 1"), Some(&rv1)),
         RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
     );
     // Disjoint via id on both sides → serve.
-    let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
+    let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1).into()));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders WHERE id = 1"), Some(&r1)),
         RawDecision::ServeDisjoint(DisjointKinds {
@@ -1164,7 +1176,7 @@ fn test_waiting_tiers_drain_independently() {
     log.stamp(seq, Lsn::from_raw(200));
     // Both inserts pending; a read of id = 1 forwards, bound by the tier it
     // intersects (the disjoint 200-tier does not raise it).
-    let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
+    let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1).into()));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders"), Some(&r1)),
         RawDecision::Forward(
@@ -1182,7 +1194,7 @@ fn test_waiting_tiers_drain_independently() {
             ..Default::default()
         })
     );
-    let r2 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(2)));
+    let r2 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(2).into()));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders"), Some(&r2)),
         RawDecision::Forward(
@@ -1206,7 +1218,7 @@ fn test_waiting_saturation_folds_into_newest() {
         log.stamp(seq, Lsn::from_raw(id.unsigned_abs() * 100));
     }
     // The oldest batch still clears at its own bound.
-    let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
+    let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1).into()));
     log.purge(Lsn::from_raw(100));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders"), Some(&r1)),
@@ -1217,7 +1229,7 @@ fn test_waiting_saturation_folds_into_newest() {
         "the oldest bound must stay anchored through saturation"
     );
     // The folded pair ({8, 9} under 900) waits on the later bound.
-    let r8 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(8)));
+    let r8 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(8).into()));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders"), Some(&r8)),
         RawDecision::Forward(
@@ -1249,7 +1261,7 @@ fn test_saturation_keeps_oldest_anchored_under_sustained_stamping() {
         let seq = log.stamp_seq().expect("bound pending");
         log.stamp(seq, Lsn::from_raw(id.unsigned_abs() * 100));
     }
-    let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
+    let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1).into()));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders"), Some(&r1)),
         RawDecision::Forward(
@@ -1362,7 +1374,7 @@ fn test_blocker_disjoint_tier_does_not_bind() {
     log.record(&delete_eq("orders", "id", 7), None, None);
     let seq = log.stamp_seq().expect("active awaiting a bound");
     log.stamp(seq, Lsn::from_raw(200));
-    let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5)));
+    let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5).into()));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders WHERE id = 5"), Some(&r5)),
         RawDecision::Forward(

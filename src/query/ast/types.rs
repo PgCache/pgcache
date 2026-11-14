@@ -34,11 +34,6 @@ pub enum LiteralValue {
     /// ANY-clause queries subsume each other (PGC-106). The cast string
     /// is the array type name, e.g. `"int4[]"`.
     Array(Vec<LiteralValue>, EcoString),
-    /// Text that compares under a byte-ordered collation, so its bytes
-    /// decide order as well as equality. Never parsed: predicate derivation
-    /// rewrites a string bound on such a column into it, and it renders as
-    /// the plain string it came from.
-    OrderedText(EcoString),
 }
 
 /// A value a query reads from the session rather than the data: who is
@@ -81,10 +76,9 @@ impl LiteralValue {
             (None, LiteralValue::Null) => true,
             (None, LiteralValue::NullWithCast(_)) => true,
             (None, _) => false,
-            (
-                Some(row_str),
-                LiteralValue::String(constraint_str) | LiteralValue::OrderedText(constraint_str),
-            ) => row_str.as_str() == constraint_str.as_str(),
+            (Some(row_str), LiteralValue::String(constraint_str)) => {
+                row_str.as_str() == constraint_str.as_str()
+            }
             (Some(row_str), LiteralValue::StringWithCast(constraint_str, _)) => {
                 row_str.as_str() == constraint_str.as_str()
             }
@@ -121,9 +115,7 @@ impl LiteralValue {
 impl Deparse for LiteralValue {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         match self {
-            LiteralValue::String(s) | LiteralValue::OrderedText(s) => {
-                emit_escaped_string_literal(s, buf);
-            }
+            LiteralValue::String(s) => emit_escaped_string_literal(s, buf),
             LiteralValue::StringWithCast(s, cast) => {
                 emit_escaped_string_literal(s, buf);
                 buf.push_str("::");
@@ -228,9 +220,7 @@ fn array_element_text_render(elem: &LiteralValue, out: &mut String) {
         }
         // PG array text format uses single-character `t`/`f`, not `true`/`false`.
         LiteralValue::Boolean(b) => out.push(if *b { 't' } else { 'f' }),
-        LiteralValue::String(s)
-        | LiteralValue::StringWithCast(s, _)
-        | LiteralValue::OrderedText(s) => {
+        LiteralValue::String(s) | LiteralValue::StringWithCast(s, _) => {
             array_element_text_push_quoted(s, out);
         }
         // `binary_array_to_literal` rejects multi-dim and only produces

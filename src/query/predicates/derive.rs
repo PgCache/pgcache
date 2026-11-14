@@ -10,7 +10,6 @@ use super::{
 use std::sync::Arc;
 
 use crate::catalog::{ColumnPosition, TableMetadata};
-use crate::query::constraint_index::table_constraints_keyed;
 use crate::query::constraints::{ColumnConstraintKind, NullTest, TableRanges};
 use crate::query::resolve::{Bindings, ColumnBinding, SlotId, TableSlot};
 use crate::query::typed_compare::ColumnCompare;
@@ -122,7 +121,6 @@ impl RelationPredicates {
         Self {
             filters: Vec::new().into(),
             ranges: TableRanges::default(),
-            keyed_ranges: TableRanges::default(),
             link_columns: table
                 .columns
                 .iter()
@@ -509,8 +507,7 @@ type FilterEdge = (ColumnBinding, ColumnBinding);
 
 /// The step through join `id`, with its position, when the path has one.
 /// The reference `slot`'s predicates by column name: its filters and link
-/// columns named through `bindings`, the filters reduced to ranges, and
-/// keyed for the slot's table when it is a catalog table (PGC-478).
+/// columns named through `bindings`, and the filters reduced to ranges.
 fn relation_predicates_project(
     bindings: &Bindings,
     slot: SlotId,
@@ -535,16 +532,9 @@ fn relation_predicates_project(
         })
         .collect::<Option<Vec<_>>>()?;
     let ranges = TableRanges::build(&filters);
-    let keyed_ranges = match bindings.slot(slot)? {
-        TableSlot::Base { table, .. } => {
-            TableRanges::build(&table_constraints_keyed(&filters, table))
-        }
-        TableSlot::Derived { .. } => ranges.clone(),
-    };
     Some(RelationPredicates {
         filters: filters.into(),
         ranges,
-        keyed_ranges,
         link_columns,
         unrecognized: predicates.unrecognized,
         exact: predicates.exact,

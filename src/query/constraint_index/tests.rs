@@ -6,7 +6,7 @@ use super::*;
 use crate::query::ast::{BinaryOp, LiteralValue};
 use crate::query::cast::CastTarget;
 use crate::query::constraints::{
-    ColumnConstraintKind, ColumnRange, NullTest, TableConstraint, TableRanges,
+    ColumnConstraintKind, ColumnRange, ConstraintValue, NullTest, TableConstraint, TableRanges,
     table_ranges_subsumed,
 };
 use crate::query::{Fingerprint, FingerprintSet};
@@ -38,19 +38,25 @@ fn constraint(c: &str, kind: ColumnConstraintKind) -> TableConstraint {
     }
 }
 
-fn comparison(c: &str, op: BinaryOp, value: LiteralValue) -> TableConstraint {
-    constraint(c, ColumnConstraintKind::Comparison { op, value })
+fn comparison(c: &str, op: BinaryOp, value: impl Into<ConstraintValue>) -> TableConstraint {
+    constraint(
+        c,
+        ColumnConstraintKind::Comparison {
+            op,
+            value: value.into(),
+        },
+    )
 }
 
-fn eq(c: &str, v: LiteralValue) -> TableConstraint {
+fn eq(c: &str, v: impl Into<ConstraintValue>) -> TableConstraint {
     comparison(c, BinaryOp::Equal, v)
 }
 
-fn gt(c: &str, v: LiteralValue) -> TableConstraint {
+fn gt(c: &str, v: impl Into<ConstraintValue>) -> TableConstraint {
     comparison(c, BinaryOp::GreaterThan, v)
 }
 
-fn lt(c: &str, v: LiteralValue) -> TableConstraint {
+fn lt(c: &str, v: impl Into<ConstraintValue>) -> TableConstraint {
     comparison(c, BinaryOp::LessThan, v)
 }
 
@@ -59,7 +65,10 @@ fn text(s: &str) -> LiteralValue {
 }
 
 fn any_of(c: &str, vs: Vec<LiteralValue>) -> TableConstraint {
-    constraint(c, ColumnConstraintKind::AnyOf(vs))
+    constraint(
+        c,
+        ColumnConstraintKind::AnyOf(vs.into_iter().map(Into::into).collect()),
+    )
 }
 
 fn cast_eq(c: &str, cast: CastTarget, v: LiteralValue) -> TableConstraint {
@@ -68,7 +77,7 @@ fn cast_eq(c: &str, cast: CastTarget, v: LiteralValue) -> TableConstraint {
         ColumnConstraintKind::CastComparison {
             cast,
             op: BinaryOp::Equal,
-            value: v,
+            value: v.into(),
         },
     )
 }
@@ -986,11 +995,14 @@ mod point {
     use postgres_types::Type;
 
     use super::*;
-    use crate::catalog::{ColumnCollation, ColumnMetadata, ColumnPosition, TableMetadata};
+    use crate::catalog::{
+        ColumnCollation, ColumnMetadata, ColumnPosition, TableMetadata, TextOrder,
+    };
     use crate::oid::TypeOid;
     use crate::pg::protocol::ByteString;
     use crate::query::constraint_index::point::{ColumnForms, row_value_forms};
     use crate::query::constraints::ColumnRange;
+    use crate::query::typed_compare::ColumnCompare;
 
     fn bs(s: &str) -> Option<ByteString> {
         Some(ByteString::from_utf8(bytes::Bytes::copy_from_slice(s.as_bytes())).expect("utf8"))
@@ -1048,7 +1060,7 @@ mod point {
         assert_eq!(null_row, fps([1, 2, 3]));
 
         let present = idx.candidates_point(|c| match c {
-            "name" => [Some(ColumnRange::Equal(text("y"))), None, None],
+            "name" => [Some(ColumnRange::Equal(text("y").into())), None, None],
             _ => [Some(ColumnRange::Unknown), None, None],
         });
         assert!(present.contains(&fp(1)));
@@ -1064,7 +1076,7 @@ mod point {
         idx.insert(fp(3), &ranges(&[])); // unconstrained — matches every row
 
         let got = idx.candidates_point(|c| match c {
-            "id" => [Some(ColumnRange::Equal(int(200))), None, None],
+            "id" => [Some(ColumnRange::Equal(int(200).into())), None, None],
             _ => [Some(ColumnRange::Unknown), None, None],
         });
         assert!(got.contains(&fp(1)));
@@ -1103,7 +1115,7 @@ mod point {
 
         // region pinned to 5, id unknown: both match on the pinned column.
         let got = idx.candidates_point(|c| match c {
-            "region" => [Some(ColumnRange::Equal(int(5))), None, None],
+            "region" => [Some(ColumnRange::Equal(int(5).into())), None, None],
             _ => [Some(ColumnRange::Unknown), None, None],
         });
         assert!(got.contains(&fp(1)));
@@ -1111,7 +1123,7 @@ mod point {
 
         // region pinned to a non-matching value excludes both.
         let none = idx.candidates_point(|c| match c {
-            "region" => [Some(ColumnRange::Equal(int(9))), None, None],
+            "region" => [Some(ColumnRange::Equal(int(9).into())), None, None],
             _ => [Some(ColumnRange::Unknown), None, None],
         });
         assert!(none.is_empty());
@@ -1142,28 +1154,25 @@ mod point {
         )
     }
 
-    /// PGC-478: entries keyed by their literal's typed form are found by a row
-    /// whose wire text spells the same value differently; an unparseable
-    /// literal is routed to the wildcard class and still returned.
+    /// PGC-478: entries holding their literal as the column's value are
+    /// found by a row whose wire text spells the same value differently; an
+    /// unparseable literal is routed to the wildcard class and still returned.
     #[test]
     fn test_point_probe_matches_typed_literals_across_spellings() {
         let t = typed_table();
         let mut idx = ConstraintIndex::<Fingerprint>::new();
-        let keyed = |cs: &[TableConstraint]| table_constraints_keyed(cs, &t);
-        idx.insert(
-            fp(1),
-            &ranges(&keyed(&[eq("at", text("2024-01-15 10:00"))])),
-        );
-        idx.insert(fp(2), &ranges(&keyed(&[eq("price", text("10.500"))])));
+        let value = |column: &str, literal: &str| {
+            let metadata = t.columns.get(column).expect("a column of the table");
+            ConstraintValue::of_column(ColumnCompare::of_column(metadata), text(literal))
+        };
+        idx.insert(fp(1), &ranges(&[eq("at", value("at", "2024-01-15 10:00"))]));
+        idx.insert(fp(2), &ranges(&[eq("price", value("price", "10.500"))]));
         idx.insert(
             fp(3),
-            &ranges(&keyed(&[gt("day", text("2024-01-10 00:00"))])),
+            &ranges(&[gt("day", value("day", "2024-01-10 00:00"))]),
         );
-        idx.insert(fp(4), &ranges(&keyed(&[eq("at", text("Jan 15 2024"))])));
-        idx.insert(
-            fp(5),
-            &ranges(&keyed(&[eq("at", text("2024-01-16 10:00"))])),
-        );
+        idx.insert(fp(4), &ranges(&[eq("at", value("at", "Jan 15 2024"))]));
+        idx.insert(fp(5), &ranges(&[eq("at", value("at", "2024-01-16 10:00"))]));
 
         let row = [
             bs("1"),
@@ -1181,8 +1190,8 @@ mod point {
             "a different instant is not returned"
         );
 
-        // The region probe keys the new query's literal the same way.
-        let region = idx.candidates(&ranges(&keyed(&[eq("at", text("2024-01-15T10:00:00"))])));
+        // The region probe keys the new query's value the same way.
+        let region = idx.candidates(&ranges(&[eq("at", value("at", "2024-01-15T10:00:00"))]));
         assert!(region.contains(&fp(1)));
         assert!(region.contains(&fp(4)));
         assert!(!region.contains(&fp(5)));
@@ -1194,11 +1203,11 @@ mod point {
         forms
             .iter()
             .flatten()
-            .any(|r| matches!(r, ColumnRange::Equal(LiteralValue::String(v)) if v == s))
+            .any(|r| matches!(r, ColumnRange::Equal(ConstraintValue::Raw(LiteralValue::String(v))) if v == s))
     }
     fn has_num_form(forms: &ColumnForms, x: f64) -> bool {
         forms.iter().flatten().any(
-            |r| matches!(r, ColumnRange::Equal(LiteralValue::Float(n)) if *n == NotNan::new(x).unwrap()),
+            |r| matches!(r, ColumnRange::Equal(ConstraintValue::Raw(LiteralValue::Float(n))) if *n == NotNan::new(x).unwrap()),
         )
     }
 
@@ -1216,22 +1225,18 @@ mod point {
         // text column "alice" → String form only (not numerically parseable).
         let name = row_value_forms(&t, &row, "name");
         assert!(has_str_form(&name, "alice"));
-        assert!(
-            !name
-                .iter()
-                .flatten()
-                .any(|r| matches!(r, ColumnRange::Equal(LiteralValue::Float(_))))
-        );
+        assert!(!name.iter().flatten().any(|r| matches!(
+            r,
+            ColumnRange::Equal(ConstraintValue::Raw(LiteralValue::Float(_)))
+        )));
 
         // bool column "t" → String("t") plus Boolean(true).
         let active = row_value_forms(&t, &row, "active");
         assert!(has_str_form(&active, "t"));
-        assert!(
-            active
-                .iter()
-                .flatten()
-                .any(|r| matches!(r, ColumnRange::Equal(LiteralValue::Boolean(true))))
-        );
+        assert!(active.iter().flatten().any(|r| matches!(
+            r,
+            ColumnRange::Equal(ConstraintValue::Raw(LiteralValue::Boolean(true)))
+        )));
 
         // SQL NULL / absent column → [Unknown] (wildcard).
         let null_row = [None, bs("bob"), bs("f")];
@@ -1248,11 +1253,10 @@ mod point {
         let bad_row = [bs("abc"), bs("bob"), bs("f")];
         let bad = row_value_forms(&t, &bad_row, "id");
         assert!(has_str_form(&bad, "abc"));
-        assert!(
-            !bad.iter()
-                .flatten()
-                .any(|r| matches!(r, ColumnRange::Equal(LiteralValue::Float(_))))
-        );
+        assert!(!bad.iter().flatten().any(|r| matches!(
+            r,
+            ColumnRange::Equal(ConstraintValue::Raw(LiteralValue::Float(_)))
+        )));
     }
 
     #[test]
@@ -1313,13 +1317,16 @@ mod point {
         }
     }
 
-    /// An ordered-text bound sits on a byte-ordered column, so the probe
-    /// walks the `Str` region and excludes by bytes.
+    /// A bound that is a value of a byte-ordered column orders by bytes, so
+    /// the probe walks the `Str` region and excludes by them.
     #[test]
     fn test_point_probe_ordered_text_range_excludes_by_bytes() {
         let t = point_table();
         let mut idx = ConstraintIndex::<Fingerprint>::new();
-        let bound = LiteralValue::OrderedText("B".into());
+        let bound = ConstraintValue::of_column(
+            ColumnCompare::new(&Type::TEXT, TextOrder::Bytes),
+            text("B"),
+        );
         idx.insert(fp(1), &ranges(&[lt("name", bound)])); // name < 'B'
 
         let row = [bs("1"), bs("A"), bs("t")];

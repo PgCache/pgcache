@@ -40,7 +40,10 @@ fn ranges(constraints: &[TableConstraint]) -> TableRanges {
 fn comparison(c: &str, op: BinaryOp, value: LiteralValue) -> TableConstraint {
     TableConstraint {
         column: col(c),
-        kind: ColumnConstraintKind::Comparison { op, value },
+        kind: ColumnConstraintKind::Comparison {
+            op,
+            value: value.into(),
+        },
     }
 }
 

@@ -5,7 +5,7 @@ use crate::query::ast::BinaryOp;
 use crate::query::cast::cast_target_coerce_text;
 use crate::query::constraints::{ColumnConstraintKind, NullTest, TableConstraint};
 use crate::query::evaluate::literal_compare;
-use crate::query::typed_compare::{ColumnCompare, typed_compare};
+use crate::query::typed_compare::ColumnCompare;
 
 /// Check that every filter of an update query's reference matches
 /// `row_data`. True when there are none (a full-scan reference).
@@ -100,16 +100,21 @@ fn constraint_value_matches(
 ) -> bool {
     match kind {
         ColumnConstraintKind::Comparison { op, value } => {
-            typed_compare(column, value, row_str, *op).unwrap_or(true)
+            value.row_compare(column, row_str, *op).unwrap_or(true)
         }
-        ColumnConstraintKind::AnyOf(values) => values
-            .iter()
-            .any(|v| typed_compare(column, v, row_str, BinaryOp::Equal).unwrap_or(true)),
+        ColumnConstraintKind::AnyOf(values) => values.iter().any(|v| {
+            v.row_compare(column, row_str, BinaryOp::Equal)
+                .unwrap_or(true)
+        }),
         // Coercion failure (e.g. `'abc'::int4`): the row would error at origin
         // and never match — safe to treat as non-matching here.
         ColumnConstraintKind::CastComparison { cast, op, value } => {
-            cast_target_coerce_text(cast, row_str)
-                .is_some_and(|coerced| literal_compare(&coerced, *op, value))
+            cast_target_coerce_text(cast, row_str).is_some_and(|coerced| {
+                // A cast comparison's value is always kept as written.
+                value
+                    .as_raw()
+                    .is_none_or(|value| literal_compare(&coerced, *op, value))
+            })
         }
         ColumnConstraintKind::NullTest(test) => *test == NullTest::IsNotNull,
     }
@@ -304,7 +309,7 @@ mod tests {
             "id",
             ColumnConstraintKind::Comparison {
                 op: BinaryOp::Equal,
-                value: LiteralValue::Integer(value),
+                value: LiteralValue::Integer(value).into(),
             },
         )
     }
@@ -320,7 +325,7 @@ mod tests {
             ColumnConstraintKind::CastComparison {
                 cast: target,
                 op,
-                value,
+                value: value.into(),
             },
         )
     }
@@ -339,7 +344,7 @@ mod tests {
             "name",
             ColumnConstraintKind::Comparison {
                 op: BinaryOp::Equal,
-                value: LiteralValue::String("alice".into()),
+                value: LiteralValue::String("alice".into()).into(),
             },
         );
         let filters = [name_is_alice];

@@ -152,13 +152,9 @@ pub struct RelationPredicates {
     /// Shared with every reference built on them, so a probe borrows
     /// instead of copying.
     pub filters: Arc<[TableConstraint]>,
-    /// `filters` reduced once to per-column ranges, for subsumption and
-    /// read-after-write.
+    /// `filters` reduced once to per-column ranges, for subsumption, the
+    /// constraint indexes and read-after-write.
     pub ranges: TableRanges,
-    /// `ranges` with every literal in its index-key form for its column's
-    /// type (PGC-478), as the constraint indexes are built and probed; the
-    /// same as `ranges` for a reference with no catalog table.
-    pub keyed_ranges: TableRanges,
     pub link_columns: Vec<EcoString>,
     pub unrecognized: bool,
     pub exact: bool,

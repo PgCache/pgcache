@@ -320,8 +320,7 @@ impl Pass<'_> {
                     self.literal(elem, element);
                 }
             }
-            LiteralValue::OrderedText(_)
-            | LiteralValue::Integer(_)
+            LiteralValue::Integer(_)
             | LiteralValue::Float(_)
             | LiteralValue::Boolean(_)
             | LiteralValue::Null

@@ -86,6 +86,7 @@ Conventions: files are `ADR-XXX-brief-title.md` with the next sequential number;
 - [ADR-068](ADR-068-cache-locale-mirroring-and-glibc-host.md) — Cache database created under origin's locale, a fail-closed text-ordering probe at startup, and a Debian (glibc) Docker image in place of Alpine *(extends ADR-056's locale gate)*
 - [ADR-069](ADR-069-amazon-linux-2-cache-postgresql-flavour.md) — A second cache PostgreSQL built on Amazon Linux 2's glibc, selected at startup so RDS and Aurora origins pass the ordering probe *(extends ADR-068)*
 - [ADR-071](ADR-071-per-column-text-order.md) — Per-column text order (`Bytes`/`Linguistic`/`Nondeterministic`) in the catalog: local comparison, subsumption and index placement order text only where bytes are the collation's order; cache columns created under the declared collation *(builds on ADR-068; lifts PGC-446's blanket refusal for byte-ordered columns)*
+- [ADR-072](ADR-072-typed-constraint-values.md) — Constraints and ranges hold each literal parsed once as its column's value (`ConstraintValue`: typed, opaque or raw), so subsumption, the constraint index and read-after-write compare values, never spellings; the separate index-key ranges are removed *(replaces ADR-071's literal forms)*
 - [ADR-019](ADR-019-anonymous-telemetry.md) — Anonymous telemetry *(Proposed)*
 
 ## Cross-cutting notes

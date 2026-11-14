@@ -8,18 +8,18 @@
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
-use super::{ColumnConstraintKind, NullTest, TableConstraint};
-use crate::query::ast::{BinaryOp, LiteralValue};
+use super::{ColumnConstraintKind, ConstraintValue, NullTest, TableConstraint};
+use crate::query::ast::BinaryOp;
 
 /// One end of a column's value range
 #[derive(Debug, Clone)]
 pub(crate) struct RangeBound {
-    pub(crate) value: LiteralValue,
+    pub(crate) value: ConstraintValue,
     pub(super) inclusive: bool, // true = >= or <=, false = > or <
 }
 
 /// Canonical representation of all constraints on a single column, reduced
-/// from a set of (BinaryOp, LiteralValue) pairs. Used by subsumption checking.
+/// from a set of (BinaryOp, ConstraintValue) pairs. Used by subsumption checking.
 #[derive(Debug, Clone)]
 pub(crate) enum ColumnRange {
     /// Values are incomparable (Parameter, Null, mixed types) — can't reason
@@ -29,9 +29,9 @@ pub(crate) enum ColumnRange {
     /// Contradictory constraints — no value can satisfy (e.g., = 5 AND > 10)
     Empty,
     /// Exactly one value: column = v
-    Equal(LiteralValue),
+    Equal(ConstraintValue),
     /// Finite set of allowed values: column IN (v1, v2, ...)
-    InSet(HashSet<LiteralValue>),
+    InSet(HashSet<ConstraintValue>),
     /// Only NULL: column IS NULL. No other range admits NULL.
     Null,
     /// Bounded interval with possible exclusions. Excludes NULL, as every
@@ -39,19 +39,8 @@ pub(crate) enum ColumnRange {
     Range {
         lower: Option<RangeBound>,
         upper: Option<RangeBound>,
-        not_equal: Vec<LiteralValue>,
+        not_equal: Vec<ConstraintValue>,
     },
-}
-
-/// Returns true if the value is incomparable for range analysis (Parameter, Null, NullWithCast).
-pub(crate) fn literal_value_is_incomparable(v: &LiteralValue) -> bool {
-    matches!(
-        v,
-        LiteralValue::Parameter(_)
-            | LiteralValue::SessionTerm(_)
-            | LiteralValue::Null
-            | LiteralValue::NullWithCast(_)
-    )
 }
 
 /// Which end of a range a bound sits on. Every bound rule below is written for
@@ -93,21 +82,26 @@ fn bound_tighten(
     existing: &RangeBound,
     candidate: &RangeBound,
 ) -> Option<RangeBound> {
-    literal_value_order(&existing.value, &candidate.value).map(|ord| match side.orient(ord) {
-        // candidate is further inside → tighter
-        Ordering::Less => candidate.clone(),
-        Ordering::Greater => existing.clone(),
-        // same value: exclusive wins
-        Ordering::Equal => RangeBound {
-            value: existing.value.clone(),
-            inclusive: existing.inclusive && candidate.inclusive,
-        },
-    })
+    existing
+        .value
+        .value_order(&candidate.value)
+        .map(|ord| match side.orient(ord) {
+            // candidate is further inside → tighter
+            Ordering::Less => candidate.clone(),
+            Ordering::Greater => existing.clone(),
+            // same value: exclusive wins
+            Ordering::Equal => RangeBound {
+                value: existing.value.clone(),
+                inclusive: existing.inclusive && candidate.inclusive,
+            },
+        })
 }
 
 /// Whether `value` satisfies `bound`; None if incomparable.
-fn value_satisfies(side: BoundSide, value: &LiteralValue, bound: &RangeBound) -> Option<bool> {
-    literal_value_order(value, &bound.value).map(|ord| side.admits(ord, bound.inclusive))
+fn value_satisfies(side: BoundSide, value: &ConstraintValue, bound: &RangeBound) -> Option<bool> {
+    value
+        .value_order(&bound.value)
+        .map(|ord| side.admits(ord, bound.inclusive))
 }
 
 /// Merge `candidate` into the bound on `side`; false if incomparable.
@@ -132,8 +126,8 @@ pub(crate) fn column_range_build(constraints: &[&TableConstraint]) -> ColumnRang
     }
 
     // Separate comparisons from in-sets
-    let mut comparisons: Vec<(BinaryOp, &LiteralValue)> = Vec::new();
-    let mut in_set: Option<&[LiteralValue]> = None;
+    let mut comparisons: Vec<(BinaryOp, &ConstraintValue)> = Vec::new();
+    let mut in_set: Option<&[ConstraintValue]> = None;
     let mut null_test: Option<NullTest> = None;
 
     for tc in constraints {
@@ -187,15 +181,15 @@ pub(crate) fn column_range_build(constraints: &[&TableConstraint]) -> ColumnRang
 
 /// Build a ColumnRange from an IN-set, optionally intersected with comparisons.
 fn in_set_range_build(
-    set_values: &[LiteralValue],
-    comparisons: &[(BinaryOp, &LiteralValue)],
+    set_values: &[ConstraintValue],
+    comparisons: &[(BinaryOp, &ConstraintValue)],
 ) -> ColumnRange {
     if set_values.is_empty() {
         return ColumnRange::Empty;
     }
 
     // Any incomparable value in the set makes it unknowable
-    if set_values.iter().any(literal_value_is_incomparable) {
+    if set_values.iter().any(ConstraintValue::is_incomparable) {
         return ColumnRange::Unknown;
     }
 
@@ -241,7 +235,7 @@ fn in_set_range_build(
                 Some(first) => match iter.next() {
                     None => ColumnRange::Equal(first),
                     Some(second) => {
-                        let mut set: HashSet<LiteralValue> = HashSet::from_iter([first, second]);
+                        let mut set: HashSet<ConstraintValue> = HashSet::from_iter([first, second]);
                         set.extend(iter);
                         ColumnRange::InSet(set)
                     }
@@ -252,18 +246,18 @@ fn in_set_range_build(
 }
 
 /// Build a ColumnRange from comparison-only constraints (no in-sets).
-fn comparison_range_build(comparisons: &[(BinaryOp, &LiteralValue)]) -> ColumnRange {
+fn comparison_range_build(comparisons: &[(BinaryOp, &ConstraintValue)]) -> ColumnRange {
     if comparisons.is_empty() {
         return ColumnRange::Unconstrained;
     }
 
-    let mut equal_value: Option<&LiteralValue> = None;
+    let mut equal_value: Option<&ConstraintValue> = None;
     let mut lower: Option<RangeBound> = None;
     let mut upper: Option<RangeBound> = None;
-    let mut not_equal: Vec<LiteralValue> = Vec::new();
+    let mut not_equal: Vec<ConstraintValue> = Vec::new();
 
     for &(op, value) in comparisons {
-        if literal_value_is_incomparable(value) {
+        if value.is_incomparable() {
             return ColumnRange::Unknown;
         }
         match op {
@@ -326,7 +320,7 @@ fn comparison_range_build(comparisons: &[(BinaryOp, &LiteralValue)]) -> ColumnRa
 
     // Check that bounds aren't contradictory (lower > upper)
     if let (Some(lb), Some(ub)) = (&lower, &upper) {
-        match literal_value_order(&lb.value, &ub.value) {
+        match lb.value.value_order(&ub.value) {
             Some(Ordering::Greater) => return ColumnRange::Empty,
             Some(Ordering::Equal) => {
                 if !lb.inclusive || !ub.inclusive {
@@ -355,14 +349,14 @@ fn comparison_range_build(comparisons: &[(BinaryOp, &LiteralValue)]) -> ColumnRa
 pub(super) struct RangeView<'a> {
     pub(super) lower: &'a Option<RangeBound>,
     pub(super) upper: &'a Option<RangeBound>,
-    pub(super) not_equal: &'a [LiteralValue],
+    pub(super) not_equal: &'a [ConstraintValue],
 }
 
 impl<'a> RangeView<'a> {
     pub(super) fn new(
         lower: &'a Option<RangeBound>,
         upper: &'a Option<RangeBound>,
-        not_equal: &'a [LiteralValue],
+        not_equal: &'a [ConstraintValue],
     ) -> Self {
         Self {
             lower,
@@ -381,7 +375,7 @@ impl<'a> RangeView<'a> {
 
 /// Check if a value falls within a range (satisfies bounds and isn't
 /// excluded). An incomparable bound counts as not containing it.
-fn range_contains_value(range: RangeView<'_>, value: &LiteralValue) -> bool {
+fn range_contains_value(range: RangeView<'_>, value: &ConstraintValue) -> bool {
     let within = BoundSide::BOTH.into_iter().all(|side| {
         range
             .bound(side)
@@ -393,11 +387,13 @@ fn range_contains_value(range: RangeView<'_>, value: &LiteralValue) -> bool {
 /// Whether `a` is at least as restrictive as `b` on `side`. At the same value,
 /// `a` is at least as tight if it is exclusive or both are inclusive.
 fn bound_at_least_as_tight(side: BoundSide, a: &RangeBound, b: &RangeBound) -> Option<bool> {
-    literal_value_order(&a.value, &b.value).map(|ord| match side.orient(ord) {
-        Ordering::Greater => true,
-        Ordering::Less => false,
-        Ordering::Equal => !a.inclusive || b.inclusive,
-    })
+    a.value
+        .value_order(&b.value)
+        .map(|ord| match side.orient(ord) {
+            Ordering::Greater => true,
+            Ordering::Less => false,
+            Ordering::Equal => !a.inclusive || b.inclusive,
+        })
 }
 
 /// A cached bound is covered when new has a bound on that side at least as
@@ -504,50 +500,12 @@ pub(super) fn column_range_subsumes(cached: &ColumnRange, new: &ColumnRange) -> 
     }
 }
 
-/// Compare two literal values for ordering. Returns None if the values are
-/// not comparable (different types, Parameters, Nulls) — and for plain
-/// strings: byte order does not mirror PostgreSQL collation order (`'a' >
-/// 'B'` in bytes but `'a' < 'B'` under en_US), so an ordering claim over text
-/// could prove a false exclusion and serve stale data (PGC-446). Only
-/// [`LiteralValue::OrderedText`], a bound on a byte-ordered column, orders by
-/// bytes, also against the plain string a write to that column carries.
-/// String *equality* is decided by `range_overlap::literal_value_eq` instead.
-pub(crate) fn literal_value_order(
-    a: &LiteralValue,
-    b: &LiteralValue,
-) -> Option<std::cmp::Ordering> {
-    match (a, b) {
-        (LiteralValue::Integer(a), LiteralValue::Integer(b)) => Some(a.cmp(b)),
-        (LiteralValue::Float(a), LiteralValue::Float(b)) => Some(a.cmp(b)),
-        (LiteralValue::OrderedText(a), LiteralValue::OrderedText(b))
-        | (LiteralValue::OrderedText(a), LiteralValue::String(b))
-        | (LiteralValue::String(a), LiteralValue::OrderedText(b)) => {
-            Some(a.as_bytes().cmp(b.as_bytes()))
-        }
-        _ => None,
-    }
-}
-
-/// Total order for canonicalization only (deterministic `InSet` hashing and
-/// dedup) — never a PostgreSQL-semantic claim, so byte order on strings is
-/// fine here. Incomparable pairs order as equal, matching the previous
-/// `unwrap_or(Equal)` at the sort sites.
-pub(crate) fn literal_value_canonical_order(a: &LiteralValue, b: &LiteralValue) -> Ordering {
-    match (a, b) {
-        (LiteralValue::Integer(a), LiteralValue::Integer(b)) => a.cmp(b),
-        (LiteralValue::Float(a), LiteralValue::Float(b)) => a.cmp(b),
-        (LiteralValue::String(a), LiteralValue::String(b))
-        | (LiteralValue::OrderedText(a), LiteralValue::OrderedText(b)) => a.cmp(b),
-        (LiteralValue::StringWithCast(a, _), LiteralValue::StringWithCast(b, _)) => a.cmp(b),
-        _ => Ordering::Equal,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::wildcard_enum_match_arm)]
 
     use super::*;
+    use crate::query::ast::LiteralValue;
 
     // ========== ColumnRange unit tests ==========
 
@@ -558,12 +516,15 @@ mod tests {
         }
     }
 
-    fn comparison(op: BinaryOp, value: LiteralValue) -> TableConstraint {
-        constraint(ColumnConstraintKind::Comparison { op, value })
+    fn comparison(op: BinaryOp, value: impl Into<ConstraintValue>) -> TableConstraint {
+        constraint(ColumnConstraintKind::Comparison {
+            op,
+            value: value.into(),
+        })
     }
 
     /// Helper: build a ColumnRange from comparison tuples (convenience for tests)
-    fn range_from_comparisons(comparisons: &[(BinaryOp, LiteralValue)]) -> ColumnRange {
+    fn range_from_comparisons(comparisons: &[(BinaryOp, ConstraintValue)]) -> ColumnRange {
         let tcs: Vec<TableConstraint> = comparisons
             .iter()
             .map(|(op, val)| comparison(*op, val.clone()))
@@ -580,18 +541,18 @@ mod tests {
 
     #[test]
     fn test_column_range_build_equal() {
-        let range = range_from_comparisons(&[(BinaryOp::Equal, LiteralValue::Integer(5))]);
+        let range = range_from_comparisons(&[(BinaryOp::Equal, LiteralValue::Integer(5).into())]);
         assert!(matches!(
             range,
-            ColumnRange::Equal(LiteralValue::Integer(5))
+            ColumnRange::Equal(ConstraintValue::Raw(LiteralValue::Integer(5)))
         ));
     }
 
     #[test]
     fn test_column_range_build_contradictory_equals() {
         let range = range_from_comparisons(&[
-            (BinaryOp::Equal, LiteralValue::Integer(5)),
-            (BinaryOp::Equal, LiteralValue::Integer(3)),
+            (BinaryOp::Equal, LiteralValue::Integer(5).into()),
+            (BinaryOp::Equal, LiteralValue::Integer(3).into()),
         ]);
         assert!(matches!(range, ColumnRange::Empty));
     }
@@ -599,8 +560,8 @@ mod tests {
     #[test]
     fn test_column_range_build_equal_with_not_equal_contradiction() {
         let range = range_from_comparisons(&[
-            (BinaryOp::Equal, LiteralValue::Integer(5)),
-            (BinaryOp::NotEqual, LiteralValue::Integer(5)),
+            (BinaryOp::Equal, LiteralValue::Integer(5).into()),
+            (BinaryOp::NotEqual, LiteralValue::Integer(5).into()),
         ]);
         assert!(matches!(range, ColumnRange::Empty));
     }
@@ -608,8 +569,8 @@ mod tests {
     #[test]
     fn test_column_range_build_bounds_contradictory() {
         let range = range_from_comparisons(&[
-            (BinaryOp::GreaterThan, LiteralValue::Integer(10)),
-            (BinaryOp::LessThan, LiteralValue::Integer(5)),
+            (BinaryOp::GreaterThan, LiteralValue::Integer(10).into()),
+            (BinaryOp::LessThan, LiteralValue::Integer(5).into()),
         ]);
         assert!(matches!(range, ColumnRange::Empty));
     }
@@ -617,8 +578,8 @@ mod tests {
     #[test]
     fn test_column_range_build_bounds_equal_exclusive() {
         let range = range_from_comparisons(&[
-            (BinaryOp::GreaterThan, LiteralValue::Integer(5)),
-            (BinaryOp::LessThan, LiteralValue::Integer(5)),
+            (BinaryOp::GreaterThan, LiteralValue::Integer(5).into()),
+            (BinaryOp::LessThan, LiteralValue::Integer(5).into()),
         ]);
         assert!(matches!(range, ColumnRange::Empty));
     }
@@ -631,11 +592,11 @@ mod tests {
     );
 
     fn is_equal_to(range: &ColumnRange, expected: i64) -> bool {
-        matches!(range, ColumnRange::Equal(LiteralValue::Integer(v)) if *v == expected)
+        matches!(range, ColumnRange::Equal(ConstraintValue::Raw(LiteralValue::Integer(v))) if *v == expected)
     }
 
     fn bound_is(bound: &Option<RangeBound>, expected: i64, inclusive: bool) -> bool {
-        matches!(bound, Some(b) if b.value == LiteralValue::Integer(expected) && b.inclusive == inclusive)
+        matches!(bound, Some(b) if b.value == LiteralValue::Integer(expected).into() && b.inclusive == inclusive)
     }
 
     #[test]
@@ -679,6 +640,10 @@ mod tests {
             ),
         ];
         for (label, comparisons, expected) in cases {
+            let comparisons: Vec<(BinaryOp, ConstraintValue)> = comparisons
+                .into_iter()
+                .map(|(op, value)| (op, value.into()))
+                .collect();
             let range = range_from_comparisons(&comparisons);
             assert!(expected(&range), "{label}: got {range:?}");
         }
@@ -708,7 +673,9 @@ mod tests {
         assert!(matches!(
             build(&[
                 null_test(NullTest::IsNull),
-                constraint(ColumnConstraintKind::AnyOf(vec![LiteralValue::Integer(1)]))
+                constraint(ColumnConstraintKind::AnyOf(vec![
+                    LiteralValue::Integer(1).into()
+                ]))
             ]),
             ColumnRange::Empty
         ));
@@ -735,14 +702,16 @@ mod tests {
 
     #[test]
     fn test_column_range_build_parameter_unknown() {
-        let range =
-            range_from_comparisons(&[(BinaryOp::Equal, LiteralValue::Parameter("$1".into()))]);
+        let range = range_from_comparisons(&[(
+            BinaryOp::Equal,
+            LiteralValue::Parameter("$1".into()).into(),
+        )]);
         assert!(matches!(range, ColumnRange::Unknown));
     }
 
     #[test]
     fn test_column_range_build_null_unknown() {
-        let range = range_from_comparisons(&[(BinaryOp::Equal, LiteralValue::Null)]);
+        let range = range_from_comparisons(&[(BinaryOp::Equal, LiteralValue::Null.into())]);
         assert!(matches!(range, ColumnRange::Unknown));
     }
 
@@ -750,11 +719,11 @@ mod tests {
     /// hash determinism only, never a PG-semantic claim.
     #[test]
     fn test_canonical_order_sorts_strings() {
-        let mut values = [
-            LiteralValue::String("b".into()),
-            LiteralValue::String("a".into()),
+        let mut values: [ConstraintValue; 2] = [
+            LiteralValue::String("b".into()).into(),
+            LiteralValue::String("a".into()).into(),
         ];
-        values.sort_by(literal_value_canonical_order);
-        assert_eq!(values[0], LiteralValue::String("a".into()));
+        values.sort_by(|a, b| a.canonical_order(b));
+        assert_eq!(values[0], LiteralValue::String("a".into()).into());
     }
 }

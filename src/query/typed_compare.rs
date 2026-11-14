@@ -29,7 +29,7 @@ use crate::query::cast::bool_literal_parse;
 use crate::query::literal_settings::{DateOrder, LiteralSettings};
 
 /// How a column's values compare, derived from its type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ValueKind {
     /// `int2`, `int4`, `int8`, `oid`: exact integers.
     Integer,
@@ -96,7 +96,7 @@ impl ValueKind {
 
 /// A column as the comparator sees it: its type's kind, and for text what
 /// bytes decide under its collation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ColumnCompare {
     kind: ValueKind,
     text_order: TextOrder,
@@ -148,8 +148,111 @@ impl ColumnCompare {
     }
 }
 
+/// A literal parsed as the value it is in its column, in one form per
+/// value: `'10.50'` and `10.5` in a `numeric` column are the same
+/// `ColumnValue`, as are `'a '` and `'a'` in a `char(n)` one. Constraints and
+/// ranges hold these, so they compare values and never spellings.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct ColumnValue {
+    column: ColumnCompare,
+    value: TypedValue,
+}
+
+impl std::fmt::Debug for ColumnValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.value.fmt(f)
+    }
+}
+
+impl ColumnValue {
+    /// `literal` as a value of `column`; `None` when it does not parse as the
+    /// column's kind, or bytes do not even decide equality there (an
+    /// unsupported type, nondeterministically collated text).
+    pub fn parse(column: ColumnCompare, literal: &LiteralValue) -> Option<Self> {
+        if !column.op_decidable(BinaryOp::Equal) {
+            return None;
+        }
+        let value = literal_parse(column.kind, literal)?.canonical(column.kind);
+        Some(Self { column, value })
+    }
+
+    /// Whether the column's values order locally (not linguistically
+    /// collated text, not an enum's labels).
+    pub fn orders(&self) -> bool {
+        self.column.op_decidable(BinaryOp::LessThan)
+    }
+
+    /// Whether this value equals `other`, a value of a column that compares
+    /// the same way; `None` across columns that do not.
+    pub fn value_eq(&self, other: &Self) -> Option<bool> {
+        (self.column == other.column).then(|| self.value == other.value)
+    }
+
+    /// This value against `other` in their column's order; `None` when the
+    /// column has no local order or the two columns compare differently.
+    pub fn value_order(&self, other: &Self) -> Option<Ordering> {
+        if self.column != other.column || !self.orders() {
+            return None;
+        }
+        self.value.cmp_same_kind(&other.value)
+    }
+
+    /// `literal`, of unknown type, read as a value of this one's column:
+    /// what a write's bare literal means against a read's typed value.
+    pub fn literal_parse(&self, literal: &LiteralValue) -> Option<Self> {
+        Self::parse(self.column, literal)
+    }
+
+    /// `row_text op self` for a present (non-NULL) row value; `None` when
+    /// the row's text does not parse or the column leaves `op` undecided.
+    pub fn row_compare(&self, row_text: &str, op: BinaryOp) -> Option<bool> {
+        if !self.column.op_decidable(op) {
+            return None;
+        }
+        let row = text_parse(self.column.kind, row_text)?;
+        ordering_op_holds(row.cmp_same_kind(&self.value)?, op)
+    }
+
+    /// A total order for canonicalization only: the kind's value order, also
+    /// where the column itself has none (linguistic text sorts by bytes).
+    pub fn canonical_order(&self, other: &Self) -> Ordering {
+        self.value
+            .cmp_same_kind(&other.value)
+            .unwrap_or(Ordering::Equal)
+    }
+
+    /// The constraint-index key form ([`literal_index_key`]).
+    pub fn index_key(&self) -> Option<LiteralValue> {
+        self.value.clone().into_index_key()
+    }
+}
+
+/// Whether `ordering` satisfies comparison `op`; `None` for any other operator.
+fn ordering_op_holds(ordering: Ordering, op: BinaryOp) -> Option<bool> {
+    Some(match op {
+        BinaryOp::Equal => ordering == Ordering::Equal,
+        BinaryOp::NotEqual => ordering != Ordering::Equal,
+        BinaryOp::LessThan => ordering == Ordering::Less,
+        BinaryOp::LessThanOrEqual => ordering != Ordering::Greater,
+        BinaryOp::GreaterThan => ordering == Ordering::Greater,
+        BinaryOp::GreaterThanOrEqual => ordering != Ordering::Less,
+        BinaryOp::And
+        | BinaryOp::Or
+        | BinaryOp::Like
+        | BinaryOp::ILike
+        | BinaryOp::NotLike
+        | BinaryOp::NotILike
+        | BinaryOp::RegexMatch
+        | BinaryOp::RegexIMatch
+        | BinaryOp::NotRegexMatch
+        | BinaryOp::NotRegexIMatch
+        | BinaryOp::IsDistinctFrom
+        | BinaryOp::IsNotDistinctFrom => return None,
+    })
+}
+
 /// A value parsed for comparison. `Ord` within one kind only.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum TypedValue {
     Integer(i128),
     Decimal(Decimal),
@@ -168,6 +271,20 @@ enum TypedValue {
 }
 
 impl TypedValue {
+    /// The one form of this value in a column of `kind`, so equal values are
+    /// equal structurally: a whole number is an integer in an integer column
+    /// however it was spelled (`'7.0'`), and a decimal in a decimal one.
+    fn canonical(self, kind: ValueKind) -> Self {
+        match (kind, self) {
+            (ValueKind::Integer, Self::Decimal(decimal)) => match decimal.to_integer() {
+                Some(n) => Self::Integer(n),
+                None => Self::Decimal(decimal),
+            },
+            (ValueKind::Decimal, Self::Integer(n)) => Self::Decimal(Decimal::from_int(n)),
+            (_, value) => value,
+        }
+    }
+
     fn cmp_same_kind(&self, other: &Self) -> Option<Ordering> {
         match (self, other) {
             (Self::NaN, Self::NaN) => return Some(Ordering::Equal),
@@ -212,7 +329,7 @@ impl TypedValue {
 /// An exact decimal: sign, digits with the point removed, and the exponent
 /// such that value = digits × 10^exponent. Normalised (no leading or trailing
 /// zeros in `digits`) so equal values compare equal.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Decimal {
     negative: bool,
     digits: Vec<u8>,
@@ -272,6 +389,16 @@ impl Decimal {
             digits,
             exponent,
         }
+    }
+
+    /// The integer this is, when it is one that fits.
+    fn to_integer(&self) -> Option<i128> {
+        let exponent = u32::try_from(self.exponent).ok()?;
+        let magnitude = self.digits.iter().try_fold(0_i128, |acc, digit| {
+            acc.checked_mul(10)?.checked_add(i128::from(*digit))
+        })?;
+        let magnitude = magnitude.checked_mul(10_i128.checked_pow(exponent)?)?;
+        Some(if self.negative { -magnitude } else { magnitude })
     }
 
     /// -1, 0 or 1: the order of signs, zero between.
@@ -361,7 +488,6 @@ pub fn literal_locally_comparable(
         LiteralValue::Array(..) => false,
         LiteralValue::String(_)
         | LiteralValue::StringWithCast(..)
-        | LiteralValue::OrderedText(_)
         | LiteralValue::Integer(_)
         | LiteralValue::Float(_)
         | LiteralValue::Boolean(_) => literal_parse(kind, literal).is_some(),
@@ -409,7 +535,6 @@ impl TypedLiteral {
             LiteralValue::Array(..) => LiteralParse::Undecidable,
             LiteralValue::String(_)
             | LiteralValue::StringWithCast(..)
-            | LiteralValue::OrderedText(_)
             | LiteralValue::Integer(_)
             | LiteralValue::Float(_)
             | LiteralValue::Boolean(_) => {
@@ -431,27 +556,7 @@ impl TypedLiteral {
             return None;
         }
         let row = text_parse(self.column.kind, row_text)?;
-        let ordering = row.cmp_same_kind(filter)?;
-        Some(match op {
-            BinaryOp::Equal => ordering == Ordering::Equal,
-            BinaryOp::NotEqual => ordering != Ordering::Equal,
-            BinaryOp::LessThan => ordering == Ordering::Less,
-            BinaryOp::LessThanOrEqual => ordering != Ordering::Greater,
-            BinaryOp::GreaterThan => ordering == Ordering::Greater,
-            BinaryOp::GreaterThanOrEqual => ordering != Ordering::Less,
-            BinaryOp::And
-            | BinaryOp::Or
-            | BinaryOp::Like
-            | BinaryOp::ILike
-            | BinaryOp::NotLike
-            | BinaryOp::NotILike
-            | BinaryOp::RegexMatch
-            | BinaryOp::RegexIMatch
-            | BinaryOp::NotRegexMatch
-            | BinaryOp::NotRegexIMatch
-            | BinaryOp::IsDistinctFrom
-            | BinaryOp::IsNotDistinctFrom => return None,
-        })
+        ordering_op_holds(row.cmp_same_kind(filter)?, op)
     }
 }
 
@@ -685,7 +790,7 @@ fn civil_parse_date(date: Date, time: Option<&str>) -> Option<DateTime> {
 /// name the same kind as the column.
 fn literal_parse(kind: ValueKind, literal: &LiteralValue) -> Option<TypedValue> {
     match literal {
-        LiteralValue::String(s) | LiteralValue::OrderedText(s) => text_parse(kind, s),
+        LiteralValue::String(s) => text_parse(kind, s),
         LiteralValue::StringWithCast(s, cast) => {
             if ValueKind::of_cast_name(cast) != kind {
                 return None;
@@ -1286,12 +1391,7 @@ mod tests {
         let name = ColumnCompare::new(&Type::TEXT, TextOrder::Bytes);
         assert_eq!(name.collated_text_order(), Some(TextOrder::Bytes));
         assert_eq!(
-            typed_compare(
-                name,
-                &LiteralValue::OrderedText("B".into()),
-                "a",
-                GreaterThan
-            ),
+            typed_compare(name, &LiteralValue::String("B".into()), "a", GreaterThan),
             Some(true)
         );
     }

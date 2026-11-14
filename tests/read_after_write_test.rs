@@ -1621,3 +1621,50 @@ async fn test_gate_forwards_write_spelled_differently_from_read() -> Result<(), 
     }
     Ok(())
 }
+
+/// A write to another value, however it is spelled, is disjoint from the
+/// read: the read's literal is its column's value, and the write's bare
+/// string is read as one too, so the proof holds by value and the read is
+/// served from cache.
+#[tokio::test]
+async fn test_gate_serves_read_disjoint_from_spelled_write() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&RAW_LAG).await?;
+    ctx.query(
+        "CREATE TABLE apart (id int primary key, v int, price numeric, code char(3), \
+         ts timestamp)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO apart VALUES (1, 10, 10.5, 'a', '2024-03-01 00:00'), \
+         (2, 20, 20.5, 'b', '2024-06-01 00:00')",
+        &[],
+    )
+    .await?;
+    ctx.cdc_apply_settle().await?;
+
+    // (read predicate on row 1, write predicate on row 2 in another spelling)
+    let cases = [
+        ("price = '10.5'", "price = '20.50'"),
+        ("code = 'a'", "code = 'b '"),
+        ("ts = '2024-03-01 00:00:00'", "ts = '2024-06-01'"),
+        ("ts < '2024-04-01'", "ts >= '2024-05-01 00:00'"),
+    ];
+    for (read, write) in cases {
+        let sql = format!("SELECT v FROM apart WHERE {read}");
+        register(&mut ctx, &sql).await?;
+        ctx.simple_query(&format!("UPDATE apart SET v = v + 1 WHERE {write}"))
+            .await?;
+        let m = ctx.metrics().await?;
+        let res = ctx.simple_query(&sql).await?;
+        assert_row_at(&res, 1, &[("v", "10")])?;
+        let delta = metrics_delta(&m, &ctx.metrics_after_outcomes(&m, 1).await?);
+        assert_eq!(delta.queries_cache_hit, 1, "{read} after {write}");
+        assert!(
+            delta.raw_serve_disjoint_update >= 1,
+            "{read} is provably apart from {write}"
+        );
+        ctx.cdc_apply_settle().await?;
+    }
+    Ok(())
+}

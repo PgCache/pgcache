@@ -99,7 +99,7 @@ mod tests {
             column: "id".into(),
             kind: ColumnConstraintKind::Comparison {
                 op: BinaryOp::Equal,
-                value,
+                value: value.into(),
             },
         }
     }
@@ -134,7 +134,7 @@ mod tests {
                     column: "v".into(),
                     kind: ColumnConstraintKind::Comparison {
                         op: BinaryOp::GreaterThan,
-                        value: LiteralValue::Integer(3),
+                        value: LiteralValue::Integer(3).into(),
                     },
                 },
             ],

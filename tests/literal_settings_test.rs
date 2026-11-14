@@ -6,7 +6,10 @@
 
 use std::io::Error;
 
-use crate::util::{TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, metrics_delta};
+use crate::util::{
+    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, assert_subsume_hit,
+    metrics_delta,
+};
 
 mod util;
 
@@ -55,11 +58,12 @@ async fn test_zoneless_timestamptz_literal_keys_per_session_zone() -> Result<(),
     assert_eq!(ids(&res)?, ["2", "3"]);
     let m = assert_cache_hit(&mut ctx, m).await?;
 
-    // UTC: 10:00 admits only the 12:00 row. A second entry, never the first.
+    // UTC: 10:00 admits only the 12:00 row. A second entry, never the first,
+    // whose rows the Tokyo entry's earlier bound already holds.
     ctx.simple_query("SET TimeZone = 'UTC'").await?;
     let res = ctx.simple_query(sql).await?;
     assert_eq!(ids(&res)?, ["3"]);
-    let m = assert_cache_miss(&mut ctx, m).await?;
+    let m = assert_subsume_hit(&mut ctx, m).await?;
     ctx.cache_settle().await?;
     let res = ctx.simple_query(sql).await?;
     assert_eq!(ids(&res)?, ["3"]);

@@ -7,9 +7,8 @@ use std::collections::HashSet;
 use ecow::{EcoString, EcoVec};
 use smallvec::SmallVec;
 
-use super::TableConstraint;
 use super::range::{ColumnRange, column_range_build, column_range_subsumes};
-use crate::query::ast::LiteralValue;
+use super::{ConstraintValue, TableConstraint};
 use crate::query::cast::CastTarget;
 
 /// One column's ranges: its bare constraints reduced to one range, and one
@@ -128,7 +127,9 @@ impl TableRanges {
     }
 
     /// Every column whose bare range is a finite set of values, with the set.
-    pub(crate) fn set_columns(&self) -> impl Iterator<Item = (&EcoString, &HashSet<LiteralValue>)> {
+    pub(crate) fn set_columns(
+        &self,
+    ) -> impl Iterator<Item = (&EcoString, &HashSet<ConstraintValue>)> {
         self.columns.iter().filter_map(|entry| match &entry.bare {
             Some(ColumnRange::InSet(values)) => Some((&entry.column, values)),
             Some(
@@ -226,7 +227,7 @@ mod tests {
             column,
             ColumnConstraintKind::Comparison {
                 op,
-                value: LiteralValue::Integer(value),
+                value: LiteralValue::Integer(value).into(),
             },
         )
     }
@@ -237,7 +238,7 @@ mod tests {
             ColumnConstraintKind::CastComparison {
                 cast: CastTarget::Int4,
                 op,
-                value: LiteralValue::Integer(value),
+                value: LiteralValue::Integer(value).into(),
             },
         )
     }
@@ -258,7 +259,7 @@ mod tests {
         assert_eq!(columns, ["id", "name", "x"]);
         assert!(matches!(
             ranges.index_range("id"),
-            ColumnRange::Equal(LiteralValue::Integer(5))
+            ColumnRange::Equal(ConstraintValue::Raw(LiteralValue::Integer(5)))
         ));
         assert!(matches!(ranges.index_range("name"), ColumnRange::Unknown));
         assert!(matches!(
@@ -285,7 +286,9 @@ mod tests {
         assert_eq!(bare, ["id", "x"]);
         assert!(matches!(
             ranges.bare_range("id"),
-            Some(ColumnRange::Equal(LiteralValue::Integer(5)))
+            Some(ColumnRange::Equal(ConstraintValue::Raw(
+                LiteralValue::Integer(5)
+            )))
         ));
         assert!(ranges.bare_range("x").is_some() && ranges.bare_range("name").is_none());
     }

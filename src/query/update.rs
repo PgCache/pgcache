@@ -474,7 +474,6 @@ mod tests {
     };
     use crate::oid::TypeOid;
     #[cfg(feature = "proxy")]
-    use crate::query::ast::LiteralValue;
     use crate::query::ast::query_tree_parse;
     #[cfg(feature = "proxy")]
     use crate::query::constraints::ColumnRange;
@@ -665,7 +664,7 @@ mod tests {
         assert_eq!(ranges.len(), 1);
         assert!(matches!(
             ranges[0].bare_range("id"),
-            Some(ColumnRange::Equal(LiteralValue::Integer(5)))
+            Some(ColumnRange::Equal(value)) if format!("{value:?}") == "Integer(5)"
         ));
         let s1_columns = s1.columns.as_ref().expect("s1.orders columns known");
         assert!(s1_columns.contains("id") && s1_columns.contains("x"));

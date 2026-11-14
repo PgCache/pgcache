@@ -22,21 +22,24 @@ mod range;
 #[cfg(feature = "proxy")]
 mod range_overlap;
 mod subsume;
+mod value;
 
 pub use subsume::{TableRanges, table_ranges_subsumed};
 
 #[cfg(test)]
 pub(crate) use subsume::table_constraints_subsumed;
 
+pub(crate) use range::ColumnRange;
 #[cfg(test)]
 pub(crate) use range::column_range_build;
-pub(crate) use range::{
-    ColumnRange, literal_value_canonical_order, literal_value_is_incomparable, literal_value_order,
-};
 #[cfg(feature = "proxy")]
 pub(crate) use range_overlap::{
     column_range_contains, column_ranges_disjoint, table_column_ranges,
 };
+pub use value::ConstraintValue;
+#[cfg(feature = "proxy")]
+pub(crate) use value::ValueRef;
+pub(crate) use value::literal_is_incomparable;
 
 /// A constraint on one column, keyed by `C`: a column binding inside the
 /// predicate model, a column name once projected for a table's consumers.
@@ -64,15 +67,18 @@ pub type TableConstraint = Constraint<EcoString>;
 #[derive(Debug, Clone, PartialEq)]
 pub enum ColumnConstraintKind {
     /// `column op value`.
-    Comparison { op: BinaryOp, value: LiteralValue },
+    Comparison {
+        op: BinaryOp,
+        value: ConstraintValue,
+    },
     /// Set membership; the values are sorted and distinct.
-    AnyOf(Vec<LiteralValue>),
+    AnyOf(Vec<ConstraintValue>),
     /// A comparison in the cast's output domain, so subsumption buckets it by
     /// `(column, cast)` apart from bare comparisons on the same column.
     CastComparison {
         cast: CastTarget,
         op: BinaryOp,
-        value: LiteralValue,
+        value: ConstraintValue,
     },
     /// `column IS [NOT] NULL`.
     NullTest(NullTest),
@@ -89,15 +95,19 @@ impl ColumnConstraintKind {
         }
     }
 
-    /// Every literal the constraint compares against.
+    /// Every literal the constraint compares against that is kept as
+    /// written: all of a write's, whose bind values are filled in here.
     pub fn literals_mut(&mut self) -> impl Iterator<Item = &mut LiteralValue> {
-        let (single, many): (Option<&mut LiteralValue>, &mut [LiteralValue]) = match self {
+        let (single, many): (Option<&mut ConstraintValue>, &mut [ConstraintValue]) = match self {
             ColumnConstraintKind::Comparison { value, .. }
             | ColumnConstraintKind::CastComparison { value, .. } => (Some(value), &mut []),
             ColumnConstraintKind::AnyOf(values) => (None, values.as_mut_slice()),
             ColumnConstraintKind::NullTest(_) => (None, &mut []),
         };
-        single.into_iter().chain(many)
+        single
+            .into_iter()
+            .chain(many)
+            .filter_map(ConstraintValue::as_raw_mut)
     }
 }
 

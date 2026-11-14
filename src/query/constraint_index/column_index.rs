@@ -9,8 +9,7 @@ use super::IdSet;
 use super::point::ColumnForms;
 use super::value_key::{Placement, ValueKey, placement};
 use crate::id_hash::IdHashable;
-use crate::query::ast::LiteralValue;
-use crate::query::constraints::ColumnRange;
+use crate::query::constraints::{ColumnRange, ConstraintValue};
 
 /// Intersect per-column match sets, smallest first so the accumulator shrinks
 /// as fast as possible, short-circuiting once it empties.
@@ -318,7 +317,7 @@ impl<K: IdHashable + Copy> ColumnIndex<K> {
     /// `LiteralValue` entry point for `extend_two_sided`. Falls back to
     /// over-returning every two-sided parent if either bound isn't orderable.
     #[inline]
-    fn extend_two_sided_lit(&self, qlo: &LiteralValue, qhi: &LiteralValue, out: &mut Vec<K>) {
+    fn extend_two_sided_lit(&self, qlo: &ConstraintValue, qhi: &ConstraintValue, out: &mut Vec<K>) {
         if self.range_both.is_empty() {
             return;
         }
@@ -330,7 +329,7 @@ impl<K: IdHashable + Copy> ColumnIndex<K> {
 
     /// `range_lower` parents `(l, +inf)` with `l <= bound`. A non-orderable
     /// bound can't probe the `BTreeMap`, so return the whole bucket.
-    fn extend_lower_covering(&self, bound: &LiteralValue, out: &mut Vec<K>) {
+    fn extend_lower_covering(&self, bound: &ConstraintValue, out: &mut Vec<K>) {
         match ValueKey::try_new(bound) {
             Some(key) => out.extend(self.range_lower.range(..=key).flat_map(|(_, f)| f)),
             None => out.extend(self.range_lower.values().flatten()),
@@ -338,7 +337,7 @@ impl<K: IdHashable + Copy> ColumnIndex<K> {
     }
 
     /// `range_upper` parents `(-inf, u)` with `u >= bound`.
-    fn extend_upper_covering(&self, bound: &LiteralValue, out: &mut Vec<K>) {
+    fn extend_upper_covering(&self, bound: &ConstraintValue, out: &mut Vec<K>) {
         match ValueKey::try_new(bound) {
             Some(key) => out.extend(self.range_upper.range(key..).flat_map(|(_, f)| f)),
             None => out.extend(self.range_upper.values().flatten()),
@@ -347,7 +346,7 @@ impl<K: IdHashable + Copy> ColumnIndex<K> {
 
     /// `InSet` query branch of `containing`: a parent subsumes it only if the
     /// parent's constraint covers every value in the set.
-    fn containing_inset(&self, set: &HashSet<LiteralValue>, out: &mut Vec<K>) {
+    fn containing_inset(&self, set: &HashSet<ConstraintValue>, out: &mut Vec<K>) {
         // Any non-keyable member means we can't reason about the set
         // precisely — return the whole bucket conservatively.
         let Some(keys): Option<Vec<ValueKey>> = set.iter().map(ValueKey::try_new).collect() else {

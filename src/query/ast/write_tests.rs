@@ -17,7 +17,10 @@ use crate::query::write::{
 fn comparison(column: &str, op: BinaryOp, value: LiteralValue) -> TableConstraint {
     TableConstraint {
         column: column.into(),
-        kind: ColumnConstraintKind::Comparison { op, value },
+        kind: ColumnConstraintKind::Comparison {
+            op,
+            value: value.into(),
+        },
     }
 }
 

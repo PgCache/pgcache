@@ -5,7 +5,7 @@ use ecow::EcoString;
 use ordered_float::NotNan;
 
 use crate::query::ast::LiteralValue;
-use crate::query::constraints::ColumnRange;
+use crate::query::constraints::{ColumnRange, ConstraintValue};
 
 /// Which `ColumnIndex` sub-structure a column range belongs in.
 pub(super) enum Placement {
@@ -70,9 +70,10 @@ pub(super) fn placement(range: &ColumnRange) -> Placement {
 /// share one `f64`, which only ever over-returns (the caller's precise check
 /// rejects); it never drops a true match.
 ///
-/// `String`, `StringWithCast` and `OrderedText` all key by their string
-/// content, so equality lookups meet whatever form the other side took; only
-/// a range bound has to be ordered text ([`ValueKey::try_new_bound`]). Non-keyable
+/// A typed value keys by its index-key form and a raw string by its
+/// content, so a row's wire text meets the entry whatever either was
+/// spelled; a range bound also has to order ([`ValueKey::try_new_bound`]).
+/// Non-keyable
 /// values (`Null`, `Parameter`, `Array`) route to the `opaque` fallback.
 /// Derived `Ord` orders by variant first (`Num` < `Str` < `Bool`), then by
 /// value — `Bool` never reaches a range `BTreeMap`, and a single column never
@@ -85,16 +86,27 @@ pub(super) enum ValueKey {
 }
 
 impl ValueKey {
-    pub(super) fn try_new(v: &LiteralValue) -> Option<Self> {
+    /// The bucket key of a value: a typed one by its index-key form, a raw
+    /// literal by what it is. An opaque value, a parameter and NULL have
+    /// none.
+    pub(super) fn try_new(v: &ConstraintValue) -> Option<Self> {
+        match v {
+            ConstraintValue::Typed(value) => Self::of_literal(&value.index_key()?),
+            ConstraintValue::Raw(literal) => Self::of_literal(literal),
+            ConstraintValue::Opaque(_) => None,
+        }
+    }
+
+    fn of_literal(v: &LiteralValue) -> Option<Self> {
         match v {
             // Integers past 2^53 may share an f64 — see the type doc; only
             // over-returns, never drops a true match.
             #[allow(clippy::cast_precision_loss)]
             LiteralValue::Integer(n) => NotNan::new(*n as f64).ok().map(ValueKey::Num),
             LiteralValue::Float(f) => Some(ValueKey::Num(*f)),
-            LiteralValue::String(s)
-            | LiteralValue::StringWithCast(s, _)
-            | LiteralValue::OrderedText(s) => Some(ValueKey::Str(s.clone())),
+            LiteralValue::String(s) | LiteralValue::StringWithCast(s, _) => {
+                Some(ValueKey::Str(s.clone()))
+            }
             LiteralValue::Boolean(b) => Some(ValueKey::Bool(*b)),
             LiteralValue::Null
             | LiteralValue::NullWithCast(_)
@@ -104,22 +116,18 @@ impl ValueKey {
         }
     }
 
-    /// The key of a range bound, for the ordered range maps. A plain string
-    /// has none: the maps walk `Str` keys in byte order, which is the order
-    /// of the column's values only for ordered text (PGC-446), so such a
-    /// range goes to the opaque fallback and the precise check decides.
-    pub(super) fn try_new_bound(v: &LiteralValue) -> Option<Self> {
+    /// The key of a range bound, for the ordered range maps, which walk
+    /// `Str` keys in byte order. That is the order of the column's values
+    /// only where the column orders locally (PGC-446): a typed bound that
+    /// does not, and a raw string whose collation is unknown, have no key,
+    /// so the range goes to the opaque fallback and the precise check
+    /// decides.
+    pub(super) fn try_new_bound(v: &ConstraintValue) -> Option<Self> {
         match v {
-            LiteralValue::String(_) | LiteralValue::StringWithCast(..) => None,
-            LiteralValue::OrderedText(_)
-            | LiteralValue::Integer(_)
-            | LiteralValue::Float(_)
-            | LiteralValue::Boolean(_)
-            | LiteralValue::Null
-            | LiteralValue::NullWithCast(_)
-            | LiteralValue::Parameter(_)
-            | LiteralValue::SessionTerm(_)
-            | LiteralValue::Array(..) => Self::try_new(v),
+            ConstraintValue::Typed(value) => value.orders().then(|| Self::try_new(v))?,
+            ConstraintValue::Raw(LiteralValue::String(_) | LiteralValue::StringWithCast(..))
+            | ConstraintValue::Opaque(_) => None,
+            ConstraintValue::Raw(_) => Self::try_new(v),
         }
     }
 }

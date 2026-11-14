@@ -69,15 +69,17 @@ pub(crate) fn row_value_forms(
     // deliberate compile-time gate on growing the inline capacity.
     //
     // The typed slot is the column kind's key form (PGC-478): a number, a
-    // day count or an instant in microseconds, matching how
-    // `table_constraints_keyed` keyed the entry's literal. An untyped column
+    // day count or an instant in microseconds, as the entry's typed value
+    // keys ([`ValueKey::try_new`]). An untyped column
     // keeps the lexical float reinterpretation.
     let typed = match kind {
         ValueKind::Integer
         | ValueKind::Decimal
         | ValueKind::Date
         | ValueKind::Timestamp
-        | ValueKind::TimestampTz => wire_text_index_key(kind, text).map(ColumnRange::Equal),
+        | ValueKind::TimestampTz => {
+            wire_text_index_key(kind, text).map(|key| ColumnRange::Equal(key.into()))
+        }
         ValueKind::Bool
         | ValueKind::Text
         | ValueKind::Bpchar
@@ -87,7 +89,7 @@ pub(crate) fn row_value_forms(
             .parse::<f64>()
             .ok()
             .and_then(|x| NotNan::new(x).ok())
-            .map(|n| ColumnRange::Equal(LiteralValue::Float(n))),
+            .map(|n| ColumnRange::Equal(LiteralValue::Float(n).into())),
     };
     let lexical = match kind {
         ValueKind::Bpchar | ValueKind::Uuid => {
@@ -103,8 +105,9 @@ pub(crate) fn row_value_forms(
         | ValueKind::Enum
         | ValueKind::Unsupported => LiteralValue::String(text.into()),
     };
-    let boolean = bool_wire_text_parse(text).map(|b| ColumnRange::Equal(LiteralValue::Boolean(b)));
-    [Some(ColumnRange::Equal(lexical)), typed, boolean]
+    let boolean =
+        bool_wire_text_parse(text).map(|b| ColumnRange::Equal(LiteralValue::Boolean(b).into()));
+    [Some(ColumnRange::Equal(lexical.into())), typed, boolean]
 }
 
 /// Every joint tuple of the per-column key sets, for the point-probe
