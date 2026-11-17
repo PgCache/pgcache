@@ -47,9 +47,11 @@ const ANN_UUID_TOKEN_LATER: &str =
 const BOB_UUID_TOKEN: &str =
     r#"{"sub":"22222222-2222-2222-2222-222222222222","role":"authenticated","exp":1700000000}"#;
 /// A valid token of a user who owns nothing.
+#[cfg(feature = "fault-injection")]
 const STRANGER_UUID_TOKEN: &str =
     r#"{"sub":"33333333-3333-3333-3333-333333333333","role":"authenticated","exp":1700000000}"#;
 /// PostgREST's claims for an unauthenticated request.
+#[cfg(feature = "fault-injection")]
 const ANON_TOKEN: &str = r#"{"role":"anon"}"#;
 const UID_READ: &str = "SELECT id, body FROM uid_docs ORDER BY id";
 
