@@ -13,8 +13,15 @@ use crate::oid::{FunctionOid, Oid};
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 enum Payload {
-    Ddl { objects: Vec<DdlObject> },
-    Drop { objects: Vec<DroppedObject> },
+    Ddl {
+        objects: Vec<DdlObject>,
+    },
+    Drop {
+        objects: Vec<DroppedObject>,
+    },
+    /// From pgcache 0.9's per-partition truncate trigger, left on origin until
+    /// an administrator removes it. The stream reports the truncate itself.
+    Truncate {},
 }
 
 #[derive(Deserialize)]
@@ -210,6 +217,7 @@ pub(super) fn schema_change_parse(content: &[u8]) -> Result<SchemaChange, serde_
                 }
             }
         }
+        Payload::Truncate {} => {}
     }
     Ok(change)
 }
@@ -297,6 +305,13 @@ mod tests {
             "a GRANT reaches the writer to flush verdicts"
         );
         assert!(!change.is_empty());
+    }
+
+    #[test]
+    fn test_schema_change_parse_ignores_a_legacy_partition_truncate() {
+        let payload = br#"{"kind":"truncate","objects":[{"oid":16500,"identity":"events_p2"}]}"#;
+        let change = schema_change_parse(payload).expect("parse legacy truncate payload");
+        assert!(change.is_empty());
     }
 
     #[test]

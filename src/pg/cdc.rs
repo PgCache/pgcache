@@ -10,6 +10,7 @@ use tracing::{debug, error};
 use super::connect::{config_build, config_connect, connect};
 use super::event_trigger::{
     SignalDefect, event_triggers_install, event_triggers_shutdown_note, event_triggers_state_load,
+    legacy_truncate_triggers_warn,
 };
 use crate::pg::Lsn;
 use crate::result::{MapIntoReport, ReportExt, error_chain_format};
@@ -89,6 +90,7 @@ pub(crate) async fn replication_provision(settings: &Settings) -> PgCdcResult<()
     if let Some(defect) = signal.defect() {
         return Err(PgCdcError::SchemaSignal { defect }.into());
     }
+    legacy_truncate_triggers_warn(&client).await;
 
     // Check if replication slot exists
     let slot_exists = client

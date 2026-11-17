@@ -289,6 +289,39 @@ pub(crate) async fn event_triggers_install(client: &Client, role: &str) -> Resul
     }
 }
 
+/// Removes the per-partition truncate triggers pgcache 0.9 installed. Left to
+/// an administrator, since dropping a trigger locks its table.
+pub(crate) const LEGACY_TRUNCATE_UNINSTALL_SQL: &str = "DROP FUNCTION IF EXISTS \
+     pgcache.partition_truncate() CASCADE; DROP FUNCTION IF EXISTS \
+     pgcache.partition_signal_install(regclass);";
+
+/// Startup notice for pgcache 0.9's per-partition truncate triggers, which
+/// the CDC stream now ignores. Advisory only: a failed check never blocks
+/// startup.
+pub(crate) async fn legacy_truncate_triggers_warn(client: &Client) {
+    let found = client
+        .query_opt(
+            "SELECT count(t.oid) FROM pg_proc p \
+             JOIN pg_namespace n ON n.oid = p.pronamespace \
+             LEFT JOIN pg_trigger t ON t.tgfoid = p.oid \
+             WHERE n.nspname = 'pgcache' AND p.proname = 'partition_truncate' \
+               AND p.pronargs = 0 \
+             GROUP BY p.oid",
+            &[],
+        )
+        .await
+        .and_then(|row| row.map(|row| row.try_get::<_, i64>(0)).transpose());
+    match found {
+        Ok(Some(triggers)) => warn!(
+            "origin still has pgcache 0.9's truncate signal ({triggers} per-partition \
+             pgcache_truncate triggers), which this version ignores; an administrator can \
+             remove it, taking a lock on each partition: {LEGACY_TRUNCATE_UNINSTALL_SQL}"
+        ),
+        Ok(None) => {}
+        Err(e) => warn!("could not check origin for pgcache 0.9's truncate triggers: {e}"),
+    }
+}
+
 /// Shutdown reminder: the triggers stay installed on purpose (see
 /// [`UNINSTALL_SQL`]), and a sibling instance may still depend on them.
 pub(crate) async fn event_triggers_shutdown_note(client: &Client) {
