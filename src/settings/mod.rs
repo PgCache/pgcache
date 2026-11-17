@@ -349,6 +349,13 @@ pub struct PreflightSettings {
 pub enum RunMode {
     Serve(Box<Settings>),
     Check(Box<PreflightSettings>),
+    /// `--cleanup`: remove this instance's replication slot and publication
+    /// from origin and exit; with `--purge`, the shared event triggers and
+    /// schema too.
+    Cleanup {
+        settings: Box<PreflightSettings>,
+        purge: bool,
+    },
     /// `--healthcheck`: probe the admin socket of a running pgcache and exit.
     Healthcheck(SocketAddr),
     /// `--origin_locale`: print origin's database locale on one line and exit;

@@ -24,6 +24,7 @@ use pgcache_lib::cache::database_locale_describe;
 use pgcache_lib::metrics::metrics_recorder_install;
 #[cfg(not(feature = "console"))]
 use pgcache_lib::metrics::names::LOG_DROPPED_LINES;
+use pgcache_lib::origin_cleanup::{cleanup_report_render, origin_cleanup_run};
 use pgcache_lib::preflight::{preflight_run, report_render};
 use pgcache_lib::proxy::SharedProxyStatus;
 use pgcache_lib::proxy::{ConnectionError, proxy_run};
@@ -86,6 +87,7 @@ fn main() -> Result<(), Report> {
 
     let settings = match RunMode::from_args()? {
         RunMode::Check(preflight) => return preflight_main(&preflight),
+        RunMode::Cleanup { settings, purge } => return origin_cleanup_main(&settings, purge),
         RunMode::Healthcheck(socket) => healthcheck_main(socket),
         RunMode::OriginLocale(preflight) => return origin_locale_main(&preflight),
         RunMode::Serve(settings) => *settings,
@@ -274,6 +276,18 @@ fn origin_locale_main(settings: &PreflightSettings) -> Result<(), Report> {
     let line = runtime.block_on(database_locale_describe(&settings.origin))?;
     println!("{line}");
     Ok(())
+}
+
+/// `--cleanup`: remove what this instance left on origin, print what was
+/// done and exit. Exit status is 1 when the slot is in use or a step failed.
+fn origin_cleanup_main(settings: &PreflightSettings, purge: bool) -> Result<(), Report> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let report = runtime.block_on(origin_cleanup_run(settings, purge));
+    print!("{}", cleanup_report_render(&report));
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    std::process::exit(if report.failed() { 1 } else { 0 });
 }
 
 fn preflight_main(settings: &PreflightSettings) -> Result<(), Report> {

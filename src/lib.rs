@@ -16,6 +16,8 @@ pub mod listener;
 pub mod memory;
 #[cfg(feature = "proxy")]
 pub mod metrics;
+#[cfg(feature = "proxy")]
+pub mod origin_cleanup;
 pub mod pg;
 #[cfg(feature = "proxy")]
 pub mod preflight;

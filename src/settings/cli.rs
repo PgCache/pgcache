@@ -178,6 +178,8 @@ pub(super) struct CliArgs {
     pub(super) pinned_tables: Option<String>,
     pub(super) telemetry_off: bool,
     pub(super) check: bool,
+    pub(super) cleanup: bool,
+    pub(super) purge: bool,
     pub(super) healthcheck: bool,
     pub(super) origin_locale: bool,
 }
@@ -440,6 +442,8 @@ fn cli_args_parse() -> ConfigResult<(CliArgs, Option<SettingsToml>, Option<PathB
             Long("pinned_tables") => args.pinned_tables = Some(arg_string(&mut parser)?),
             Long("telemetry_off") => args.telemetry_off = true,
             Long("check") => args.check = true,
+            Long("cleanup") => args.cleanup = true,
+            Long("purge") => args.purge = true,
             Long("healthcheck") => args.healthcheck = true,
             Long("origin_locale") => args.origin_locale = true,
             Long("help") => {
@@ -823,6 +827,16 @@ impl RunMode {
                 args, config,
             )?)));
         }
+        if args.purge && !args.cleanup {
+            return Err(ConfigError::ArgumentMissing { name: "cleanup" }.into());
+        }
+        if args.cleanup {
+            let purge = args.purge;
+            return Ok(RunMode::Cleanup {
+                settings: Box::new(preflight_settings_build(args, config)?),
+                purge,
+            });
+        }
         if args.origin_locale {
             return Ok(RunMode::OriginLocale(Box::new(preflight_settings_build(
                 args, config,
@@ -867,6 +881,7 @@ impl Settings {
             [--log_level LEVEL] (e.g., debug, info, pgcache_lib::cache=debug) \n \
             [--telemetry_off] (disable anonymous telemetry) \n \
             [--check] (check the origin is ready for pgcache, print a report and exit; cache settings not needed) \n \
+            [--cleanup [--purge]] (drop this instance's replication slot and publication on the origin and exit, for an instance that was killed or is being retired; --purge also drops the event triggers and schema every pgcache on the database shares) \n \
             [--healthcheck] (probe a running pgcache's /healthz on --metrics_socket and exit 0 when it answers; for container health checks) \n \
             [--origin_locale] (print origin's database locale, provider and collation version on one line and exit; the image picks its cache PostgreSQL from it) \n \
             [--version] (print the pgcache version and exit)"
