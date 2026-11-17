@@ -144,13 +144,14 @@ pub async fn preflight_run(settings: &PreflightSettings) -> PreflightReport {
         .push(server::replication_slots_check(&client, &settings.cdc.slot_name, environment).await);
 
     let role = privileges::role_info_load(&client).await;
-    let (superuser, bypasses_rls, role_name) = match &role {
+    let (superuser, bypasses_rls, event_triggers_installable, role_name) = match &role {
         Ok(role) => (
             role.superuser,
             role.superuser || role.bypassrls,
+            role.event_triggers_installable(),
             role.name.clone(),
         ),
-        Err(_) => (false, false, origin.user.clone()),
+        Err(_) => (false, false, false, origin.user.clone()),
     };
     report.results.push(match &role {
         Ok(role) => privileges::role_privileges_evaluate(role, origin, environment),
@@ -160,9 +161,9 @@ pub async fn preflight_run(settings: &PreflightSettings) -> PreflightReport {
     report
         .results
         .push(privileges::cdc_objects_check(&client, &settings.cdc).await);
-    report
-        .results
-        .push(privileges::schema_signal_check(&client, superuser, environment).await);
+    report.results.push(
+        privileges::schema_signal_check(&client, event_triggers_installable, environment).await,
+    );
     report
         .results
         .push(connection::replication_connect_check(&settings.replication, environment).await);

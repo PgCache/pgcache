@@ -17,6 +17,15 @@ pub(super) struct RoleInfo {
     pub replication: bool,
     pub create_on_database: bool,
     pub rds_replication: bool,
+    /// The RDS and Aurora master user's role, which may create event triggers.
+    pub rds_superuser: bool,
+}
+
+impl RoleInfo {
+    /// Whether pgcache installs the schema-change event triggers itself at startup.
+    pub(super) fn event_triggers_installable(&self) -> bool {
+        self.superuser || self.rds_superuser
+    }
 }
 
 pub(super) async fn role_info_load(client: &Client) -> Result<RoleInfo, Error> {
@@ -27,7 +36,10 @@ pub(super) async fn role_info_load(client: &Client) -> Result<RoleInfo, Error> {
                     CASE WHEN EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'rds_replication') \
                          THEN pg_has_role(current_user, 'rds_replication', 'MEMBER') \
                          ELSE false END, \
-                    r.rolbypassrls \
+                    r.rolbypassrls, \
+                    CASE WHEN EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'rds_superuser') \
+                         THEN pg_has_role(current_user, 'rds_superuser', 'MEMBER') \
+                         ELSE false END \
              FROM pg_roles r WHERE r.rolname = current_user",
             &[],
         )
@@ -39,6 +51,7 @@ pub(super) async fn role_info_load(client: &Client) -> Result<RoleInfo, Error> {
         create_on_database: row.try_get(3)?,
         rds_replication: row.try_get(4)?,
         bypassrls: row.try_get(5)?,
+        rds_superuser: row.try_get(6)?,
     })
 }
 
@@ -197,28 +210,29 @@ fn cdc_objects_evaluate(objects: &CdcObjects, cdc: &CdcSettings) -> CheckResult 
 
 pub(super) async fn schema_signal_check(
     client: &Client,
-    superuser: bool,
+    installable: bool,
     environment: Environment,
 ) -> CheckResult {
     match event_triggers_state_load(client).await {
-        Ok(state) => schema_signal_evaluate(state, superuser, environment),
+        Ok(state) => schema_signal_evaluate(state, installable, environment),
         Err(e) => CheckResult::skipped("schema-change signal", e),
     }
 }
 
 /// pgcache refuses to start without the event triggers at its own version:
 /// nothing else reports `DROP TABLE`, a quiet `ALTER TABLE` or a partition
-/// attach/detach on a cached table. A superuser installs them at startup.
+/// attach/detach on a cached table. A role that may create event triggers
+/// installs them at startup.
 fn schema_signal_evaluate(
     state: EventTriggerState,
-    superuser: bool,
+    installable: bool,
     environment: Environment,
 ) -> CheckResult {
     let name = "schema-change signal";
     let Some(defect) = state.defect() else {
         return CheckResult::pass(name, "event triggers are installed");
     };
-    if superuser {
+    if installable {
         return CheckResult::pass(name, "event triggers will be installed at startup");
     }
     CheckResult::fail(
@@ -254,6 +268,7 @@ mod tests {
             replication: false,
             create_on_database: false,
             rds_replication: false,
+            rds_superuser: false,
         };
         let result = role_privileges_evaluate(&role, &origin(), Environment::SelfHosted);
         assert_eq!(result.verdict, Verdict::Fail);
@@ -284,8 +299,45 @@ mod tests {
         );
     }
 
+    /// The RDS and Aurora master user is no superuser, but its `rds_superuser`
+    /// membership lets it create event triggers, so startup installs them.
     #[test]
-    fn test_schema_signal_evaluate_fails_with_install_sql_unless_superuser() {
+    fn test_event_triggers_installable_by_superuser_or_rds_master() {
+        let plain = RoleInfo {
+            name: "app".to_owned(),
+            superuser: false,
+            bypassrls: false,
+            replication: true,
+            create_on_database: true,
+            rds_replication: true,
+            rds_superuser: false,
+        };
+        assert!(!plain.event_triggers_installable());
+        let master = RoleInfo {
+            rds_superuser: true,
+            ..plain.clone()
+        };
+        assert!(master.event_triggers_installable());
+        let superuser = RoleInfo {
+            superuser: true,
+            ..plain
+        };
+        assert!(superuser.event_triggers_installable());
+
+        let missing = EventTriggerState::default();
+        assert_eq!(
+            schema_signal_evaluate(
+                missing,
+                master.event_triggers_installable(),
+                Environment::Rds
+            )
+            .verdict,
+            Verdict::Pass
+        );
+    }
+
+    #[test]
+    fn test_schema_signal_evaluate_fails_with_install_sql_unless_installable() {
         use crate::pg::event_trigger::{SIGNAL_VERSION, TriggerPresence};
 
         let missing = EventTriggerState::default();
