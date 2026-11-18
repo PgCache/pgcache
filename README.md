@@ -226,8 +226,8 @@ pgcache is source-available under the [Elastic License 2.0](LICENSE.txt).
 
 ## Export controls and sanctions
 
-PgCache is developed by PgCache, Inc., a US company, and is subject to US export control
-and sanctions laws. We do not provide PgCache, support or any other services to anyone in
+pgcache is developed by PgCache, Inc., a US company, and is subject to US export control
+and sanctions laws. We do not provide pgcache, support or any other services to anyone in
 a country or region under comprehensive US sanctions, or to anyone on a US government
-restricted-party list. If you download, build or redistribute PgCache, you are responsible
+restricted-party list. If you download, build or redistribute pgcache, you are responsible
 for complying with the laws that apply to you. This notice does not change the license.
