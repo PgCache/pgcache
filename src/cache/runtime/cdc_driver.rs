@@ -118,7 +118,19 @@ pub(super) fn cdc_run(
         // Wrapped once for the whole stream/reconnect loop so a
         // fault-injected apply lag covers reconnected processors too.
         handles.cdc_tx = fault_cdc_apply_lag_relay(handles.cdc_tx);
-        let mut cdc = CdcProcessor::new(settings, handles.clone())
+        let slot_lsn = slot_confirmed_lsn(settings)
+            .await
+            .map_err(|r| {
+                // The context is collapsed below; the cause is only known here.
+                error!(
+                    "slot position lookup failed: {}",
+                    error_chain_format(r.current_context()),
+                );
+                r.context_transform(|_| CacheError::CdcFailure)
+            })
+            .attach_loc("reading the slot's confirmed position")?
+            .unwrap_or_default();
+        let mut cdc = CdcProcessor::new(settings, handles.clone(), slot_lsn)
             .await
             .attach_loc("initializing CDC processor")?;
         debug!("CDC processor initialized, entering stream loop");
@@ -255,7 +267,7 @@ async fn cdc_reconnect(
             }
         }
         // LSN matches — attempt to re-establish the replication connection
-        let processor = CdcProcessor::new(settings, handles.clone());
+        let processor = CdcProcessor::new(settings, handles.clone(), saved_lsn);
         let Some(reconnect) = cancellable(cancel, processor, reconnect_cancelled).await else {
             return Ok(None);
         };

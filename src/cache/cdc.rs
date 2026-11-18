@@ -122,6 +122,9 @@ pub(super) struct CdcProcessor {
     /// the writer's `last_applied_lsn`, which only advances after the
     /// writer has actually executed the resulting cache mutations.
     last_decoded_lsn: Lsn,
+    /// Highest position acknowledged to origin for this slot. Starts from
+    /// what was acknowledged before this stream, so a drop before its first
+    /// status update is still compared against the slot's real position.
     last_flushed_lsn: Lsn,
     keep_alive_timer: Interval,
     last_flush_sent: Option<Instant>,
@@ -137,10 +140,13 @@ pub(super) struct CdcProcessor {
 }
 
 impl CdcProcessor {
-    /// Creates a new CdcProcessor with the provided CDC client and cache.
+    /// Connect a processor for the slot. `acknowledged_lsn` is the highest
+    /// position already acknowledged for it: the slot's confirmed position
+    /// at first start, the previous stream's on a reconnect.
     pub(super) async fn new(
         settings: &Settings,
         handles: CdcProcessorHandles,
+        acknowledged_lsn: Lsn,
     ) -> CacheResult<Self> {
         let CdcProcessorHandles {
             cdc_tx,
@@ -173,7 +179,7 @@ impl CdcProcessor {
             announced_partitions: HashSet::new(),
             last_received_lsn: Lsn::from_raw(0),
             last_decoded_lsn: Lsn::from_raw(0),
-            last_flushed_lsn: Lsn::from_raw(0),
+            last_flushed_lsn: acknowledged_lsn,
             keep_alive_timer: timer,
             last_flush_sent: None,
             keep_alive_sent_count: 0,
@@ -364,36 +370,38 @@ impl CdcProcessor {
         stream: std::pin::Pin<&mut LogicalReplicationStream>,
         reply_requested: bool,
     ) -> Result<(), Error> {
-        let decoded_lsn = self.last_decoded_lsn;
-        let pg_lsn = PgLsn::from(decoded_lsn);
+        // Never acknowledge backwards: a reconnected stream replays positions
+        // below what the previous one acknowledged.
+        let ack_lsn = self.last_decoded_lsn.max(self.last_flushed_lsn);
+        let pg_lsn = PgLsn::from(ack_lsn);
         let timestamp = Self::get_pg_timestamp();
         let reply_flag = if reply_requested { 1 } else { 0 };
 
-        // Send standby status update: write_lsn, flush_lsn, apply_lsn all set to decoded_lsn
+        // Send standby status update: write_lsn, flush_lsn, apply_lsn all set to ack_lsn
         match stream
             .standby_status_update(pg_lsn, pg_lsn, pg_lsn, timestamp, reply_flag)
             .await
         {
             Ok(()) => {
                 // Update tracking on successful send
-                self.last_flushed_lsn = decoded_lsn;
+                self.last_flushed_lsn = ack_lsn;
                 #[allow(clippy::cast_precision_loss)]
                 crate::metrics::handles()
                     .cdc
                     .flushed_lsn
-                    .set(decoded_lsn.get() as f64);
+                    .set(ack_lsn.get() as f64);
                 self.last_flush_sent = Some(Instant::now());
                 self.keep_alive_sent_count += 1;
                 let count = self.keep_alive_sent_count;
 
-                debug!("Sent keep-alive #{count} (LSN: {decoded_lsn}, reply: {reply_flag})");
+                debug!("Sent keep-alive #{count} (LSN: {ack_lsn}, reply: {reply_flag})");
 
                 Ok(())
             }
             Err(e) => {
                 // Log warning but don't terminate CDC processing for keep-alive failures
                 error!(
-                    "Warning: Failed to send standby status update (LSN: {decoded_lsn}, reply: {reply_flag}): {e}"
+                    "Warning: Failed to send standby status update (LSN: {ack_lsn}, reply: {reply_flag}): {e}"
                 );
                 error!("CDC processing will continue despite keep-alive failure");
                 Ok(()) // Return Ok to continue processing
