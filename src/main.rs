@@ -1,3 +1,4 @@
+use std::ffi::c_int;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
@@ -7,6 +8,10 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use rootcause::Report;
+use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
+use signal_hook::iterator::SignalsInfo;
+use signal_hook::iterator::exfiltrator::WithOrigin;
+use signal_hook::low_level::signal_name;
 use tokio::io;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -152,8 +157,8 @@ fn main() -> Result<(), Report> {
         (guard, dropped_lines)
     };
 
-    let sigint = Arc::new(AtomicBool::new(false));
-    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&sigint))?;
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    shutdown_signals_watch(Arc::clone(&shutdown_requested))?;
 
     thread::scope(|scope| {
         let cancel_proxy = cancel.child_token();
@@ -167,8 +172,8 @@ fn main() -> Result<(), Report> {
 
         let sleep_duration = Duration::from_millis(500);
 
-        // Wait for either SIGINT or proxy thread to finish
-        while !sigint.load(Ordering::Relaxed) && !proxy_handle.is_finished() {
+        // Wait for either a shutdown signal or proxy thread to finish
+        while !shutdown_requested.load(Ordering::Relaxed) && !proxy_handle.is_finished() {
             sleep(sleep_duration);
             #[cfg(not(feature = "console"))]
             metrics::counter!(LOG_DROPPED_LINES).absolute(log_dropped_lines.dropped_lines() as u64);
@@ -194,6 +199,38 @@ fn main() -> Result<(), Report> {
 
         res
     })
+}
+
+/// Signals that ask pgcache to stop. SIGTERM is what systemd sends, and a
+/// container runtime unless the image declares another; as PID 1 pgcache would
+/// ignore it without a handler and be killed when the stop grace runs out.
+const SHUTDOWN_SIGNALS: [c_int; 4] = [SIGHUP, SIGINT, SIGQUIT, SIGTERM];
+
+/// Log each shutdown signal with its sender and raise `shutdown_requested`.
+/// A second signal while the first shutdown is still running exits at once,
+/// so a cleanup stuck on an unreachable origin cannot hold the process.
+fn shutdown_signals_watch(shutdown_requested: Arc<AtomicBool>) -> std::io::Result<()> {
+    let mut signals = SignalsInfo::<WithOrigin>::new(SHUTDOWN_SIGNALS)?;
+    thread::Builder::new()
+        .name("signals".to_owned())
+        .spawn(move || {
+            for origin in &mut signals {
+                let name = signal_name(origin.signal).unwrap_or("signal");
+                let sender = origin.process.map_or_else(String::new, |process| {
+                    format!(" from pid {} (uid {})", process.pid, process.uid)
+                });
+                if shutdown_requested.swap(true, Ordering::Relaxed) {
+                    // Straight to stderr: the log queue is not flushed on this exit.
+                    eprintln!(
+                        "pgcache: received {name}{sender} during shutdown; exiting without \
+                         finishing cleanup"
+                    );
+                    std::process::exit(128 + origin.signal);
+                }
+                info!("received {name}{sender}; shutting down");
+            }
+        })?;
+    Ok(())
 }
 
 /// `--healthcheck`: GET `/healthz` on the admin socket of a running pgcache

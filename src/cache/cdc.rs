@@ -29,7 +29,7 @@ use tracing::{debug, error, trace};
 use crate::cache::reference_settings;
 use crate::oid::Oid;
 use crate::pg::Lsn;
-use crate::pg::cdc::{MESSAGE_PREFIX, connect_replication};
+use crate::pg::cdc::{MESSAGE_PREFIX, connect_replication, stream_backend_record};
 use crate::result::error_chain_format;
 use crate::settings::Settings;
 
@@ -152,6 +152,10 @@ impl CdcProcessor {
             .await
             .map_into_report::<CacheError>()
             .attach_loc("connecting to origin for CDC")?;
+        stream_backend_record(&origin_cdc_client)
+            .await
+            .map_into_report::<CacheError>()
+            .attach_loc("reading the CDC stream's backend pid")?;
         // pgoutput renders row text under this session: ISO dates and the
         // reference zone are what the typed comparator parses (PGC-478).
         reference_settings::pin(&origin_cdc_client, "CDC replication").await?;

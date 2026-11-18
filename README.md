@@ -64,7 +64,7 @@ the connection string to switch your app to. Then:
 
 ```bash
 curl -fsSL https://pgcache.com/try.sh | bash -s -- status   # live hit rate
-curl -fsSL https://pgcache.com/try.sh | bash -s -- stop     # remove the container
+curl -fsSL https://pgcache.com/try.sh | bash -s -- stop     # stop it, clean up the origin
 ```
 
 The script is plain bash, so [read it](https://pgcache.com/try.sh) before you run it if you

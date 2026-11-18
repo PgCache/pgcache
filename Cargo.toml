@@ -183,7 +183,7 @@ dhat = { version = "0.3.3", optional = true }
 uuid = { version = "1.17.0", features = ["v4"], optional = true }
 reqwest = { version = "0.13.2", default-features = false, features = ["rustls", "json"], optional = true }
 webpki-root-certs = { version = "1.0.7", optional = true }
-signal-hook = { version = "0.4.3", features = ["iterator"], optional = true }
+signal-hook = { version = "0.4.3", features = ["iterator", "extended-siginfo"], optional = true }
 nix = { version = "0.31.2", features = ["fs", "signal"], optional = true }
 metrics = { version = "0.24.3", optional = true }
 metrics-util = { version = "0.20.1", optional = true }

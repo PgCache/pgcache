@@ -8,7 +8,7 @@ use rootcause::Report;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::{Builder, Handle};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 
 use super::SharedProxyStatus;
 use super::{
@@ -16,7 +16,7 @@ use super::{
 };
 use crate::admin::admin_server_spawn;
 use crate::profiling::{runtime_build, runtime_shared_build};
-use crate::result::{MapIntoReport, ReportExt};
+use crate::result::{MapIntoReport, ReportExt, error_chain_format};
 use crate::{
     cache::query::CacheableQuery,
     cache::{
@@ -294,9 +294,26 @@ pub fn proxy_run(
         })
     });
 
+    // On every way out of the scope, a startup that failed after provisioning
+    // included. The scope has joined the CDC thread, so the stream's
+    // connection is closed before the slot it held is dropped.
+    let cleaned = rt
+        .block_on(replication_cleanup(settings))
+        .map_err(|r| r.context_transform(ConnectionError::CdcError))
+        .attach_loc("cleaning up replication");
+
     drop(rt);
     profiling.shutdown();
-    result
+    match (result, cleaned) {
+        (Err(e), Err(cleanup)) => {
+            warn!(
+                "could not clean up replication on origin: {}",
+                error_chain_format(cleanup.current_context()),
+            );
+            Err(e)
+        }
+        (result, cleaned) => result.and(cleaned),
+    }
 }
 
 /// Per-connection values cloned into every accepted connection's task.
@@ -331,7 +348,7 @@ impl ConnectionContext {
 }
 
 /// Resolve the origin, bind the listener, and accept connections until
-/// `cancel`; then clean up the replication slot.
+/// `cancel`.
 async fn accept_run(
     settings: &Settings,
     context: ConnectionContext,
@@ -379,10 +396,6 @@ async fn accept_run(
         }
     }
 
-    replication_cleanup(settings)
-        .await
-        .map_err(|r| r.context_transform(ConnectionError::CdcError))
-        .attach_loc("cleaning up replication")?;
     Ok(())
 }
 
