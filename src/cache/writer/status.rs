@@ -112,11 +112,14 @@ impl WriterCore {
         }
 
         let dynamic = cache.dynamic.load();
+        let disk_used_bytes = usize::try_from(self.disk_used()).unwrap_or(usize::MAX);
+        let disk_limit_bytes =
+            Some(usize::try_from(self.disk_limit_effective).unwrap_or(usize::MAX));
         let cache_status = CacheStatusData {
-            size_bytes: usize::try_from(self.disk_used()).unwrap_or(usize::MAX),
-            size_limit_bytes: Some(
-                usize::try_from(self.disk_limit_effective).unwrap_or(usize::MAX),
-            ),
+            disk_used_bytes,
+            disk_limit_bytes,
+            size_bytes: disk_used_bytes,
+            size_limit_bytes: disk_limit_bytes,
             generation: cache.generation_counter.get(),
             tables_tracked: cache.tables.len(),
             policy: format!("{:?}", dynamic.cache_policy),
@@ -134,6 +137,7 @@ impl WriterCore {
         }
 
         let response = StatusResponse {
+            version: env!("CARGO_PKG_VERSION").to_owned(),
             cache: cache_status,
             cdc: CdcStatusData {
                 last_received_lsn,

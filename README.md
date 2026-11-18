@@ -138,6 +138,14 @@ origin otherwise.
 > single `--upstream postgres://…` flag. The try script above runs this same image;
 > [Deploy → Docker](https://www.pgcache.com/docs/docker/) covers Compose, TLS, and production settings.
 
+## Telemetry
+
+pgcache sends anonymous telemetry once at startup and every 24 hours: a random per-start ID,
+the pgcache and PostgreSQL versions, OS and architecture, and a few cache counters. It never
+sends queries, schema, data or credentials. It is on by default. Turn it off with
+`PGCACHE_TELEMETRY=off`, `telemetry = false` in the TOML file, `--telemetry_off`, or
+`--no-telemetry` on the try script. [What is collected](https://www.pgcache.com/docs/telemetry/).
+
 ## Talk to us
 
 Running pgcache against a real workload, or wondering whether it would pay off on yours? We'd like to hear from you.

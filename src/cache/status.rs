@@ -12,6 +12,9 @@ pub struct StatusRequest {
 /// Full status response assembled by the cache writer.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StatusResponse {
+    /// The pgcache version, as `--version` prints it.
+    #[serde(default)]
+    pub version: String,
     pub cache: CacheStatusData,
     pub cdc: CdcStatusData,
     pub queries: Vec<QueryStatusData>,
@@ -25,7 +28,16 @@ pub struct StatusResponse {
 /// Cache subsystem state.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CacheStatusData {
+    /// Used bytes on the filesystem that holds the cache, everything on it
+    /// included; not the size of the cached data.
+    #[serde(default)]
+    pub disk_used_bytes: usize,
+    /// The effective disk limit `disk_used_bytes` is held under.
+    #[serde(default)]
+    pub disk_limit_bytes: Option<usize>,
+    /// Deprecated alias of `disk_used_bytes`.
     pub size_bytes: usize,
+    /// Deprecated alias of `disk_limit_bytes`.
     pub size_limit_bytes: Option<usize>,
     pub generation: i64,
     pub tables_tracked: usize,

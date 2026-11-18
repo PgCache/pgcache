@@ -241,10 +241,30 @@ async fn test_status_cache_fields() -> Result<(), Error> {
     let json: serde_json::Value = serde_json::from_str(&body)
         .map_err(|e| Error::other(format!("invalid JSON: {e}\nbody: {body}")))?;
 
+    assert_eq!(
+        json["version"].as_str(),
+        Some(env!("CARGO_PKG_VERSION")),
+        "the pgcache version"
+    );
+
     let cache = &json["cache"];
     assert!(
-        cache.get("size_bytes").is_some(),
-        "missing cache.size_bytes"
+        cache["disk_used_bytes"]
+            .as_u64()
+            .is_some_and(|used| used > 0),
+        "cache.disk_used_bytes is the cache volume's used bytes"
+    );
+    assert!(
+        cache["disk_limit_bytes"].as_u64().is_some(),
+        "missing cache.disk_limit_bytes"
+    );
+    assert_eq!(
+        cache["size_bytes"], cache["disk_used_bytes"],
+        "cache.size_bytes is kept as an alias"
+    );
+    assert_eq!(
+        cache["size_limit_bytes"], cache["disk_limit_bytes"],
+        "cache.size_limit_bytes is kept as an alias"
     );
     assert!(
         cache.get("generation").is_some(),
