@@ -1,8 +1,10 @@
 use std::io::Error;
 
+use tokio_postgres::error::SqlState;
+
 use crate::util::{
     TestContext, assert_cache_hit, assert_cache_miss, assert_limit_order_decides,
-    assert_proxy_rows_match_origin, assert_row_at, origin_change_applied_in_place,
+    assert_proxy_rows_match_origin, assert_row_at, metrics_delta, origin_change_applied_in_place,
     origin_change_invalidates, query_warm,
 };
 
@@ -1246,5 +1248,72 @@ async fn test_limit_cdc_delete_of_uncached_row_keeps_cache() -> Result<(), Error
     let m = origin_change_applied_in_place(&mut ctx, m, "DELETE FROM posts WHERE id = 3", query)
         .await?;
     origin_change_applied_in_place(&mut ctx, m, "DELETE FROM posts WHERE id = 4", query).await?;
+    Ok(())
+}
+
+/// A NULL bound to LIMIT is no limit on origin (PGC-630): the read is
+/// registered and served as the unlimited query it is.
+#[tokio::test]
+async fn test_limit_bound_null_reads_every_row() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_items_table(&mut ctx).await?;
+
+    let stmt = ctx
+        .prepare("SELECT id, name FROM items WHERE category = $1 ORDER BY id LIMIT $2")
+        .await?;
+    let no_limit: Option<i64> = None;
+    let start = ctx.metrics().await?;
+
+    let rows = ctx.query(&stmt, &[&"z", &no_limit]).await?;
+    assert_eq!(rows.len(), 4);
+    let m = assert_cache_miss(&mut ctx, start.clone()).await?;
+    ctx.cache_settle().await?;
+
+    let rows = ctx.query(&stmt, &[&"z", &no_limit]).await?;
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0].get::<_, i32>("id"), 7);
+    assert_eq!(rows[3].get::<_, i32>("id"), 10);
+    let m = assert_cache_hit(&mut ctx, m).await?;
+
+    // Every row is cached, so any window of it is too.
+    let rows = ctx.query(&stmt, &[&"z", &2i64]).await?;
+    assert_eq!(rows.len(), 2);
+    let m = assert_cache_hit(&mut ctx, m).await?;
+
+    let delta = metrics_delta(&start, &m);
+    assert_eq!(delta.queries_cache_error, 0, "no serve may fail");
+    Ok(())
+}
+
+/// Origin rejects a negative LIMIT (PGC-630). The read forwards before the
+/// cache is involved, so the client gets origin's error and no serve
+/// connection is spent on a statement that cannot run.
+#[tokio::test]
+async fn test_limit_negative_bound_value_forwards() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_items_table(&mut ctx).await?;
+
+    let stmt = ctx
+        .prepare("SELECT id, name FROM items WHERE category = $1 ORDER BY id LIMIT $2")
+        .await?;
+    let start = ctx.metrics().await?;
+
+    for _ in 0..2 {
+        let error = ctx
+            .cache
+            .query(&stmt, &[&"z", &-1i64])
+            .await
+            .expect_err("origin rejects a negative LIMIT");
+        assert_eq!(
+            error.code(),
+            Some(&SqlState::INVALID_ROW_COUNT_IN_LIMIT_CLAUSE),
+            "{error}"
+        );
+        ctx.cache_settle().await?;
+    }
+
+    let delta = metrics_delta(&start, &ctx.metrics().await?);
+    assert_eq!(delta.queries_cache_error, 0, "the cache is not asked");
+    assert_eq!(delta.cache_pool_replenished, 0, "no serve connection lost");
     Ok(())
 }

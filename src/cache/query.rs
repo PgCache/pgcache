@@ -26,7 +26,7 @@ pub(crate) use cacheability::{
     query_tree_has_volatile_function_except,
 };
 
-pub use limit::{limit_clause_of, limit_is_sufficient, limit_rows_needed};
+pub use limit::{RowLimit, limit_is_sufficient, limit_rows_needed};
 pub use request::RequestQuery;
 
 // Each variant names the item that triggered it: pgcache-fit's per-statement

@@ -5,12 +5,11 @@
 
 use std::sync::Arc;
 
-use crate::cache::query::{CacheableQuery, QueryParameters, limit_clause_of};
+use crate::cache::query::{CacheableQuery, QueryParameters, RowLimit};
 use crate::query::SessionKey;
-use crate::query::ast::LimitClause;
 use crate::query::ast::rope::QueryTree;
 use crate::query::keying_settings::KeyingSettings;
-use crate::query::transform::{AstTransformResult, literal_value_parameters_replace};
+use crate::query::transform::AstTransformResult;
 
 #[derive(Debug)]
 pub struct RequestQuery {
@@ -50,20 +49,9 @@ impl RequestQuery {
         }
     }
 
-    /// The LIMIT with its bind values in place.
-    pub fn limit(&self) -> AstTransformResult<Option<LimitClause>> {
-        let Some(mut clause) = limit_clause_of(self.tree().root()) else {
-            return Ok(None);
-        };
-        if let Some(parameters) = &self.parameters {
-            if let Some(count) = &mut clause.count {
-                literal_value_parameters_replace(count, parameters)?;
-            }
-            if let Some(offset) = &mut clause.offset {
-                literal_value_parameters_replace(offset, parameters)?;
-            }
-        }
-        Ok(Some(clause))
+    /// The LIMIT and OFFSET this read runs with, bind values included.
+    pub fn limit(&self) -> AstTransformResult<RowLimit> {
+        RowLimit::decode(self.tree().root(), self.parameters.as_ref())
     }
 
     /// The query with its bind values in place: what the writer resolves
@@ -84,7 +72,7 @@ mod tests {
     use super::*;
     use crate::catalog::FunctionCatalog;
     use crate::oid::TypeOid;
-    use crate::query::ast::{LiteralValue, query_tree_parse};
+    use crate::query::ast::query_tree_parse;
 
     fn cacheable(sql: &str) -> Arc<CacheableQuery> {
         let tree = query_tree_parse(sql).expect("parse query");
@@ -118,12 +106,14 @@ mod tests {
             cacheable("SELECT id FROM users WHERE id = $1 LIMIT $2 OFFSET $3"),
             int_params(&[b"7", b"10", b"5"]),
         );
-        let limit = request
-            .limit()
-            .expect("limit decodes")
-            .expect("limit present");
-        assert_eq!(limit.count, Some(LiteralValue::Integer(10)));
-        assert_eq!(limit.offset, Some(LiteralValue::Integer(5)));
+        let limit = request.limit().expect("limit decodes");
+        assert_eq!(
+            limit,
+            RowLimit {
+                count: Some(10),
+                offset: 5
+            }
+        );
         assert_eq!(
             request.tree().sql(),
             "SELECT id FROM users WHERE id = $1 LIMIT $2 OFFSET $3"
@@ -133,17 +123,19 @@ mod tests {
     #[test]
     fn test_limit_without_values_is_the_clause_as_written() {
         let request = RequestQuery::new(cacheable("SELECT id FROM users LIMIT 3"), empty_params());
-        let limit = request
-            .limit()
-            .expect("limit decodes")
-            .expect("limit present");
-        assert_eq!(limit.count, Some(LiteralValue::Integer(3)));
-        assert_eq!(limit.offset, None);
-        assert!(
+        let limit = request.limit().expect("limit decodes");
+        assert_eq!(
+            limit,
+            RowLimit {
+                count: Some(3),
+                offset: 0
+            }
+        );
+        assert_eq!(
             RequestQuery::unparameterized(cacheable("SELECT id FROM users"))
                 .limit()
-                .expect("limit decodes")
-                .is_none()
+                .expect("limit decodes"),
+            RowLimit::default()
         );
     }
 
@@ -154,6 +146,30 @@ mod tests {
             int_params(&[b"ten"]),
         );
         assert!(request.limit().is_err());
+    }
+
+    /// A client that declares no parameter types (node-postgres) binds a
+    /// LIMIT as text of unspecified type; the position makes it a bigint.
+    #[test]
+    fn test_limit_reads_an_undeclared_text_value_as_a_bigint() {
+        let request = RequestQuery::new(
+            cacheable("SELECT id FROM users ORDER BY id LIMIT $1 OFFSET $2"),
+            QueryParameters {
+                values: vec![
+                    Some(Bytes::from_static(b"1000")),
+                    Some(Bytes::from_static(b"0")),
+                ],
+                formats: Vec::new(),
+                oids: Vec::new(),
+            },
+        );
+        assert_eq!(
+            request.limit().expect("limit decodes"),
+            RowLimit {
+                count: Some(1000),
+                offset: 0
+            }
+        );
     }
 
     #[test]

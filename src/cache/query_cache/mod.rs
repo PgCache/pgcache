@@ -10,7 +10,7 @@ use super::explain::ExplainJob;
 use super::messages::{CacheReply, MessageSlices, PipelineContext, PipelineDescribe, QueryCommand};
 use super::mv::MvServe;
 use super::output_settings::OutputSettings;
-use super::query::RequestQuery;
+use super::query::{RequestQuery, RowLimit};
 use super::reg_bucket::RegRateBucket;
 use super::reply::ReplySender;
 use super::types::{CacheStateView, SharedQueryShape, SharedResolvedQuery};
@@ -18,7 +18,6 @@ use crate::cache::Generation;
 use crate::pg::protocol::backend::TransactionStatus;
 use crate::pg::protocol::session::ResultFormats;
 use crate::proxy::ClientSocket;
-use crate::query::ast::LimitClause;
 use crate::query::keying_settings::KeyingSettings;
 use crate::query::{Fingerprint, SessionKey};
 use crate::settings::DynamicConfigHandle;
@@ -52,8 +51,8 @@ pub struct QueryRequest {
     pub query_type: QueryType,
     pub data: BytesMut,
     pub query: RequestQuery,
-    /// The LIMIT with its bind values in place.
-    pub limit: Option<LimitClause>,
+    /// The LIMIT and OFFSET with their bind values in place.
+    pub limit: RowLimit,
     pub result_formats: ResultFormats,
     pub client_socket: ClientSocket,
     pub reply_tx: ReplySender<CacheReply>,
@@ -97,8 +96,8 @@ pub struct ServeRequest {
     pub reply_tx: ReplySender<CacheReply>,
     /// Per-query timing data
     pub timing: QueryTiming,
-    /// Incoming query's LIMIT clause, appended to SQL at serve time
-    pub limit: Option<LimitClause>,
+    /// The incoming query's LIMIT and OFFSET, applied at serve time
+    pub limit: RowLimit,
     /// Whether the serve path should append ReadyForQuery after this execute's
     /// response (the trailing execute of a Sync-terminated dispatch).
     pub emit_rfq: bool,

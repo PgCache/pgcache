@@ -9,7 +9,7 @@ use super::dispatch::reply_forward;
 use super::{CacheDispatch, CoalescedClient, QueryRequest, QueryType, ServeJob, ServeRequest};
 use crate::cache::Generation;
 use crate::cache::fast_path::{self, MvDecision};
-use crate::cache::memo::{MemoHit, MemoKey, MemoShape};
+use crate::cache::memo::{MemoHit, MemoKey};
 use crate::cache::messages::{CacheOutcome, CacheReply, PipelineDescribe, slices_concat};
 use crate::cache::mv::MvServe;
 use crate::cache::types::{SharedQueryShape, SharedResolvedQuery};
@@ -77,7 +77,7 @@ impl CacheDispatch {
 
     /// Build a plan to serve this Ready hit from an in-process memo, or `None`
     /// to fall through to the serve pool. Returns `None` for: memoization disabled,
-    /// a non-keyable LIMIT/OFFSET shape, cold-path extended (no pipeline), a
+    /// cold-path extended (no pipeline), a
     /// `Describe('S')` that needs a regenerated `ParameterDescription` (v1
     /// skips), a memo miss, or a stale snapshot (dropped by `get`).
     fn memo_serve_plan(&self, fingerprint: Fingerprint, msg: &QueryRequest) -> Option<MemoServe> {
@@ -102,11 +102,10 @@ impl CacheDispatch {
             }
         };
         let binary = msg.result_formats.is_binary();
-        let shape = MemoShape::from_limit(&msg.limit)?;
         let key = MemoKey {
             fingerprint,
             binary,
-            shape,
+            limit: msg.limit,
             profile: msg.output_settings.profile(),
         };
         let hit = self.state_view.memo.get(&key, wants_row_description)?;

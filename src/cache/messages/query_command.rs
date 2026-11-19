@@ -13,13 +13,12 @@ use crate::cache::serve_decision::AdmitAction;
 use crate::cache::types::{SharedQueryShape, SharedResolvedQuery};
 use crate::cache::{
     CacheError, CacheMessage, Report,
-    query::{CacheableQuery, RequestQuery},
+    query::{CacheableQuery, RequestQuery, RowLimit},
     query_cache::QueryType,
 };
 use crate::oid::Oid;
 use crate::pg::protocol::session::ResultFormats;
 use crate::pg::{Lsn, OriginSnapshot};
-use crate::query::ast::LimitClause;
 use crate::query::keying_settings::KeyingSettings;
 use crate::query::{Fingerprint, SessionKey};
 
@@ -42,7 +41,7 @@ pub struct QueryData {
     pub data: BytesMut,
     pub query: RequestQuery,
     /// The LIMIT with its bind values in place.
-    pub limit: Option<LimitClause>,
+    pub limit: RowLimit,
     pub query_type: QueryType,
     pub result_formats: ResultFormats,
 }

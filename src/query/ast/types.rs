@@ -608,26 +608,6 @@ impl Deparse for OrderDirection {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct LimitClause {
-    pub count: Option<LiteralValue>,
-    pub offset: Option<LiteralValue>,
-}
-
-impl Deparse for LimitClause {
-    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
-        if let Some(count) = &self.count {
-            buf.push_str(" LIMIT ");
-            count.deparse(buf);
-        }
-        if let Some(offset) = &self.offset {
-            buf.push_str(" OFFSET ");
-            offset.deparse(buf);
-        }
-        buf
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Hash)]
 pub enum JoinType {
     Inner,

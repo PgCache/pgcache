@@ -16,9 +16,10 @@ use ecow::EcoString;
 use postgres_protocol::escape::escape_identifier;
 
 use super::mv_shape::ShapeGate;
+use crate::cache::query::RowLimit;
 use crate::query::Fingerprint;
 use crate::query::ast::rope::{Body, OrderBy, Query, Run, Select, SelectItem, Source};
-use crate::query::ast::{Deparse, LimitClause, OrderDirection};
+use crate::query::ast::{Deparse, OrderDirection};
 use crate::query::resolve::ResolvedQuery;
 
 /// Runtime state of the materialized result for a cached query.
@@ -327,11 +328,14 @@ impl MvServePlan {
 /// Build the serve-time SQL for an MV hit into a caller-provided buffer
 /// (cleared first) so the serve path can reuse the connection's recycled
 /// `sql_buf` rather than allocating a fresh `String` per cache hit.
-pub fn mv_serve_sql_into(sql: &mut String, plan: &MvServePlan, limit: Option<&LimitClause>) {
+pub fn mv_serve_sql_into(sql: &mut String, plan: &MvServePlan, limit: RowLimit) {
     sql.clear();
     sql.push_str(&plan.sql);
-    if let Some(l) = limit {
-        l.deparse(sql);
+    if let Some(count) = limit.count {
+        let _ = write!(sql, " LIMIT {count}");
+    }
+    if limit.offset > 0 {
+        let _ = write!(sql, " OFFSET {}", limit.offset);
     }
 }
 
@@ -604,7 +608,7 @@ mod tests {
         let plan = MvServePlan::new(Fingerprint::from_raw(42), &resolve_for_serve(sql), names)
             .expect("ORDER BY expressible against the MV");
         let mut out = String::new();
-        mv_serve_sql_into(&mut out, &plan, None);
+        mv_serve_sql_into(&mut out, &plan, RowLimit::default());
         out
     }
 

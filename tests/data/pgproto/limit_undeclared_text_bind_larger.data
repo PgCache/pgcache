@@ -1,0 +1,8 @@
+# PGC-630: the same statement as limit_undeclared_text_bind.data with a
+# window the first one's capped population does not cover. LIMIT 4 OFFSET 1.
+'P'	"S1"	"SELECT id, name FROM proto_limit ORDER BY id LIMIT $1 OFFSET $2"	0
+'B'	""	"S1"	0	2	1	"4"	1	"1"	0
+'E'	""	0
+'S'
+'Y'
+'X'

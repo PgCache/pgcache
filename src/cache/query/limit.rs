@@ -1,31 +1,92 @@
-//! How many rows a LIMIT/OFFSET needs, and whether a cached row cap covers it.
+//! A read's LIMIT and OFFSET as the values PostgreSQL runs it with, and
+//! whether a cached row cap covers them.
 
+use rootcause::Report;
+
+use crate::cache::query::QueryParameters;
+use crate::query::ast::LiteralValue;
 use crate::query::ast::rope::Query;
-use crate::query::ast::{LimitClause, LiteralValue};
+use crate::query::transform::{
+    AstTransformError, AstTransformResult, bigint_text_parse, placeholder_bigint_decode,
+};
 
-/// The LIMIT clause of `query` as written, with its literals as they are.
-pub fn limit_clause_of(query: Query<'_>) -> Option<LimitClause> {
-    query.has_limit().then(|| LimitClause {
-        count: query.limit_count().map(|literal| literal.value().clone()),
-        offset: query.limit_offset().map(|literal| literal.value().clone()),
-    })
+/// PostgreSQL types both clauses bigint, and a NULL in either means the
+/// clause is not there.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct RowLimit {
+    /// `None` without a LIMIT, and for `LIMIT NULL`.
+    pub count: Option<u64>,
+    pub offset: u64,
 }
 
-/// Extract the total rows needed from a LIMIT clause.
-///
-/// Returns `None` if there is no LIMIT count (= unlimited rows needed).
-/// Returns `Some(limit + offset)` when a LIMIT count is present.
-pub fn limit_rows_needed(limit: &Option<LimitClause>) -> Option<u64> {
-    let limit_clause = limit.as_ref()?;
-    let count = match &limit_clause.count {
-        Some(LiteralValue::Integer(n)) => u64::try_from(*n).ok()?,
-        _ => return None,
+impl RowLimit {
+    /// The root LIMIT and OFFSET of `query`, a placeholder read from
+    /// `parameters`. Fails on a value PostgreSQL would reject, or would round
+    /// to a bigint by rules this does not reproduce.
+    pub fn decode(
+        query: Query<'_>,
+        parameters: Option<&QueryParameters>,
+    ) -> AstTransformResult<Self> {
+        let count = match query.limit_count() {
+            Some(literal) => limit_value_decode(literal.value(), parameters)?,
+            None => None,
+        };
+        let offset = match query.limit_offset() {
+            Some(literal) => limit_value_decode(literal.value(), parameters)?,
+            None => None,
+        };
+        Ok(Self {
+            count,
+            offset: offset.unwrap_or(0),
+        })
+    }
+
+    /// Rows a serve reads to answer this: `None` when every row is needed.
+    pub fn rows_needed(&self) -> Option<u64> {
+        self.count.map(|count| count.saturating_add(self.offset))
+    }
+}
+
+/// Rows the root LIMIT and OFFSET of `query` need, its bind values already
+/// substituted. A value that does not decode needs every row, like no LIMIT.
+pub fn limit_rows_needed(query: Query<'_>) -> Option<u64> {
+    RowLimit::decode(query, None)
+        .ok()
+        .and_then(|limit| limit.rows_needed())
+}
+
+/// One LIMIT or OFFSET value, `None` for NULL. A string is a bind value the
+/// substitution pass left as an untyped literal.
+fn limit_value_decode(
+    literal: &LiteralValue,
+    parameters: Option<&QueryParameters>,
+) -> AstTransformResult<Option<u64>> {
+    let value = match literal {
+        LiteralValue::Integer(value) => Some(*value),
+        LiteralValue::Null => None,
+        LiteralValue::String(text) => {
+            Some(bigint_text_parse(text).ok_or_else(|| limit_value_error("is not a bigint"))?)
+        }
+        LiteralValue::Parameter(placeholder) => match parameters {
+            Some(parameters) => placeholder_bigint_decode(placeholder, parameters)?,
+            None => return Err(limit_value_error("is a placeholder with no value")),
+        },
+        LiteralValue::StringWithCast(..)
+        | LiteralValue::Float(_)
+        | LiteralValue::Boolean(_)
+        | LiteralValue::NullWithCast(_)
+        | LiteralValue::SessionTerm(_)
+        | LiteralValue::Array(..) => return Err(limit_value_error("is not a bigint")),
     };
-    let offset = match &limit_clause.offset {
-        Some(LiteralValue::Integer(n)) => u64::try_from(*n).unwrap_or(0),
-        _ => 0,
-    };
-    Some(count + offset)
+    value
+        .map(|value| u64::try_from(value).map_err(|_| limit_value_error("is negative")))
+        .transpose()
+}
+
+fn limit_value_error(problem: &str) -> Report<AstTransformError> {
+    Report::from(AstTransformError::InvalidParameterValue {
+        message: format!("LIMIT/OFFSET value {problem}"),
+    })
 }
 
 /// Check whether the cached `max_limit` is sufficient for the incoming `needed` rows.
@@ -42,39 +103,115 @@ pub fn limit_is_sufficient(cached_max: Option<u64>, needed: Option<u64>) -> bool
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+    use postgres_types::Type as PgType;
+
     use super::*;
+    use crate::oid::TypeOid;
+    use crate::query::ast::query_tree_parse;
+    use crate::query::transform::query_tree_parameters_replace;
+
+    /// Name, the three bind values, their declared type, and the limit
+    /// decoded (`None` for an error).
+    type Case<'a> = (&'a str, [Option<&'a [u8]>; 3], TypeOid, Option<RowLimit>);
+
+    fn parameters(values: &[Option<&[u8]>], oid: TypeOid) -> QueryParameters {
+        QueryParameters {
+            values: values
+                .iter()
+                .map(|value| value.map(Bytes::copy_from_slice))
+                .collect(),
+            formats: vec![0],
+            oids: vec![oid; values.len()],
+        }
+    }
+
+    fn decoded(sql: &str, parameters: Option<&QueryParameters>) -> Option<RowLimit> {
+        let tree = query_tree_parse(sql).expect("parse query");
+        RowLimit::decode(tree.root(), parameters).ok()
+    }
+
+    fn limit(count: Option<u64>, offset: u64) -> Option<RowLimit> {
+        Some(RowLimit { count, offset })
+    }
 
     #[test]
-    fn test_limit_rows_needed() {
-        // No limit clause
-        assert_eq!(limit_rows_needed(&None), None);
-
-        // LIMIT 10
+    fn test_row_limit_decode_reads_the_clause_as_written() {
+        assert_eq!(decoded("SELECT id FROM users", None), limit(None, 0));
         assert_eq!(
-            limit_rows_needed(&Some(LimitClause {
-                count: Some(LiteralValue::Integer(10)),
-                offset: None,
-            })),
-            Some(10)
+            decoded("SELECT id FROM users LIMIT 10", None),
+            limit(Some(10), 0)
         );
-
-        // LIMIT 10 OFFSET 5
         assert_eq!(
-            limit_rows_needed(&Some(LimitClause {
-                count: Some(LiteralValue::Integer(10)),
-                offset: Some(LiteralValue::Integer(5)),
-            })),
-            Some(15)
+            decoded("SELECT id FROM users LIMIT 10 OFFSET 5", None),
+            limit(Some(10), 5)
         );
-
-        // OFFSET only (no count) = unlimited
         assert_eq!(
-            limit_rows_needed(&Some(LimitClause {
-                count: None,
-                offset: Some(LiteralValue::Integer(5)),
-            })),
-            None
+            decoded("SELECT id FROM users OFFSET 5", None),
+            limit(None, 5)
         );
+        assert_eq!(decoded("SELECT id FROM users LIMIT $1", None), None);
+    }
+
+    #[test]
+    fn test_row_limit_decode_types_a_placeholder_by_its_position() {
+        let sql = "SELECT id FROM users WHERE id > $1 LIMIT $2 OFFSET $3";
+        let undeclared = TypeOid::UNSPECIFIED;
+        let int4 = TypeOid::from_type(&PgType::INT4);
+        let text = TypeOid::from_type(&PgType::TEXT);
+        #[rustfmt::skip]
+        let cases: Vec<Case<'_>> = vec![
+            ("undeclared text",    [Some(b"7"), Some(b"1000"), Some(b"0")],  undeclared, limit(Some(1000), 0)),
+            ("declared int4",      [Some(b"7"), Some(b"10"),   Some(b"5")],  int4,       limit(Some(10), 5)),
+            ("null count",         [Some(b"7"), None,          Some(b"5")],  undeclared, limit(None, 5)),
+            ("null offset",        [Some(b"7"), Some(b"10"),   None],        undeclared, limit(Some(10), 0)),
+            ("null of any type",   [Some(b"7"), None,          None],        text,       limit(None, 0)),
+            ("negative count",     [Some(b"7"), Some(b"-1"),   Some(b"0")],  undeclared, None),
+            ("negative offset",    [Some(b"7"), Some(b"10"),   Some(b"-1")], int4,       None),
+            ("not a number",       [Some(b"7"), Some(b"ten"),  Some(b"0")],  undeclared, None),
+            ("declared text",      [Some(b"7"), Some(b"10"),   Some(b"0")],  text,       None),
+        ];
+        for (name, values, oid, expected) in cases {
+            let parameters = parameters(&values, oid);
+            assert_eq!(decoded(sql, Some(&parameters)), expected, "{name}");
+        }
+    }
+
+    /// Registration reads its population cap from the substituted tree, where
+    /// an undeclared bind is a string literal and a NULL bind a NULL.
+    #[test]
+    fn test_row_limit_decode_reads_a_substituted_tree() {
+        let tree = query_tree_parse("SELECT id FROM users LIMIT $1 OFFSET $2").expect("parse");
+        let substituted = |values: &[Option<&[u8]>]| {
+            let parameters = parameters(values, TypeOid::UNSPECIFIED);
+            let tree = query_tree_parameters_replace(&tree, &parameters).expect("substitute");
+            RowLimit::decode(tree.root(), None).ok()
+        };
+        assert_eq!(
+            substituted(&[Some(b"1000"), Some(b"20")]),
+            limit(Some(1000), 20)
+        );
+        assert_eq!(substituted(&[None, None]), limit(None, 0));
+        assert_eq!(substituted(&[Some(b"ten"), Some(b"0")]), None);
+    }
+
+    #[test]
+    fn test_limit_rows_needed_reads_every_row_for_a_value_that_does_not_decode() {
+        let needed = |sql: &str| limit_rows_needed(query_tree_parse(sql).expect("parse").root());
+        assert_eq!(needed("SELECT id FROM users LIMIT 10 OFFSET 5"), Some(15));
+        assert_eq!(needed("SELECT id FROM users"), None);
+        assert_eq!(needed("SELECT id FROM users LIMIT $1"), None);
+    }
+
+    #[test]
+    fn test_row_limit_rows_needed() {
+        let needed = |count, offset| RowLimit { count, offset }.rows_needed();
+        assert_eq!(needed(None, 0), None);
+        assert_eq!(needed(Some(10), 0), Some(10));
+        assert_eq!(needed(Some(10), 5), Some(15));
+        // OFFSET alone reads to the end.
+        assert_eq!(needed(None, 5), None);
+        assert_eq!(needed(Some(u64::MAX), 5), Some(u64::MAX));
     }
 
     #[test]

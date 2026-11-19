@@ -27,7 +27,7 @@ pub(crate) fn literal_value_parameters_replace(
 }
 
 /// Parse parameter index from placeholder string (e.g. `$1` → 0, `$2` → 1).
-fn parameter_index_parse(placeholder: &str) -> AstTransformResult<usize> {
+pub(super) fn parameter_index_parse(placeholder: &str) -> AstTransformResult<usize> {
     let Some(index_str) = placeholder.strip_prefix('$') else {
         return Err(AstTransformError::InvalidParameterPlaceholder {
             placeholder: placeholder.to_owned(),

@@ -512,3 +512,54 @@ async fn test_pgproto_close_then_batch_ordering() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// PGC-630: LIMIT and OFFSET bound as text with no declared type and no
+/// Describe. The position types them bigint, so the read is served from
+/// cache, and its population is capped at LIMIT plus OFFSET: a window past
+/// the cap is a miss.
+#[tokio::test]
+async fn test_pgproto_limit_undeclared_text_bind() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE proto_limit (id integer PRIMARY KEY, name text)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO proto_limit VALUES \
+         (6, 'f'), (5, 'e'), (4, 'd'), (3, 'c'), (2, 'b'), (1, 'a')",
+        &[],
+    )
+    .await?;
+
+    let small = "tests/data/pgproto/limit_undeclared_text_bind.data";
+    let larger = "tests/data/pgproto/limit_undeclared_text_bind_larger.data";
+    let rows = |output: &str| output.matches("<= BE DataRow").count();
+    let start = ctx.metrics().await?;
+
+    let output = pgproto_run(ctx.cache_port, small);
+    assert_eq!(rows(&output), 2, "LIMIT 2 OFFSET 1:\n{output}");
+    let m = assert_cache_miss(&mut ctx, start.clone()).await?;
+    ctx.cache_settle().await?;
+
+    let output = pgproto_run(ctx.cache_port, small);
+    assert_eq!(rows(&output), 2, "LIMIT 2 OFFSET 1 from cache:\n{output}");
+    let m = assert_cache_hit(&mut ctx, m).await?;
+
+    // Three rows were loaded; five are needed.
+    let output = pgproto_run(ctx.cache_port, larger);
+    assert_eq!(rows(&output), 4, "LIMIT 4 OFFSET 1:\n{output}");
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    let output = pgproto_run(ctx.cache_port, larger);
+    assert_eq!(rows(&output), 4, "LIMIT 4 OFFSET 1 from cache:\n{output}");
+    let m = assert_cache_hit(&mut ctx, m).await?;
+
+    let delta = metrics_delta(&start, &m);
+    assert_eq!(delta.queries_cache_error, 0, "no serve may fail");
+    assert_eq!(delta.cache_pool_replenished, 0, "no serve connection lost");
+
+    Ok(())
+}

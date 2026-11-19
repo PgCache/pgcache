@@ -5,7 +5,7 @@ use tracing::error;
 
 use super::{CacheDispatch, CoalescedClient, QueryRequest};
 use crate::cache::messages::slices_concat;
-use crate::cache::query::{limit_is_sufficient, limit_rows_needed};
+use crate::cache::query::limit_is_sufficient;
 use crate::cache::reference_settings::{self, ReferenceSettings};
 use crate::cache::types::{CachedQueryState, QueryServing, ServingAt};
 use crate::query::Fingerprint;
@@ -136,7 +136,7 @@ impl CacheDispatch {
         let primary = waiters.remove(0);
 
         // Check whether the cached rows cover this group's LIMIT
-        let primary_needed = limit_rows_needed(&primary.limit);
+        let primary_needed = primary.limit.rows_needed();
         if !limit_is_sufficient(serving.max_limit, primary_needed) {
             let _ = primary.forward();
             for msg in waiters {

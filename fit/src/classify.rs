@@ -10,7 +10,7 @@ use pgcache_lib::cache::admission::{
     population_max_limit, query_admission_analyze, query_decorrelate_checked, query_pushdown,
     query_resolve_canonical, subsumption_references,
 };
-use pgcache_lib::cache::query::{limit_clause_of, limit_rows_needed};
+use pgcache_lib::cache::query::limit_rows_needed;
 use pgcache_lib::cache::{CacheabilityError, CacheableQuery};
 use pgcache_lib::catalog::Catalog;
 use pgcache_lib::oid::Oid;
@@ -404,7 +404,7 @@ pub fn statement_classify(
         shape_key: bound.shape().key,
         relations,
         has_limit,
-        rows_needed: limit_rows_needed(&limit_clause_of(cacheable.tree().root())),
+        rows_needed: limit_rows_needed(cacheable.tree().root()),
         max_limit,
         references,
         join_region,

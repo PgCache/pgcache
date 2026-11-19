@@ -4,11 +4,11 @@ use std::time::{Duration, Instant};
 
 use crate::cache::messages::PipelineDescribe;
 use crate::cache::output_settings::OutputProfile;
+use crate::cache::query::RowLimit;
 use crate::cache::query_cache::{QueryRequest, QueryType};
 use crate::cache::types::{CacheStateView, CachedQueryState};
 use crate::pg::protocol::backend::TransactionStatus;
 use crate::pg::protocol::session::ResultFormats;
-use crate::query::ast::LimitClause;
 use crate::query::{Fingerprint, FingerprintMap};
 
 /// Coalesce-forward deadline policy (PGC-335 fix A). A request parked on a
@@ -66,7 +66,7 @@ pub(super) struct CoalesceKey {
     has_bind: bool,
     pipeline_describe: PipelineDescribe,
     result_formats: ResultFormats,
-    limit: Option<LimitClause>,
+    limit: RowLimit,
     /// Waiters rendered under different settings never share bytes (PGC-287).
     profile: OutputProfile,
 }
@@ -86,7 +86,7 @@ impl CoalesceKey {
             has_bind,
             pipeline_describe,
             result_formats: msg.result_formats.clone(),
-            limit: msg.limit.clone(),
+            limit: msg.limit,
             profile: msg.output_settings.profile(),
         }
     }

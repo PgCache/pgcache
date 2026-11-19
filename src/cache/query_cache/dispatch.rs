@@ -21,7 +21,7 @@ use crate::cache::messages::{
 use crate::cache::mv::MvMeta;
 use crate::cache::mv_shape::ShapeGate;
 use crate::cache::privileges::PrivilegeCheck;
-use crate::cache::query::{CacheableQuery, limit_rows_needed};
+use crate::cache::query::{CacheableQuery, RowLimit};
 use crate::cache::reference_settings;
 use crate::cache::reg_bucket::RegRateBucket;
 use crate::cache::reply::ReplySender;
@@ -33,7 +33,6 @@ use crate::cache::types::{
 use crate::cache::{CacheError, CacheResult, fast_path};
 use crate::pg::Lsn;
 use crate::proxy::ClientSocket;
-use crate::query::ast::LimitClause;
 use crate::query::keying_settings::KeyingSettings;
 use crate::query::resolve::PrivilegeNeeds;
 use crate::query::{Fingerprint, SessionKey};
@@ -334,7 +333,7 @@ impl CacheDispatch {
         let Some((session_key, fingerprint)) = self.identity_resolve(&msg, &cfg).await else {
             return msg.forward();
         };
-        let target = self.dispatch_target(fingerprint, &msg.limit, &cfg);
+        let target = self.dispatch_target(fingerprint, msg.limit, &cfg);
         trace!("{fingerprint}");
 
         let mut cache_entry = self.entry_lookup_timed(fingerprint);
@@ -487,13 +486,13 @@ impl CacheDispatch {
     fn dispatch_target(
         &self,
         fingerprint: Fingerprint,
-        limit: &Option<LimitClause>,
+        limit: RowLimit,
         cfg: &DynamicConfig,
     ) -> DispatchTarget {
         DispatchTarget {
             fingerprint,
             input: DecisionInput {
-                rows_needed: limit_rows_needed(limit),
+                rows_needed: limit.rows_needed(),
                 admission_threshold: cfg.admission_threshold,
                 cache_policy: cfg.cache_policy,
                 throttled: self.state_view.throttled(),

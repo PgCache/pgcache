@@ -16,7 +16,7 @@ use super::{AdmissionAnalysis, TableAdmission};
 use crate::cache::mv_shape::select_reshapes;
 #[cfg(feature = "proxy")]
 use crate::cache::mv_shape::{ShapeGate, shape_classify};
-use crate::cache::query::{limit_clause_of, limit_rows_needed};
+use crate::cache::query::limit_rows_needed;
 use crate::cache::update_query::{OrderByKey, UpdateEvalStrategy, UpdateQuery, UpdateQuerySource};
 use crate::cache::{CacheError, CacheResult};
 use crate::catalog::{Catalog, ColumnMask};
@@ -52,7 +52,7 @@ pub fn base_query_prepare(query: &QueryTree) -> (QueryTree, Option<u64>) {
     let root = query.root();
     let max_limit = match root.body() {
         Body::SetOp(_) => None,
-        Body::Select(_) | Body::Values(_) => limit_rows_needed(&limit_clause_of(root)),
+        Body::Select(_) | Body::Values(_) => limit_rows_needed(root),
     };
     (query_tree_without_limit(query), max_limit)
 }

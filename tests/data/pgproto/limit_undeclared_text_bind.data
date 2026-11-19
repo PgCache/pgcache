@@ -1,0 +1,11 @@
+# PGC-630: a client that declares no parameter types and never Describes the
+# statement (node-postgres) binds LIMIT and OFFSET as text of unspecified
+# type. LIMIT 2 OFFSET 1.
+# The Bind gives no format codes (all text), as node-postgres does; pgproto
+# also mis-encodes a Bind with one format code and two parameters.
+'P'	"S1"	"SELECT id, name FROM proto_limit ORDER BY id LIMIT $1 OFFSET $2"	0
+'B'	""	"S1"	0	2	1	"2"	1	"1"	0
+'E'	""	0
+'S'
+'Y'
+'X'

@@ -14,7 +14,6 @@ use crate::cache::Generation;
 use crate::cache::messages::{AdmitAction, QueryCommand, RegisterRequest, SubsumptionResult};
 use crate::cache::mv::MvMeta;
 use crate::cache::mv_shape::ShapeGate;
-use crate::cache::query::limit_rows_needed;
 use crate::cache::reference_settings;
 use crate::cache::types::{CachedQueryState, CachedQueryView, PinnedQuery, QueryMetrics};
 use crate::cache::{CacheError, CacheResult};
@@ -140,7 +139,7 @@ impl CacheDispatch {
                 // Subsumed queries have mv_state = MeasurePending (see Future Work:
                 // "MV first-pop for subsumed queries"); mv_dispatch_decide returns
                 // false and the serve goes through the fallthrough path.
-                let rows_needed = limit_rows_needed(&msg.limit);
+                let rows_needed = msg.limit.rows_needed();
                 let mv = self.mv_dispatch_decide(fingerprint, rows_needed);
                 self.pool_serve(fingerprint, msg, bound, serve_shape, generation, mv)
             }

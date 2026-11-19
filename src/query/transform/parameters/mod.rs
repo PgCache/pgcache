@@ -1,6 +1,7 @@
 //! Decode extended-query Bind values for `$N` placeholders. The decoder pipeline forks on wire format: `text` for UTF-8 text
 //! values (format=0), `binary` for the per-type wire formats (format=1).
 
+mod bigint;
 mod binary;
 mod replace;
 mod text;
@@ -11,6 +12,7 @@ use super::AstTransformResult;
 use crate::cache::QueryParameter;
 use crate::query::ast::LiteralValue;
 
+pub(crate) use bigint::{bigint_text_parse, placeholder_bigint_decode};
 pub(crate) use replace::literal_value_parameters_replace;
 #[cfg(feature = "proxy")]
 pub(crate) use write_parameterize::{

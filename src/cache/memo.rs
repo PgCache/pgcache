@@ -73,9 +73,9 @@ use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 
 use crate::cache::output_settings::OutputProfile;
+use crate::cache::query::RowLimit;
 use crate::oid::Oid;
 use crate::query::Fingerprint;
-use crate::query::ast::{LimitClause, LiteralValue};
 use crate::settings::DynamicConfigHandle;
 
 /// Time a memo saves per KiB it holds: `serve_cost × hits / bytes`, in
@@ -120,47 +120,16 @@ pub enum SlotKey {
     Relation(Oid),
 }
 
-/// The result-shape component of a memo key. Cross-shape slicing is unsafe
-/// without `ORDER BY`, so v1 serves only the exact captured shape.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct MemoShape {
-    pub limit: Option<u64>,
-    pub offset: Option<u64>,
-}
-
-impl MemoShape {
-    /// Derive the shape key from a request's LIMIT/OFFSET. Returns `None` when
-    /// either is present but not an integer literal (post-bind these are
-    /// literals; a non-literal is rare and simply not memoized).
-    pub fn from_limit(limit: &Option<LimitClause>) -> Option<Self> {
-        let Some(clause) = limit else {
-            return Some(MemoShape {
-                limit: None,
-                offset: None,
-            });
-        };
-        let limit = match &clause.count {
-            None => None,
-            Some(LiteralValue::Integer(n)) => Some(u64::try_from(*n).ok()?),
-            Some(_) => return None,
-        };
-        let offset = match &clause.offset {
-            None => None,
-            Some(LiteralValue::Integer(n)) => Some(u64::try_from(*n).ok()?),
-            Some(_) => return None,
-        };
-        Some(MemoShape { limit, offset })
-    }
-}
-
 /// Identity of a memoized result. A query is materialized in at most one memo
-/// per `(result format, shape)`.
+/// per `(result format, limit, profile)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MemoKey {
     pub fingerprint: Fingerprint,
     /// Result format negotiated at Bind: text (`false`) vs binary (`true`).
     pub binary: bool,
-    pub shape: MemoShape,
+    /// The exact LIMIT and OFFSET captured: slicing one result to answer
+    /// another is unsafe without `ORDER BY`.
+    pub limit: RowLimit,
     /// The rendering settings the bytes were produced under (PGC-287).
     pub profile: OutputProfile,
 }
@@ -740,10 +709,7 @@ mod tests {
         MemoKey {
             fingerprint: Fingerprint::from_raw(fp),
             binary: false,
-            shape: MemoShape {
-                limit: None,
-                offset: None,
-            },
+            limit: RowLimit::default(),
             profile: OutputProfile::default(),
         }
     }
@@ -1399,37 +1365,6 @@ mod tests {
         assert!(m.get(&key(2), false).is_some(), "live entry survives gc");
         assert_eq!(m.len(), 1);
         assert_eq!(m.total_bytes(), 3);
-    }
-
-    fn int_limit(count: Option<i64>, offset: Option<i64>) -> Option<LimitClause> {
-        Some(LimitClause {
-            count: count.map(LiteralValue::Integer),
-            offset: offset.map(LiteralValue::Integer),
-        })
-    }
-
-    #[test]
-    fn test_memo_shape_from_limit() {
-        assert_eq!(
-            MemoShape::from_limit(&None),
-            Some(MemoShape {
-                limit: None,
-                offset: None
-            })
-        );
-        assert_eq!(
-            MemoShape::from_limit(&int_limit(Some(10), Some(5))),
-            Some(MemoShape {
-                limit: Some(10),
-                offset: Some(5)
-            })
-        );
-        // Non-integer literal → not keyable → skip.
-        let text_limit = Some(LimitClause {
-            count: Some(LiteralValue::String("x".into())),
-            offset: None,
-        });
-        assert_eq!(MemoShape::from_limit(&text_limit), None);
     }
 
     #[test]

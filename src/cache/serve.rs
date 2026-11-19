@@ -9,7 +9,7 @@ use tracing::{debug, instrument, trace, warn};
 
 use super::{
     CacheError, CacheResult,
-    memo::{MEMO_CAPTURE_MIN_HITS, MemoCapture, MemoKey, MemoShape},
+    memo::{MEMO_CAPTURE_MIN_HITS, MemoCapture, MemoKey},
     mv::{MvServe, mv_serve_sql_into},
     query_cache::{QueryType, ServeRequest},
     types::CacheStateView,
@@ -19,7 +19,6 @@ use crate::cache::messages::PipelineDescribe;
 use crate::pg::cache_connection::{CacheConnection, NamedQuerySend, PrepareOutcome};
 use crate::pg::protocol::backend::TransactionStatus;
 use crate::pg::protocol::encode::{BIND_COMPLETE_MSG, PARSE_COMPLETE_MSG};
-use crate::query::ast::{Deparse, LiteralValue};
 
 mod coalesce;
 mod relay;
@@ -85,7 +84,6 @@ fn memo_capture_begin(
     if hits < MEMO_CAPTURE_MIN_HITS {
         return None;
     }
-    let shape = MemoShape::from_limit(&msg.limit)?;
     // Every relation the query *reads* — deliberately broader than the
     // precomputed `CachedQuery.relation_oids` (which excludes subquery
     // tables): a change to any read relation, subqueries included, must evict
@@ -97,7 +95,7 @@ fn memo_capture_begin(
     let key = MemoKey {
         fingerprint: msg.fingerprint,
         binary,
-        shape,
+        limit: msg.limit,
         profile: msg.output_settings.profile(),
     };
     MemoCapture::begin(&state_view.memo, key, &oids, hits)
@@ -167,27 +165,12 @@ pub(crate) mod fault {
     }
 }
 
-/// Render a `LIMIT`/`OFFSET` clause field into text for its `$1`/`$2` bind. An
-/// integer limit — virtually every real one — formats into the caller's stack
-/// `itoa::Buffer` with no allocation. Any other literal (e.g. a float) deparses
-/// into `other` (a heap `String`); it then fails the `int8` coercion on the
-/// cache DB, erroring that hit so it forwards to origin rather than silently
-/// dropping the limit and over-returning rows. `None` binds NULL (no limit /
-/// offset 0). The two scratch buffers are caller-owned so the returned `&str`
-/// outlives the bind.
-fn limit_bind_text<'a>(
-    value: Option<&LiteralValue>,
-    itoa_buf: &'a mut itoa::Buffer,
-    other: &'a mut String,
-) -> Option<&'a str> {
-    match value {
-        None => None,
-        Some(LiteralValue::Integer(n)) => Some(itoa_buf.format(*n)),
-        Some(v) => {
-            v.deparse(other);
-            Some(other.as_str())
-        }
-    }
+/// A LIMIT or OFFSET value as the text of its bind, formatted into the
+/// caller's stack buffer. `None` binds NULL, which the cache DB reads as no
+/// limit and as offset 0.
+fn row_count_bind_text(value: Option<u64>, buffer: &mut itoa::Buffer) -> Option<&str> {
+    let value = value?;
+    Some(buffer.format(value))
 }
 
 /// Issue the cached query on the pooled cache-DB connection and return what was
@@ -206,7 +189,7 @@ async fn serve_query_send(
     if let MvServe::Mv(plan) = &msg.mv {
         // Render into the connection's recycled SQL buffer rather than a fresh
         // String.
-        mv_serve_sql_into(&mut conn.sql_buf, plan, msg.limit.as_ref());
+        mv_serve_sql_into(&mut conn.sql_buf, plan, msg.limit);
         return conn
             .extended_query_unnamed_send(&msg.output_settings, include_describe, binary_results)
             .await;
@@ -231,18 +214,9 @@ async fn serve_query_send(
 
     let mut limit_itoa = itoa::Buffer::new();
     let mut offset_itoa = itoa::Buffer::new();
-    let mut limit_other = String::new();
-    let mut offset_other = String::new();
-    let limit_text = limit_bind_text(
-        msg.limit.as_ref().and_then(|l| l.count.as_ref()),
-        &mut limit_itoa,
-        &mut limit_other,
-    );
-    let offset_text = limit_bind_text(
-        msg.limit.as_ref().and_then(|l| l.offset.as_ref()),
-        &mut offset_itoa,
-        &mut offset_other,
-    );
+    let limit_text = row_count_bind_text(msg.limit.count, &mut limit_itoa);
+    let offset = (msg.limit.offset > 0).then_some(msg.limit.offset);
+    let offset_text = row_count_bind_text(offset, &mut offset_itoa);
     conn.pipelined_named_query_send(NamedQuerySend {
         shape_key: shape.key,
         generation: msg.generation,
@@ -516,35 +490,14 @@ mod tests {
     }
 
     #[test]
-    fn test_limit_bind_text_binds_value_and_never_drops_non_integers() {
-        let mut itoa_buf = itoa::Buffer::new();
-        let mut other = String::new();
-
-        // No clause field → NULL bind (no limit, offset 0).
-        assert_eq!(limit_bind_text(None, &mut itoa_buf, &mut other), None);
-
-        // Integer binds its decimal value (negatives included) with no alloc.
+    fn test_row_count_bind_text_binds_null_for_no_value() {
+        let mut buffer = itoa::Buffer::new();
+        assert_eq!(row_count_bind_text(None, &mut buffer), None);
+        assert_eq!(row_count_bind_text(Some(0), &mut buffer), Some("0"));
         assert_eq!(
-            limit_bind_text(Some(&LiteralValue::Integer(5)), &mut itoa_buf, &mut other),
-            Some("5")
+            row_count_bind_text(Some(u64::MAX), &mut buffer),
+            Some("18446744073709551615")
         );
-        assert!(
-            other.is_empty(),
-            "integer path must not touch the heap buffer"
-        );
-        assert_eq!(
-            limit_bind_text(Some(&LiteralValue::Integer(-2)), &mut itoa_buf, &mut other),
-            Some("-2")
-        );
-
-        // PGC-229 review #1: a non-integer limit must still BIND (not None, which
-        // would bind NULL and silently drop the limit, returning every row). It
-        // binds text that fails int8 coercion on the cache DB, erroring that hit
-        // so it forwards to origin.
-        let float =
-            LiteralValue::Float(ordered_float::NotNan::new(3.7).expect("non-NaN test value"));
-        let bound = limit_bind_text(Some(&float), &mut itoa_buf, &mut other);
-        assert!(bound.is_some(), "non-integer limit must bind, not drop");
     }
 
     #[test]
