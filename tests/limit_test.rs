@@ -152,18 +152,13 @@ async fn test_limit_bump() -> Result<(), Error> {
 
     ctx.cache_settle().await?;
 
-    dbg!("hihihi");
-
     // LIMIT 3 → cache hit after re-population
     let res = ctx.simple_query(&format!("{base} LIMIT 3")).await?;
-
-    dbg!("hihihi");
     assert_eq!(res.len(), 5);
     assert_row_at(&res, 1, &[("id", "4"), ("name", "d")])?;
     assert_row_at(&res, 2, &[("id", "5"), ("name", "e")])?;
     assert_row_at(&res, 3, &[("id", "6"), ("name", "f")])?;
     let m = assert_cache_hit(&mut ctx, m).await?;
-    dbg!("hihihi");
 
     // LIMIT 2 → still a cache hit (2 ≤ 3)
     let res = ctx.simple_query(&format!("{base} LIMIT 2")).await?;
@@ -171,8 +166,6 @@ async fn test_limit_bump() -> Result<(), Error> {
     assert_row_at(&res, 1, &[("id", "4"), ("name", "d")])?;
     assert_row_at(&res, 2, &[("id", "5"), ("name", "e")])?;
     let _m = assert_cache_hit(&mut ctx, m).await?;
-
-    dbg!("hihihi");
 
     Ok(())
 }
