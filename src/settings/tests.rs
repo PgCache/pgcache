@@ -777,6 +777,70 @@ fn test_restart_required_ignores_an_absent_cache_table() {
     fs::remove_dir_all(&dir).expect("remove temp dir");
 }
 
+// ==================== restart_required ====================
+
+/// Settings built from `content` written to a fresh file under `dir_name`,
+/// with `args` over it. Returns the file's path for later edits.
+fn settings_build_from_file(
+    dir_name: &str,
+    content: &str,
+    args: CliArgs,
+) -> (Settings, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(dir_name);
+    fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("config.toml");
+    fs::write(&path, content).expect("write test TOML");
+    let config: SettingsToml = toml::from_str(content).expect("parse test TOML");
+    let settings = settings_build(args, Some(config), Some(path.clone())).expect("build settings");
+    (settings, path)
+}
+
+/// A flag that overrides the file is not an edit to the file: an unedited
+/// file never asks for a restart, whatever the flags (PGC-638).
+#[test]
+fn test_restart_required_false_when_flags_override_an_unedited_file() {
+    let mut args = cache_flags();
+    args.num_workers = Some(4);
+    args.listen_socket = Some("127.0.0.1:7000".parse().expect("valid socket addr"));
+    args.cdc_slot_name = Some("Other_Slot".to_owned());
+    args.origin.password = Some("from-the-environment".to_owned());
+    let content = CONFIG_WITHOUT_CACHE_TABLE.replace("pgcache_pub", "PgCache_Pub");
+
+    let (settings, path) =
+        settings_build_from_file("pgcache_test_restart_flags_override", &content, args);
+
+    assert_eq!(settings.cdc.publication_name, "pgcache_pub");
+    assert!(!settings.dynamic.restart_required());
+    fs::remove_dir_all(path.parent().expect("temp dir")).expect("remove temp dir");
+}
+
+/// `restart_required` answers whether a restart would change anything: an
+/// edit to a value a flag overrides would not, an edit to any other static
+/// value would.
+#[test]
+fn test_restart_required_follows_what_a_restart_would_change() {
+    let mut args = cache_flags();
+    args.num_workers = Some(4);
+    let (settings, path) = settings_build_from_file(
+        "pgcache_test_restart_masked_edit",
+        CONFIG_WITHOUT_CACHE_TABLE,
+        args,
+    );
+
+    let masked = CONFIG_WITHOUT_CACHE_TABLE.replace("num_workers = 2", "num_workers = 8");
+    fs::write(&path, &masked).expect("write masked edit");
+    assert!(
+        !settings.dynamic.restart_required(),
+        "the num_workers flag still decides the value"
+    );
+
+    let effective = masked.replace("origin.example.com", "other.example.com");
+    fs::write(&path, effective).expect("write effective edit");
+    assert!(settings.dynamic.restart_required());
+
+    fs::remove_dir_all(path.parent().expect("temp dir")).expect("remove temp dir");
+}
+
 // ==================== settings_build CLI-only Tests ====================
 
 /// All required CLI fields populated, no config file.

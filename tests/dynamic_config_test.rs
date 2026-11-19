@@ -38,8 +38,9 @@ async fn test_config_get_returns_dynamic_fields() -> Result<(), Error> {
 
     // Default setup uses FIFO policy (overridden via CLI)
     assert_eq!(dynamic["cache_policy"].as_str(), Some("fifo"));
-    // restart_required is a boolean (may be true if CLI args differ from TOML file)
-    assert!(json["restart_required"].is_boolean());
+    // The harness passes flags over the config file; an unedited file still
+    // needs no restart.
+    assert_eq!(json["restart_required"], false);
 
     Ok(())
 }

@@ -7,10 +7,8 @@ use arc_swap::ArcSwap;
 use serde::Deserialize;
 use serde::Serialize;
 
-use super::cli::allowlist_parse;
-use super::{
-    Allowlist, CachePolicy, CdcSettings, ListenSettings, PgSettings, Settings, SettingsToml,
-};
+use super::cli::{StaticFlags, allowlist_parse, static_settings_resolve};
+use super::{Allowlist, CachePolicy, CdcSettings, ListenSettings, PgSettings, SettingsToml};
 
 /// Runtime-adjustable configuration fields.
 /// Stored behind ArcSwap for lock-free reads on the hot path.
@@ -120,8 +118,7 @@ pub struct LogReloadHandle {
     pub current: LogCurrentFn,
 }
 
-/// Snapshot of static config fields captured at startup.
-/// Used to detect when the TOML file has been edited and a restart is needed.
+/// The static settings: fixed at startup, changed only by a restart.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StaticConfigSnapshot {
     pub origin: PgSettings,
@@ -131,32 +128,11 @@ pub struct StaticConfigSnapshot {
     pub cdc: CdcSettings,
 }
 
-impl StaticConfigSnapshot {
-    pub fn from_settings(settings: &Settings) -> Self {
-        Self {
-            origin: settings.origin.clone(),
-            cache: settings.cache.clone(),
-            listen: settings.listen.clone(),
-            num_workers: settings.num_workers,
-            cdc: settings.cdc.clone(),
-        }
-    }
-
-    /// The file's static fields. A file with no `[cache]` table took the
-    /// cache connection from flags, which a file edit cannot change, so it
-    /// keeps `running`'s.
-    fn from_toml(config: &SettingsToml, running: &Self) -> Self {
-        Self {
-            origin: config.origin.clone(),
-            cache: config
-                .cache
-                .clone()
-                .unwrap_or_else(|| running.cache.clone()),
-            listen: config.listen.clone(),
-            num_workers: config.num_workers,
-            cdc: config.cdc.clone(),
-        }
-    }
+/// What `restart_required` compares against: the running static settings
+/// and the flags they were resolved with.
+pub(super) struct StaticBaseline {
+    pub(super) running: StaticConfigSnapshot,
+    pub(super) flags: StaticFlags,
 }
 
 /// Shared handle for reading/updating dynamic config. Cloneable, lock-free reads.
@@ -167,7 +143,7 @@ pub struct DynamicConfigHandle {
     // the static config. Both are set once at startup and never mutated.
     config_path: Option<Arc<PathBuf>>,
     log_reload: Arc<Mutex<Option<LogReloadHandle>>>,
-    pub(super) static_snapshot: Option<Arc<StaticConfigSnapshot>>,
+    pub(super) static_baseline: Option<Arc<StaticBaseline>>,
 }
 
 impl Clone for DynamicConfigHandle {
@@ -176,7 +152,7 @@ impl Clone for DynamicConfigHandle {
             inner: Arc::clone(&self.inner),
             config_path: self.config_path.clone(),
             log_reload: Arc::clone(&self.log_reload),
-            static_snapshot: self.static_snapshot.clone(),
+            static_baseline: self.static_baseline.clone(),
         }
     }
 }
@@ -191,16 +167,13 @@ impl fmt::Debug for DynamicConfigHandle {
 }
 
 impl DynamicConfigHandle {
-    pub(super) fn new(
-        config: DynamicConfig,
-        config_path: Option<PathBuf>,
-        static_snapshot: Option<StaticConfigSnapshot>,
-    ) -> Self {
+    /// The static baseline is set by `settings_build` once the settings exist.
+    pub(super) fn new(config: DynamicConfig, config_path: Option<PathBuf>) -> Self {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(config)),
             config_path: config_path.map(Arc::new),
             log_reload: Arc::new(Mutex::new(None)),
-            static_snapshot: static_snapshot.map(Arc::new),
+            static_baseline: None,
         }
     }
 
@@ -214,10 +187,11 @@ impl DynamicConfigHandle {
         self.config_path.as_deref().map(PathBuf::as_path)
     }
 
-    /// Check if the TOML config file has static fields that differ from the running config.
-    /// Returns true if a restart is needed to apply the changes.
+    /// True when a restart would change a static setting: the config file as
+    /// it stands now, under the flags pgcache started with, resolves to
+    /// something other than what is running.
     pub fn restart_required(&self) -> bool {
-        let (Some(path), Some(snapshot)) = (self.config_path.as_deref(), &self.static_snapshot)
+        let (Some(path), Some(baseline)) = (self.config_path.as_deref(), &self.static_baseline)
         else {
             return false;
         };
@@ -227,8 +201,8 @@ impl DynamicConfigHandle {
         let Ok(config) = toml::from_str::<SettingsToml>(&content) else {
             return false;
         };
-        let file_snapshot = StaticConfigSnapshot::from_toml(&config, snapshot);
-        **snapshot != file_snapshot
+        static_settings_resolve(&baseline.flags, Some(&config))
+            .is_ok_and(|resolved| resolved != baseline.running)
     }
 
     /// Query the effective log level from the tracing subscriber.
@@ -277,7 +251,6 @@ impl DynamicConfigHandle {
     pub fn test_default() -> Self {
         Self::new(
             DynamicConfig::new(None, None, None, None, None, None, None, None, None, None),
-            None,
             None,
         )
     }

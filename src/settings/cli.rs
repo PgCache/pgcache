@@ -10,7 +10,7 @@ use std::time::Duration;
 use lexopt::prelude::*;
 use rootcause::Report;
 
-use super::dynamic::{DynamicConfig, DynamicConfigHandle};
+use super::dynamic::{DynamicConfig, DynamicConfigHandle, StaticBaseline};
 use super::{
     Allowlist, AllowlistEntry, BoxedError, CachePolicy, CdcSettings, ConfigError, ConfigResult,
     DEFAULT_PUBLICATION_NAME, DEFAULT_SLOT_NAME, ListenSettings, MetricsSettings, PgSettings,
@@ -383,7 +383,31 @@ impl PgSettingsPartial {
     }
 }
 
+/// The flags that take part in resolving the static settings. Kept after
+/// startup so `restart_required` resolves an edited config file the way
+/// startup did.
+#[derive(Clone)]
+pub(super) struct StaticFlags {
+    origin: PgSettingsPartial,
+    cache: PgSettingsPartial,
+    listen_socket: Option<SocketAddr>,
+    num_workers: Option<usize>,
+    cdc_publication_name: Option<String>,
+    cdc_slot_name: Option<String>,
+}
+
 impl CliArgs {
+    fn static_flags(&self) -> StaticFlags {
+        StaticFlags {
+            origin: self.origin.clone(),
+            cache: self.cache.clone(),
+            listen_socket: self.listen_socket,
+            num_workers: self.num_workers,
+            cdc_publication_name: self.cdc_publication_name.clone(),
+            cdc_slot_name: self.cdc_slot_name.clone(),
+        }
+    }
+
     fn pg_mut(&mut self, target: PgTarget) -> &mut PgSettingsPartial {
         match target {
             PgTarget::Origin => &mut self.origin,
@@ -648,19 +672,15 @@ pub(super) fn settings_build(
     config: Option<SettingsToml>,
     config_path: Option<PathBuf>,
 ) -> ConfigResult<Settings> {
+    let flags = args.static_flags();
+    let running = static_settings_resolve(&flags, config.as_ref())?;
     let mut settings = if let Some(mut config) = config {
-        settings_build_with_config(args, &mut config, config_path)?
+        settings_build_with_config(args, running.clone(), &mut config, config_path)?
     } else {
-        settings_build_cli_only(args)?
+        settings_build_cli_only(args, running.clone())?
     };
 
-    // Lowercase CDC names to avoid quoting in postgres
-    settings.cdc.publication_name = settings.cdc.publication_name.to_ascii_lowercase();
-    settings.cdc.slot_name = settings.cdc.slot_name.to_ascii_lowercase();
-
-    // Capture static config snapshot for restart-required detection
-    settings.dynamic.static_snapshot =
-        Some(Arc::new(StaticConfigSnapshot::from_settings(&settings)));
+    settings.dynamic.static_baseline = Some(Arc::new(StaticBaseline { running, flags }));
 
     Ok(settings)
 }
@@ -682,7 +702,7 @@ fn pinned_queries_resolve(
 /// The cache connection: flags over the file's `[cache]` table, or the flags
 /// alone when the file has none, and then all four are required.
 fn cache_settings_resolve(
-    flags: PgSettingsPartial,
+    flags: &PgSettingsPartial,
     toml_cache: Option<&PgSettings>,
 ) -> ConfigResult<PgSettings> {
     match toml_cache {
@@ -690,23 +710,70 @@ fn cache_settings_resolve(
         // Cache is localhost: trust auth (no password flag) and no TLS.
         None => Ok(PgSettings {
             ssl_mode: SslMode::Disable,
-            ..flags.require(&CACHE_REQUIRED_FLAGS)?
+            ..flags.clone().require(&CACHE_REQUIRED_FLAGS)?
         }),
     }
 }
 
+/// The static settings: flags over the config file, or the flags alone
+/// without one, and then each is required. Startup and `restart_required`
+/// both resolve through here, so the two cannot disagree.
+pub(super) fn static_settings_resolve(
+    flags: &StaticFlags,
+    config: Option<&SettingsToml>,
+) -> ConfigResult<StaticConfigSnapshot> {
+    let listen_socket = flags.listen_socket;
+    let num_workers = flags.num_workers;
+    let publication_name = flags.cdc_publication_name.clone();
+    let slot_name = flags.cdc_slot_name.clone();
+    let (origin, cache, socket, num_workers, publication_name, slot_name) = match config {
+        Some(config) => (
+            flags.origin.merge_with(&config.origin),
+            cache_settings_resolve(&flags.cache, config.cache.as_ref())?,
+            listen_socket.unwrap_or(config.listen.socket),
+            num_workers.unwrap_or(config.num_workers),
+            publication_name.unwrap_or_else(|| config.cdc.publication_name.clone()),
+            slot_name.unwrap_or_else(|| config.cdc.slot_name.clone()),
+        ),
+        None => (
+            flags.origin.clone().require(&ORIGIN_REQUIRED_FLAGS)?,
+            cache_settings_resolve(&flags.cache, None)?,
+            require(listen_socket, "listen_socket")?,
+            require(num_workers, "num_workers")?,
+            require(publication_name, "cdc_publication_name")?,
+            require(slot_name, "cdc_slot_name")?,
+        ),
+    };
+    Ok(StaticConfigSnapshot {
+        origin,
+        cache,
+        listen: ListenSettings { socket },
+        num_workers,
+        // Lowercase CDC names to avoid quoting in postgres
+        cdc: CdcSettings {
+            publication_name: publication_name.to_ascii_lowercase(),
+            slot_name: slot_name.to_ascii_lowercase(),
+        },
+    })
+}
+
 /// Build settings by merging CLI args over a TOML config file.
-pub(super) fn settings_build_with_config(
+fn settings_build_with_config(
     args: CliArgs,
+    statics: StaticConfigSnapshot,
     config: &mut SettingsToml,
     config_path: Option<PathBuf>,
 ) -> ConfigResult<Settings> {
-    let origin = args.origin.merge_with(&config.origin);
+    let StaticConfigSnapshot {
+        origin,
+        cache,
+        listen,
+        num_workers,
+        cdc,
+    } = statics;
     let replication =
         replication_settings_resolve(&origin, config.replication.take(), args.replication);
-    let cache = cache_settings_resolve(args.cache, config.cache.as_ref())?;
 
-    let num_workers = args.num_workers.unwrap_or(config.num_workers);
     let (population_workers_min, population_workers_max) = population_workers_bounds(
         num_workers,
         env_override_resolve(
@@ -726,17 +793,8 @@ pub(super) fn settings_build_with_config(
         origin,
         replication,
         cache,
-        cdc: CdcSettings {
-            publication_name: args
-                .cdc_publication_name
-                .unwrap_or_else(|| config.cdc.publication_name.clone()),
-            slot_name: args
-                .cdc_slot_name
-                .unwrap_or_else(|| config.cdc.slot_name.clone()),
-        },
-        listen: ListenSettings {
-            socket: args.listen_socket.unwrap_or(config.listen.socket),
-        },
+        cdc,
+        listen,
         num_workers,
         population_workers_min,
         population_workers_max,
@@ -750,7 +808,7 @@ pub(super) fn settings_build_with_config(
             .metrics_socket
             .map(|socket| MetricsSettings { socket })
             .or_else(|| config.metrics.clone()),
-        dynamic: DynamicConfigHandle::new(dynamic, config_path, None),
+        dynamic: DynamicConfigHandle::new(dynamic, config_path),
         pinned_queries: pinned_queries_resolve(
             args.pinned_queries,
             args.pinned_tables,
@@ -762,14 +820,19 @@ pub(super) fn settings_build_with_config(
 }
 
 /// Build settings from CLI args alone (no config file). Required fields must be present.
-pub(super) fn settings_build_cli_only(args: CliArgs) -> ConfigResult<Settings> {
-    let origin = args.origin.require(&ORIGIN_REQUIRED_FLAGS)?;
+fn settings_build_cli_only(args: CliArgs, statics: StaticConfigSnapshot) -> ConfigResult<Settings> {
+    let StaticConfigSnapshot {
+        origin,
+        cache,
+        listen,
+        num_workers,
+        cdc,
+    } = statics;
 
     // CLI-only mode: replication defaults to origin, with CLI overrides
     let replication = replication_settings_resolve(&origin, None, args.replication);
     let dynamic = dynamic_config_resolve(args.dynamic, DynamicToml::default());
 
-    let num_workers = require(args.num_workers, "num_workers")?;
     let (population_workers_min, population_workers_max) = population_workers_bounds(
         num_workers,
         env_override_resolve(
@@ -786,14 +849,9 @@ pub(super) fn settings_build_cli_only(args: CliArgs) -> ConfigResult<Settings> {
     Ok(Settings {
         origin,
         replication,
-        cache: cache_settings_resolve(args.cache, None)?,
-        cdc: CdcSettings {
-            publication_name: require(args.cdc_publication_name, "cdc_publication_name")?,
-            slot_name: require(args.cdc_slot_name, "cdc_slot_name")?,
-        },
-        listen: ListenSettings {
-            socket: require(args.listen_socket, "listen_socket")?,
-        },
+        cache,
+        cdc,
+        listen,
         num_workers,
         population_workers_min,
         population_workers_max,
@@ -801,10 +859,8 @@ pub(super) fn settings_build_cli_only(args: CliArgs) -> ConfigResult<Settings> {
         tls_cert: args.tls_cert,
         tls_key: args.tls_key,
         metrics: args.metrics_socket.map(|socket| MetricsSettings { socket }),
-        dynamic: DynamicConfigHandle::new(
-            dynamic, None, // no config file in CLI-only mode
-            None, // snapshot set in settings_build
-        ),
+        // No config file in CLI-only mode.
+        dynamic: DynamicConfigHandle::new(dynamic, None),
         pinned_queries: pinned_queries_resolve(args.pinned_queries, args.pinned_tables, None, None),
         telemetry: telemetry_resolve(args.telemetry_off, None),
     })
