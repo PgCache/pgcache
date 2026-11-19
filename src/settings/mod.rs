@@ -41,10 +41,10 @@ error_set! {
 }
 
 /// A config file parse error located in `content` by `span`, as the `toml`
-/// and `toml_edit` parsers report it. A missing top-level field is most
-/// often one written below a `[table]` header, which TOML reads as a key of
-/// that table, so the message says so; its span is the empty document
-/// start, which names no line.
+/// and `toml_edit` parsers report it. A missing top-level field has the
+/// empty document start as its span, which names no line; when the key was
+/// written below a `[table]` header, which TOML reads as a key of that
+/// table, the message names the table.
 pub(super) fn toml_parse_error(
     message: &str,
     span: Option<std::ops::Range<usize>>,
@@ -55,14 +55,29 @@ pub(super) fn toml_parse_error(
             .get(..span.start)
             .map_or(1, |before| before.matches('\n').count() + 1)
     });
-    let message = match (message.starts_with("missing field"), line) {
-        (true, _) => {
-            format!("{message} (a top-level key must come before the first [table] header)")
-        }
-        (false, Some(line)) => format!("{message} at line {line}"),
-        (false, None) => message.to_owned(),
+    let message = match line {
+        Some(line) => format!("{message} at line {line}"),
+        None => match missing_key_table_find(message, content) {
+            Some(table) => format!(
+                "{message} (it is set under [{table}]; a top-level key must come before the first [table] header)"
+            ),
+            None => message.to_owned(),
+        },
     };
     ConfigError::TomlParse { message }
+}
+
+/// The `[table]` that holds the key a "missing field" message names, when
+/// the file sets that key inside a table instead of at the top level.
+fn missing_key_table_find(message: &str, content: &str) -> Option<String> {
+    let key = message.strip_prefix("missing field `")?.split('`').next()?;
+    let document = content.parse::<toml_edit::DocumentMut>().ok()?;
+    document.iter().find_map(|(table, item)| {
+        item.as_table()?
+            .get(key)?
+            .is_value()
+            .then(|| table.to_owned())
+    })
 }
 
 /// Concrete wrapper around an arbitrary boxed error so it satisfies the
@@ -265,7 +280,9 @@ struct SettingsToml {
     origin: PgSettings,
     #[serde(default)]
     replication: Option<PgSettingsPartial>,
-    cache: PgSettings,
+    /// Optional: the image's entrypoint gives the cache connection by flag.
+    #[serde(default)]
+    cache: Option<PgSettings>,
     cdc: CdcSettings,
     listen: ListenSettings,
     num_workers: usize,

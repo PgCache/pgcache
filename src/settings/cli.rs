@@ -679,6 +679,22 @@ fn pinned_queries_resolve(
     )
 }
 
+/// The cache connection: flags over the file's `[cache]` table, or the flags
+/// alone when the file has none, and then all four are required.
+fn cache_settings_resolve(
+    flags: PgSettingsPartial,
+    toml_cache: Option<&PgSettings>,
+) -> ConfigResult<PgSettings> {
+    match toml_cache {
+        Some(base) => Ok(flags.merge_with(base)),
+        // Cache is localhost: trust auth (no password flag) and no TLS.
+        None => Ok(PgSettings {
+            ssl_mode: SslMode::Disable,
+            ..flags.require(&CACHE_REQUIRED_FLAGS)?
+        }),
+    }
+}
+
 /// Build settings by merging CLI args over a TOML config file.
 pub(super) fn settings_build_with_config(
     args: CliArgs,
@@ -688,7 +704,7 @@ pub(super) fn settings_build_with_config(
     let origin = args.origin.merge_with(&config.origin);
     let replication =
         replication_settings_resolve(&origin, config.replication.take(), args.replication);
-    let cache = args.cache.merge_with(&config.cache);
+    let cache = cache_settings_resolve(args.cache, config.cache.as_ref())?;
 
     let num_workers = args.num_workers.unwrap_or(config.num_workers);
     let (population_workers_min, population_workers_max) = population_workers_bounds(
@@ -770,11 +786,7 @@ pub(super) fn settings_build_cli_only(args: CliArgs) -> ConfigResult<Settings> {
     Ok(Settings {
         origin,
         replication,
-        // Cache is localhost: trust auth (no password flag) and no TLS.
-        cache: PgSettings {
-            ssl_mode: SslMode::Disable,
-            ..args.cache.require(&CACHE_REQUIRED_FLAGS)?
-        },
+        cache: cache_settings_resolve(args.cache, None)?,
         cdc: CdcSettings {
             publication_name: require(args.cdc_publication_name, "cdc_publication_name")?,
             slot_name: require(args.cdc_slot_name, "cdc_slot_name")?,

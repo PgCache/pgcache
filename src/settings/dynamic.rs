@@ -142,10 +142,16 @@ impl StaticConfigSnapshot {
         }
     }
 
-    fn from_toml(config: &SettingsToml) -> Self {
+    /// The file's static fields. A file with no `[cache]` table took the
+    /// cache connection from flags, which a file edit cannot change, so it
+    /// keeps `running`'s.
+    fn from_toml(config: &SettingsToml, running: &Self) -> Self {
         Self {
             origin: config.origin.clone(),
-            cache: config.cache.clone(),
+            cache: config
+                .cache
+                .clone()
+                .unwrap_or_else(|| running.cache.clone()),
             listen: config.listen.clone(),
             num_workers: config.num_workers,
             cdc: config.cdc.clone(),
@@ -221,7 +227,7 @@ impl DynamicConfigHandle {
         let Ok(config) = toml::from_str::<SettingsToml>(&content) else {
             return false;
         };
-        let file_snapshot = StaticConfigSnapshot::from_toml(&config);
+        let file_snapshot = StaticConfigSnapshot::from_toml(&config, snapshot);
         **snapshot != file_snapshot
     }
 

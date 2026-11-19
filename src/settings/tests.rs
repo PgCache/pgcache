@@ -517,14 +517,14 @@ fn base_toml_config() -> SettingsToml {
             ssl_mode: SslMode::Disable,
         },
         replication: None,
-        cache: PgSettings {
+        cache: Some(PgSettings {
             host: "localhost".to_owned(),
             port: 5433,
             user: "cache_user".to_owned(),
             password: None,
             database: "cache_db".to_owned(),
             ssl_mode: SslMode::Disable,
-        },
+        }),
         cdc: CdcSettings {
             publication_name: "pub".to_owned(),
             slot_name: "slot".to_owned(),
@@ -670,6 +670,111 @@ fn test_settings_build_cdc_names_lowercased() {
 
     assert_eq!(settings.cdc.publication_name, "my_pub");
     assert_eq!(settings.cdc.slot_name, "my_slot");
+}
+
+// ==================== Config file without [cache] ====================
+
+/// A config file as the site documents it. It has no `[cache]` table: the
+/// image's entrypoint gives the cache connection by flag (PGC-636).
+const CONFIG_WITHOUT_CACHE_TABLE: &str = r#"
+num_workers = 2
+
+[origin]
+host = "origin.example.com"
+port = 6432
+user = "admin"
+database = "postgres"
+
+[cdc]
+publication_name = "pgcache_pub"
+slot_name = "pgcache_slot"
+
+[listen]
+socket = "0.0.0.0:5432"
+
+[metrics]
+socket = "0.0.0.0:9090"
+"#;
+
+/// The cache connection flags the image's entrypoint always passes.
+fn cache_flags() -> CliArgs {
+    CliArgs {
+        cache: PgSettingsPartial {
+            host: Some("127.0.0.1".to_owned()),
+            port: Some(5433),
+            user: Some("postgres".to_owned()),
+            database: Some("pgcache_cache".to_owned()),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+#[test]
+fn test_settings_build_config_without_cache_table_takes_cache_flags() {
+    let config: SettingsToml =
+        toml::from_str(CONFIG_WITHOUT_CACHE_TABLE).expect("parse TOML without [cache]");
+
+    let settings = settings_build(cache_flags(), Some(config), None).expect("build settings");
+
+    assert_eq!(
+        settings.cache,
+        PgSettings {
+            host: "127.0.0.1".to_owned(),
+            port: 5433,
+            user: "postgres".to_owned(),
+            password: None,
+            database: "pgcache_cache".to_owned(),
+            ssl_mode: SslMode::Disable,
+        }
+    );
+    assert_eq!(settings.origin.host, "origin.example.com");
+    assert_eq!(settings.num_workers, 2);
+}
+
+#[test]
+fn test_settings_build_config_without_cache_table_or_flags_names_the_flag() {
+    let config: SettingsToml =
+        toml::from_str(CONFIG_WITHOUT_CACHE_TABLE).expect("parse TOML without [cache]");
+
+    let err = settings_build(CliArgs::default(), Some(config), None)
+        .expect_err("no cache connection given");
+
+    assert!(err.to_string().contains("cache_host"), "{err}");
+}
+
+#[test]
+fn test_settings_build_cache_flags_override_cache_table() {
+    let mut args = CliArgs::default();
+    args.cache.port = Some(7777);
+
+    let settings = settings_build(args, Some(base_toml_config()), None).expect("build settings");
+
+    assert_eq!(settings.cache.port, 7777);
+    assert_eq!(settings.cache.host, "localhost");
+    assert_eq!(settings.cache.database, "cache_db");
+}
+
+/// A file with no `[cache]` table does not differ from the running cache
+/// connection, which came from flags; an edited static field still does.
+#[test]
+fn test_restart_required_ignores_an_absent_cache_table() {
+    let dir = std::env::temp_dir().join("pgcache_test_config_without_cache_table");
+    fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("config.toml");
+    fs::write(&path, CONFIG_WITHOUT_CACHE_TABLE).expect("write test TOML");
+    let config: SettingsToml =
+        toml::from_str(CONFIG_WITHOUT_CACHE_TABLE).expect("parse TOML without [cache]");
+
+    let settings =
+        settings_build(cache_flags(), Some(config), Some(path.clone())).expect("build settings");
+    assert!(!settings.dynamic.restart_required());
+
+    let edited = CONFIG_WITHOUT_CACHE_TABLE.replace("num_workers = 2", "num_workers = 3");
+    fs::write(&path, edited).expect("write edited TOML");
+    assert!(settings.dynamic.restart_required());
+
+    fs::remove_dir_all(&dir).expect("remove temp dir");
 }
 
 // ==================== settings_build CLI-only Tests ====================
@@ -1230,7 +1335,9 @@ fn test_config_parse_error_never_echoes_the_file() {
         "{rendered}"
     );
     assert!(
-        rendered.contains("before the first [table] header"),
+        rendered.contains(
+            "it is set under [metrics]; a top-level key must come before the first [table] header"
+        ),
         "{rendered}"
     );
     assert!(
@@ -1256,4 +1363,29 @@ fn test_config_parse_error_never_echoes_the_file() {
     assert!(rendered.contains("config file:"), "{rendered}");
     assert!(!rendered.contains("s3cret"), "{rendered}");
     fs::remove_dir_all(&dir).expect("remove temp dir");
+}
+
+/// The misplaced-key hint is only for a key the file sets inside a table. A
+/// table the file leaves out, or a field missing from a table while another
+/// table sets a key of that name, gets no such hint (PGC-636).
+#[test]
+fn test_config_parse_error_hints_only_at_a_misplaced_key() {
+    let no_cdc_table = "num_workers = 2\n\n[origin]\nhost = \"h\"\nport = 5432\nuser = \"u\"\n\
+                        database = \"d\"\n\n[listen]\nsocket = \"127.0.0.1:1\"\n";
+    let error = toml::from_str::<SettingsToml>(no_cdc_table)
+        .map_err(|e| toml_parse_error(e.message(), e.span(), no_cdc_table))
+        .expect_err("the file has no [cdc] table");
+    let rendered = error.to_string();
+    assert!(rendered.contains("missing field `cdc`"), "{rendered}");
+    assert!(!rendered.contains("[table] header"), "{rendered}");
+
+    let no_origin_host = "num_workers = 2\n\n[origin]\nport = 5432\nuser = \"u\"\ndatabase = \"d\"\n\n\
+                          [replication]\nhost = \"r\"\n\n[cdc]\npublication_name = \"p\"\n\
+                          slot_name = \"s\"\n\n[listen]\nsocket = \"127.0.0.1:1\"\n";
+    let error = toml::from_str::<SettingsToml>(no_origin_host)
+        .map_err(|e| toml_parse_error(e.message(), e.span(), no_origin_host))
+        .expect_err("[origin] has no host");
+    let rendered = error.to_string();
+    assert!(rendered.contains("missing field `host`"), "{rendered}");
+    assert!(!rendered.contains("[table] header"), "{rendered}");
 }
