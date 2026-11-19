@@ -12,10 +12,10 @@ use super::pool_controller::{PoolController, PoolControllerConfig, StepKind, Tic
 use crate::cache::explain::handle_explain_request;
 use crate::cache::messages::{CacheOutcome, CacheReply, slices_concat};
 use crate::cache::query_cache::{ServeJob, ServeRequest};
-use crate::cache::serve::{CoalescedOutcome, SQLSTATE_UNDEFINED_TABLE, handle_cached_query};
+use crate::cache::serve::{CoalescedOutcome, handle_cached_query};
 use crate::cache::serve_pool_state::ServePool;
 use crate::cache::types::CacheStateView;
-use crate::cache::{CacheError, CacheResult, ReportExt};
+use crate::cache::{CacheError, CacheResult, ReportExt, SqlState};
 use crate::pg::cache_connection::CacheConnection;
 use crate::query::Fingerprint;
 use crate::result::error_chain_format;
@@ -140,8 +140,8 @@ async fn handle_serve_request(
             let ctx = e.current_context();
             let undefined_table = matches!(
                 ctx,
-                CacheError::CacheServerError { sqlstate: Some(s) }
-                    if *s == SQLSTATE_UNDEFINED_TABLE
+                CacheError::CacheServerError { sqlstate }
+                    if *sqlstate == SqlState::UNDEFINED_TABLE
             );
             if undefined_table {
                 debug!("cache hit fell through to origin (table dropped during eviction)");

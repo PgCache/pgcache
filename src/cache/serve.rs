@@ -30,7 +30,6 @@ pub(super) use coalesce::CoalescedOutcome;
 use coalesce::{broadcast_setup, push_and_broadcast};
 use relay::{Relay, ServeClient, ServeDiagnostics};
 use response_state::ServeResponseState;
-pub(crate) use sqlstate::SQLSTATE_UNDEFINED_TABLE;
 
 /// Max gap between cache-DB frames while draining a response for a departed
 /// primary client before the connection is treated as stalled and discarded.
@@ -456,6 +455,7 @@ pub(super) async fn handle_cached_query(
 mod tests {
     use super::sqlstate::sqlstate_extract;
     use super::*;
+    use crate::cache::SqlState;
     use crate::pg::protocol::encode::SERVE_ERROR_MSG;
 
     /// Build a minimal PG ErrorResponse frame with the given (code, value)
@@ -500,6 +500,21 @@ mod tests {
         );
     }
 
+    /// The serve error is logged through its `Display`: the SQLSTATE reads
+    /// as its five characters.
+    #[test]
+    fn test_cache_server_error_displays_the_sqlstate_as_text() {
+        let error = CacheError::CacheServerError {
+            sqlstate: SqlState::new(*b"22P02"),
+        };
+        assert_eq!(error.to_string(), "Cache server error (SQLSTATE 22P02)");
+        assert_eq!(format!("{:?}", SqlState::UNDEFINED_TABLE), "42P01");
+        assert_eq!(
+            SqlState::new([b'2', 0xFF, 0, b'\n', b'2']).to_string(),
+            "2\\xff\\x00\\n2"
+        );
+    }
+
     #[test]
     fn test_sqlstate_extract_undefined_table() {
         let frame = error_response_frame(&[
@@ -507,14 +522,14 @@ mod tests {
             (b'C', b"42P01"),
             (b'M', b"relation \"public.evict_a\" does not exist"),
         ]);
-        assert_eq!(sqlstate_extract(&frame), Some(*b"42P01"));
+        assert_eq!(sqlstate_extract(&frame), Some(SqlState::UNDEFINED_TABLE));
     }
 
     #[test]
     fn test_sqlstate_extract_first_field() {
         // SQLSTATE-first ordering should still parse.
         let frame = error_response_frame(&[(b'C', b"23505"), (b'S', b"ERROR")]);
-        assert_eq!(sqlstate_extract(&frame), Some(*b"23505"));
+        assert_eq!(sqlstate_extract(&frame), Some(SqlState::new(*b"23505")));
     }
 
     #[test]

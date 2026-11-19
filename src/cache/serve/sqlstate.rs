@@ -1,8 +1,6 @@
 //! Wire-level SQLSTATE extraction from a backend `ErrorResponse` frame.
 
-/// SQLSTATE `42P01` — `undefined_table`. The expected outcome when the cache
-/// table is dropped between dispatch and SELECT (eviction-window race).
-pub(crate) const SQLSTATE_UNDEFINED_TABLE: [u8; 5] = *b"42P01";
+use crate::cache::SqlState;
 
 /// Extract the 5-char SQLSTATE from a backend `ErrorResponse` frame.
 ///
@@ -10,7 +8,7 @@ pub(crate) const SQLSTATE_UNDEFINED_TABLE: [u8; 5] = *b"42P01";
 /// field is `code (1 byte) | value (null-terminated string)`. Field code `'C'`
 /// carries SQLSTATE — always exactly 5 ASCII bytes per the protocol.
 /// Returns `None` when the frame is malformed or the field is missing.
-pub(super) fn sqlstate_extract(frame_data: &[u8]) -> Option<[u8; 5]> {
+pub(super) fn sqlstate_extract(frame_data: &[u8]) -> Option<SqlState> {
     let payload = frame_data.get(5..)?;
     let mut i = 0;
     while i < payload.len() {
@@ -22,10 +20,8 @@ pub(super) fn sqlstate_extract(frame_data: &[u8]) -> Option<[u8; 5]> {
         let rest = payload.get(value_start..)?;
         let value_len = rest.iter().position(|&b| b == 0)?;
         if code == b'C' && value_len == 5 {
-            let value = rest.get(..5)?;
-            let mut out = [0u8; 5];
-            out.copy_from_slice(value);
-            return Some(out);
+            let code = <[u8; 5]>::try_from(rest.get(..5)?).ok()?;
+            return Some(SqlState::new(code));
         }
         i = value_start + value_len + 1;
     }
@@ -58,13 +54,13 @@ mod tests {
             (b'C', b"42P01"),
             (b'M', b"relation does not exist"),
         ]);
-        assert_eq!(sqlstate_extract(&frame), Some(SQLSTATE_UNDEFINED_TABLE));
+        assert_eq!(sqlstate_extract(&frame), Some(SqlState::UNDEFINED_TABLE));
     }
 
     #[test]
     fn test_sqlstate_extract_first_field() {
         let frame = error_response_frame(&[(b'C', b"23505"), (b'M', b"dup")]);
-        assert_eq!(sqlstate_extract(&frame), Some(*b"23505"));
+        assert_eq!(sqlstate_extract(&frame), Some(SqlState::new(*b"23505")));
     }
 
     #[test]

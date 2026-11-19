@@ -46,19 +46,15 @@ async fn cache_error_response_handle(
     broadcast: &mut Option<BroadcastState>,
 ) -> rootcause::Report<CacheError> {
     guard.poisoned = true;
-    let sqlstate = sqlstate_extract(frame_data);
-    let sqlstate_str = sqlstate
-        .as_ref()
-        .and_then(|s| std::str::from_utf8(s).ok())
-        .unwrap_or("?");
-    debug!(
-        "cache ErrorResponse sqlstate={sqlstate_str} bytes_served={bytes_served} — \
-         forwarding to origin"
-    );
+    let error = match sqlstate_extract(frame_data) {
+        Some(sqlstate) => CacheError::CacheServerError { sqlstate },
+        None => CacheError::CacheServerErrorMalformed,
+    };
+    debug!("{error}, bytes_served={bytes_served}: forwarding to origin");
     if let Some(bc) = broadcast.take() {
         broadcast_error_reply(bc).await;
     }
-    CacheError::CacheServerError { sqlstate }.into()
+    error.into()
 }
 
 /// The primary client's side of one serve: its socket and buffered reply, plus

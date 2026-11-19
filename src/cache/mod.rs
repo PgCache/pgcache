@@ -1,3 +1,4 @@
+use std::fmt;
 use std::io;
 
 use ecow::EcoString;
@@ -111,6 +112,32 @@ pub use update_query::{
     SubqueryKind, UpdateEvalStrategy, UpdateQueries, UpdateQuery, UpdateQueryKey, UpdateQuerySource,
 };
 
+/// The five-character SQLSTATE of a backend `ErrorResponse`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct SqlState([u8; 5]);
+
+impl SqlState {
+    /// `undefined_table`: what a hit gets when its cache table was dropped
+    /// between dispatch and SELECT (the eviction-window race).
+    pub const UNDEFINED_TABLE: Self = Self(*b"42P01");
+
+    pub const fn new(code: [u8; 5]) -> Self {
+        Self(code)
+    }
+}
+
+impl fmt::Display for SqlState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0.escape_ascii())
+    }
+}
+
+impl fmt::Debug for SqlState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
 error_set! {
     CacheError := WriteError || ReadError || DbError || ParseError || TableError || SendError || QueryResolutionError || SetupError || PrivilegeError || RlsError || FunctionError
 
@@ -118,12 +145,15 @@ error_set! {
         IoError(io::Error),
         InvalidMessage,
         /// Cache DB returned an ErrorResponse on the hit path. Triggers a
-        /// forward-to-origin retry via CacheReply::Error. `sqlstate` is
-        /// `None` only when the ErrorResponse frame was malformed.
-        #[display("Cache server error (SQLSTATE: {sqlstate:?})")]
+        /// forward-to-origin retry via CacheReply::Error.
+        #[display("Cache server error (SQLSTATE {sqlstate})")]
         CacheServerError {
-            sqlstate: Option<[u8; 5]>,
+            sqlstate: SqlState,
         },
+        /// As `CacheServerError`, from an ErrorResponse frame with no
+        /// SQLSTATE field to read.
+        #[display("Cache server error (no SQLSTATE in the ErrorResponse)")]
+        CacheServerErrorMalformed,
         /// A serve failed after bytes reached the client inside a transaction
         /// block (PGC-387): the connection must close rather than forward.
         ServeAbandonedInBlock,
