@@ -283,21 +283,20 @@ impl QueryParameters {
     pub fn get(&self, index: usize) -> Option<QueryParameter> {
         let value = self.values.get(index)?;
 
-        // Per the extended query protocol, format codes and OIDs may have fewer
-        // entries than there are parameters:
-        //   0 entries  → apply the default (text format / unspecified OID) to all
-        //   1 entry    → apply that single value to all parameters
-        //   N entries  → one entry per parameter
+        // Bind's format codes: none is text for all, one applies to all,
+        // otherwise one per parameter.
         let format = match self.formats.as_slice() {
             [] => 0,
             [single] => *single,
             codes => *codes.get(index)?,
         };
-        let oid = match self.oids.as_slice() {
-            [] => TypeOid::UNSPECIFIED,
-            [single] => *single,
-            oids => *oids.get(index)?,
-        };
+        // Parse's type list is a prefix, not a broadcast: a parameter past
+        // its end is unspecified, as an explicit 0 is.
+        let oid = self
+            .oids
+            .get(index)
+            .copied()
+            .unwrap_or(TypeOid::UNSPECIFIED);
 
         Some(QueryParameter {
             value: value.clone(),
@@ -348,6 +347,52 @@ mod tests {
                 .map(|(_, ty)| TypeOid::from_type(ty))
                 .collect(),
         }
+    }
+
+    fn parameter_oids(values: usize, declared: &[PgType]) -> Vec<TypeOid> {
+        let parameters = QueryParameters {
+            values: vec![Some(Bytes::from_static(b"1")); values],
+            formats: Vec::new(),
+            oids: declared.iter().map(TypeOid::from_type).collect(),
+        };
+        (0..values)
+            .map(|index| parameters.get(index).expect("parameter exists").oid)
+            .collect()
+    }
+
+    /// Parse declares types for a prefix of the parameters (PGC-468): one
+    /// declared type is the first parameter's, not every parameter's, and a
+    /// parameter past a shorter list still exists.
+    #[test]
+    fn test_parameter_past_the_declared_types_is_unspecified() {
+        let int8 = TypeOid::from_type(&PgType::INT8);
+        let text = TypeOid::from_type(&PgType::TEXT);
+        let unspecified = TypeOid::UNSPECIFIED;
+        assert_eq!(parameter_oids(2, &[]), [unspecified, unspecified]);
+        assert_eq!(parameter_oids(2, &[PgType::INT8]), [int8, unspecified]);
+        assert_eq!(
+            parameter_oids(3, &[PgType::INT8, PgType::TEXT]),
+            [int8, text, unspecified]
+        );
+        assert_eq!(
+            parameter_oids(2, &[PgType::INT8, PgType::TEXT]),
+            [int8, text]
+        );
+    }
+
+    /// One format code still applies to every parameter; only the type list
+    /// is a prefix.
+    #[test]
+    fn test_single_format_code_applies_to_every_parameter() {
+        let parameters = QueryParameters {
+            values: vec![Some(Bytes::from_static(b"1")); 3],
+            formats: vec![1],
+            oids: Vec::new(),
+        };
+        for index in 0..3 {
+            assert_eq!(parameters.get(index).expect("parameter exists").format, 1);
+        }
+        assert!(parameters.get(3).is_none());
     }
 
     fn plain(tree: &QueryTree) -> String {

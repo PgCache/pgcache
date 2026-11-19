@@ -177,6 +177,27 @@ mod tests {
         }
     }
 
+    /// A LIMIT placeholder past the end of Parse's type list is undeclared,
+    /// whatever the parameters before it were declared as.
+    #[test]
+    fn test_row_limit_decode_reads_a_placeholder_past_the_declared_types() {
+        let parameters = QueryParameters {
+            values: vec![
+                Some(Bytes::from_static(b"alice")),
+                Some(Bytes::from_static(b"10")),
+            ],
+            formats: Vec::new(),
+            oids: vec![TypeOid::from_type(&PgType::TEXT)],
+        };
+        assert_eq!(
+            decoded(
+                "SELECT id FROM users WHERE name = $1 LIMIT $2",
+                Some(&parameters)
+            ),
+            limit(Some(10), 0)
+        );
+    }
+
     /// Registration reads its population cap from the substituted tree, where
     /// an undeclared bind is a string literal and a NULL bind a NULL.
     #[test]
