@@ -310,7 +310,8 @@ struct SettingsToml {
     #[serde(default)]
     mv_compute_min_rows: Option<u64>,
     /// Total-bytes budget for the in-process hot-result cache (PGC-236).
-    /// 0 disables in-memory result memoization. Defaults to 64 MiB.
+    /// 0 disables in-memory result memoization. Defaults to a quarter of the
+    /// memory budget, at least 64 MiB.
     #[serde(default)]
     memo_cache_size: Option<usize>,
     /// Optional absolute RSS ceiling (bytes) for registration throttling.

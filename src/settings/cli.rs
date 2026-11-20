@@ -938,7 +938,7 @@ impl Settings {
             [--admission_threshold N] (default: 1, clock policy only) \n \
             [--mv_size_ratio N] (default: 10, materialized view size gate) \n \
             [--mv_compute_min_rows N] (default: 1000, ComputeAvoid MV gate threshold in source rows) \n \
-            [--memo_cache_size BYTES] (default: 64 MiB, in-process hot-result cache budget; 0 disables) \n \
+            [--memo_cache_size BYTES] (default: a quarter of the memory budget, at least 64 MiB; in-process hot-result cache budget; 0 disables) \n \
             [--memory_limit BYTES] (default: 80% of detected RAM; absolute ceiling for registration throttling, can only lower) \n \
             [--disk_limit BYTES] (default: auto from free disk; cap on cache-volume space used before throttling + table drops) \n \
             [--tls_cert CERT_FILE --tls_key KEY_FILE] \n \
@@ -952,7 +952,8 @@ impl Settings {
             [--cleanup [--purge]] (drop this instance's replication slot and publication on the origin and exit, for an instance that was killed or is being retired; --purge also drops the event triggers and schema every pgcache on the database shares) \n \
             [--healthcheck] (probe a running pgcache's /healthz on --metrics_socket and exit 0 when it answers; for container health checks) \n \
             [--origin_locale] (print origin's database locale, provider and collation version on one line and exit; the image picks its cache PostgreSQL from it) \n \
-            [--version] (print the pgcache version and exit)"
+            [--version] (print the pgcache version and exit) \n \
+            A flag overrides the config file's value. Without a config file the unbracketed flags are required; with one, only the --cache_* flags, and only when the file has no [cache] table."
         );
         std::process::exit(1);
     }

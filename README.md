@@ -120,8 +120,8 @@ pgcache -c pgcache.toml
 ```
 
 Every setting also has an equivalent CLI flag (`--origin_host`, `--cache_host`,
-`--cdc_publication_name`, `--listen_socket`, `--num_workers`, …) and environment variable;
-run `pgcache --help` for the full list.
+`--cdc_publication_name`, `--listen_socket`, `--num_workers`, …), and a flag overrides the
+file; run `pgcache --help` for the full list.
 
 **3.** Point your application at pgcache by changing one connection string:
 
@@ -135,7 +135,8 @@ origin otherwise.
 
 > **Deploying with Docker?** The [Docker image](https://hub.docker.com/r/pgcache/pgcache) bundles the cache
 > PostgreSQL (with `pgcache_pgrx` already preloaded) and wraps all of the above behind a
-> single `--upstream postgres://…` flag. The try script above runs this same image;
+> single `--upstream postgres://…` flag. A config file mounted into the image leaves out
+> `[cache]`. The try script above runs this same image;
 > [Deploy → Docker](https://www.pgcache.com/docs/docker/) covers Compose, TLS, and production settings.
 
 ## Telemetry
