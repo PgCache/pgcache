@@ -1523,18 +1523,14 @@ fn test_config_parse_error_never_echoes_the_file() {
         .expect_err("num_workers sits under [metrics]");
     let rendered = format!("{error} / {error:?}");
     assert!(
-        rendered.contains("missing field `num_workers`"),
+        rendered.contains("unknown field `num_workers`"),
         "{rendered}"
     );
     assert!(
         rendered.contains(
-            "it is set under [metrics]; a top-level key must come before the first [table] header"
+            "at line 23 (`num_workers` is a top-level key and must come before the first [table] header)"
         ),
         "{rendered}"
-    );
-    assert!(
-        !rendered.contains("at line"),
-        "a missing field names no line\n{rendered}"
     );
     assert!(!rendered.contains("s3cret"), "{rendered}");
 
@@ -1558,8 +1554,58 @@ fn test_config_parse_error_never_echoes_the_file() {
     fs::remove_dir_all(&dir).expect("remove temp dir");
 }
 
-/// The misplaced-key hint is only for a key the file sets inside a table. A
-/// table the file leaves out, or a field missing from a table while another
+/// A complete config file, for a test to add a key to.
+const VALID_CONFIG: &str = "num_workers = 2\n\n[origin]\nhost = \"h\"\nport = 5432\nuser = \"u\"\n\
+     database = \"d\"\n\n[cdc]\npublication_name = \"p\"\nslot_name = \"s\"\n\n\
+     [listen]\nsocket = \"127.0.0.1:1\"\n";
+
+fn config_parse_error(content: &str) -> String {
+    toml::from_str::<SettingsToml>(content)
+        .map_err(|e| toml_parse_error(e.message(), e.span(), content))
+        .expect_err("the file names a key no table takes")
+        .to_string()
+}
+
+/// A key no table takes is refused rather than ignored: an optional key
+/// appended below the last `[table]` header, or misspelled, would otherwise
+/// never apply and nothing would say so (PGC-644).
+#[test]
+fn test_config_parse_refuses_unknown_keys() {
+    toml::from_str::<SettingsToml>(VALID_CONFIG).expect("the base file parses");
+
+    // A top-level key appended to the end lands in the last table.
+    let appended = format!("{VALID_CONFIG}excluded_tables = [\"audit_logs\"]\n");
+    let rendered = config_parse_error(&appended);
+    assert!(
+        rendered.contains("unknown field `excluded_tables`"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(
+            "at line 15 (`excluded_tables` is a top-level key and must come before the first [table] header)"
+        ),
+        "{rendered}"
+    );
+
+    // A misspelled top-level key is no key anywhere: no hint.
+    let misspelled = format!("exclude_tables = [\"audit_logs\"]\n{VALID_CONFIG}");
+    let rendered = config_parse_error(&misspelled);
+    assert!(
+        rendered.contains("unknown field `exclude_tables`"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("at line 1"), "{rendered}");
+    assert!(!rendered.contains("[table] header"), "{rendered}");
+
+    // Nor is a key a table does not take and the top level does not either.
+    let in_table = VALID_CONFIG.replace("port = 5432\n", "port = 5432\nsslmode = \"require\"\n");
+    let rendered = config_parse_error(&in_table);
+    assert!(rendered.contains("unknown field `sslmode`"), "{rendered}");
+    assert!(!rendered.contains("[table] header"), "{rendered}");
+}
+
+/// The misplaced-key hint is only for a key the top level takes. A table
+/// the file leaves out, or a field missing from a table while another
 /// table sets a key of that name, gets no such hint (PGC-636).
 #[test]
 fn test_config_parse_error_hints_only_at_a_misplaced_key() {

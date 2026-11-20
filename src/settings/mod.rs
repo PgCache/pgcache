@@ -43,10 +43,9 @@ error_set! {
 }
 
 /// A config file parse error located in `content` by `span`, as the `toml`
-/// and `toml_edit` parsers report it. A missing top-level field has the
-/// empty document start as its span, which names no line; when the key was
-/// written below a `[table]` header, which TOML reads as a key of that
-/// table, the message names the table.
+/// and `toml_edit` parsers report it. A key no table takes is an error, and
+/// the message says so when it is a top-level key written below a `[table]`
+/// header, which TOML reads as a key of that table.
 pub(super) fn toml_parse_error(
     message: &str,
     span: Option<std::ops::Range<usize>>,
@@ -57,29 +56,34 @@ pub(super) fn toml_parse_error(
             .get(..span.start)
             .map_or(1, |before| before.matches('\n').count() + 1)
     });
-    let message = match line {
+    let located = match line {
         Some(line) => format!("{message} at line {line}"),
-        None => match missing_key_table_find(message, content) {
-            Some(table) => format!(
-                "{message} (it is set under [{table}]; a top-level key must come before the first [table] header)"
-            ),
-            None => message.to_owned(),
-        },
+        None => message.to_owned(),
+    };
+    let message = match misplaced_top_level_key_find(message) {
+        Some(key) => format!(
+            "{located} (`{key}` is a top-level key and must come before the first [table] header)"
+        ),
+        None => located,
     };
     ConfigError::TomlParse { message }
 }
 
-/// The `[table]` that holds the key a "missing field" message names, when
-/// the file sets that key inside a table instead of at the top level.
-fn missing_key_table_find(message: &str, content: &str) -> Option<String> {
-    let key = message.strip_prefix("missing field `")?.split('`').next()?;
-    let document = content.parse::<toml_edit::DocumentMut>().ok()?;
-    document.iter().find_map(|(table, item)| {
-        item.as_table()?
-            .get(key)?
-            .is_value()
-            .then(|| table.to_owned())
-    })
+/// The key an "unknown field" message names, when the top level of the
+/// config file takes that key: it was written below a `[table]` header,
+/// which TOML reads as a key of that table.
+fn misplaced_top_level_key_find(message: &str) -> Option<&str> {
+    let key = message.strip_prefix("unknown field `")?.split('`').next()?;
+    let bare = !key.is_empty()
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    // A document of the key alone fails on something else when the top
+    // level knows the key, so the set of keys is never listed twice.
+    let known = bare
+        && toml::from_str::<SettingsToml>(&format!("{key} = 0"))
+            .is_err_and(|e| !e.message().starts_with("unknown field"));
+    known.then_some(key)
 }
 
 /// Concrete wrapper around an arbitrary boxed error so it satisfies the
@@ -229,6 +233,7 @@ impl FromStr for SslMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PgSettings {
     pub host: String,
     pub port: u16,
@@ -243,6 +248,7 @@ pub struct PgSettings {
 /// Partial PostgreSQL settings where all fields are optional.
 /// Used for replication settings that cascade defaults from origin.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PgSettingsPartial {
     pub host: Option<String>,
     pub port: Option<u16>,
@@ -255,23 +261,27 @@ pub struct PgSettingsPartial {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CdcSettings {
     pub publication_name: String,
     pub slot_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListenSettings {
     pub socket: SocketAddr,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetricsSettings {
     pub socket: SocketAddr,
 }
 
 /// Internal struct for TOML deserialization with optional replication settings.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SettingsToml {
     origin: PgSettings,
     #[serde(default)]
