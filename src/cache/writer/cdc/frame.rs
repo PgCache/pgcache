@@ -8,6 +8,7 @@ use ecow::EcoString;
 use tokio::time::sleep;
 use tracing::{error, info};
 
+use super::dispatch::fault_cdc_commit_deadlock_sql;
 use super::segment_eval::{BatchEvalView, SegmentEvents, SegmentMembership};
 use super::toast_repair::toasted_column_names;
 use super::{RelationRow, RelationUpdate, WriterCdc};
@@ -49,6 +50,9 @@ impl WriterCdc {
     /// were already flushed, `frame_buf` holds only the tail + `COMMIT`.
     async fn frame_commit(&mut self, core: &mut WriterCore) -> CacheResult<()> {
         if core.frame_state == FrameState::TxnOpen {
+            if let Some(failing) = fault_cdc_commit_deadlock_sql() {
+                core.frame_buf.push_str(failing);
+            }
             core.frame_buf.push_str("COMMIT");
             self.cdc_write_conn
                 .batch_execute(&core.frame_buf)
@@ -65,10 +69,10 @@ impl WriterCdc {
     /// server-side txn if a chunk had already opened one, and enter `Recovering`
     /// (relation-level recovery happens at `CommitMark`, PGC-147).
     pub(super) async fn frame_recover_enter(&mut self, core: &mut WriterCore) -> CacheResult<()> {
-        // A fully-buffered frame never sent anything (a failed `BEGIN; …; COMMIT`
-        // batch auto-rolls-back), so only an already-flushed chunk leaves a live
-        // aborted txn block that needs an explicit ROLLBACK.
-        if core.frame_chunk_flushed {
+        // A batch that failed after its `BEGIN` leaves the session in an
+        // aborted txn block, as an already-flushed chunk does: only a
+        // ROLLBACK ends it. A frame not yet `TxnOpen` sent nothing.
+        if core.frame_chunk_flushed || core.frame_state == FrameState::TxnOpen {
             self.cdc_write_conn
                 .batch_execute("ROLLBACK")
                 .await

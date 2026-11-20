@@ -947,6 +947,21 @@ mod fault {
     pub(super) fn cdc_deadlock_take() -> bool {
         CDC_DEADLOCK_ONCE.swap(false, Ordering::Relaxed)
     }
+
+    /// One-shot (`PGCACHE_FAULT_CDC_COMMIT_DEADLOCK_ONCE`): the first frame
+    /// commit fails with `40P01`, after the frame's invalidations were
+    /// flushed, which an arrival-time deadlock never reaches.
+    pub(super) fn cdc_commit_deadlock_take() -> bool {
+        use std::sync::OnceLock;
+        static ARMED: OnceLock<AtomicBool> = OnceLock::new();
+        ARMED
+            .get_or_init(|| {
+                AtomicBool::new(
+                    std::env::var_os("PGCACHE_FAULT_CDC_COMMIT_DEADLOCK_ONCE").is_some(),
+                )
+            })
+            .swap(false, Ordering::Relaxed)
+    }
 }
 
 /// Whether to simulate a CDC-frame `40P01` for the current insert. Always
@@ -962,6 +977,20 @@ fn fault_cdc_deadlock_should_inject(core: &WriterCore) -> bool {
 #[cfg(not(feature = "fault-injection"))]
 fn fault_cdc_deadlock_should_inject(_core: &WriterCore) -> bool {
     false
+}
+
+/// A statement that fails the frame's commit batch as a deadlock victim
+/// would, when the commit-deadlock one-shot is armed.
+#[cfg(feature = "fault-injection")]
+pub(super) fn fault_cdc_commit_deadlock_sql() -> Option<&'static str> {
+    fault::cdc_commit_deadlock_take().then_some(
+        "DO $$BEGIN RAISE EXCEPTION 'fault: injected commit deadlock' USING ERRCODE = '40P01'; END$$;",
+    )
+}
+
+#[cfg(not(feature = "fault-injection"))]
+pub(super) fn fault_cdc_commit_deadlock_sql() -> Option<&'static str> {
+    None
 }
 
 /// Test-only flush hold (PGC-242): with `PGCACHE_FAULT_CDC_HOLD_FLUSH_FRAMES=N`

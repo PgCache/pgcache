@@ -488,6 +488,70 @@ async fn test_cdc_frame_deadlock_recovery() -> Result<(), Error> {
     Ok(())
 }
 
+/// A `40P01` at the frame's commit, where buffered writes reach the server
+/// as one `BEGIN; …; COMMIT`, recovers like one at a row's arrival. The
+/// failed batch leaves the session in an aborted transaction block; left
+/// there, the recovery's own truncate is refused and the cache resets.
+/// Forced by the one-shot `PGCACHE_FAULT_CDC_COMMIT_DEADLOCK_ONCE`.
+#[cfg(feature = "fault-injection")]
+#[tokio::test]
+async fn test_cdc_frame_commit_deadlock_recovery() -> Result<(), Error> {
+    let mut ctx =
+        TestContext::setup_fault(&[("PGCACHE_FAULT_CDC_COMMIT_DEADLOCK_ONCE", "1")]).await?;
+    ctx.query(
+        "create table rec_c (id integer primary key, k integer)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "insert into rec_c select g, g % 4 from generate_series(1, 40) g",
+        &[],
+    )
+    .await?;
+    ctx.cdc_decode_settle().await?;
+
+    let q = "SELECT count(*) FROM rec_c WHERE k = 0";
+    let m = ctx.metrics().await?;
+    ctx.simple_query(q).await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+    ctx.simple_query(q).await?;
+    let m = assert_cache_hit(&mut ctx, m).await?;
+
+    // The first write applied in place opens the frame's txn; its commit
+    // is the one the fault fails.
+    ctx.origin
+        .batch_execute("insert into rec_c (id, k) values (10001, 0)")
+        .await
+        .map_err(Error::other)?;
+
+    // Recovery did not reset the cache: the settle would see it unavailable.
+    ctx.cdc_apply_settle().await?;
+
+    let expected = ctx.origin.simple_query(q).await.map_err(Error::other)?;
+    let after = ctx.simple_query(q).await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    assert_eq!(scalar_of(&after), scalar_of(&expected));
+
+    ctx.cache_settle().await?;
+    let rehit = ctx.simple_query(q).await?;
+    assert_cache_hit(&mut ctx, m).await?;
+    assert_eq!(scalar_of(&rehit), scalar_of(&expected));
+
+    // A later write commits on the same connection.
+    ctx.origin
+        .batch_execute("insert into rec_c (id, k) values (10002, 0)")
+        .await
+        .map_err(Error::other)?;
+    ctx.cdc_apply_settle().await?;
+    let expected = ctx.origin.simple_query(q).await.map_err(Error::other)?;
+    let m = ctx.metrics().await?;
+    let served = ctx.simple_query(q).await?;
+    assert_cache_hit(&mut ctx, m).await?;
+    assert_eq!(scalar_of(&served), scalar_of(&expected));
+    Ok(())
+}
+
 /// One fat source transaction updating ~70 rows of a relation referenced by
 /// several join (PgEval) queries — exercises the batched per-segment
 /// membership eval (PGC-241) across the `PG_EVAL_ROW_CHUNK` (64) boundary and
