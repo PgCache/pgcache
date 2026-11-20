@@ -22,8 +22,8 @@ use super::term_fold::bare_select_item;
 use crate::catalog::{FunctionFacts, FunctionKind, FunctionRow, FunctionVolatility};
 use crate::oid::FunctionOid;
 use crate::query::ast::rope::{
-    Body, Node, NodeKind, NodeRef, QueryTree, Replacement, Replacements, ScalarKind, SelectItem,
-    TreeBuilder, View,
+    Body, LimitCount, Node, NodeKind, NodeRef, QueryTree, Replacement, Replacements, ScalarKind,
+    SelectItem, TreeBuilder, View,
 };
 use crate::query::ast::{LiteralValue, NodeId, SubLinkType, query_tree_parse};
 use crate::query::cast::CastTarget;
@@ -301,7 +301,9 @@ fn body_shape(tree: &QueryTree) -> Result<BodyShape, FunctionBodyError> {
     }
     match (query.limit_count(), query.limit_offset()) {
         (None, None) => Ok(BodyShape::Subquery { add_limit: true }),
-        (Some(count), None) if *count.value() == LiteralValue::Integer(1) => {
+        (Some(count), None)
+            if count.literal() == Some(&LiteralValue::Integer(1)) && !query.with_ties() =>
+        {
             Ok(BodyShape::Subquery { add_limit: false })
         }
         _ => Err(FunctionBodyError::LimitNotOne),
@@ -601,7 +603,7 @@ impl FragmentEmitter<'_> {
             } => NodeKind::Query {
                 cte_count: *cte_count,
                 order_by_count: *order_by_count,
-                has_limit_count: true,
+                limit_count: LimitCount::Rows,
                 has_limit_offset: *has_limit_offset,
             },
             other => other.clone(),

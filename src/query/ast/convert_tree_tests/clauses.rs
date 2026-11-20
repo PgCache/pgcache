@@ -78,6 +78,63 @@ fn test_group_by_having_cases() {
     );
 }
 
+/// Every LIMIT and OFFSET form converts (PGC-640, PGC-643): the ones
+/// PostgreSQL reads as a plain bigint become that literal or drop out, and
+/// the rest stay as written for the cacheability check to refuse.
+#[test]
+fn test_limit_forms_reduce_to_a_literal_or_stay_as_written() {
+    #[rustfmt::skip]
+    let cases = [
+        ("all",                  "LIMIT ALL",                              ""),
+        ("null",                 "LIMIT NULL OFFSET NULL",                 ""),
+        ("null cast",            "LIMIT NULL::int",                        ""),
+        ("untyped string",       "LIMIT '2' OFFSET ' 7 '",                 " LIMIT 2 OFFSET 7"),
+        ("wide integer",         "LIMIT 3000000000",                       " LIMIT 3000000000"),
+        ("integer cast",         "LIMIT 10::int OFFSET '5'::bigint",       " LIMIT 10 OFFSET 5"),
+        ("smallint cast",        "LIMIT 10::smallint",                     " LIMIT 10"),
+        ("placeholder bigint",   "LIMIT $1::bigint OFFSET $2",             " LIMIT $1 OFFSET $2"),
+        ("fetch first only",     "FETCH FIRST 2 ROWS ONLY",                " LIMIT 2"),
+        ("ties of no limit",     "FETCH FIRST (NULL) ROWS WITH TIES",      ""),
+        ("constant arithmetic",  "LIMIT 1 + 1 OFFSET 2 * 5",               " LIMIT 2 OFFSET 10"),
+        ("placeholder int",      "LIMIT $1::int",                          " LIMIT ($1)::int4"),
+        ("cast out of range",    "LIMIT 3000000000::int",                  " LIMIT (3000000000)::int4"),
+        ("numeric",              "LIMIT 2.5",                              " LIMIT 2.5"),
+        ("word",                 "LIMIT 'ten'",                            " LIMIT 'ten'"),
+        ("arithmetic",           "LIMIT $1 + 1 OFFSET ($1 - 1) * $2",      " LIMIT ($1 + 1) OFFSET (($1 - 1) * $2)"),
+        ("function",             "LIMIT f(1)",                             " LIMIT F(1)"),
+        ("with ties",            "FETCH FIRST 2 ROWS WITH TIES",           " FETCH FIRST (2) ROWS WITH TIES"),
+        ("with ties and offset", "OFFSET 1 FETCH FIRST $1 ROWS WITH TIES", " FETCH FIRST ($1) ROWS WITH TIES OFFSET 1"),
+    ];
+    let base = "SELECT * FROM users ORDER BY id ASC";
+    for (label, limit, expected) in cases {
+        let tree = parse(&format!("{base} {limit}"));
+        assert_eq!(tree.sql(), format!("{base}{expected}"), "{label}: {limit}");
+        assert_eq!(
+            tree.root().with_ties(),
+            expected.contains("WITH TIES"),
+            "{label}"
+        );
+    }
+}
+
+/// The session hash leaves out a root LIMIT that is a literal, the row
+/// count the dispatch tracks apart. An expression or WITH TIES is no such
+/// count, so a query with one never shares the key of its literal sibling.
+#[test]
+fn test_session_hash_leaves_out_only_a_literal_limit() {
+    let hash = |limit: &str| session_hash(&parse(&format!("SELECT * FROM users {limit}")));
+    assert_eq!(hash("LIMIT ALL"), hash(""));
+    assert_eq!(hash("LIMIT '5' OFFSET $1"), hash("LIMIT 10 OFFSET 5"));
+    assert_ne!(hash("LIMIT $1 + 1"), hash("LIMIT 10"));
+    assert_ne!(hash("LIMIT $1 + 1"), hash("LIMIT $1 + 2"));
+    assert_ne!(hash("LIMIT 10 OFFSET f(2)"), hash("LIMIT 10 OFFSET 5"));
+    assert_ne!(hash("LIMIT $1::int"), hash("LIMIT $1"));
+    assert_ne!(
+        hash("ORDER BY id FETCH FIRST 2 ROWS WITH TIES"),
+        hash("ORDER BY id LIMIT 2")
+    );
+}
+
 #[test]
 fn test_limit_cases() {
     use LiteralValue::{Integer, Parameter};
@@ -93,8 +150,10 @@ fn test_limit_cases() {
     for (label, sql, expected) in cases {
         let tree = parse(sql);
         let actual = (
-            tree.root().limit_count().map(|l| l.value().clone()),
-            tree.root().limit_offset().map(|l| l.value().clone()),
+            tree.root().limit_count().and_then(|l| l.literal().cloned()),
+            tree.root()
+                .limit_offset()
+                .and_then(|l| l.literal().cloned()),
         );
         assert_eq!(actual, expected, "{label}: {sql}");
         assert_eq!(

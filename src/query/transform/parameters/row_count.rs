@@ -83,7 +83,7 @@ fn oid_is_undeclared(oid: TypeOid) -> bool {
 /// `text` as PostgreSQL's bigint input reads it, for the decimal spelling:
 /// an optional sign and digits, with whitespace around them. The hex, octal,
 /// binary and underscore spellings are left to origin.
-fn bigint_text_parse(text: &str) -> Option<i64> {
+pub(crate) fn bigint_text_parse(text: &str) -> Option<i64> {
     text.trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\x0B' | '\x0C' | '\r'))
         .parse()
         .ok()

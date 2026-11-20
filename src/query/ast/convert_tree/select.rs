@@ -6,18 +6,22 @@ use pg_query::pg_nodes as pg;
 use smallvec::SmallVec;
 
 use super::from::source_emit;
-use super::scalar::scalar_emit;
-use super::where_clause::{column_ref_emit, const_value_extract, where_emit};
+use super::scalar::{scalar_emit, type_name_render};
+use super::where_clause::{column_ref_emit, const_value_extract, param_ref_extract, where_emit};
 use super::window::{order_by_emit, window_defs_extract};
 use super::{ExpressionScope, ParseContext, RawCte, cte_raw};
 use crate::query::ast::raw::{
     NodePtr, cast, cstr, list_is_empty, list_len, list_nodes, node_tag, node_tag_name,
     string_node_value,
 };
-use crate::query::ast::rope::{NodeKind, TreeBuilder};
+use crate::query::ast::rope::{LimitCount, NodeKind, TreeBuilder};
 use crate::query::ast::{AstError, LiteralValue, SetOpType};
+use crate::query::cast::{
+    cast_target_from_canonical, cast_target_integer_bits, integer_bits_contain,
+};
+use crate::query::transform::bigint_text_parse;
 
-/// Emit a query: its CTEs, body, ORDER BY and LIMIT literals.
+/// Emit a query: its CTEs, body, ORDER BY and LIMIT values.
 pub(super) unsafe fn query_emit(
     builder: &mut TreeBuilder<'_>,
     select_stmt: *const pg::SelectStmt,
@@ -31,14 +35,21 @@ pub(super) unsafe fn query_emit(
         }
         let ctes = with_clause_extract((*select_stmt).withClause)?;
         let ctx = ParseContext::with_ctes(outer_ctx, &ctes);
-        let limit_count = limit_node_extract((*select_stmt).limitCount as NodePtr)?;
-        let limit_offset = limit_node_extract((*select_stmt).limitOffset as NodePtr)?;
+        let count = row_count_extract((*select_stmt).limitCount as NodePtr)?;
+        let offset = row_count_extract((*select_stmt).limitOffset as NodePtr)?;
+        let with_ties = (*select_stmt).limitOption == pg::LimitOption_LIMIT_OPTION_WITH_TIES;
+        let limit_count = match (count.is_present(), with_ties) {
+            // Ties of a count that limits nothing add no rows.
+            (false, _) => LimitCount::Absent,
+            (true, false) => LimitCount::Rows,
+            (true, true) => LimitCount::RowsWithTies,
+        };
 
         let open = builder.open(NodeKind::Query {
             cte_count: list_len_u32(ctes.len()),
             order_by_count: list_len((*select_stmt).sortClause),
-            has_limit_count: limit_count.is_some(),
-            has_limit_offset: limit_offset.is_some(),
+            limit_count,
+            has_limit_offset: offset.is_present(),
         });
         for (index, cte) in ctes.iter().enumerate() {
             let cte_ctx = ParseContext::with_ctes(outer_ctx, ctes.get(..index).unwrap_or(&[]));
@@ -50,8 +61,16 @@ pub(super) unsafe fn query_emit(
             (*select_stmt).sortClause,
             ExpressionScope::of(&ctx),
         )?;
-        for literal in [limit_count, limit_offset].into_iter().flatten() {
-            builder.leaf(NodeKind::Literal(literal));
+        for value in [count, offset] {
+            match value {
+                RowCount::Absent => {}
+                RowCount::Literal(literal) => {
+                    builder.leaf(NodeKind::Literal(literal));
+                }
+                RowCount::Expression(node) => {
+                    scalar_emit(builder, node, ExpressionScope::of(&ctx))?;
+                }
+            }
         }
         builder.close(open);
         Ok(())
@@ -311,28 +330,87 @@ unsafe fn star_qualifier(
     }
 }
 
-/// A LIMIT or OFFSET value: an integer literal or a placeholder.
-unsafe fn limit_node_extract(node: NodePtr) -> Result<Option<LiteralValue>, AstError> {
+/// The width PostgreSQL reads a LIMIT or OFFSET value in.
+const BIGINT_BITS: u32 = 64;
+
+/// A LIMIT or OFFSET value as the tree carries it.
+enum RowCount {
+    /// No clause, or one that limits nothing: `LIMIT ALL`, `LIMIT NULL`.
+    Absent,
+    /// An integer or a placeholder, which a cacheable query is served by.
+    Literal(LiteralValue),
+    /// Anything else, kept as written for origin to evaluate.
+    Expression(NodePtr),
+}
+
+impl RowCount {
+    fn is_present(&self) -> bool {
+        match self {
+            RowCount::Absent => false,
+            RowCount::Literal(_) | RowCount::Expression(_) => true,
+        }
+    }
+}
+
+/// A LIMIT or OFFSET value, reduced to a literal where PostgreSQL reads the
+/// same bigint from it: a constant, a placeholder, or either cast to an
+/// integer type that changes nothing.
+unsafe fn row_count_extract(node: NodePtr) -> Result<RowCount, AstError> {
     unsafe {
         if node.is_null() {
-            return Ok(None);
+            return Ok(RowCount::Absent);
         }
+        let reduced = if node_tag(node) == pg::NodeTag_T_TypeCast {
+            let type_cast = cast::<pg::TypeCast>(node);
+            let arg = (*type_cast).arg as NodePtr;
+            if arg.is_null() || (*type_cast).typeName.is_null() {
+                None
+            } else {
+                let target = cast_target_from_canonical(&type_name_render((*type_cast).typeName)?);
+                cast_target_integer_bits(&target).and_then(|bits| row_count_reduce(arg, bits))
+            }
+        } else {
+            row_count_reduce(node, BIGINT_BITS)
+        };
+        Ok(reduced.unwrap_or(RowCount::Expression(node)))
+    }
+}
+
+/// The literal `node` reduces to as an integer `bits` wide: a constant in
+/// that range, or a placeholder when the width is a bigint's. A narrower
+/// cast range-checks the bound value, which only origin can do. `None` for
+/// anything else.
+unsafe fn row_count_reduce(node: NodePtr, bits: u32) -> Option<RowCount> {
+    unsafe {
         match node_tag(node) {
             pg::NodeTag_T_A_Const => {
-                let value = const_value_extract(cast::<pg::A_Const>(node))?;
-                match value {
-                    LiteralValue::Integer(_) => Ok(Some(value)),
-                    _ => Err(AstError::UnsupportedFeature {
-                        feature: format!("LIMIT/OFFSET value: {value:?}"),
-                    }),
+                let constant = cast::<pg::A_Const>(node);
+                if (*constant).isnull {
+                    return Some(RowCount::Absent);
                 }
+                const_bigint(constant)
+                    .filter(|value| integer_bits_contain(bits, i128::from(*value)))
+                    .map(|value| RowCount::Literal(LiteralValue::Integer(value)))
             }
-            pg::NodeTag_T_ParamRef => Ok(Some(LiteralValue::Parameter(
-                format!("${}", (*cast::<pg::ParamRef>(node)).number).into(),
-            ))),
-            other => Err(AstError::UnsupportedFeature {
-                feature: format!("{} in LIMIT/OFFSET", node_tag_name(other)),
-            }),
+            pg::NodeTag_T_ParamRef if bits == BIGINT_BITS => Some(RowCount::Literal(
+                param_ref_extract(cast::<pg::ParamRef>(node)),
+            )),
+            _ => None,
+        }
+    }
+}
+
+/// The bigint an integer-valued constant spells. The parser holds one too
+/// wide for an int as a Float node, and an untyped string is read as the
+/// bigint its position requires.
+unsafe fn const_bigint(constant: *const pg::A_Const) -> Option<i64> {
+    unsafe {
+        let val = &(*constant).val;
+        match val.node.type_ {
+            pg::NodeTag_T_Integer => Some(i64::from(val.ival.ival)),
+            pg::NodeTag_T_Float => cstr(val.fval.fval).parse().ok(),
+            pg::NodeTag_T_String => bigint_text_parse(cstr(val.sval.sval)),
+            _ => None,
         }
     }
 }

@@ -8,8 +8,8 @@ use super::plan::{
 };
 use crate::cache::SubqueryKind;
 use crate::query::ast::rope::{
-    Body, JoinQualKind, NodeKind, Query, QueryTree, Remap, Replacement, Replacements, SetOp,
-    TreeBuilder, View,
+    Body, JoinQualKind, LimitCount, NodeKind, Query, QueryTree, Remap, Replacement, Replacements,
+    SetOp, TreeBuilder, View,
 };
 use crate::query::ast::{BinaryOp, NodeId, UnaryOp};
 
@@ -227,7 +227,7 @@ impl<'t> Emitter<'t> {
         let query = self.builder.open(NodeKind::Query {
             cte_count: 0,
             order_by_count: 0,
-            has_limit_count: false,
+            limit_count: LimitCount::Absent,
             has_limit_offset: false,
         });
         let select = self.builder.open(NodeKind::Select {

@@ -23,7 +23,9 @@ use crate::catalog::{Catalog, ColumnMask};
 use crate::oid::Oid;
 use crate::query::Fingerprint;
 use crate::query::ast::JoinType;
-use crate::query::ast::rope::{Body, NodeKind, QueryTree, Select, Source, TreeBuilder, View};
+use crate::query::ast::rope::{
+    Body, LimitCount, NodeKind, QueryTree, Select, Source, TreeBuilder, View,
+};
 use crate::query::compiled_predicate::CompiledPredicate;
 use crate::query::decorrelate::query_decorrelate;
 use crate::query::join_region::JoinRegion;
@@ -124,7 +126,7 @@ fn query_tree_without_limit(query: &QueryTree) -> QueryTree {
         NodeKind::Query {
             cte_count,
             order_by_count,
-            has_limit_count: false,
+            limit_count: LimitCount::Absent,
             has_limit_offset: false,
         },
         root.id(),

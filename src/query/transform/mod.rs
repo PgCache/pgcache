@@ -40,12 +40,14 @@ pub use function_inline::{
     TypeCasts, function_body_parse, query_tree_functions_inline,
 };
 pub use literal_canon::{LiteralCanonOutcome, query_literals_canonicalise};
+pub(crate) use parameters::{
+    bigint_text_parse, literal_is_parameterizable, placeholder_row_count_literal,
+};
 #[cfg(feature = "proxy")]
 pub(crate) use parameters::{
     delete_statement_parameterize, insert_statement_parameterize, literal_value_parameters_replace,
     update_statement_parameterize,
 };
-pub(crate) use parameters::{literal_is_parameterizable, placeholder_row_count_literal};
 pub use predicate_pushdown::query_predicate_pushdown;
 pub use session_terms::{
     CustomSettingValue, FoldedTerm, SessionTermContext, SessionTermError, query_tree_setting_names,

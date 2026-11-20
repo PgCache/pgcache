@@ -13,7 +13,7 @@ use crate::cache::QueryParameter;
 use crate::query::ast::LiteralValue;
 
 pub(crate) use replace::literal_value_parameters_replace;
-pub(crate) use row_count::placeholder_row_count_literal;
+pub(crate) use row_count::{bigint_text_parse, placeholder_row_count_literal};
 #[cfg(feature = "proxy")]
 pub(crate) use write_parameterize::{
     delete_statement_parameterize, insert_statement_parameterize, update_statement_parameterize,

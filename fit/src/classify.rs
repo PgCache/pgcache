@@ -172,6 +172,9 @@ fn cacheability_reason(error: &CacheabilityError) -> (PassthroughReason, Option<
         ),
 
         CacheabilityError::HasLimit => (PassthroughReason::HasLimit, None),
+        CacheabilityError::UnsupportedLimit { form } => {
+            (PassthroughReason::HasLimit, Some(form.to_string()))
+        }
         CacheabilityError::SystemCatalogReference { relation } => (
             PassthroughReason::SystemCatalogReference,
             Some(relation.to_string()),

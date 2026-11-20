@@ -21,17 +21,37 @@ pub struct Node {
     pub kind: NodeKind,
 }
 
+/// Whether a query has a LIMIT count, and whether its result also takes the
+/// rows tied with the last one (`FETCH FIRST … WITH TIES`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum LimitCount {
+    #[default]
+    Absent,
+    Rows,
+    RowsWithTies,
+}
+
+impl LimitCount {
+    pub fn is_present(self) -> bool {
+        match self {
+            LimitCount::Absent => false,
+            LimitCount::Rows | LimitCount::RowsWithTies => true,
+        }
+    }
+}
+
 /// What a node is, with the counts and flags that say which children follow
 /// it. Children come in the order the variant's doc lists; a count is that
 /// many subtrees, a flag is one subtree when set.
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub enum NodeKind {
     /// Children: `cte_count` × `Cte`, the body, `order_by_count` ×
-    /// `OrderBy`, then the LIMIT count and offset literals when flagged.
+    /// `OrderBy`, then the LIMIT count and offset scalars when present: a
+    /// literal each in a cacheable query.
     Query {
         cte_count: u32,
         order_by_count: u32,
-        has_limit_count: bool,
+        limit_count: LimitCount,
         has_limit_offset: bool,
     },
     /// Children: `alias_count` × `Name`, then the query.
@@ -254,9 +274,15 @@ impl NodeKind {
             NodeKind::Query {
                 cte_count,
                 order_by_count,
-                has_limit_count,
+                limit_count,
                 has_limit_offset,
-            } => cte_count + 1 + order_by_count + flag(*has_limit_count) + flag(*has_limit_offset),
+            } => {
+                cte_count
+                    + 1
+                    + order_by_count
+                    + flag(limit_count.is_present())
+                    + flag(*has_limit_offset)
+            }
             NodeKind::Cte { alias_count, .. } => alias_count + 1,
             NodeKind::Select {
                 item_count,
@@ -338,18 +364,6 @@ impl NodeKind {
                 ..
             } => 1 + collation_count + opclass_count + opclass_option_count,
             NodeKind::IndexOption { has_value, .. } => flag(*has_value),
-        }
-    }
-
-    /// How many LIMIT literals end a query node's subtree.
-    pub(super) fn limit_count(&self) -> u32 {
-        match self {
-            NodeKind::Query {
-                has_limit_count,
-                has_limit_offset,
-                ..
-            } => u32::from(*has_limit_count) + u32::from(*has_limit_offset),
-            _ => 0,
         }
     }
 }

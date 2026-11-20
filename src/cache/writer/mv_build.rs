@@ -642,8 +642,8 @@ mod tests {
     /// Whether any query node carries ORDER BY or LIMIT.
     fn any_ordered_or_limited(tree: &QueryTree) -> bool {
         kinds(tree).any(|kind| {
-            matches!(kind, NodeKind::Query { order_by_count, has_limit_count, has_limit_offset, .. }
-            if *order_by_count > 0 || *has_limit_count || *has_limit_offset)
+            matches!(kind, NodeKind::Query { order_by_count, limit_count, has_limit_offset, .. }
+            if *order_by_count > 0 || limit_count.is_present() || *has_limit_offset)
         })
     }
 

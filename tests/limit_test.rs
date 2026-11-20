@@ -1310,3 +1310,62 @@ async fn test_limit_negative_bound_value_forwards() -> Result<(), Error> {
     assert_eq!(delta.cache_pool_replenished, 0, "no serve connection lost");
     Ok(())
 }
+
+/// A LIMIT that limits nothing, and one spelled as an untyped string, are
+/// cached as the forms PostgreSQL reads them as (PGC-640).
+#[tokio::test]
+async fn test_limit_all_and_string_forms_are_cached() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_items_table(&mut ctx).await?;
+
+    let unlimited =
+        "SELECT id, name FROM items WHERE category = 'z' ORDER BY id LIMIT ALL OFFSET NULL";
+    let start = ctx.metrics().await?;
+
+    let rows = ctx.query(unlimited, &[]).await?;
+    assert_eq!(rows.len(), 4);
+    let m = assert_cache_miss(&mut ctx, start.clone()).await?;
+    ctx.cache_settle().await?;
+
+    let rows = ctx.query(unlimited, &[]).await?;
+    assert_eq!(rows.len(), 4);
+    let m = assert_cache_hit(&mut ctx, m).await?;
+
+    // Every row is cached, so a window of it written as a string is too.
+    let rows = ctx
+        .query(
+            "SELECT id, name FROM items WHERE category = 'z' ORDER BY id LIMIT '2' OFFSET '1'",
+            &[],
+        )
+        .await?;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<_, i32>("id"), 8);
+    let m = assert_cache_hit(&mut ctx, m).await?;
+
+    let delta = metrics_delta(&start, &m);
+    assert_eq!(delta.queries_cache_error, 0, "no serve may fail");
+    Ok(())
+}
+
+/// `FETCH FIRST n ROWS WITH TIES` returns every row tied with the last one
+/// (PGC-643). The count alone does not say how many rows that is, so the
+/// read goes to origin every time.
+#[tokio::test]
+async fn test_limit_with_ties_returns_the_tied_rows() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_items_table(&mut ctx).await?;
+
+    let ties = "SELECT id, category FROM items ORDER BY category FETCH FIRST 1 ROW WITH TIES";
+    let start = ctx.metrics().await?;
+
+    for _ in 0..3 {
+        let rows = ctx.query(ties, &[]).await?;
+        assert_eq!(rows.len(), 3, "the three rows of category x");
+        assert_proxy_rows_match_origin(&mut ctx, ties).await?;
+        ctx.cache_settle().await?;
+    }
+
+    let delta = metrics_delta(&start, &ctx.metrics().await?);
+    assert_eq!(delta.queries_cache_hit, 0, "never served from cache");
+    Ok(())
+}

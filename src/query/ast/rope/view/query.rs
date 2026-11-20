@@ -9,7 +9,7 @@ use super::{
     Column, Cte, EMPTY_NAME, Literal, Name, NodeRef, OrderBy, Query, Run, Scalar, Select,
     SelectExpr, SetOp, Source, Star, Table, Values, ValuesRow, View, Where, mismatch,
 };
-use crate::query::ast::rope::node::NodeKind;
+use crate::query::ast::rope::node::{LimitCount, NodeKind};
 use crate::query::ast::{CteMaterialization, NullOrder, OrderDirection, SetOpType};
 
 // --- Query -----------------------------------------------------------------
@@ -18,7 +18,7 @@ use crate::query::ast::{CteMaterialization, NullOrder, OrderDirection, SetOpType
 struct QueryLayout {
     cte_count: u32,
     order_by_count: u32,
-    has_limit_count: bool,
+    limit_count: LimitCount,
     has_limit_offset: bool,
 }
 
@@ -28,12 +28,12 @@ impl<'t> Query<'t> {
             NodeKind::Query {
                 cte_count,
                 order_by_count,
-                has_limit_count,
+                limit_count,
                 has_limit_offset,
             } => QueryLayout {
                 cte_count,
                 order_by_count,
-                has_limit_count,
+                limit_count,
                 has_limit_offset,
             },
             _ => mismatch("query"),
@@ -53,25 +53,38 @@ impl<'t> Query<'t> {
         self.0.run(layout.cte_count + 1, layout.order_by_count)
     }
 
-    pub fn limit_count(&self) -> Option<Literal<'t>> {
+    /// The LIMIT value: a literal in a cacheable query, any expression
+    /// otherwise.
+    pub fn limit_count(&self) -> Option<Scalar<'t>> {
         let layout = self.layout();
         layout
-            .has_limit_count
+            .limit_count
+            .is_present()
             .then(|| self.0.nth(layout.cte_count + 1 + layout.order_by_count))
     }
 
-    pub fn limit_offset(&self) -> Option<Literal<'t>> {
+    /// The OFFSET value, as [`Self::limit_count`].
+    pub fn limit_offset(&self) -> Option<Scalar<'t>> {
         let layout = self.layout();
         layout.has_limit_offset.then(|| {
             self.0.nth(
-                layout.cte_count + 1 + layout.order_by_count + u32::from(layout.has_limit_count),
+                layout.cte_count
+                    + 1
+                    + layout.order_by_count
+                    + u32::from(layout.limit_count.is_present()),
             )
         })
     }
 
     pub fn has_limit(&self) -> bool {
         let layout = self.layout();
-        layout.has_limit_count || layout.has_limit_offset
+        layout.limit_count.is_present() || layout.has_limit_offset
+    }
+
+    /// Whether the count is a `FETCH FIRST … WITH TIES`, which also returns
+    /// every row tied with the last one.
+    pub fn with_ties(&self) -> bool {
+        self.layout().limit_count == LimitCount::RowsWithTies
     }
 }
 

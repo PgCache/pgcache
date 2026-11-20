@@ -5,7 +5,7 @@
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use super::node::{Node, NodeKind};
+use super::node::{LimitCount, Node, NodeKind};
 use super::view::{NodeRef, Query, Statement, View};
 use crate::query::ast::NodeId;
 
@@ -188,27 +188,71 @@ impl QueryTree {
         )
     }
 
+    /// How many nodes at the end of the tree the session hash leaves out:
+    /// the root's LIMIT and OFFSET when each is a literal. `None` for a tree
+    /// hashed whole: a root that is no query, and a LIMIT that is an
+    /// expression or WITH TIES, which is no row count to track apart.
+    fn limit_literal_len(&self, root: &Node) -> Option<u32> {
+        let NodeKind::Query {
+            limit_count,
+            has_limit_offset,
+            ..
+        } = &root.kind
+        else {
+            return None;
+        };
+        let count = match limit_count {
+            LimitCount::Absent => 0,
+            LimitCount::Rows => 1,
+            LimitCount::RowsWithTies => return None,
+        };
+        let values = count + u32::from(*has_limit_offset);
+        let query = self.root();
+        let Some(first) = query.limit_count().or_else(|| query.limit_offset()) else {
+            return Some(0);
+        };
+        // A literal is one node, so literals alone end the tree `values`
+        // nodes after the first of them.
+        let first = first.node_ref();
+        let start = position(first.id());
+        let literals = start + values == self.len
+            && (start..self.len).all(|at| {
+                matches!(
+                    first.at_position(NodeId::from_index(at)).kind(),
+                    NodeKind::Literal(_)
+                )
+            });
+        literals.then_some(values)
+    }
+
     /// Hash what identifies the query to a session: everything but the
-    /// root's LIMIT and OFFSET, which the dispatch tracks apart so queries
-    /// differing only there share an entry.
+    /// root's LIMIT and OFFSET literals, which the dispatch tracks apart so
+    /// queries differing only there share an entry.
     pub fn session_hash<H: Hasher>(&self, state: &mut H) {
         let mut nodes = self.nodes();
         let Some(root) = nodes.next() else {
             return;
         };
-        let limit = root.kind.limit_count();
-        (root.len - limit).hash(state);
-        match &root.kind {
-            NodeKind::Query {
-                cte_count,
-                order_by_count,
-                ..
-            } => {
+        let limit = match (&root.kind, self.limit_literal_len(root)) {
+            (
+                NodeKind::Query {
+                    cte_count,
+                    order_by_count,
+                    ..
+                },
+                Some(limit),
+            ) => {
+                (root.len - limit).hash(state);
                 cte_count.hash(state);
                 order_by_count.hash(state);
+                limit
             }
-            other => other.hash(state),
-        }
+            (kind, _) => {
+                root.len.hash(state);
+                kind.hash(state);
+                0
+            }
+        };
         for node in nodes.take((self.len - 1 - limit) as usize) {
             node.hash(state);
         }

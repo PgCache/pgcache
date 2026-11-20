@@ -5,7 +5,7 @@ use rootcause::Report;
 
 use crate::cache::query::QueryParameters;
 use crate::query::ast::LiteralValue;
-use crate::query::ast::rope::Query;
+use crate::query::ast::rope::{Query, Scalar};
 use crate::query::transform::{
     AstTransformError, AstTransformResult, placeholder_row_count_literal,
 };
@@ -22,18 +22,21 @@ pub struct RowLimit {
 
 impl RowLimit {
     /// The root LIMIT and OFFSET of `query`, a placeholder read from
-    /// `parameters`. Fails on a value PostgreSQL would reject, or would round
-    /// to a bigint by rules this does not reproduce.
+    /// `parameters`. Fails on a value PostgreSQL would reject, on one only
+    /// it can evaluate, and on WITH TIES, whose row count the data decides.
     pub fn decode(
         query: Query<'_>,
         parameters: Option<&QueryParameters>,
     ) -> AstTransformResult<Self> {
+        if query.with_ties() {
+            return Err(limit_value_error("is WITH TIES"));
+        }
         let count = match query.limit_count() {
-            Some(literal) => limit_value_decode(literal.value(), parameters)?,
+            Some(value) => limit_value_decode(value, parameters)?,
             None => None,
         };
         let offset = match query.limit_offset() {
-            Some(literal) => limit_value_decode(literal.value(), parameters)?,
+            Some(value) => limit_value_decode(value, parameters)?,
             None => None,
         };
         Ok(Self {
@@ -59,12 +62,52 @@ pub fn limit_rows_needed(query: Query<'_>) -> Option<u64> {
         .and_then(|limit| limit.rows_needed())
 }
 
+/// What a LIMIT or OFFSET literal tells a serve, which needs the row count
+/// before the read.
+enum LimitValue {
+    Rows(i64),
+    Unlimited,
+    Placeholder,
+}
+
+fn limit_literal_value(literal: &LiteralValue) -> Option<LimitValue> {
+    match literal {
+        LiteralValue::Integer(rows) => Some(LimitValue::Rows(*rows)),
+        LiteralValue::Null => Some(LimitValue::Unlimited),
+        LiteralValue::Parameter(_) => Some(LimitValue::Placeholder),
+        LiteralValue::String(_)
+        | LiteralValue::StringWithCast(..)
+        | LiteralValue::Float(_)
+        | LiteralValue::Boolean(_)
+        | LiteralValue::NullWithCast(_)
+        | LiteralValue::SessionTerm(_)
+        | LiteralValue::Array(..) => None,
+    }
+}
+
+/// Why a serve cannot answer `query`'s own LIMIT and OFFSET, `None` when it
+/// can. WITH TIES ends on the rows' values, and a value that is not an
+/// integer, a NULL or a placeholder is origin's to evaluate.
+pub(super) fn limit_unsupported_form(query: Query<'_>) -> Option<&'static str> {
+    if query.with_ties() {
+        return Some("WITH TIES");
+    }
+    let servable = [query.limit_count(), query.limit_offset()]
+        .into_iter()
+        .flatten()
+        .all(|value| value.literal().and_then(limit_literal_value).is_some());
+    (!servable).then_some("expression")
+}
+
 /// One LIMIT or OFFSET value, `None` for NULL. A placeholder is read as the
 /// literal substitution puts in its place.
 fn limit_value_decode(
-    literal: &LiteralValue,
+    value: Scalar<'_>,
     parameters: Option<&QueryParameters>,
 ) -> AstTransformResult<Option<u64>> {
+    let Some(literal) = value.literal() else {
+        return Err(limit_value_error("is an expression"));
+    };
     let bound;
     let literal =
         if let (LiteralValue::Parameter(placeholder), Some(parameters)) = (literal, parameters) {
@@ -73,23 +116,17 @@ fn limit_value_decode(
         } else {
             literal
         };
-    let value = match literal {
-        LiteralValue::Integer(value) => Some(*value),
-        LiteralValue::Null => None,
-        LiteralValue::Parameter(_) => {
+    let rows = match limit_literal_value(literal) {
+        Some(LimitValue::Rows(rows)) => rows,
+        Some(LimitValue::Unlimited) => return Ok(None),
+        Some(LimitValue::Placeholder) => {
             return Err(limit_value_error("is a placeholder with no value"));
         }
-        LiteralValue::String(_)
-        | LiteralValue::StringWithCast(..)
-        | LiteralValue::Float(_)
-        | LiteralValue::Boolean(_)
-        | LiteralValue::NullWithCast(_)
-        | LiteralValue::SessionTerm(_)
-        | LiteralValue::Array(..) => return Err(limit_value_error("is not a bigint")),
+        None => return Err(limit_value_error("is not a bigint")),
     };
-    value
-        .map(|value| u64::try_from(value).map_err(|_| limit_value_error("is negative")))
-        .transpose()
+    u64::try_from(rows)
+        .map(Some)
+        .map_err(|_| limit_value_error("is negative"))
 }
 
 fn limit_value_error(problem: &str) -> Report<AstTransformError> {
@@ -160,6 +197,14 @@ mod tests {
             limit(None, 5)
         );
         assert_eq!(decoded("SELECT id FROM users LIMIT $1", None), None);
+        assert_eq!(
+            decoded("SELECT id FROM users LIMIT ALL OFFSET NULL", None),
+            limit(None, 0)
+        );
+        assert_eq!(
+            decoded("SELECT id FROM users LIMIT '10' OFFSET 5::int", None),
+            limit(Some(10), 5)
+        );
     }
 
     #[test]
@@ -223,6 +268,21 @@ mod tests {
         );
         assert_eq!(substituted(&[None, None]), limit(None, 0));
         assert_eq!(substituted(&[Some(b"ten"), Some(b"0")]), None);
+    }
+
+    /// WITH TIES and a value only origin can evaluate have no row count to
+    /// decode, so nothing caps a read on them.
+    #[test]
+    fn test_row_limit_decode_refuses_with_ties_and_expressions() {
+        let ties = "SELECT id FROM users ORDER BY id FETCH FIRST 2 ROWS WITH TIES";
+        assert_eq!(decoded(ties, None), None);
+        assert_eq!(
+            decoded("SELECT id FROM users LIMIT 5::int * f(2)", None),
+            None
+        );
+        assert_eq!(decoded("SELECT id FROM users OFFSET 2.5", None), None);
+        let needed = limit_rows_needed(query_tree_parse(ties).expect("parse").root());
+        assert_eq!(needed, None);
     }
 
     #[test]

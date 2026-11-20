@@ -467,6 +467,12 @@ pub(crate) mod tests {
     /// Shapes the corpora leave out.
     const EXTRA: &[&str] = &[
         "SELECT a FROM t WHERE b = 1 OR c = 2 OR d = 3 AND e = 4",
+        "SELECT a FROM t LIMIT ALL OFFSET NULL",
+        "SELECT a FROM t LIMIT 1 + 1 OFFSET ($1 - 1) * $2",
+        "SELECT a FROM t LIMIT $1::int OFFSET 2.5",
+        "SELECT a FROM t ORDER BY a FETCH FIRST 2 ROWS WITH TIES",
+        "SELECT a FROM t ORDER BY a OFFSET 1 FETCH FIRST $1 ROWS WITH TIES",
+        "SELECT a FROM t WHERE b IN (SELECT c FROM u ORDER BY c FETCH FIRST 1 ROW WITH TIES)",
         "SELECT sum(a) OVER w, rank() OVER w FROM t WINDOW w AS (PARTITION BY b ORDER BY c)",
         "SELECT sum(a) OVER w FROM t WINDOW w AS (ROWS BETWEEN 2 PRECEDING AND 1 FOLLOWING)",
         "SELECT a FROM t WHERE 1 + 2 * 3 = a AND (4 - 1) / 0 = b",
@@ -488,7 +494,6 @@ pub(crate) mod tests {
         "SELECT sum(a) OVER w FROM t",
         "SELECT a FROM t ORDER BY sum(b) OVER w",
         "SELECT sum(a) OVER (w ORDER BY b) FROM t WINDOW w AS (PARTITION BY c)",
-        "SELECT a FROM t LIMIT ALL",
         "SELECT a FROM t WHERE tags && ARRAY['x']",
         "SELECT a FROM t WHERE b > ANY (SELECT c FROM u)",
         "SELECT * FROM (VALUES (1 + 1)) v",

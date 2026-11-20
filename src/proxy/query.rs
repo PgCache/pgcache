@@ -721,6 +721,48 @@ mod tests {
         ));
     }
 
+    /// A LIMIT pgcache cannot serve still converts, so the statement is a
+    /// plain uncacheable read and not an assumed write (PGC-640, PGC-643);
+    /// a volatile call inside the LIMIT is still found.
+    #[test]
+    fn test_analyze_unsupported_limit_is_a_read() {
+        let fv = Arc::new(FunctionCatalog::test_builtins([(
+            "f_volatile",
+            FunctionVolatility::Volatile,
+        )]));
+        for sql in [
+            "SELECT * FROM t LIMIT $1 + 1",
+            "SELECT * FROM t LIMIT $1::int OFFSET ($2 - 1) * $1",
+            "SELECT * FROM t LIMIT 2.5",
+            "SELECT * FROM t ORDER BY a FETCH FIRST 2 ROWS WITH TIES",
+        ] {
+            assert!(
+                matches!(
+                    analyze_fresh(sql, &fv),
+                    Action::Forward(
+                        ForwardReason::UncacheableSelect,
+                        StatementEffects { write: None, .. }
+                    )
+                ),
+                "for {sql:?}"
+            );
+        }
+        assert!(matches!(
+            analyze_fresh("SELECT * FROM t LIMIT f_volatile(1)", &fv),
+            Action::Forward(
+                ForwardReason::UncacheableSelect,
+                StatementEffects {
+                    write: Some(WriteClass::Connection),
+                    ..
+                }
+            )
+        ));
+        assert!(matches!(
+            analyze_fresh("SELECT * FROM t LIMIT ALL", &fv),
+            Action::CacheCheck(_)
+        ));
+    }
+
     #[test]
     fn test_analyze_volatile_nested_in_stable_is_a_write() {
         // A volatile nested inside a stable function still executes and can

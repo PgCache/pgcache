@@ -492,7 +492,11 @@ fn test_group_by_having_and_limit_bind() {
     );
     assert_eq!(query.tree().root().order_by().len(), 1);
     assert_eq!(
-        query.tree().root().limit_count().map(|l| l.value().clone()),
+        query
+            .tree()
+            .root()
+            .limit_count()
+            .and_then(|l| l.literal().cloned()),
         Some(LiteralValue::Integer(10))
     );
 
@@ -524,8 +528,8 @@ fn test_limit_cases() {
         let query = bound(sql, &tables);
         let root = query.tree().root();
         let actual = (
-            root.limit_count().map(|l| l.value().clone()),
-            root.limit_offset().map(|l| l.value().clone()),
+            root.limit_count().and_then(|l| l.literal().cloned()),
+            root.limit_offset().and_then(|l| l.literal().cloned()),
         );
         assert_eq!(actual, expected, "{label}: (count, offset) of {sql}");
     }

@@ -131,29 +131,41 @@ pub fn cast_target_coerce_text(target: &CastTarget, row_text: &str) -> Option<Li
 /// since PostgreSQL 16) is applied in its widest form, so a value accepted
 /// here and rejected by an older origin only keeps the behaviour it had.
 pub fn cast_target_rejects_text(target: &CastTarget, text: &str) -> Option<&'static str> {
-    let bits = match target {
-        CastTarget::Int4 => 32,
-        CastTarget::Int8 => 64,
-        CastTarget::Bool => {
-            return bool_literal_parse(text)
-                .is_none()
-                .then_some("text the boolean type rejects");
-        }
+    if let Some(bits) = cast_target_integer_bits(target) {
+        let Some(value) = integer_text_parse(text) else {
+            return Some("text the integer type rejects");
+        };
+        return (!integer_bits_contain(bits, value))
+            .then_some("an integer out of range for the type");
+    }
+    match target {
+        CastTarget::Bool => bool_literal_parse(text)
+            .is_none()
+            .then_some("text the boolean type rejects"),
         CastTarget::Other(name) => match name.as_str() {
-            "int2" => 16,
-            "numeric" => {
-                return (!numeric_text_accepts(text)).then_some("text the numeric type rejects");
-            }
-            "uuid" => return (!uuid_text_accepts(text)).then_some("text the uuid type rejects"),
-            _ => return None,
+            "numeric" => (!numeric_text_accepts(text)).then_some("text the numeric type rejects"),
+            "uuid" => (!uuid_text_accepts(text)).then_some("text the uuid type rejects"),
+            _ => None,
         },
-        CastTarget::Text | CastTarget::Date => return None,
-    };
-    let Some(value) = integer_text_parse(text) else {
-        return Some("text the integer type rejects");
-    };
+        CastTarget::Int4 | CastTarget::Int8 | CastTarget::Text | CastTarget::Date => None,
+    }
+}
+
+/// The width in bits of the integer type `target` names, `None` for any
+/// other type.
+pub fn cast_target_integer_bits(target: &CastTarget) -> Option<u32> {
+    match target {
+        CastTarget::Int4 => Some(32),
+        CastTarget::Int8 => Some(64),
+        CastTarget::Other(name) => (name == "int2").then_some(16),
+        CastTarget::Text | CastTarget::Bool | CastTarget::Date => None,
+    }
+}
+
+/// Whether `value` is in the range of a signed integer `bits` wide.
+pub fn integer_bits_contain(bits: u32, value: i128) -> bool {
     let limit: i128 = 1 << (bits - 1);
-    (value < -limit || value >= limit).then_some("an integer out of range for the type")
+    (-limit..limit).contains(&value)
 }
 
 /// The integer `text` denotes as `pg_strtoint` reads it (whitespace around,

@@ -4,6 +4,7 @@
 use ecow::EcoString;
 
 use super::CacheabilityError;
+use super::limit::limit_unsupported_form;
 #[cfg(feature = "proxy")]
 use crate::catalog::{FunctionCatalog, schema_is_builtin};
 use crate::catalog::{FunctionFacts, FunctionVolatility, is_settings_stable};
@@ -113,7 +114,14 @@ fn query_cacheable_at(
     for clause in query.order_by() {
         scalar_cacheable(clause.expr(), ExprContext::WhereClause, functions)?;
     }
-    Ok(())
+    limit_supported(query)
+}
+
+fn limit_supported(query: Query<'_>) -> Result<(), CacheabilityError> {
+    match limit_unsupported_form(query) {
+        Some(form) => Err(CacheabilityError::UnsupportedLimit { form }),
+        None => Ok(()),
+    }
 }
 
 fn select_cacheable(
@@ -786,6 +794,47 @@ mod tests {
         let sql = "SELECT * FROM orders WHERE tenant_id = 1 OFFSET 5";
         let result = check_cacheable(sql);
         assert!(result.is_ok(), "OFFSET should be cacheable");
+    }
+
+    /// A LIMIT the converter reduced to a literal is cacheable; WITH TIES
+    /// and a value only origin can evaluate are not, at any depth (PGC-640,
+    /// PGC-643).
+    #[test]
+    fn test_limit_forms_cacheability() {
+        let base = "SELECT id FROM orders WHERE tenant_id = 1 ORDER BY id";
+        for limit in [
+            "LIMIT ALL",
+            "LIMIT '2'",
+            "LIMIT 10::int",
+            "LIMIT 1 + 1",
+            "LIMIT $1::bigint OFFSET $2",
+            "FETCH FIRST 2 ROWS ONLY",
+        ] {
+            let result = check_cacheable(&format!("{base} {limit}"));
+            assert!(result.is_ok(), "{limit}: {result:?}");
+        }
+        #[rustfmt::skip]
+        let refused = [
+            ("FETCH FIRST 2 ROWS WITH TIES", "WITH TIES"),
+            ("LIMIT $1::int",                "expression"),
+            ("LIMIT 2.5",                    "expression"),
+            ("LIMIT 'ten'",                  "expression"),
+            ("LIMIT $1 + 1",                 "expression"),
+            ("OFFSET ($1 - 1) * $2",         "expression"),
+        ];
+        for (limit, form) in refused {
+            let result = check_cacheable(&format!("{base} {limit}"));
+            assert!(
+                matches!(result, Err(CacheabilityError::UnsupportedLimit { form: f }) if f == form),
+                "{limit}: {result:?}"
+            );
+        }
+        let nested = "SELECT id FROM orders WHERE id IN \
+                      (SELECT order_id FROM items ORDER BY order_id FETCH FIRST 1 ROW WITH TIES)";
+        assert!(matches!(
+            check_cacheable(nested),
+            Err(CacheabilityError::UnsupportedLimit { form: "WITH TIES" })
+        ));
     }
 
     #[test]

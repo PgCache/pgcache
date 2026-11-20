@@ -1668,3 +1668,46 @@ async fn test_gate_serves_read_disjoint_from_spelled_write() -> Result<(), Error
     }
     Ok(())
 }
+
+/// A SELECT whose LIMIT pgcache cannot serve still converts (PGC-640,
+/// PGC-643), so it forwards as the read it is. A failed conversion is
+/// recorded as a connection-scoped write, which these forms once were.
+#[tokio::test]
+async fn test_unsupported_limit_read_records_no_write() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&[RAW_ON]).await?;
+
+    ctx.query(
+        "CREATE TABLE raw_pages (id int primary key, data text)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO raw_pages SELECT g, 'r' FROM generate_series(1, 6) g",
+        &[],
+    )
+    .await?;
+
+    // Baseline after the setup writes so only the reads below are measured.
+    let before = ctx.metrics().await?;
+
+    for sql in [
+        "SELECT id FROM raw_pages ORDER BY id LIMIT ALL",
+        "SELECT id FROM raw_pages ORDER BY id LIMIT '2'",
+        "SELECT id FROM raw_pages ORDER BY id LIMIT 2.5",
+        "SELECT id FROM raw_pages ORDER BY id LIMIT 2::numeric OFFSET 1",
+        "SELECT id FROM raw_pages ORDER BY data FETCH FIRST 1 ROW WITH TIES",
+    ] {
+        let rows = ctx.simple_query(sql).await?;
+        assert!(row_count(&rows) > 0, "{sql}");
+    }
+    let paged = ctx
+        .prepare("SELECT id FROM raw_pages ORDER BY id LIMIT $1::int OFFSET ($2 - 1) * $1")
+        .await?;
+    let rows = ctx.query(&paged, &[&2i32, &2i32]).await?;
+    let ids: Vec<i32> = rows.iter().map(|row| row.get("id")).collect();
+    assert_eq!(ids, [3, 4], "the second page of two");
+
+    let delta = metrics_delta(&before, &ctx.metrics().await?);
+    assert_eq!(delta.raw_writes_recorded, 0, "a read is not a write");
+    Ok(())
+}

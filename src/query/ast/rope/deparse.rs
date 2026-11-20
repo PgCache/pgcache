@@ -290,12 +290,18 @@ pub fn query_deparse_with<C: DeparseContext>(query: Query<'_>, cx: &mut C, buf: 
     if query.has_limit() {
         cx.clause_enter(Clause::Limit);
         if let Some(count) = query.limit_count() {
-            buf.push_str(" LIMIT ");
-            cx.literal_deparse(count.value(), buf);
+            if query.with_ties() {
+                buf.push_str(" FETCH FIRST (");
+                scalar_deparse_with(count, cx, buf);
+                buf.push_str(") ROWS WITH TIES");
+            } else {
+                buf.push_str(" LIMIT ");
+                scalar_deparse_with(count, cx, buf);
+            }
         }
         if let Some(offset) = query.limit_offset() {
             buf.push_str(" OFFSET ");
-            cx.literal_deparse(offset.value(), buf);
+            scalar_deparse_with(offset, cx, buf);
         }
         cx.clause_leave(Clause::Limit);
     }

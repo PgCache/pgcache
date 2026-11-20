@@ -77,6 +77,12 @@ error_set! {
             function: EcoString,
         },
         HasLimit,
+        /// A LIMIT or OFFSET the serve cannot turn into a row count before
+        /// the read: an expression origin evaluates, or WITH TIES.
+        #[display("Unsupported LIMIT: {form}")]
+        UnsupportedLimit {
+            form: &'static str,
+        },
         #[display("System catalog reference: {relation}")]
         SystemCatalogReference {
             relation: EcoString,

@@ -255,11 +255,11 @@ fn test_views_read_limit_literals_from_the_values() {
     let root = limited.root();
     assert!(root.has_limit());
     assert_eq!(
-        root.limit_count().map(|l| l.value().clone()),
+        root.limit_count().and_then(|l| l.literal().cloned()),
         Some(LiteralValue::Integer(10))
     );
     assert_eq!(
-        root.limit_offset().map(|l| l.value().clone()),
+        root.limit_offset().and_then(|l| l.literal().cloned()),
         Some(LiteralValue::Integer(5))
     );
     assert!(tree("SELECT a FROM t").root().limit_count().is_none());

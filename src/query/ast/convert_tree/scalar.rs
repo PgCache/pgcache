@@ -161,7 +161,7 @@ unsafe fn type_cast_emit(
     }
 }
 
-unsafe fn type_name_render(tn: *const pg::TypeName) -> Result<EcoString, AstError> {
+pub(super) unsafe fn type_name_render(tn: *const pg::TypeName) -> Result<EcoString, AstError> {
     unsafe {
         let mut out = type_name_parts(tn)?.join(".");
         if !list_is_empty((*tn).typmods) {
