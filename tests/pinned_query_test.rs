@@ -385,3 +385,50 @@ async fn test_readmit_of_an_evicted_pinned_query_allocates_no_generation() -> Re
     );
     Ok(())
 }
+
+/// A pinned query that CDC invalidated is not served from the cache while
+/// its readmit is still queued: the change that invalidated it is applied
+/// to the cache tables, and the rows it needs to join to may not be there
+/// (PGC-649).
+#[cfg(feature = "fault-injection")]
+#[tokio::test]
+async fn test_pinned_query_is_not_served_between_invalidation_and_readmit() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_pinned_fault(
+        READMIT_PINNED,
+        &[("PGCACHE_FAULT_READMIT_DELAY_MS", "3000")],
+        readmit_tables_create,
+    )
+    .await?;
+    ctx.cache_settle().await?;
+    ctx.verdict_warm(READMIT_PINNED).await?;
+    let before = crate::util::result_rows(&ctx.simple_query(READMIT_PINNED).await?);
+
+    // One transaction: a rename applied in place, and a detail row for a
+    // parent the join had not matched, which invalidates the query.
+    for sql in [
+        "BEGIN",
+        "UPDATE gen_parent SET name = 'alicia' WHERE id = 1",
+        "INSERT INTO gen_detail (parent_id, detail) VALUES (2, 'added')",
+        "COMMIT",
+    ] {
+        ctx.origin_query(sql, &[]).await?;
+    }
+    let after = crate::util::result_rows(
+        &ctx.origin
+            .simple_query(READMIT_PINNED)
+            .await
+            .map_err(Error::other)?,
+    );
+    assert_ne!(before, after);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
+    while std::time::Instant::now() < deadline {
+        let rows = crate::util::result_rows(&ctx.simple_query(READMIT_PINNED).await?);
+        assert!(
+            rows == before || rows == after,
+            "served a result origin never had: {rows:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    Ok(())
+}

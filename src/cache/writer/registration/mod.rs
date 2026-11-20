@@ -166,6 +166,21 @@ fn fault_mv_evict_on_build(_core: &WriterCore, _fingerprint: Fingerprint) -> boo
     false
 }
 
+/// Hold a pinned query's readmit (`PGCACHE_FAULT_READMIT_DELAY_MS`), as a
+/// writer busy with queued commands does, so a test can read in between.
+#[cfg(feature = "fault-injection")]
+async fn fault_readmit_delay() {
+    if let Some(ms) = std::env::var("PGCACHE_FAULT_READMIT_DELAY_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
+}
+#[cfg(not(feature = "fault-injection"))]
+async fn fault_readmit_delay() {}
+
 /// The per-command handle-time histogram.
 fn command_histogram(cmd: &QueryCommand) -> &'static Histogram {
     let reg = &crate::metrics::handles().reg;
@@ -459,6 +474,7 @@ impl WriterRegistration {
 
     async fn readmit_command(&mut self, core: &mut WriterCore, fingerprint: Fingerprint) {
         trace!("command readmit {fingerprint}");
+        fault_readmit_delay().await;
         if let Err(e) = self.query_readmit(core, fingerprint, Instant::now()).await {
             error!(
                 "pinned readmit failed for {fingerprint}: {}",

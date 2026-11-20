@@ -495,6 +495,13 @@ impl WriterCore {
             .is_some();
         if pinned {
             debug!("pinned query invalidated, deferring readmit {fingerprint}");
+            // Loading now, as the queued readmit will leave it: until it runs
+            // the cache tables hold the change without the rows it joins to.
+            if let Some(mut entry) = self.state_view.cached_queries.get_mut(&fingerprint) {
+                entry.state = CachedQueryState::Loading;
+                entry.referenced = false;
+                entry.mv.dirty_apply(Instant::now());
+            }
             let _ = self.query_tx.send(QueryCommand::Readmit { fingerprint });
             self.waiters_fail(fingerprint);
             self.waiters_release_request(fingerprint);
