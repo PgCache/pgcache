@@ -45,8 +45,8 @@ use crate::settings::{PgSettings, Settings, TableFilter};
 /// Compiled out entirely unless built with `--features fault-injection`.
 #[cfg(feature = "fault-injection")]
 pub(crate) mod fault {
-    use std::sync::Once;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Once, OnceLock};
 
     use crate::cache::messages::CdcValue;
 
@@ -73,6 +73,18 @@ pub(crate) mod fault {
             .ok()
             .and_then(|s| s.parse().ok())
             .filter(|divisor| *divisor > 0)
+    }
+
+    /// One-shot (`PGCACHE_FAULT_PUBLICATION_UPDATE_FAIL`): the first
+    /// publication update that would change the table list fails on origin
+    /// instead, so a test can check a later drain tries it again (PGC-645).
+    pub(crate) fn publication_update_fail() -> bool {
+        static ARMED: OnceLock<AtomicBool> = OnceLock::new();
+        ARMED
+            .get_or_init(|| {
+                AtomicBool::new(std::env::var_os("PGCACHE_FAULT_PUBLICATION_UPDATE_FAIL").is_some())
+            })
+            .swap(false, Ordering::Relaxed)
     }
 
     /// Test override for the eviction count cap

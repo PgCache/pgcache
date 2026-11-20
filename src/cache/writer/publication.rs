@@ -5,6 +5,8 @@ use tokio_postgres::error::SqlState;
 use tracing::debug;
 
 use super::core::WriterCore;
+#[cfg(feature = "fault-injection")]
+use super::core::fault;
 use crate::cache::{CacheError, CacheResult, MapIntoReport, ReportExt};
 use crate::oid::Oid;
 
@@ -148,6 +150,11 @@ impl WriterCore {
             ))
         };
 
+        #[cfg(feature = "fault-injection")]
+        let sql = match sql {
+            Some(_) if fault::publication_update_fail() => Some("SELECT 1/0".to_owned()),
+            sql => sql,
+        };
         if let Some(sql) = sql {
             debug!("publication update: {sql}");
             self.db_origin
@@ -228,8 +235,8 @@ impl WriterCore {
         if self.frame_holds_locks() {
             return Ok(());
         }
-        self.relations_dirty = false;
-        self.publication_update().await?;
-        Ok(())
+        // The flag is cleared by the update once it succeeds, so a failed
+        // one is tried again at the next drain.
+        self.publication_update().await
     }
 }

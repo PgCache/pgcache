@@ -195,3 +195,49 @@ async fn test_eviction_removes_table_from_publication() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// A publication update that fails on origin is tried again at the next
+/// drain rather than forgotten: the table whose queries were evicted still
+/// leaves the publication (PGC-645).
+#[tokio::test]
+async fn test_failed_publication_update_is_retried() -> Result<(), Error> {
+    let mut ctx =
+        TestContext::setup_fault(&[("PGCACHE_FAULT_PUBLICATION_UPDATE_FAIL", "1")]).await?;
+    let timeout = Duration::from_secs(10);
+    for table in ["retry_kept", "retry_gone"] {
+        ctx.query(
+            &format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, data TEXT)"),
+            &[],
+        )
+        .await?;
+        ctx.query(&format!("INSERT INTO {table} VALUES (1, 'a')"), &[])
+            .await?;
+        ctx.simple_query(&format!("SELECT id, data FROM {table}"))
+            .await?;
+        publication_table_wait(&mut ctx, table, timeout).await?;
+    }
+    ctx.cache_settle().await?;
+
+    // Evicting the table's query is the first update that changes the
+    // table list, and the one the fault fails.
+    let (status, body) = crate::util::http_put(
+        ctx.metrics_port,
+        "/config",
+        r#"{"excluded_tables": ["retry_gone"]}"#,
+    )
+    .await?;
+    assert_eq!(status, 200, "body: {body}");
+    ctx.queries_registered_wait(1, timeout).await?;
+
+    // A change on the other table reaches the writer and ends in a drain;
+    // it registers and evicts nothing, so only a retry clears the table.
+    ctx.query("UPDATE retry_kept SET data = 'b' WHERE id = 1", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+    let tables = publication_table_removed_wait(&mut ctx, "retry_gone", timeout).await?;
+    assert!(
+        tables.iter().any(|t| t.contains("retry_kept")),
+        "expected retry_kept still in publication, got: {tables:?}"
+    );
+    Ok(())
+}
