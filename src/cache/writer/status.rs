@@ -121,6 +121,7 @@ impl WriterCore {
             size_bytes: disk_used_bytes,
             size_limit_bytes: disk_limit_bytes,
             generation: cache.generation_counter.get(),
+            generations_active: cache.generations.len(),
             tables_tracked: cache.tables.len(),
             policy: format!("{:?}", dynamic.cache_policy),
             queries_registered: cache.cached_queries.len(),

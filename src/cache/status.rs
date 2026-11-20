@@ -40,6 +40,10 @@ pub struct CacheStatusData {
     /// Deprecated alias of `disk_limit_bytes`.
     pub size_limit_bytes: Option<usize>,
     pub generation: i64,
+    /// Generations cached queries hold; rows below the lowest are
+    /// reclaimable, so one held by no query stalls reclaim.
+    #[serde(default)]
+    pub generations_active: usize,
     pub tables_tracked: usize,
     pub policy: String,
     pub queries_registered: usize,

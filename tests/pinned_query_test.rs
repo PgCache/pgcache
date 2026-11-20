@@ -277,3 +277,111 @@ async fn test_pinned_query_invalid_sql_skipped() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// The number of generations the writer holds for cached queries.
+async fn generations_active(ctx: &TestContext) -> Result<u64, Error> {
+    let (status, body) = crate::util::http_get(ctx.metrics_port, "/status").await?;
+    if status != 200 {
+        return Err(Error::other(format!("/status returned {status}: {body}")));
+    }
+    let json: serde_json::Value = serde_json::from_str(&body).map_err(Error::other)?;
+    json.get("cache")
+        .and_then(|cache| cache.get("generations_active"))
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| Error::other("cache.generations_active missing"))
+}
+
+const READMIT_PINNED: &str = "SELECT p.id, p.name, d.detail \
+    FROM gen_parent p JOIN gen_detail d ON d.parent_id = p.id \
+    ORDER BY d.detail";
+
+/// Origin tables for a pinned join query and one ordinary single-table query.
+async fn readmit_tables_create(
+    origin: tokio_postgres::Client,
+) -> Result<tokio_postgres::Client, Error> {
+    for sql in [
+        "CREATE TABLE gen_parent (id INTEGER PRIMARY KEY, name TEXT)",
+        "CREATE TABLE gen_detail (id SERIAL PRIMARY KEY, parent_id INTEGER, detail TEXT)",
+        "CREATE TABLE gen_other (id INTEGER PRIMARY KEY, name TEXT)",
+        "INSERT INTO gen_parent (id, name) VALUES (1, 'alice'), (2, 'bob')",
+        "INSERT INTO gen_detail (parent_id, detail) VALUES (1, 'original')",
+        "INSERT INTO gen_other VALUES (1, 'x')",
+    ] {
+        origin.execute(sql, &[]).await.map_err(Error::other)?;
+    }
+    Ok(origin)
+}
+
+/// A pinned query's readmission gives up the generation it held: one left
+/// in the active set belongs to no query and holds the purge threshold
+/// below it for the life of the cache (PGC-646).
+#[tokio::test]
+async fn test_pinned_readmit_releases_its_previous_generation() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_pinned(READMIT_PINNED, readmit_tables_create).await?;
+    ctx.cache_settle().await?;
+    ctx.simple_query("SELECT * FROM gen_other WHERE id = 1")
+        .await?;
+    ctx.cache_settle().await?;
+    assert_eq!(generations_active(&ctx).await?, 2);
+
+    for round in 0..3 {
+        let m = ctx.metrics().await?;
+        ctx.origin_query(
+            &format!("INSERT INTO gen_detail (parent_id, detail) VALUES (1, 'added{round}')"),
+            &[],
+        )
+        .await?;
+        ctx.cdc_apply_settle().await?;
+        ctx.cache_settle().await?;
+        let delta = metrics_delta(&m, &ctx.metrics().await?);
+        assert_eq!(delta.cache_readmissions, 1, "round {round}");
+        assert_eq!(
+            generations_active(&ctx).await?,
+            2,
+            "round {round}: a readmit left a generation no query holds"
+        );
+    }
+    Ok(())
+}
+
+/// A readmit that finds its query gone allocates no generation. A deadlock
+/// at the frame's commit is one way there: the frame's invalidations are
+/// flushed first, queueing the pinned query's readmit, and the recovery
+/// then evicts every query over the frame's relations (PGC-646).
+#[cfg(feature = "fault-injection")]
+#[tokio::test]
+async fn test_readmit_of_an_evicted_pinned_query_allocates_no_generation() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_pinned_fault(
+        READMIT_PINNED,
+        &[("PGCACHE_FAULT_CDC_COMMIT_DEADLOCK_ONCE", "1")],
+        readmit_tables_create,
+    )
+    .await?;
+    ctx.cache_settle().await?;
+    ctx.simple_query("SELECT * FROM gen_other WHERE id = 1")
+        .await?;
+    ctx.cache_settle().await?;
+    assert_eq!(generations_active(&ctx).await?, 2);
+
+    // One transaction: a write applied in place, so the frame commits, and
+    // an insert that grows the join, so the pinned query is invalidated.
+    for sql in [
+        "BEGIN",
+        "UPDATE gen_other SET name = 'y' WHERE id = 1",
+        "INSERT INTO gen_detail (parent_id, detail) VALUES (1, 'added')",
+        "COMMIT",
+    ] {
+        ctx.origin_query(sql, &[]).await?;
+    }
+    ctx.cdc_apply_settle().await?;
+    // The recovery evicted both queries; the queued readmit ran after.
+    ctx.queries_registered_wait(0, std::time::Duration::from_secs(10))
+        .await?;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(
+        generations_active(&ctx).await?,
+        0,
+        "the readmit of the evicted query left a generation no query holds"
+    );
+    Ok(())
+}

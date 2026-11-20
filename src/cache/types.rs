@@ -298,6 +298,14 @@ impl Cache {
         self.generation_counter
     }
 
+    /// A new generation for a query that held `previous`, which leaves the
+    /// active set: a generation no query holds would keep the purge
+    /// threshold below it for good.
+    pub fn generation_replace(&mut self, previous: Generation) -> Generation {
+        self.generations.remove(&previous);
+        self.generation_allocate()
+    }
+
     /// Returns the minimum generation that can be safely purged.
     /// This is the highest generation that is less than all active generations
     /// or the current generation_counter if there are no active generations

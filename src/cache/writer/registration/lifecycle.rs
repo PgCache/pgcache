@@ -107,12 +107,14 @@ impl WriterRegistration {
             })
             .unwrap_or((None, None));
 
-        let new_generation = core.cache.generation_allocate();
-
-        // Extract data before remove/reinsert (generation is key2)
+        // Extract data before remove/reinsert (generation is key2). A query
+        // evicted while its readmit was queued takes no generation.
         let Some(mut cached) = core.cache.cached_queries.remove1(fingerprint) else {
             return Ok(SubsumptionResult::NotSubsumed);
         };
+        // A pinned invalidation leaves the entry its generation, and a
+        // repeated readmit finds the one the first took.
+        let new_generation = core.cache.generation_replace(cached.generation);
 
         let at = ServingAt {
             generation: new_generation,
@@ -278,8 +280,7 @@ impl WriterRegistration {
         let relation_oids = cached_query.relation_oids.clone();
         let old_generation = cached_query.generation;
 
-        let new_generation = core.cache.generation_allocate();
-        core.cache.generations.remove(&old_generation);
+        let new_generation = core.cache.generation_replace(old_generation);
         core.population_staged_drop(fingerprint, old_generation);
 
         // Update cached query — must remove and reinsert because generation is key2
