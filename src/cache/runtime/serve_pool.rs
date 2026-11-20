@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{
     Receiver, Sender, UnboundedReceiver, UnboundedSender, channel, unbounded_channel,
 };
+use tokio_postgres::error::SqlState;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
@@ -15,7 +16,7 @@ use crate::cache::query_cache::{ServeJob, ServeRequest};
 use crate::cache::serve::{CoalescedOutcome, handle_cached_query};
 use crate::cache::serve_pool_state::ServePool;
 use crate::cache::types::CacheStateView;
-use crate::cache::{CacheError, CacheResult, ReportExt, SqlState};
+use crate::cache::{CacheError, CacheResult, ReportExt};
 use crate::pg::cache_connection::CacheConnection;
 use crate::query::Fingerprint;
 use crate::result::error_chain_format;

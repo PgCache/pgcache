@@ -453,9 +453,10 @@ pub(super) async fn handle_cached_query(
 
 #[cfg(test)]
 mod tests {
+    use tokio_postgres::error::SqlState;
+
     use super::sqlstate::sqlstate_extract;
     use super::*;
-    use crate::cache::SqlState;
     use crate::pg::protocol::encode::SERVE_ERROR_MSG;
 
     /// Build a minimal PG ErrorResponse frame with the given (code, value)
@@ -505,14 +506,9 @@ mod tests {
     #[test]
     fn test_cache_server_error_displays_the_sqlstate_as_text() {
         let error = CacheError::CacheServerError {
-            sqlstate: SqlState::new(*b"22P02"),
+            sqlstate: SqlState::INVALID_TEXT_REPRESENTATION,
         };
         assert_eq!(error.to_string(), "Cache server error (SQLSTATE 22P02)");
-        assert_eq!(format!("{:?}", SqlState::UNDEFINED_TABLE), "42P01");
-        assert_eq!(
-            SqlState::new([b'2', 0xFF, 0, b'\n', b'2']).to_string(),
-            "2\\xff\\x00\\n2"
-        );
     }
 
     #[test]
@@ -529,7 +525,7 @@ mod tests {
     fn test_sqlstate_extract_first_field() {
         // SQLSTATE-first ordering should still parse.
         let frame = error_response_frame(&[(b'C', b"23505"), (b'S', b"ERROR")]);
-        assert_eq!(sqlstate_extract(&frame), Some(SqlState::new(*b"23505")));
+        assert_eq!(sqlstate_extract(&frame), Some(SqlState::UNIQUE_VIOLATION));
     }
 
     #[test]

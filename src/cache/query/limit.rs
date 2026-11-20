@@ -16,6 +16,7 @@ use crate::query::transform::{
 pub struct RowLimit {
     /// `None` without a LIMIT, and for `LIMIT NULL`.
     pub count: Option<u64>,
+    /// 0 without an OFFSET, and for `OFFSET NULL`.
     pub offset: u64,
 }
 
@@ -42,8 +43,11 @@ impl RowLimit {
     }
 
     /// Rows a serve reads to answer this: `None` when every row is needed.
+    /// A sum past the largest bigint is every row: population sends it to
+    /// origin as a LIMIT, which rejects anything larger.
     pub fn rows_needed(&self) -> Option<u64> {
-        self.count.map(|count| count.saturating_add(self.offset))
+        let rows = self.count?.checked_add(self.offset)?;
+        i64::try_from(rows).is_ok().then_some(rows)
     }
 }
 
@@ -232,7 +236,10 @@ mod tests {
         assert_eq!(needed(Some(10), 5), Some(15));
         // OFFSET alone reads to the end.
         assert_eq!(needed(None, 5), None);
-        assert_eq!(needed(Some(u64::MAX), 5), Some(u64::MAX));
+        let bigint_max = u64::try_from(i64::MAX).expect("bigint max fits u64");
+        assert_eq!(needed(Some(bigint_max), 0), Some(bigint_max));
+        assert_eq!(needed(Some(bigint_max), 20), None);
+        assert_eq!(needed(Some(u64::MAX), 5), None);
     }
 
     #[test]

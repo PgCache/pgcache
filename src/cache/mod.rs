@@ -1,4 +1,3 @@
-use std::fmt;
 use std::io;
 
 use ecow::EcoString;
@@ -6,6 +5,8 @@ use error_set::error_set;
 use rootcause::Report;
 #[cfg(feature = "proxy")]
 use tokio_postgres::Error;
+#[cfg(feature = "proxy")]
+use tokio_postgres::error::SqlState;
 
 use crate::oid::{Oid, TypeOid};
 #[cfg(feature = "proxy")]
@@ -112,32 +113,6 @@ pub use update_query::{
     SubqueryKind, UpdateEvalStrategy, UpdateQueries, UpdateQuery, UpdateQueryKey, UpdateQuerySource,
 };
 
-/// The five-character SQLSTATE of a backend `ErrorResponse`.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct SqlState([u8; 5]);
-
-impl SqlState {
-    /// `undefined_table`: what a hit gets when its cache table was dropped
-    /// between dispatch and SELECT (the eviction-window race).
-    pub const UNDEFINED_TABLE: Self = Self(*b"42P01");
-
-    pub const fn new(code: [u8; 5]) -> Self {
-        Self(code)
-    }
-}
-
-impl fmt::Display for SqlState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0.escape_ascii())
-    }
-}
-
-impl fmt::Debug for SqlState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(self, f)
-    }
-}
-
 error_set! {
     CacheError := WriteError || ReadError || DbError || ParseError || TableError || SendError || QueryResolutionError || SetupError || PrivilegeError || RlsError || FunctionError
 
@@ -146,7 +121,8 @@ error_set! {
         InvalidMessage,
         /// Cache DB returned an ErrorResponse on the hit path. Triggers a
         /// forward-to-origin retry via CacheReply::Error.
-        #[display("Cache server error (SQLSTATE {sqlstate})")]
+        #[cfg(feature = "proxy")]
+        #[display("Cache server error (SQLSTATE {})", sqlstate.code())]
         CacheServerError {
             sqlstate: SqlState,
         },

@@ -1,6 +1,6 @@
 //! Wire-level SQLSTATE extraction from a backend `ErrorResponse` frame.
 
-use crate::cache::SqlState;
+use tokio_postgres::error::SqlState;
 
 /// Extract the 5-char SQLSTATE from a backend `ErrorResponse` frame.
 ///
@@ -20,8 +20,8 @@ pub(super) fn sqlstate_extract(frame_data: &[u8]) -> Option<SqlState> {
         let rest = payload.get(value_start..)?;
         let value_len = rest.iter().position(|&b| b == 0)?;
         if code == b'C' && value_len == 5 {
-            let code = <[u8; 5]>::try_from(rest.get(..5)?).ok()?;
-            return Some(SqlState::new(code));
+            let code = std::str::from_utf8(rest.get(..5)?).ok()?;
+            return Some(SqlState::from_code(code));
         }
         i = value_start + value_len + 1;
     }
@@ -60,7 +60,7 @@ mod tests {
     #[test]
     fn test_sqlstate_extract_first_field() {
         let frame = error_response_frame(&[(b'C', b"23505"), (b'M', b"dup")]);
-        assert_eq!(sqlstate_extract(&frame), Some(SqlState::new(*b"23505")));
+        assert_eq!(sqlstate_extract(&frame), Some(SqlState::UNIQUE_VIOLATION));
     }
 
     #[test]

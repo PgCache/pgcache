@@ -2,6 +2,7 @@
 //! OFFSET). The position fixes the type, so a parameter the client left
 //! undeclared is the bigint the server infers, not a string.
 
+use postgres_types::Type as PgType;
 use rootcause::Report;
 
 use super::parameter_to_literal;
@@ -30,7 +31,7 @@ fn parameter_bigint_decode(parameter: &QueryParameter) -> AstTransformResult<Opt
     let Some(bytes) = &parameter.value else {
         return Ok(None);
     };
-    if parameter.oid == TypeOid::UNSPECIFIED {
+    if oid_is_undeclared(parameter.oid) {
         let value = if parameter.format == 0 {
             std::str::from_utf8(bytes).ok().and_then(bigint_text_parse)
         } else {
@@ -56,6 +57,12 @@ fn parameter_bigint_decode(parameter: &QueryParameter) -> AstTransformResult<Opt
     }
 }
 
+/// A parameter declared `unknown` is typed by its position, as one left
+/// undeclared is.
+fn oid_is_undeclared(oid: TypeOid) -> bool {
+    oid == TypeOid::UNSPECIFIED || oid == TypeOid::from_type(&PgType::UNKNOWN)
+}
+
 /// `text` as PostgreSQL's bigint input reads it, for the decimal spelling:
 /// an optional sign and digits, with whitespace around them. The hex, octal,
 /// binary and underscore spellings are left to origin.
@@ -74,7 +81,6 @@ fn not_a_bigint() -> Report<AstTransformError> {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use postgres_types::Type as PgType;
 
     use super::*;
 
@@ -111,6 +117,8 @@ mod tests {
             ("undeclared text, empty",     Some(b""),        0, undeclared,        None),
             ("undeclared binary",          Some(&seven),     1, undeclared,        Some(Some(7))),
             ("undeclared binary, 4 bytes", Some(&seven_int4), 1, undeclared,       None),
+            ("declared unknown, text",     Some(b"10"),      0, of(PgType::UNKNOWN), Some(Some(10))),
+            ("declared unknown, binary",   Some(&seven),     1, of(PgType::UNKNOWN), Some(Some(7))),
             ("null",                       None,             0, undeclared,        Some(None)),
             ("null, declared text",        None,             0, of(PgType::TEXT),  Some(None)),
             ("int4 text",                  Some(b"10"),      0, of(PgType::INT4),  Some(Some(10))),
