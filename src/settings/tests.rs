@@ -1453,3 +1453,168 @@ fn test_config_parse_error_hints_only_at_a_misplaced_key() {
     assert!(rendered.contains("missing field `host`"), "{rendered}");
     assert!(!rendered.contains("[table] header"), "{rendered}");
 }
+
+// ==================== config_file_create ====================
+
+/// An empty directory under the temp dir for one test's config file.
+fn config_dir_fresh(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(name);
+    let _ = fs::remove_dir_all(&dir);
+    dir
+}
+
+/// The flags of a first start in create mode: every required setting, both
+/// passwords, and a few optional settings.
+fn config_create_args() -> CliArgs {
+    let mut args = base_cli_args();
+    args.cdc_slot_name = Some("My_Slot".to_owned());
+    args.origin.ssl_mode = Some(SslMode::Require);
+    args.replication.host = Some("replica.example.com".to_owned());
+    args.replication.password = Some("repl_pass".to_owned());
+    args.metrics_socket = Some("127.0.0.1:9090".parse().expect("valid socket addr"));
+    args.dynamic.cache_policy = Some(CachePolicy::Fifo);
+    args.dynamic.allowed_tables = Some("users,audit.orders".to_owned());
+    args.pinned_queries = Some("SELECT 1;SELECT 2".to_owned());
+    args.telemetry_off = true;
+    args
+}
+
+/// A created config file holds the required settings and the optional ones a
+/// flag set; passwords, the cache connection and unset optional settings
+/// stay out (PGC-641).
+#[test]
+fn test_config_file_create_writes_required_and_flagged_settings_only() {
+    let dir = config_dir_fresh("pgcache_test_config_create_content");
+    let path = dir.join("nested").join("config.toml");
+
+    config_file_create(&path, &config_create_args()).expect("create config file");
+    let content = fs::read_to_string(&path).expect("read created file");
+
+    for written in [
+        "num_workers = 4",
+        "[origin]",
+        "host = \"origin.example.com\"",
+        "ssl_mode = \"require\"",
+        "[replication]",
+        "host = \"replica.example.com\"",
+        "publication_name = \"pub\"",
+        "slot_name = \"my_slot\"",
+        "[listen]",
+        "socket = \"127.0.0.1:6432\"",
+        "[metrics]",
+        "socket = \"127.0.0.1:9090\"",
+        "cache_policy = \"fifo\"",
+        "allowed_tables = [\"users\", \"audit.orders\"]",
+        "pinned_queries = [\"SELECT 1\", \"SELECT 2\"]",
+        "telemetry = false",
+    ] {
+        assert!(
+            content.contains(written),
+            "missing `{written}` in:\n{content}"
+        );
+    }
+    for left_out in [
+        "origin_pass",
+        "repl_pass",
+        "password =",
+        "[cache]",
+        "cache_user",
+        "admission_threshold",
+        "memo_cache_size",
+        "disk_limit",
+        "log_level",
+        "population_workers",
+    ] {
+        assert!(
+            !content.contains(left_out),
+            "`{left_out}` should not be in:\n{content}"
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&path)
+            .expect("stat created file")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    fs::remove_dir_all(&dir).expect("remove temp dir");
+}
+
+/// The start that creates the file and a later start from the file resolve to
+/// the settings the flags alone give. The later start passes only what the
+/// file does not hold: the cache connection and the passwords.
+#[test]
+fn test_config_file_create_round_trips_to_the_same_settings() {
+    let dir = config_dir_fresh("pgcache_test_config_create_round_trip");
+    let path = dir.join("config.toml");
+    let from_flags = settings_build(config_create_args(), None, None).expect("build from flags");
+
+    let created = config_file_create(&path, &config_create_args()).expect("create config file");
+    let first = settings_build(config_create_args(), Some(created), Some(path.clone()))
+        .expect("build the creating start");
+
+    let mut later_args = CliArgs {
+        cache: base_cli_args().cache,
+        ..Default::default()
+    };
+    later_args.origin.password = Some("origin_pass".to_owned());
+    later_args.replication.password = Some("repl_pass".to_owned());
+    let reread: SettingsToml =
+        toml::from_str(&fs::read_to_string(&path).expect("read created file"))
+            .expect("parse created file");
+    let later = settings_build(later_args, Some(reread), Some(path)).expect("build a later start");
+
+    for settings in [&first, &later] {
+        assert_eq!(settings.origin, from_flags.origin);
+        assert_eq!(settings.replication, from_flags.replication);
+        assert_eq!(settings.cache, from_flags.cache);
+        assert_eq!(settings.cdc, from_flags.cdc);
+        assert_eq!(settings.listen, from_flags.listen);
+        assert_eq!(settings.num_workers, from_flags.num_workers);
+        assert_eq!(
+            settings.metrics.as_ref().map(|m| m.socket),
+            from_flags.metrics.as_ref().map(|m| m.socket)
+        );
+        assert_eq!(settings.pinned_queries, from_flags.pinned_queries);
+        assert_eq!(settings.telemetry, from_flags.telemetry);
+        let (dynamic, expected) = (settings.dynamic.load(), from_flags.dynamic.load());
+        assert_eq!(dynamic.cache_policy, expected.cache_policy);
+        assert_eq!(dynamic.allowed_tables, expected.allowed_tables);
+        assert_eq!(dynamic.admission_threshold, expected.admission_threshold);
+        assert!(!settings.dynamic.restart_required());
+    }
+
+    fs::remove_dir_all(&dir).expect("remove temp dir");
+}
+
+#[test]
+fn test_config_file_create_leaves_an_existing_file_alone() {
+    let dir = config_dir_fresh("pgcache_test_config_create_existing");
+    fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("config.toml");
+    fs::write(&path, "kept").expect("write existing file");
+
+    config_file_create(&path, &config_create_args()).expect_err("the file already exists");
+
+    assert_eq!(
+        fs::read_to_string(&path).expect("read existing file"),
+        "kept"
+    );
+    fs::remove_dir_all(&dir).expect("remove temp dir");
+}
+
+#[test]
+fn test_config_file_create_without_a_required_flag_writes_nothing() {
+    let dir = config_dir_fresh("pgcache_test_config_create_incomplete");
+    let path = dir.join("config.toml");
+    let mut args = config_create_args();
+    args.num_workers = None;
+
+    let err = config_file_create(&path, &args).expect_err("num_workers is not given");
+
+    assert!(err.to_string().contains("num_workers"), "{err}");
+    assert!(!path.exists());
+}

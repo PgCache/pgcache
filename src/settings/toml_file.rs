@@ -1,15 +1,19 @@
 use std::fs;
-use std::fs::read_to_string;
+use std::fs::{OpenOptions, read_to_string};
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 use rootcause::Report;
 
+use super::cli::{CliArgs, csv_parse, pinned_queries_parse, static_settings_resolve};
 use super::dynamic::DynamicConfig;
 use super::{
-    BoxedError, CachePolicy, ConfigError, ConfigResult, DynamicConfigPatch, SettingsToml,
-    toml_parse_error,
+    BoxedError, CachePolicy, ConfigError, ConfigResult, DynamicConfigPatch, PgSettingsPartial,
+    SettingsToml, SslMode, toml_parse_error,
 };
-use crate::result::MapIntoReport;
+use crate::result::{MapIntoReport, ReportExt};
 
 /// Extract dynamic config fields from a parsed TOML config file.
 fn dynamic_config_from_toml(config: &SettingsToml) -> DynamicConfig {
@@ -126,6 +130,183 @@ fn nullable_int_edit<T: TryInto<i64> + Copy + std::fmt::Display>(
     value: Option<Option<T>>,
 ) -> ConfigResult<Option<Option<toml_edit::Item>>> {
     value.map(|v| v.map(int_item).transpose()).transpose()
+}
+
+/// Opens a created config file.
+const CREATED_HEADER: &str = "\
+# Written by pgcache --config_create from the settings it first started with.
+# Passwords and the cache database connection are not stored here: keep
+# giving those as flags or environment variables.
+";
+
+/// Write a config file at `path` from the flags of a first start and return
+/// it parsed, so that start runs from the file as every later one will.
+pub(super) fn config_file_create(path: &Path, args: &CliArgs) -> ConfigResult<SettingsToml> {
+    let content = config_file_render(args)?;
+    let location = || format!("creating config file {}", path.display());
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)
+            .map_into_report::<ConfigError>()
+            .attach_loc(location())?;
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    // Owner-only: the file names the origin and is the user's to widen.
+    #[cfg(unix)]
+    options.mode(0o600);
+    options
+        .open(path)
+        .and_then(|mut file| file.write_all(content.as_bytes()))
+        .map_into_report::<ConfigError>()
+        .attach_loc(location())?;
+    toml::from_str(&content)
+        .map_err(|e| toml_parse_error(e.message(), e.span(), &content))
+        .map_into_report::<ConfigError>()
+}
+
+/// The text of a created config file. Required settings are always written
+/// and optional ones only when a flag set them, so a default derived at
+/// startup is not frozen into the file. Passwords and the cache connection
+/// are never written.
+fn config_file_render(args: &CliArgs) -> ConfigResult<String> {
+    let statics = static_settings_resolve(&args.static_flags(), None)?;
+    let dynamic = &args.dynamic;
+    let string_item = |text: &str| toml_edit::value(text);
+    let path_item = |path: &Path| toml_edit::value(path.display().to_string());
+    let list_item = |values: Option<Vec<String>>| values.as_deref().map(string_array_item);
+
+    let mut doc = toml_edit::DocumentMut::new();
+    doc.insert("num_workers", int_item(statics.num_workers)?);
+    // `cache_size` is left out: it is deprecated and ignored.
+    let optional = [
+        (
+            "population_workers_min",
+            args.population_workers_min.map(int_item).transpose()?,
+        ),
+        (
+            "population_workers_max",
+            args.population_workers_max.map(int_item).transpose()?,
+        ),
+        (
+            "role_poll_interval",
+            args.role_poll_interval.map(int_item).transpose()?,
+        ),
+        ("tls_cert", args.tls_cert.as_deref().map(path_item)),
+        ("tls_key", args.tls_key.as_deref().map(path_item)),
+        ("log_level", dynamic.log_level.as_deref().map(string_item)),
+        (
+            "cache_policy",
+            dynamic
+                .cache_policy
+                .map(|policy| string_item(cache_policy_name(policy))),
+        ),
+        (
+            "admission_threshold",
+            dynamic.admission_threshold.map(int_item).transpose()?,
+        ),
+        (
+            "mv_size_ratio",
+            dynamic.mv_size_ratio.map(int_item).transpose()?,
+        ),
+        (
+            "mv_compute_min_rows",
+            dynamic.mv_compute_min_rows.map(int_item).transpose()?,
+        ),
+        (
+            "memo_cache_size",
+            dynamic.memo_cache_size.map(int_item).transpose()?,
+        ),
+        (
+            "memory_limit",
+            dynamic.memory_limit.map(int_item).transpose()?,
+        ),
+        ("disk_limit", dynamic.disk_limit.map(int_item).transpose()?),
+        (
+            "allowed_tables",
+            list_item(csv_parse(dynamic.allowed_tables.clone())),
+        ),
+        (
+            "pinned_queries",
+            list_item(pinned_queries_parse(args.pinned_queries.clone())),
+        ),
+        (
+            "pinned_tables",
+            list_item(csv_parse(args.pinned_tables.clone())),
+        ),
+        (
+            "telemetry",
+            args.telemetry_off.then(|| toml_edit::value(false)),
+        ),
+    ];
+    for (key, item) in optional {
+        if let Some(item) = item {
+            doc.insert(key, item);
+        }
+    }
+
+    let mut origin = toml_edit::Table::new();
+    origin.insert("host", string_item(&statics.origin.host));
+    origin.insert("port", int_item(statics.origin.port)?);
+    origin.insert("user", string_item(&statics.origin.user));
+    origin.insert("database", string_item(&statics.origin.database));
+    if let Some(mode) = args.origin.ssl_mode {
+        origin.insert("ssl_mode", string_item(ssl_mode_name(mode)));
+    }
+    doc.insert("origin", toml_edit::Item::Table(origin));
+
+    let replication = replication_table(&args.replication)?;
+    if !replication.is_empty() {
+        doc.insert("replication", toml_edit::Item::Table(replication));
+    }
+
+    let mut cdc = toml_edit::Table::new();
+    cdc.insert(
+        "publication_name",
+        string_item(&statics.cdc.publication_name),
+    );
+    cdc.insert("slot_name", string_item(&statics.cdc.slot_name));
+    doc.insert("cdc", toml_edit::Item::Table(cdc));
+
+    let mut listen = toml_edit::Table::new();
+    listen.insert("socket", string_item(&statics.listen.socket.to_string()));
+    doc.insert("listen", toml_edit::Item::Table(listen));
+
+    if let Some(socket) = args.metrics_socket {
+        let mut metrics = toml_edit::Table::new();
+        metrics.insert("socket", string_item(&socket.to_string()));
+        doc.insert("metrics", toml_edit::Item::Table(metrics));
+    }
+
+    Ok(format!("{CREATED_HEADER}{doc}"))
+}
+
+/// The `[replication]` overrides given by flag, without the password.
+fn replication_table(flags: &PgSettingsPartial) -> ConfigResult<toml_edit::Table> {
+    let mut table = toml_edit::Table::new();
+    if let Some(host) = &flags.host {
+        table.insert("host", toml_edit::value(host.as_str()));
+    }
+    if let Some(port) = flags.port {
+        table.insert("port", int_item(port)?);
+    }
+    if let Some(user) = &flags.user {
+        table.insert("user", toml_edit::value(user.as_str()));
+    }
+    if let Some(database) = &flags.database {
+        table.insert("database", toml_edit::value(database.as_str()));
+    }
+    if let Some(mode) = flags.ssl_mode {
+        table.insert("ssl_mode", toml_edit::value(ssl_mode_name(mode)));
+    }
+    Ok(table)
+}
+
+fn ssl_mode_name(mode: SslMode) -> &'static str {
+    match mode {
+        SslMode::Disable => "disable",
+        SslMode::Require => "require",
+        SslMode::VerifyFull => "verify-full",
+    }
 }
 
 fn cache_policy_name(policy: CachePolicy) -> &'static str {

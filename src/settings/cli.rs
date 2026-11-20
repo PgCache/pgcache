@@ -11,6 +11,7 @@ use lexopt::prelude::*;
 use rootcause::Report;
 
 use super::dynamic::{DynamicConfig, DynamicConfigHandle, StaticBaseline};
+use super::toml_file::config_file_create;
 use super::{
     Allowlist, AllowlistEntry, BoxedError, CachePolicy, CdcSettings, ConfigError, ConfigResult,
     DEFAULT_PUBLICATION_NAME, DEFAULT_SLOT_NAME, ListenSettings, MetricsSettings, PgSettings,
@@ -121,13 +122,13 @@ fn separated_parse(input: Option<String>, separator: char) -> Option<Vec<String>
 }
 
 /// Parse a comma-separated list.
-fn csv_parse(csv: Option<String>) -> Option<Vec<String>> {
+pub(super) fn csv_parse(csv: Option<String>) -> Option<Vec<String>> {
     separated_parse(csv, ',')
 }
 
 /// Parse a semicolon-separated query list. Semicolons are used instead of
 /// commas because SQL queries contain commas.
-fn pinned_queries_parse(input: Option<String>) -> Option<Vec<String>> {
+pub(super) fn pinned_queries_parse(input: Option<String>) -> Option<Vec<String>> {
     separated_parse(input, ';')
 }
 
@@ -397,7 +398,7 @@ pub(super) struct StaticFlags {
 }
 
 impl CliArgs {
-    fn static_flags(&self) -> StaticFlags {
+    pub(super) fn static_flags(&self) -> StaticFlags {
         StaticFlags {
             origin: self.origin.clone(),
             cache: self.cache.clone(),
@@ -417,7 +418,35 @@ impl CliArgs {
     }
 }
 
-fn cli_args_parse() -> ConfigResult<(CliArgs, Option<SettingsToml>, Option<PathBuf>)> {
+/// Where the config file stands once the flags are read.
+enum ConfigFile {
+    /// No `--config`.
+    Unset,
+    Loaded {
+        path: PathBuf,
+        config: Box<SettingsToml>,
+    },
+    /// `--config_create` and nothing at the path yet.
+    ToCreate { path: PathBuf },
+}
+
+impl ConfigFile {
+    fn loaded(&self) -> Option<&SettingsToml> {
+        match self {
+            ConfigFile::Loaded { config, .. } => Some(config),
+            ConfigFile::Unset | ConfigFile::ToCreate { .. } => None,
+        }
+    }
+
+    fn into_loaded(self) -> Option<SettingsToml> {
+        match self {
+            ConfigFile::Loaded { config, .. } => Some(*config),
+            ConfigFile::Unset | ConfigFile::ToCreate { .. } => None,
+        }
+    }
+}
+
+fn cli_args_parse() -> ConfigResult<(CliArgs, ConfigFile)> {
     let mut args = CliArgs::default();
     let mut config_path = None;
     let mut config_create = false;
@@ -483,8 +512,8 @@ fn cli_args_parse() -> ConfigResult<(CliArgs, Option<SettingsToml>, Option<PathB
         }
     }
 
-    let config = config_read(config_path.as_ref(), config_create)?;
-    Ok((args, config, config_path))
+    let config_file = config_read(config_path, config_create)?;
+    Ok((args, config_file))
 }
 
 impl DynamicArgs {
@@ -509,24 +538,27 @@ impl DynamicArgs {
 }
 
 /// Read the config file. Read after the flag loop so flag order is irrelevant.
-/// In create mode a missing file is expected — start from defaults and let the
-/// dynamic config write-back create it on the first `PUT /config`. Other IO
+/// In create mode a missing file is expected: a serving start writes it from
+/// the flags, and the one-shot modes run from the flags alone. Other IO
 /// errors (permissions, etc.) still fail even in create mode, since those
 /// aren't typos.
-fn config_read(
-    config_path: Option<&PathBuf>,
-    config_create: bool,
-) -> ConfigResult<Option<SettingsToml>> {
+fn config_read(config_path: Option<PathBuf>, config_create: bool) -> ConfigResult<ConfigFile> {
     let Some(path) = config_path else {
-        return Ok(None);
+        return Ok(ConfigFile::Unset);
     };
-    match read_to_string(path) {
-        Ok(file) => Ok(Some(
-            toml::from_str(&file)
+    match read_to_string(&path) {
+        Ok(file) => {
+            let config = toml::from_str(&file)
                 .map_err(|e| toml_parse_error(e.message(), e.span(), &file))
-                .map_into_report::<ConfigError>()?,
-        )),
-        Err(e) if config_create && e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                .map_into_report::<ConfigError>()?;
+            Ok(ConfigFile::Loaded {
+                path,
+                config: Box::new(config),
+            })
+        }
+        Err(e) if config_create && e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(ConfigFile::ToCreate { path })
+        }
         Err(e) => Err(e).map_into_report::<ConfigError>(),
     }
 }
@@ -883,16 +915,17 @@ fn healthcheck_socket_resolve(
 
 impl RunMode {
     pub fn from_args() -> ConfigResult<RunMode> {
-        let (args, config, config_path) = cli_args_parse()?;
+        let (args, config_file) = cli_args_parse()?;
         if args.healthcheck {
             return Ok(RunMode::Healthcheck(healthcheck_socket_resolve(
                 args.metrics_socket,
-                config.as_ref(),
+                config_file.loaded(),
             )?));
         }
         if args.check {
             return Ok(RunMode::Check(Box::new(preflight_settings_build(
-                args, config,
+                args,
+                config_file.into_loaded(),
             )?)));
         }
         if args.purge && !args.cleanup {
@@ -901,15 +934,23 @@ impl RunMode {
         if args.cleanup {
             let purge = args.purge;
             return Ok(RunMode::Cleanup {
-                settings: Box::new(preflight_settings_build(args, config)?),
+                settings: Box::new(preflight_settings_build(args, config_file.into_loaded())?),
                 purge,
             });
         }
         if args.origin_locale {
             return Ok(RunMode::OriginLocale(Box::new(preflight_settings_build(
-                args, config,
+                args,
+                config_file.into_loaded(),
             )?)));
         }
+        // A created file is read back and merged like any other, so the
+        // first start and every later one resolve settings the same way.
+        let (config, config_path) = match config_file {
+            ConfigFile::Unset => (None, None),
+            ConfigFile::Loaded { path, config } => (Some(*config), Some(path)),
+            ConfigFile::ToCreate { path } => (Some(config_file_create(&path, &args)?), Some(path)),
+        };
         Ok(RunMode::Serve(Box::new(settings_build(
             args,
             config,
@@ -922,7 +963,7 @@ impl Settings {
     fn print_usage_and_exit(name: &str) -> ! {
         println!(
             "Usage: {name} -c|--config TOML_FILE --origin_host HOST --origin_port PORT --origin_user USER --origin_database DB \n \
-            [--config_create] (create the config file if missing; persist dynamic /config changes to it) \n \
+            [--config_create] (when the config file is missing, write it from the flags given, without passwords or the cache connection, and start from it) \n \
             [--origin_password PASSWORD] [--origin_ssl_mode disable|require|verify-full] \n \
             [--replication_host HOST] [--replication_port PORT] [--replication_user USER] [--replication_database DB] \n \
             [--replication_password PASSWORD] [--replication_ssl_mode disable|require|verify-full] \n \

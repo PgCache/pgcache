@@ -1,8 +1,98 @@
 use std::io::Error;
+use std::process::Command;
+use std::time::{Duration, Instant};
 
-use crate::util::{TestContext, http_get, http_post, http_put};
+use crate::util::{
+    PgCacheProcess, TestContext, connect_pgcache_args, http_get, http_post, http_put,
+    start_databases,
+};
 
 mod util;
+
+/// Stop pgcache with SIGTERM and wait for it to exit, so it leaves origin
+/// clean for the next start.
+fn pgcache_stop(pgcache: &mut PgCacheProcess) -> Result<(), Error> {
+    let sent = Command::new("kill")
+        .arg("-TERM")
+        .arg(pgcache.id().to_string())
+        .status()?;
+    assert!(sent.success(), "send SIGTERM to pgcache");
+    let started = Instant::now();
+    while pgcache.try_wait()?.is_none() {
+        if started.elapsed() > Duration::from_secs(20) {
+            return Err(Error::other("pgcache still running 20s after SIGTERM"));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(())
+}
+
+/// Create mode (`--config_create` and no file yet): the first start writes
+/// the config file, a `PUT /config` change lands in it, and a later start
+/// takes its settings from the file (PGC-641).
+#[tokio::test]
+async fn test_config_create_writes_a_file_later_starts_run_from() -> Result<(), Error> {
+    let (dbs, origin) = start_databases().await?;
+    let dir =
+        std::env::temp_dir().join(format!("pgcache_test_config_create_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("created.toml");
+    let path_arg = path.to_str().expect("utf-8 temp path");
+    // The harness passes its own --config first; the later one wins. Nothing
+    // is at that path yet, so every setting comes from a flag.
+    let first_args = [
+        "--config",
+        path_arg,
+        "--config_create",
+        "--num_workers",
+        "2",
+        "--cdc_publication_name",
+        "pub_config_create",
+        "--cdc_slot_name",
+        "slot_config_create",
+        "--disk_limit",
+        "9223372036854775807",
+    ];
+
+    let (mut pgcache, _listen_port, metrics_port, client) =
+        connect_pgcache_args(&dbs, &first_args).await?;
+    let created = std::fs::read_to_string(&path)?;
+    assert!(created.contains("num_workers = 2"), "{created}");
+    assert!(created.contains("[origin]"), "{created}");
+    assert!(
+        created.contains("slot_name = \"slot_config_create\""),
+        "{created}"
+    );
+    assert!(!created.contains("[cache]"), "{created}");
+    assert!(!created.contains("admission_threshold"), "{created}");
+
+    let (status, body) = http_put(metrics_port, "/config", r#"{"admission_threshold": 7}"#).await?;
+    assert_eq!(status, 200, "PUT failed: {body}");
+    assert!(std::fs::read_to_string(&path)?.contains("admission_threshold = 7"));
+    drop(client);
+    pgcache_stop(&mut pgcache)?;
+
+    // No worker count or CDC names by flag: the file supplies them.
+    let later_args = ["--config", path_arg, "--config_create"];
+    let (_pgcache, _listen_port, metrics_port, _client) =
+        connect_pgcache_args(&dbs, &later_args).await?;
+    let (status, body) = http_get(metrics_port, "/config").await?;
+    assert_eq!(status, 200, "body: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).map_err(Error::other)?;
+    assert_eq!(json["dynamic"]["admission_threshold"].as_u64(), Some(7));
+    assert_eq!(json["restart_required"], false);
+    let slots = origin
+        .query_one(
+            "SELECT COUNT(*) FROM pg_replication_slots WHERE slot_name = 'slot_config_create' AND active",
+            &[],
+        )
+        .await
+        .map_err(Error::other)?;
+    assert_eq!(slots.get::<_, i64>(0), 1, "the file's slot name is in use");
+
+    std::fs::remove_dir_all(&dir)?;
+    Ok(())
+}
 
 /// GET /config returns current dynamic config with expected fields
 #[tokio::test]
