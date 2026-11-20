@@ -7,7 +7,7 @@ use crate::cache::query::QueryParameters;
 use crate::query::ast::LiteralValue;
 use crate::query::ast::rope::Query;
 use crate::query::transform::{
-    AstTransformError, AstTransformResult, bigint_text_parse, placeholder_bigint_decode,
+    AstTransformError, AstTransformResult, placeholder_row_count_literal,
 };
 
 /// PostgreSQL types both clauses bigint, and a NULL in either means the
@@ -59,23 +59,28 @@ pub fn limit_rows_needed(query: Query<'_>) -> Option<u64> {
         .and_then(|limit| limit.rows_needed())
 }
 
-/// One LIMIT or OFFSET value, `None` for NULL. A string is a bind value the
-/// substitution pass left as an untyped literal.
+/// One LIMIT or OFFSET value, `None` for NULL. A placeholder is read as the
+/// literal substitution puts in its place.
 fn limit_value_decode(
     literal: &LiteralValue,
     parameters: Option<&QueryParameters>,
 ) -> AstTransformResult<Option<u64>> {
+    let bound;
+    let literal =
+        if let (LiteralValue::Parameter(placeholder), Some(parameters)) = (literal, parameters) {
+            bound = placeholder_row_count_literal(placeholder, parameters)?;
+            &bound
+        } else {
+            literal
+        };
     let value = match literal {
         LiteralValue::Integer(value) => Some(*value),
         LiteralValue::Null => None,
-        LiteralValue::String(text) => {
-            Some(bigint_text_parse(text).ok_or_else(|| limit_value_error("is not a bigint"))?)
+        LiteralValue::Parameter(_) => {
+            return Err(limit_value_error("is a placeholder with no value"));
         }
-        LiteralValue::Parameter(placeholder) => match parameters {
-            Some(parameters) => placeholder_bigint_decode(placeholder, parameters)?,
-            None => return Err(limit_value_error("is a placeholder with no value")),
-        },
-        LiteralValue::StringWithCast(..)
+        LiteralValue::String(_)
+        | LiteralValue::StringWithCast(..)
         | LiteralValue::Float(_)
         | LiteralValue::Boolean(_)
         | LiteralValue::NullWithCast(_)
@@ -203,13 +208,13 @@ mod tests {
     }
 
     /// Registration reads its population cap from the substituted tree, where
-    /// an undeclared bind is a string literal and a NULL bind a NULL.
+    /// a bound value is an integer or a NULL whatever the client declared.
     #[test]
     fn test_row_limit_decode_reads_a_substituted_tree() {
         let tree = query_tree_parse("SELECT id FROM users LIMIT $1 OFFSET $2").expect("parse");
         let substituted = |values: &[Option<&[u8]>]| {
             let parameters = parameters(values, TypeOid::UNSPECIFIED);
-            let tree = query_tree_parameters_replace(&tree, &parameters).expect("substitute");
+            let tree = query_tree_parameters_replace(&tree, &parameters).ok()?;
             RowLimit::decode(tree.root(), None).ok()
         };
         assert_eq!(

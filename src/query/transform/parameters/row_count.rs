@@ -1,6 +1,6 @@
-//! Decode a Bind value sitting where PostgreSQL requires a bigint (LIMIT,
-//! OFFSET). The position fixes the type, so a parameter the client left
-//! undeclared is the bigint the server infers, not a string.
+//! Decode a Bind value sitting in a LIMIT or OFFSET, where PostgreSQL
+//! requires a bigint. The position fixes the type, so a parameter the client
+//! left undeclared is the bigint the server infers, not a string.
 
 use postgres_types::Type as PgType;
 use rootcause::Report;
@@ -12,8 +12,25 @@ use crate::oid::TypeOid;
 use crate::query::ast::LiteralValue;
 use crate::query::transform::{AstTransformError, AstTransformResult};
 
+/// The LIMIT or OFFSET value bound to `placeholder`, as the literal a
+/// substituted tree carries there: an integer, or NULL for no value. Fails
+/// on a value PostgreSQL would reject, or would round to a bigint by rules
+/// this does not reproduce.
+pub(crate) fn placeholder_row_count_literal(
+    placeholder: &str,
+    parameters: &QueryParameters,
+) -> AstTransformResult<LiteralValue> {
+    match placeholder_bigint_decode(placeholder, parameters)? {
+        Some(value) if value < 0 => Err(Report::from(AstTransformError::InvalidParameterValue {
+            message: "LIMIT/OFFSET value is negative".to_owned(),
+        })),
+        Some(value) => Ok(LiteralValue::Integer(value)),
+        None => Ok(LiteralValue::Null),
+    }
+}
+
 /// The bigint bound to `placeholder`, `None` for NULL.
-pub(crate) fn placeholder_bigint_decode(
+fn placeholder_bigint_decode(
     placeholder: &str,
     parameters: &QueryParameters,
 ) -> AstTransformResult<Option<i64>> {
@@ -66,7 +83,7 @@ fn oid_is_undeclared(oid: TypeOid) -> bool {
 /// `text` as PostgreSQL's bigint input reads it, for the decimal spelling:
 /// an optional sign and digits, with whitespace around them. The hex, octal,
 /// binary and underscore spellings are left to origin.
-pub(crate) fn bigint_text_parse(text: &str) -> Option<i64> {
+fn bigint_text_parse(text: &str) -> Option<i64> {
     text.trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\x0B' | '\x0C' | '\r'))
         .parse()
         .ok()
@@ -132,6 +149,19 @@ mod tests {
         for (name, value, format, oid, expected) in cases {
             assert_eq!(decoded(value, format, oid).ok(), expected, "{name}");
         }
+    }
+
+    #[test]
+    fn test_placeholder_row_count_literal_is_an_integer_or_null() {
+        let literal = |value: Option<&[u8]>| {
+            let parameters = parameters(value, 0, TypeOid::UNSPECIFIED);
+            placeholder_row_count_literal("$1", &parameters).ok()
+        };
+        assert_eq!(literal(Some(b"1000")), Some(LiteralValue::Integer(1000)));
+        assert_eq!(literal(Some(b"0")), Some(LiteralValue::Integer(0)));
+        assert_eq!(literal(None), Some(LiteralValue::Null));
+        assert_eq!(literal(Some(b"-1")), None);
+        assert_eq!(literal(Some(b"ten")), None);
     }
 
     #[test]

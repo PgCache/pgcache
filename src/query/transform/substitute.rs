@@ -9,12 +9,14 @@
 //! division by zero, a non-numeric operand) is entered so what folds
 //! inside it still does.
 
+use smallvec::SmallVec;
+
 use super::AstTransformResult;
 use super::constant_fold::literal_arithmetic_fold;
-use super::parameters::literal_value_parameters_replace;
+use super::parameters::{literal_value_parameters_replace, placeholder_row_count_literal};
 use crate::cache::QueryParameters;
 use crate::query::ast::rope::{
-    NodeKind, NodeRef, QueryTree, Remap, Replacement, Replacements, Scalar, ScalarKind,
+    NodeKind, NodeRef, Query, QueryTree, Remap, Replacement, Replacements, Scalar, ScalarKind,
     TreeBuilder, View,
 };
 use crate::query::ast::{LiteralValue, NodeId, ScalarOp};
@@ -38,6 +40,7 @@ pub fn query_tree_parameters_replace_remapped(
     let mut pass = Pass {
         parameters,
         replacements: Replacements::new(),
+        row_counts: SmallVec::new(),
     };
     pass.subtree(tree.root().node_ref())?;
     if pass.replacements.is_empty() {
@@ -51,6 +54,9 @@ pub fn query_tree_parameters_replace_remapped(
 struct Pass<'a> {
     parameters: &'a QueryParameters,
     replacements: Replacements,
+    /// The LIMIT and OFFSET literals of every query entered so far.
+    /// PostgreSQL types a placeholder there bigint, whatever was declared.
+    row_counts: SmallVec<[NodeId; 2]>,
 }
 
 impl Pass<'_> {
@@ -60,6 +66,12 @@ impl Pass<'_> {
         let mut next = u32::try_from(root.id().index()).unwrap_or(u32::MAX);
         while next < end {
             let position = root.at_position(NodeId::from_index(next));
+            if let NodeKind::Query { .. } = position.kind() {
+                let query = Query::from_ref(position);
+                let literals = [query.limit_count(), query.limit_offset()];
+                self.row_counts
+                    .extend(literals.into_iter().flatten().map(|literal| literal.id()));
+            }
             next = match self.position(position)? {
                 Some(replacement) => {
                     self.replacements.push(position.id(), replacement);
@@ -124,6 +136,11 @@ impl Pass<'_> {
         let NodeKind::Literal(value) = expr.node_ref().kind() else {
             return Ok(None);
         };
+        if let LiteralValue::Parameter(placeholder) = value
+            && self.row_counts.contains(&expr.id())
+        {
+            return placeholder_row_count_literal(placeholder, self.parameters).map(Some);
+        }
         let mut value = value.clone();
         literal_value_parameters_replace(&mut value, self.parameters)?;
         Ok(Some(value))
@@ -153,6 +170,26 @@ mod tests {
                 .iter()
                 .map(|v| TypeOid::from_type(v.as_ref().map_or(&PgType::TEXT, |(_, ty)| ty)))
                 .collect(),
+        }
+    }
+
+    /// Values sent with no declared type, all in `format`.
+    fn undeclared(values: &[Option<&[u8]>], format: i16) -> QueryParameters {
+        QueryParameters {
+            values: values
+                .iter()
+                .map(|value| value.map(Bytes::copy_from_slice))
+                .collect(),
+            formats: vec![format],
+            oids: Vec::new(),
+        }
+    }
+
+    fn substituted(sql: &str, parameters: &QueryParameters) -> String {
+        let tree = query_tree_parse(sql).expect("parse");
+        match query_tree_parameters_replace(&tree, parameters) {
+            Ok(tree) => plain(&tree),
+            Err(e) => format!("ERR {}", e.current_context()),
         }
     }
 
@@ -190,12 +227,29 @@ mod tests {
             ("SELECT id FROM users WHERE id = $1", params(&[Some((b"not a number", PgType::INT4))]), "ERR Invalid parameter value: invalid integer 'not a number': invalid digit found in string"),
         ];
         for (sql, parameters, expected) in cases {
-            let tree = query_tree_parse(sql).expect("parse");
-            let actual = match query_tree_parameters_replace(&tree, &parameters) {
-                Ok(tree) => plain(&tree),
-                Err(e) => format!("ERR {}", e.current_context()),
-            };
-            assert_eq!(actual, expected, "{sql}");
+            assert_eq!(substituted(sql, &parameters), expected, "{sql}");
+        }
+    }
+
+    /// A LIMIT or OFFSET placeholder is a bigint by its position, in a
+    /// subquery as at the root, while the same undeclared value elsewhere
+    /// stays an untyped string.
+    #[test]
+    fn test_limit_placeholder_is_typed_by_its_position() {
+        let text = |value: &'static str| Some((value.as_bytes(), PgType::TEXT));
+        let eight = 8i64.to_be_bytes();
+        #[rustfmt::skip]
+        let cases: Vec<(&str, QueryParameters, &str)> = vec![
+            ("SELECT id FROM users WHERE name = $1 LIMIT $2 OFFSET $3", undeclared(&[Some(b"7"), Some(b"1000"), Some(b"20")], 0), "SELECT id FROM users WHERE name = '7' LIMIT 1000 OFFSET 20"),
+            ("SELECT id FROM users LIMIT $1 OFFSET $2", undeclared(&[None, None], 0), "SELECT id FROM users LIMIT NULL OFFSET NULL"),
+            ("SELECT id FROM users LIMIT $1", undeclared(&[Some(&eight)], 1), "SELECT id FROM users LIMIT 8"),
+            ("SELECT id FROM users WHERE id IN (SELECT user_id FROM orders ORDER BY amount LIMIT $1)", undeclared(&[Some(b"3")], 0), "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders ORDER BY amount ASC LIMIT 3)"),
+            ("SELECT id FROM users LIMIT $1", undeclared(&[Some(b"-1")], 0), "ERR Invalid parameter value: LIMIT/OFFSET value is negative"),
+            ("SELECT id FROM users LIMIT $1", undeclared(&[Some(b"ten")], 0), "ERR Invalid parameter value: value in a bigint position is not a bigint"),
+            ("SELECT id FROM users LIMIT $1", params(&[text("10")]), "ERR Invalid parameter value: value in a bigint position is not a bigint"),
+        ];
+        for (sql, parameters, expected) in cases {
+            assert_eq!(substituted(sql, &parameters), expected, "{sql}");
         }
     }
 
