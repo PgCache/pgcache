@@ -3,7 +3,7 @@
 use tokio_postgres::{Client, Error};
 
 use super::CheckResult;
-use crate::settings::Allowlist;
+use crate::settings::{TableFilter, TableVerdict};
 
 const NAMES_SHOWN: usize = 5;
 
@@ -40,24 +40,17 @@ impl Relation {
     }
 }
 
-fn relation_allowed(allowlist: &Allowlist, schema: &str, name: &str) -> bool {
-    let Some(entries) = allowlist else {
-        return true;
-    };
-    entries.iter().any(|(entry_schema, entry_name)| {
-        entry_name.eq_ignore_ascii_case(name)
-            && entry_schema
-                .as_deref()
-                .is_none_or(|s| s.eq_ignore_ascii_case(schema))
-    })
+/// Whether pgcache would cache the relation under the table filter.
+fn relation_in_scope(filter: &TableFilter, schema: &str, name: &str) -> bool {
+    filter.table_verdict(Some(schema), name) == TableVerdict::Cacheable
 }
 
-/// Load every user relation, scoped to the allowlist when one is set, since
-/// a relation pgcache will never touch should not produce a finding.
+/// Load every user relation the table filter leaves cacheable, since a
+/// relation pgcache will never touch should not produce a finding.
 /// Extension-owned relations (pg_stat_statements views etc.) are skipped.
 pub(super) async fn relations_load(
     client: &Client,
-    allowlist: &Allowlist,
+    filter: &TableFilter,
 ) -> Result<Vec<Relation>, Error> {
     let rows = client
         .query(
@@ -81,7 +74,7 @@ pub(super) async fn relations_load(
     for row in rows {
         let schema: String = row.try_get(0)?;
         let name: String = row.try_get(1)?;
-        if !relation_allowed(allowlist, &schema, &name) {
+        if !relation_in_scope(filter, &schema, &name) {
             continue;
         }
         let kind = match row.try_get::<_, String>(2)?.as_str() {
@@ -144,7 +137,8 @@ pub(super) fn primary_keys_evaluate(relations: &[Relation]) -> CheckResult {
         return CheckResult::warn(
             name,
             "no tables found",
-            "pgcache caches queries on tables; this database (or the allowlisted set) has none.",
+            "pgcache caches queries on tables; this database (or the set allowed_tables and \
+             excluded_tables leave) has none.",
         );
     }
     let missing = tables(relations)
@@ -312,16 +306,24 @@ mod tests {
     }
 
     #[test]
-    fn test_relation_allowed_matches_schema_qualified_and_bare_entries() {
-        let allowlist: Allowlist = Some(vec![
-            (None, "users".to_owned()),
-            (Some("audit".to_owned()), "events".to_owned()),
-        ]);
-        assert!(relation_allowed(&allowlist, "public", "users"));
-        assert!(relation_allowed(&allowlist, "other", "Users"));
-        assert!(relation_allowed(&allowlist, "audit", "events"));
-        assert!(!relation_allowed(&allowlist, "public", "events"));
-        assert!(relation_allowed(&None, "public", "anything"));
+    fn test_relation_in_scope_applies_both_lists() {
+        let names = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+        let allowed = names(&["users", "audit.events", "sessions"]);
+        let excluded = names(&["sessions"]);
+        let filter = TableFilter::new(Some(&allowed), Some(&excluded));
+        assert!(relation_in_scope(&filter, "public", "users"));
+        assert!(relation_in_scope(&filter, "other", "Users"));
+        assert!(relation_in_scope(&filter, "audit", "events"));
+        assert!(!relation_in_scope(&filter, "public", "events"));
+        assert!(!relation_in_scope(&filter, "public", "sessions"));
+        assert!(relation_in_scope(
+            &TableFilter::default(),
+            "public",
+            "anything"
+        ));
+        let excluded_only = TableFilter::new(None, Some(&excluded));
+        assert!(relation_in_scope(&excluded_only, "public", "users"));
+        assert!(!relation_in_scope(&excluded_only, "public", "sessions"));
     }
 
     #[test]

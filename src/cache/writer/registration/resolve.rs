@@ -30,6 +30,7 @@ use crate::query::ast::rope::{NodeKind, QueryTree};
 use crate::query::keying_settings::KeyingSettings;
 use crate::query::resolve::{ResolvedQuery, TableSlot};
 use crate::query::transform::{InlinedCall, query_tree_term_fragments_replace};
+use crate::settings::TableVerdict;
 
 /// Resolve schema for a table: use explicit schema if provided, otherwise lookup via search path.
 async fn table_schema_resolve(
@@ -44,8 +45,28 @@ async fn table_schema_resolve(
     }
 }
 
+/// Refuse a table the table filter does not let be cached, known here by
+/// the schema it resolved to: the proxy's check sees only the names a query
+/// writes, not a policy's tables or a pinned query's.
+fn table_filter_refuse(core: &WriterCore, schema: &str, name: &str) -> CacheResult<()> {
+    let m = crate::metrics::handles();
+    let (schema, name) = (EcoString::from(schema), EcoString::from(name));
+    match core.table_verdict(&schema, &name) {
+        TableVerdict::Cacheable => Ok(()),
+        TableVerdict::NotAllowed => {
+            m.query.allowlist_skipped.increment(1);
+            Err(Report::from(CacheError::TableNotAllowed { schema, name }))
+        }
+        TableVerdict::Excluded => {
+            m.query.excluded_skipped.increment(1);
+            Err(Report::from(CacheError::TableExcluded { schema, name }))
+        }
+    }
+}
+
 /// Ensure all tables referenced in the query exist in the cache.
-/// Resolves schemas and creates cache tables as needed.
+/// Resolves schemas and creates cache tables as needed; a table the table
+/// filter refuses fails the query before it gets one.
 async fn cache_tables_ensure(
     core: &mut WriterCore,
     base_query: &QueryTree,
@@ -58,6 +79,7 @@ async fn cache_tables_ensure(
     for (schema, table_name) in &tables {
         let table_name = table_name.as_str();
         let schema = table_schema_resolve(core, schema.as_deref(), table_name, search_path).await?;
+        table_filter_refuse(core, &schema, table_name)?;
         if !core
             .cache
             .tables
@@ -315,8 +337,9 @@ pub(super) async fn query_fingerprint_resolve(
 }
 
 /// The binding the Resolve command left on the request's alias, when every
-/// table it bound is still the catalog's entry; a table replaced since
-/// (schema change) binds afresh against the current catalog.
+/// table it bound is still the catalog's entry and the table filter still
+/// lets it be cached; a table replaced (schema change) or filtered out
+/// since binds afresh against the current catalog and table filter.
 fn alias_resolution_take(core: &WriterCore, request: &RegisterRequest) -> Option<AliasResolution> {
     let resolution = core
         .state_view
@@ -330,11 +353,14 @@ fn alias_resolution_take(core: &WriterCore, request: &RegisterRequest) -> Option
         .slots()
         .iter()
         .all(|slot| match slot {
-            TableSlot::Base { table, .. } => core
-                .cache
-                .tables
-                .get1(&table.relation_oid)
-                .is_some_and(|catalog| Arc::ptr_eq(catalog.shared(), table)),
+            TableSlot::Base { table, .. } => {
+                core.table_verdict(&table.schema, &table.name) == TableVerdict::Cacheable
+                    && core
+                        .cache
+                        .tables
+                        .get1(&table.relation_oid)
+                        .is_some_and(|catalog| Arc::ptr_eq(catalog.shared(), table))
+            }
             TableSlot::Derived { .. } => true,
         });
     current.then_some(resolution)

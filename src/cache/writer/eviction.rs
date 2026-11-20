@@ -11,7 +11,7 @@ use crate::cache::{CacheError, CacheResult, MapIntoReport, types::CachedQuerySta
 use crate::oid::{FunctionOid, Oid};
 use crate::query::Fingerprint;
 use crate::result::error_chain_format;
-use crate::settings::CachePolicy;
+use crate::settings::{CachePolicy, TableVerdict};
 
 /// Maximum number of generation bumps (second chances) per eviction round.
 /// Bounds re-stamping work and prevents pathological case where all queries
@@ -518,6 +518,62 @@ impl WriterCore {
             self.cache_query_evict(fp).await?;
         }
         Ok(())
+    }
+
+    /// What the table filter, as it stands now, makes of a table.
+    pub(super) fn table_verdict(&self, schema: &str, name: &str) -> TableVerdict {
+        self.cache
+            .dynamic
+            .load()
+            .table_filter
+            .table_verdict(Some(schema), name)
+    }
+
+    /// Evict the cached queries on every table the table filter has come
+    /// to refuse, at most `budget` a call so a table with many queries
+    /// does not stall the writer: a table excluded or dropped from the
+    /// allowlist at runtime stops being served and maintained. Registration
+    /// refuses the tables meanwhile, so the pass ends; the publication
+    /// drain drops their cache tables as it does any table no query
+    /// references.
+    pub(super) async fn filtered_tables_evict(&mut self, budget: usize) -> CacheResult<()> {
+        let filter = {
+            let config = self.cache.dynamic.load();
+            if config.table_filter == self.table_filter_applied {
+                return Ok(());
+            }
+            config.table_filter.clone()
+        };
+        let refused: HashSet<Oid> = self
+            .cache
+            .tables
+            .iter()
+            .filter(|table| {
+                filter.table_verdict(Some(&table.schema), &table.name) != TableVerdict::Cacheable
+            })
+            .map(|table| table.relation_oid)
+            .collect();
+        let mut fingerprints: Vec<Fingerprint> = Vec::new();
+        if !refused.is_empty() {
+            fingerprints.extend(
+                self.cache
+                    .cached_queries
+                    .iter()
+                    .filter(|q| q.relation_oids.iter().any(|oid| refused.contains(oid)))
+                    .map(|q| q.fingerprint)
+                    .take(budget.saturating_add(1)),
+            );
+        }
+        let complete = fingerprints.len() <= budget;
+        fingerprints.truncate(budget);
+        for fingerprint in fingerprints {
+            self.cache_query_evict(fingerprint).await?;
+        }
+        // Left unset while queries remain, so the next call continues.
+        if complete {
+            self.table_filter_applied = filter;
+        }
+        self.publication_dirty_drain().await
     }
 
     /// Evict every query that calls the function `oid` (PGC-578): its body

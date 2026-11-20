@@ -37,7 +37,7 @@ use crate::query::keying_settings::KeyingSettings;
 use crate::query::resolve::PrivilegeNeeds;
 use crate::query::{Fingerprint, SessionKey};
 use crate::result::error_chain_format;
-use crate::settings::{CachePolicy, DynamicConfig, Settings};
+use crate::settings::{CachePolicy, DynamicConfig, Settings, TableVerdict};
 use crate::timing::{QueryTiming, duration_to_ns_u64};
 
 /// Minimum credit stamped on a Pending entry when the previous tick saw fewer
@@ -210,17 +210,21 @@ impl CacheDispatch {
         #[cfg(feature = "fault-injection")]
         fault::init();
         let cfg = settings.dynamic.load();
-        match &cfg.allowed_tables_parsed {
-            Some(_entries) => {
-                let names: Vec<&str> = cfg
-                    .allowed_tables
-                    .as_ref()
-                    .map(|v| v.iter().map(String::as_str).collect())
-                    .unwrap_or_default();
-                info!("table allowlist enabled: {names:?}");
-            }
-            None => info!("table allowlist disabled, all tables cacheable"),
+        let filter = &cfg.table_filter;
+        if let Some(names) = &cfg.allowed_tables
+            && filter.has_allowlist()
+        {
+            info!("table allowlist enabled: {names:?}");
         }
+        if let Some(names) = &cfg.excluded_tables
+            && filter.has_exclusions()
+        {
+            info!("tables excluded from caching: {names:?}");
+        }
+        if !filter.has_allowlist() && !filter.has_exclusions() {
+            info!("no table allowlist or exclusions, all tables cacheable");
+        }
+        filter.conflicts_warn();
 
         let reg_bucket = Arc::new(RegRateBucket::new(Arc::clone(&state_view.reg_gate)));
         Ok(Self {
@@ -417,7 +421,7 @@ impl CacheDispatch {
     /// The identity of an admissible request, with the session key it was
     /// found under: through the alias map, or — once per (query, keying
     /// settings) pair — by asking the writer to resolve the query. `None`
-    /// forwards: a table outside the allowlist, a brand-new pair under
+    /// forwards: a table the table filter refuses, a brand-new pair under
     /// throttle (before resolving, as a brand-new entry would), or a query
     /// that does not resolve.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
@@ -426,12 +430,23 @@ impl CacheDispatch {
         msg: &QueryRequest,
         cfg: &DynamicConfig,
     ) -> Option<(SessionKey, Fingerprint)> {
-        if !fast_path::query_allowlist_check(&cfg.allowed_tables_parsed, msg.query.tree()) {
-            crate::metrics::handles()
-                .query
-                .allowlist_skipped
-                .increment(1);
-            return None;
+        let tables = msg.query.tree().table_names();
+        match cfg.table_filter.references_verdict(tables) {
+            TableVerdict::Cacheable => {}
+            TableVerdict::NotAllowed => {
+                crate::metrics::handles()
+                    .query
+                    .allowlist_skipped
+                    .increment(1);
+                return None;
+            }
+            TableVerdict::Excluded => {
+                crate::metrics::handles()
+                    .query
+                    .excluded_skipped
+                    .increment(1);
+                return None;
+            }
         }
         let session_key = msg
             .session_key

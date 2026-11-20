@@ -7,7 +7,10 @@ use std::path::Path;
 
 use rootcause::Report;
 
-use super::cli::{CliArgs, csv_parse, pinned_queries_parse, static_settings_resolve};
+use super::cli::{
+    CliArgs, DynamicArgs, csv_parse, dynamic_config_from_file, pinned_queries_parse,
+    static_settings_resolve,
+};
 use super::dynamic::DynamicConfig;
 use super::{
     BoxedError, CachePolicy, ConfigError, ConfigResult, DynamicConfigPatch, PgSettingsPartial,
@@ -15,29 +18,17 @@ use super::{
 };
 use crate::result::{MapIntoReport, ReportExt};
 
-/// Extract dynamic config fields from a parsed TOML config file.
-fn dynamic_config_from_toml(config: &SettingsToml) -> DynamicConfig {
-    DynamicConfig::new(
-        config.cache_size,
-        config.cache_policy,
-        config.admission_threshold,
-        config.allowed_tables.clone(),
-        config.log_level.clone(),
-        config.mv_size_ratio,
-        config.mv_compute_min_rows,
-        config.memo_cache_size,
-        config.memory_limit,
-        config.disk_limit,
-    )
-}
-
-/// Read a TOML config file and extract the dynamic config fields.
-pub fn config_file_dynamic_extract(path: &Path) -> ConfigResult<DynamicConfig> {
+/// Read a TOML config file and resolve its dynamic config fields under
+/// `flags`, the way startup did.
+pub(super) fn config_file_dynamic_extract(
+    path: &Path,
+    flags: &DynamicArgs,
+) -> ConfigResult<DynamicConfig> {
     let content = read_to_string(path).map_into_report::<ConfigError>()?;
-    let config: SettingsToml = toml::from_str(&content)
+    let mut config: SettingsToml = toml::from_str(&content)
         .map_err(|e| toml_parse_error(e.message(), e.span(), &content))
         .map_into_report::<ConfigError>()?;
-    Ok(dynamic_config_from_toml(&config))
+    Ok(dynamic_config_from_file(flags, &mut config))
 }
 
 /// Apply a patch to the TOML config file, preserving formatting and comments.
@@ -66,6 +57,13 @@ pub fn config_file_dynamic_update(path: &Path, patch: &DynamicConfigPatch) -> Co
             "allowed_tables",
             patch
                 .allowed_tables
+                .as_ref()
+                .map(|tables| tables.as_deref().map(string_array_item)),
+        ),
+        (
+            "excluded_tables",
+            patch
+                .excluded_tables
                 .as_ref()
                 .map(|tables| tables.as_deref().map(string_array_item)),
         ),
@@ -224,6 +222,10 @@ fn config_file_render(args: &CliArgs) -> ConfigResult<String> {
         (
             "allowed_tables",
             list_item(csv_parse(dynamic.allowed_tables.clone())),
+        ),
+        (
+            "excluded_tables",
+            list_item(csv_parse(dynamic.excluded_tables.clone())),
         ),
         (
             "pinned_queries",

@@ -168,7 +168,7 @@ pub async fn preflight_run(settings: &PreflightSettings) -> PreflightReport {
         .results
         .push(connection::replication_connect_check(&settings.replication, environment).await);
 
-    match relations::relations_load(&client, &settings.allowed_tables).await {
+    match relations::relations_load(&client, &settings.table_filter).await {
         Ok(relations) => {
             report.results.push(relations::table_ownership_evaluate(
                 &relations, superuser, &role_name,

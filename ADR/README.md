@@ -52,7 +52,8 @@ Conventions: files are `ADR-XXX-brief-title.md` with the next sequential number;
 - [ADR-050](ADR-050-elastic-population-pool.md) — Elastic population pool: shared queue + Little's-law BBR-lite sizing *(amends ADR-010; controller superseded by ADR-052)*
 - [ADR-052](ADR-052-probe-and-verify-population-controller.md) — Probe-and-verify population controller: measured growth, utilization shrink *(amends ADR-050; controller shared with ADR-053)*
 - [ADR-053](ADR-053-elastic-serve-pool.md) — Elastic cache serve pool: shared probe-and-verify controller sizes the cache-PG connections *(amends ADR-052)*
-- [ADR-020](ADR-020-table-allowlist.md) — Optional table allowlist restricting what is cached
+- [ADR-020](ADR-020-table-allowlist.md) — Optional table allowlist restricting what is cached *(writer check and runtime eviction added by ADR-073)*
+- [ADR-073](ADR-073-excluded-tables.md) — `excluded_tables` blocklist: one `TableFilter` for both lists; checked at dispatch on written names (erring toward forwarding) and at the writer on resolved names, so a policy's or a pinned query's table is refused too; a runtime filter change evicts *(counterpart of ADR-020, whose allowlist it gives the same checks)*
 - [ADR-023](ADR-023-pinned-queries.md) — Pinned queries: pre-populate and protect from eviction
 - [ADR-026](ADR-026-request-coalescing.md) — Request coalescing for Loading-state queries
 - [ADR-031](ADR-031-materialized-query-results.md) — Materialized query results (MV tier) *(amended: off-thread builds)*

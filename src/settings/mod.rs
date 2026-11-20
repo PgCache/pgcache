@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 mod cli;
 mod dynamic;
+mod table_filter;
 mod toml_file;
 
 #[cfg(test)]
@@ -21,7 +22,8 @@ pub use dynamic::{
     DEFAULT_ADMISSION_THRESHOLD, DynamicConfig, DynamicConfigHandle, DynamicConfigPatch,
     LogReloadHandle, StaticConfigSnapshot,
 };
-pub use toml_file::{config_file_dynamic_extract, config_file_dynamic_update};
+pub use table_filter::{TableFilter, TableVerdict};
+pub use toml_file::config_file_dynamic_update;
 
 error_set! {
     ConfigError := {
@@ -209,12 +211,6 @@ impl FromStr for CachePolicy {
     }
 }
 
-/// Parsed allowlist entry: (optional schema, table name), both lowercased.
-pub type AllowlistEntry = (Option<String>, String);
-
-/// Parsed and ready-to-match allowlist. None = all tables cacheable.
-pub type Allowlist = Option<Vec<AllowlistEntry>>;
-
 pub const DEFAULT_PUBLICATION_NAME: &str = "pgcache_pub";
 pub const DEFAULT_SLOT_NAME: &str = "pgcache_slot";
 
@@ -327,6 +323,11 @@ struct SettingsToml {
     /// If omitted or empty, all tables are cacheable.
     #[serde(default)]
     allowed_tables: Option<Vec<String>>,
+    /// Never cache queries referencing these tables; wins over
+    /// `allowed_tables`. Same name forms. If omitted or empty, no table is
+    /// excluded.
+    #[serde(default)]
+    excluded_tables: Option<Vec<String>>,
     /// Queries to pin in cache at startup. Pinned queries are pre-registered,
     /// protected from eviction, and auto-readmitted after CDC invalidation.
     #[serde(default)]
@@ -360,7 +361,7 @@ pub struct PreflightSettings {
     pub origin: PgSettings,
     pub replication: PgSettings,
     pub cdc: CdcSettings,
-    pub allowed_tables: Allowlist,
+    pub table_filter: TableFilter,
 }
 
 /// What the binary was asked to do, decided by the CLI.

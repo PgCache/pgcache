@@ -20,6 +20,7 @@ use crate::cache::{CacheError, CacheResult};
 use crate::query::Fingerprint;
 use crate::query::SessionKey;
 use crate::query::keying_settings::KeyingSettings;
+use crate::settings::TableVerdict;
 use crate::timing::duration_to_ns_u64;
 
 /// Pinned queries have no client session, so their bare table names resolve
@@ -42,6 +43,22 @@ impl CacheDispatch {
         });
         for pq in pinned {
             let session_key = keying.session_key(pq.cacheable_query.tree());
+            // Dispatch would forward every read of it: do not populate it.
+            let tables = pq.cacheable_query.tree().table_names();
+            let verdict = self.dynamic.load().table_filter.references_verdict(tables);
+            match verdict {
+                TableVerdict::Cacheable => {}
+                TableVerdict::NotAllowed => {
+                    warn!(
+                        "pinned query {session_key} names a table outside allowed_tables, skipping"
+                    );
+                    continue;
+                }
+                TableVerdict::Excluded => {
+                    warn!("pinned query {session_key} names a table in excluded_tables, skipping");
+                    continue;
+                }
+            }
             let fingerprint = match self
                 .session_key_resolve(session_key, Arc::clone(&pq.cacheable_query), &keying)
                 .await

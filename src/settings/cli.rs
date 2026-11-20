@@ -13,30 +13,12 @@ use rootcause::Report;
 use super::dynamic::{DynamicConfig, DynamicConfigHandle, StaticBaseline};
 use super::toml_file::config_file_create;
 use super::{
-    Allowlist, AllowlistEntry, BoxedError, CachePolicy, CdcSettings, ConfigError, ConfigResult,
-    DEFAULT_PUBLICATION_NAME, DEFAULT_SLOT_NAME, ListenSettings, MetricsSettings, PgSettings,
-    PgSettingsPartial, PreflightSettings, RunMode, Settings, SettingsToml, SslMode,
-    StaticConfigSnapshot, toml_parse_error,
+    BoxedError, CachePolicy, CdcSettings, ConfigError, ConfigResult, DEFAULT_PUBLICATION_NAME,
+    DEFAULT_SLOT_NAME, ListenSettings, MetricsSettings, PgSettings, PgSettingsPartial,
+    PreflightSettings, RunMode, Settings, SettingsToml, SslMode, StaticConfigSnapshot, TableFilter,
+    toml_parse_error,
 };
 use crate::result::MapIntoReport;
-
-/// Parse an allowlist entry string into (optional schema, table name).
-/// Supports "table" and "schema.table" forms.
-pub(super) fn allowlist_entry_parse(entry: &str) -> AllowlistEntry {
-    let entry = entry.trim();
-    match entry.rsplit_once('.') {
-        Some((schema, table)) => (Some(schema.to_lowercase()), table.to_lowercase()),
-        None => (None, entry.to_lowercase()),
-    }
-}
-
-/// Parse config strings into a ready-to-match allowlist.
-pub(super) fn allowlist_parse(tables: &Option<Vec<String>>) -> Allowlist {
-    tables
-        .as_ref()
-        .filter(|v| !v.is_empty())
-        .map(|entries| entries.iter().map(|e| allowlist_entry_parse(e)).collect())
-}
 
 impl PgSettingsPartial {
     /// Merge with a base PgSettings, using base values for any unspecified fields.
@@ -185,13 +167,15 @@ pub(super) struct CliArgs {
     pub(super) origin_locale: bool,
 }
 
-/// CLI values for the runtime-adjustable settings ([`DynamicConfig`]).
-#[derive(Default)]
+/// CLI values for the runtime-adjustable settings ([`DynamicConfig`]). Kept
+/// after startup so a config reload resolves the file the way startup did.
+#[derive(Clone, Default)]
 pub(super) struct DynamicArgs {
     pub(super) cache_size: Option<usize>,
     pub(super) cache_policy: Option<CachePolicy>,
     pub(super) admission_threshold: Option<u32>,
     pub(super) allowed_tables: Option<String>,
+    pub(super) excluded_tables: Option<String>,
     pub(super) log_level: Option<String>,
     pub(super) mv_size_ratio: Option<u32>,
     pub(super) mv_compute_min_rows: Option<u64>,
@@ -208,6 +192,7 @@ struct DynamicToml {
     cache_policy: Option<CachePolicy>,
     admission_threshold: Option<u32>,
     allowed_tables: Option<Vec<String>>,
+    excluded_tables: Option<Vec<String>>,
     log_level: Option<String>,
     mv_size_ratio: Option<u32>,
     mv_compute_min_rows: Option<u64>,
@@ -223,6 +208,7 @@ impl DynamicToml {
             cache_policy: config.cache_policy,
             admission_threshold: config.admission_threshold,
             allowed_tables: config.allowed_tables.take(),
+            excluded_tables: config.excluded_tables.take(),
             log_level: config.log_level.clone(),
             mv_size_ratio: config.mv_size_ratio,
             mv_compute_min_rows: config.mv_compute_min_rows,
@@ -288,6 +274,7 @@ enum DynamicField {
     MemoryLimit,
     DiskLimit,
     AllowedTables,
+    ExcludedTables,
     LogLevel,
 }
 
@@ -313,6 +300,7 @@ fn flag_route(name: &str) -> Option<FlagRoute> {
         "memory_limit" => DynamicField::MemoryLimit,
         "disk_limit" => DynamicField::DiskLimit,
         "allowed_tables" => DynamicField::AllowedTables,
+        "excluded_tables" => DynamicField::ExcludedTables,
         "log_level" => DynamicField::LogLevel,
         _ => return None,
     };
@@ -531,6 +519,7 @@ impl DynamicArgs {
             DynamicField::MemoryLimit => self.memory_limit = Some(arg_parse(parser)?),
             DynamicField::DiskLimit => self.disk_limit = Some(arg_parse(parser)?),
             DynamicField::AllowedTables => self.allowed_tables = Some(arg_string(parser)?),
+            DynamicField::ExcludedTables => self.excluded_tables = Some(arg_string(parser)?),
             DynamicField::LogLevel => self.log_level = Some(arg_string(parser)?),
         }
         Ok(())
@@ -592,6 +581,16 @@ fn env_override_resolve<T: FromStr>(
 /// falls through to the default in `DynamicConfig::new`: the MV gates and
 /// memo budget to their constants, `memory_limit` to 80% of RAM, and
 /// `disk_limit` to the cache volume's free space.
+/// The runtime-adjustable settings of a config file under `flags`. Startup
+/// and a config reload both resolve through here, so a reload cannot drop
+/// what a flag set.
+pub(super) fn dynamic_config_from_file(
+    flags: &DynamicArgs,
+    config: &mut SettingsToml,
+) -> DynamicConfig {
+    dynamic_config_resolve(flags.clone(), DynamicToml::from_config(config))
+}
+
 fn dynamic_config_resolve(args: DynamicArgs, toml: DynamicToml) -> DynamicConfig {
     let cache_size = args.cache_size.or(toml.cache_size);
     cache_size_deprecation_warn(cache_size.is_some());
@@ -600,6 +599,7 @@ fn dynamic_config_resolve(args: DynamicArgs, toml: DynamicToml) -> DynamicConfig
         args.cache_policy.or(toml.cache_policy),
         args.admission_threshold.or(toml.admission_threshold),
         csv_parse(args.allowed_tables).or(toml.allowed_tables),
+        csv_parse(args.excluded_tables).or(toml.excluded_tables),
         args.log_level.or(toml.log_level),
         env_override_resolve(
             args.mv_size_ratio,
@@ -654,7 +654,7 @@ fn preflight_settings_build(
     args: CliArgs,
     config: Option<SettingsToml>,
 ) -> ConfigResult<PreflightSettings> {
-    let (origin, replication, mut cdc, allowed_tables) = match config {
+    let (origin, replication, mut cdc, allowed_tables, excluded_tables) = match config {
         Some(mut config) => {
             let origin = args.origin.merge_with(&config.origin);
             let replication =
@@ -668,7 +668,9 @@ fn preflight_settings_build(
                     .unwrap_or_else(|| config.cdc.slot_name.clone()),
             };
             let allowed = csv_parse(args.dynamic.allowed_tables).or(config.allowed_tables.take());
-            (origin, replication, cdc, allowed)
+            let excluded =
+                csv_parse(args.dynamic.excluded_tables).or(config.excluded_tables.take());
+            (origin, replication, cdc, allowed, excluded)
         }
         None => {
             let origin = args.origin.require(&ORIGIN_REQUIRED_FLAGS)?;
@@ -686,6 +688,7 @@ fn preflight_settings_build(
                 replication,
                 cdc,
                 csv_parse(args.dynamic.allowed_tables),
+                csv_parse(args.dynamic.excluded_tables),
             )
         }
     };
@@ -695,7 +698,7 @@ fn preflight_settings_build(
         origin,
         replication,
         cdc,
-        allowed_tables: allowlist_parse(&allowed_tables),
+        table_filter: TableFilter::new(allowed_tables.as_deref(), excluded_tables.as_deref()),
     })
 }
 
@@ -819,7 +822,7 @@ fn settings_build_with_config(
             POPULATION_WORKERS_MAX_ENV,
         ),
     );
-    let dynamic = dynamic_config_resolve(args.dynamic, DynamicToml::from_config(config));
+    let dynamic = dynamic_config_from_file(&args.dynamic, config);
 
     Ok(Settings {
         origin,
@@ -840,7 +843,7 @@ fn settings_build_with_config(
             .metrics_socket
             .map(|socket| MetricsSettings { socket })
             .or_else(|| config.metrics.clone()),
-        dynamic: DynamicConfigHandle::new(dynamic, config_path),
+        dynamic: DynamicConfigHandle::new(dynamic, config_path, args.dynamic),
         pinned_queries: pinned_queries_resolve(
             args.pinned_queries,
             args.pinned_tables,
@@ -863,7 +866,7 @@ fn settings_build_cli_only(args: CliArgs, statics: StaticConfigSnapshot) -> Conf
 
     // CLI-only mode: replication defaults to origin, with CLI overrides
     let replication = replication_settings_resolve(&origin, None, args.replication);
-    let dynamic = dynamic_config_resolve(args.dynamic, DynamicToml::default());
+    let dynamic = dynamic_config_resolve(args.dynamic.clone(), DynamicToml::default());
 
     let (population_workers_min, population_workers_max) = population_workers_bounds(
         num_workers,
@@ -892,7 +895,7 @@ fn settings_build_cli_only(args: CliArgs, statics: StaticConfigSnapshot) -> Conf
         tls_key: args.tls_key,
         metrics: args.metrics_socket.map(|socket| MetricsSettings { socket }),
         // No config file in CLI-only mode.
-        dynamic: DynamicConfigHandle::new(dynamic, None),
+        dynamic: DynamicConfigHandle::new(dynamic, None, args.dynamic),
         pinned_queries: pinned_queries_resolve(args.pinned_queries, args.pinned_tables, None, None),
         telemetry: telemetry_resolve(args.telemetry_off, None),
     })
@@ -985,6 +988,7 @@ impl Settings {
             [--tls_cert CERT_FILE --tls_key KEY_FILE] \n \
             [--metrics_socket IP_AND_PORT] \n \
             [--allowed_tables TABLE1,TABLE2,...] (restrict caching to these tables) \n \
+            [--excluded_tables TABLE1,TABLE2,...] (never cache queries on these tables; wins over --allowed_tables) \n \
             [--pinned_queries QUERY1;QUERY2;...] (pin queries in cache at startup, semicolon-separated) \n \
             [--pinned_tables TABLE1,TABLE2,...] (pin SELECT * FROM table for each table) \n \
             [--log_level LEVEL] (e.g., debug, info, pgcache_lib::cache=debug) \n \

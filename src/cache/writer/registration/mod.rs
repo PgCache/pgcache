@@ -189,7 +189,9 @@ fn command_histogram(cmd: &QueryCommand) -> &'static Histogram {
 /// swallowed-error scanners don't treat an expected forward as a fault. A
 /// table with no primary key surfaces as `UnknownTable` (PGC-135, the
 /// documented "forwarded silently" path); a table with inheritance children
-/// as `InheritanceParent`; a partition whose replica identity lacks the
+/// as `InheritanceParent`; a table the table filter refuses as
+/// `TableNotAllowed` or `TableExcluded`;
+/// a partition whose replica identity lacks the
 /// table's key as `PartitionIdentity`; a column collation the cache
 /// database cannot reproduce as `CollationUnavailable`; a query the resolver can't model
 /// (ambiguous self-join columns, USING/NATURAL qualifiers, etc.) as a
@@ -206,6 +208,8 @@ fn register_failure_log(key: impl std::fmt::Display, error: &CacheError) {
             | CacheError::ResolveError(_)
             | CacheError::UnknownTable { .. }
             | CacheError::InheritanceParent { .. }
+            | CacheError::TableNotAllowed { .. }
+            | CacheError::TableExcluded { .. }
             | CacheError::PartitionIdentity { .. }
             | CacheError::CollationUnavailable { .. }
             | CacheError::RlsNoContext

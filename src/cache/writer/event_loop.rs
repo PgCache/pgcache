@@ -333,6 +333,12 @@ impl WriterLoop {
                 error_chain_format(e.current_context())
             );
         }
+        if let Err(e) = core.filtered_tables_evict(EVICTION_TICK_BUDGET).await {
+            error!(
+                "evicting queries on tables the table filter refuses failed: {}",
+                error_chain_format(e.current_context())
+            );
+        }
         // Disk-pressure throttle + escalating reclaim (PGC-276).
         if let Err(e) = core.disk_pressure_handle().await {
             error!(

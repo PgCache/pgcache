@@ -546,6 +546,7 @@ fn base_toml_config() -> SettingsToml {
         memory_limit: None,
         disk_limit: None,
         allowed_tables: None,
+        excluded_tables: None,
         pinned_queries: None,
         pinned_tables: None,
         telemetry: None,
@@ -1115,6 +1116,46 @@ fn test_settings_build_pinned_tables_cli_csv() {
 }
 
 #[test]
+fn test_settings_build_excluded_tables_cli_csv() {
+    let mut args = base_cli_args();
+    args.dynamic.excluded_tables = Some("audit_logs, analytics.events".to_owned());
+
+    let settings = settings_build(args, None, None).expect("build settings");
+
+    let dynamic = settings.dynamic.load();
+    assert_eq!(
+        dynamic.excluded_tables,
+        Some(vec!["audit_logs".to_owned(), "analytics.events".to_owned()])
+    );
+    assert!(dynamic.table_filter.excludes(None, "audit_logs"));
+    assert!(dynamic.table_filter.excludes(Some("analytics"), "events"));
+    assert!(!dynamic.table_filter.excludes(Some("public"), "events"));
+    assert!(!dynamic.table_filter.has_allowlist());
+}
+
+#[test]
+fn test_settings_build_excluded_tables_cli_overrides_toml() {
+    let mut config = base_toml_config();
+    config.excluded_tables = Some(vec!["sessions".to_owned()]);
+    let from_toml =
+        settings_build(CliArgs::default(), Some(config.clone()), None).expect("build settings");
+    assert!(
+        from_toml
+            .dynamic
+            .load()
+            .table_filter
+            .excludes(None, "sessions")
+    );
+
+    let mut args = CliArgs::default();
+    args.dynamic.excluded_tables = Some("jobs".to_owned());
+    let settings = settings_build(args, Some(config), None).expect("build settings");
+    let dynamic = settings.dynamic.load();
+    assert!(dynamic.table_filter.excludes(None, "jobs"));
+    assert!(!dynamic.table_filter.excludes(None, "sessions"));
+}
+
+#[test]
 fn test_settings_build_pinned_tables_schema_qualified() {
     let mut config = base_toml_config();
     config.pinned_tables = Some(vec!["analytics.events".to_owned()]);
@@ -1186,6 +1227,7 @@ fn base_dynamic_config() -> DynamicConfig {
         Some(CachePolicy::Clock),
         Some(2),
         Some(vec!["public.users".to_owned()]),
+        Some(vec!["audit_logs".to_owned()]),
         Some("info".to_owned()),
         None,
         None,
@@ -1203,6 +1245,7 @@ fn test_config_patch_apply_empty_preserves_current() {
         cache_policy: None,
         admission_threshold: None,
         allowed_tables: None,
+        excluded_tables: None,
         log_level: None,
         mv_size_ratio: None,
         mv_compute_min_rows: None,
@@ -1215,6 +1258,8 @@ fn test_config_patch_apply_empty_preserves_current() {
     assert_eq!(result.cache_policy, CachePolicy::Clock);
     assert_eq!(result.admission_threshold, 2);
     assert_eq!(result.allowed_tables, Some(vec!["public.users".to_owned()]));
+    assert_eq!(result.excluded_tables, Some(vec!["audit_logs".to_owned()]));
+    assert_eq!(result.table_filter, current.table_filter);
     assert_eq!(result.log_level, Some("info".to_owned()));
     assert_eq!(result.mv_size_ratio, DEFAULT_MV_SIZE_RATIO);
     assert_eq!(result.mv_compute_min_rows, DEFAULT_MV_COMPUTE_MIN_ROWS);
@@ -1228,6 +1273,7 @@ fn test_config_patch_apply_set_values() {
         cache_policy: Some(CachePolicy::Fifo),
         admission_threshold: Some(5),
         allowed_tables: Some(Some(vec!["orders".to_owned()])),
+        excluded_tables: Some(Some(vec!["analytics.events".to_owned()])),
         log_level: Some(Some("debug".to_owned())),
         mv_size_ratio: Some(25),
         mv_compute_min_rows: Some(2000),
@@ -1241,6 +1287,14 @@ fn test_config_patch_apply_set_values() {
     assert_eq!(result.admission_threshold, 5);
     assert_eq!(result.memo_cache_size, 8_000_000);
     assert_eq!(result.allowed_tables, Some(vec!["orders".to_owned()]));
+    assert_eq!(
+        result.excluded_tables,
+        Some(vec!["analytics.events".to_owned()])
+    );
+    assert!(result.table_filter.allows(None, "orders"));
+    assert!(!result.table_filter.allows(None, "users"));
+    assert!(result.table_filter.excludes(Some("analytics"), "events"));
+    assert!(!result.table_filter.excludes(None, "audit_logs"));
     assert_eq!(result.log_level, Some("debug".to_owned()));
     assert_eq!(result.mv_size_ratio, 25);
     assert_eq!(result.mv_compute_min_rows, 2000);
@@ -1254,6 +1308,7 @@ fn test_config_patch_apply_unset_optional_fields() {
         cache_policy: None,
         admission_threshold: None,
         allowed_tables: Some(None),
+        excluded_tables: Some(None),
         log_level: Some(None),
         mv_size_ratio: None,
         mv_compute_min_rows: None,
@@ -1264,7 +1319,8 @@ fn test_config_patch_apply_unset_optional_fields() {
     let result = patch.apply(&current);
     assert_eq!(result.cache_size, None);
     assert_eq!(result.allowed_tables, None);
-    assert!(result.allowed_tables_parsed.is_none());
+    assert_eq!(result.excluded_tables, None);
+    assert_eq!(result.table_filter, TableFilter::default());
     assert_eq!(result.log_level, None);
 }
 
@@ -1276,7 +1332,29 @@ fn test_config_patch_json_deserialize() {
     assert_eq!(patch.admission_threshold, Some(3));
     assert!(patch.cache_policy.is_none());
     assert!(patch.allowed_tables.is_none());
+    assert!(patch.excluded_tables.is_none());
     assert!(patch.log_level.is_none());
+}
+
+/// Patching one list keeps the other in the parsed filter.
+#[test]
+fn test_config_patch_excluded_tables_keeps_the_allowlist() {
+    let current = base_dynamic_config();
+    let json = r#"{"excluded_tables": ["Sessions", "analytics.events"]}"#;
+    let patch: DynamicConfigPatch = serde_json::from_str(json).expect("parse JSON");
+    let result = patch.apply(&current);
+    assert_eq!(result.allowed_tables, Some(vec!["public.users".to_owned()]));
+    assert!(result.table_filter.allows(Some("public"), "users"));
+    assert!(result.table_filter.excludes(None, "sessions"));
+    assert!(!result.table_filter.excludes(None, "audit_logs"));
+
+    let unset: DynamicConfigPatch =
+        serde_json::from_str(r#"{"excluded_tables": null}"#).expect("parse JSON");
+    assert_eq!(unset.excluded_tables, Some(None));
+    let result = unset.apply(&result);
+    assert_eq!(result.excluded_tables, None);
+    assert!(!result.table_filter.has_exclusions());
+    assert!(result.table_filter.has_allowlist());
 }
 
 #[test]
@@ -1328,6 +1406,7 @@ socket = "127.0.0.1:6432"
         cache_policy: Some(CachePolicy::Fifo),
         admission_threshold: None,
         allowed_tables: None,
+        excluded_tables: Some(Some(vec!["audit_logs".to_owned()])),
         log_level: Some(None),
         mv_size_ratio: None,
         mv_compute_min_rows: None,
@@ -1338,11 +1417,14 @@ socket = "127.0.0.1:6432"
     config_file_dynamic_update(&path, &patch).expect("update TOML");
 
     // Re-read to verify the changes
-    let result = config_file_dynamic_extract(&path).expect("extract after update");
+    let result =
+        config_file_dynamic_extract(&path, &DynamicArgs::default()).expect("extract after update");
     assert_eq!(result.cache_size, Some(2_000_000));
     assert_eq!(result.cache_policy, CachePolicy::Fifo);
     assert_eq!(result.admission_threshold, 2); // unchanged
     assert!(result.log_level.is_none()); // unset
+    assert_eq!(result.excluded_tables, Some(vec!["audit_logs".to_owned()]));
+    assert!(result.table_filter.excludes(None, "audit_logs"));
     assert_eq!(result.allowed_tables, Some(vec!["public.users".to_owned()]));
 
     let updated = fs::read_to_string(&path).expect("read updated TOML");
@@ -1352,6 +1434,52 @@ socket = "127.0.0.1:6432"
     assert!(!updated.contains("log_level")); // removed
 
     let _ = fs::remove_file(&path);
+}
+
+/// A reload resolves the file under the startup flags: a list a flag set
+/// survives a file that does not name it, and a list the file sets is read
+/// again from the file.
+#[test]
+fn test_config_reload_keeps_what_a_flag_set() {
+    let dir = config_dir_fresh("pgcache_test_config_reload_flags");
+    fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("config.toml");
+    let file = |allowed: &str| {
+        format!(
+            "num_workers = 4\nallowed_tables = [\"{allowed}\"]\n\n\
+             [origin]\nhost = \"localhost\"\nport = 5432\nuser = \"test\"\ndatabase = \"testdb\"\n\n\
+             [cache]\nhost = \"localhost\"\nport = 5433\nuser = \"test\"\ndatabase = \"cachedb\"\n\n\
+             [cdc]\npublication_name = \"pub\"\nslot_name = \"slot\"\n\n\
+             [listen]\nsocket = \"127.0.0.1:6432\"\n"
+        )
+    };
+    fs::write(&path, file("users")).expect("write config");
+    let config: SettingsToml =
+        toml::from_str(&fs::read_to_string(&path).expect("read config")).expect("parse config");
+    let mut args = CliArgs::default();
+    args.dynamic.excluded_tables = Some("audit_logs".to_owned());
+    let settings = settings_build(args, Some(config), Some(path.clone())).expect("build settings");
+    assert!(
+        settings
+            .dynamic
+            .load()
+            .table_filter
+            .excludes(None, "audit_logs")
+    );
+
+    fs::write(&path, file("orders")).expect("rewrite config");
+    let reloaded = settings
+        .dynamic
+        .config_file_resolve(&path)
+        .expect("resolve the edited file");
+    assert_eq!(
+        reloaded.excluded_tables,
+        Some(vec!["audit_logs".to_owned()])
+    );
+    assert!(reloaded.table_filter.excludes(None, "audit_logs"));
+    assert_eq!(reloaded.allowed_tables, Some(vec!["orders".to_owned()]));
+
+    fs::remove_dir_all(&dir).expect("remove temp dir");
 }
 
 #[test]
@@ -1422,7 +1550,8 @@ fn test_config_parse_error_never_echoes_the_file() {
     fs::create_dir_all(&dir).expect("create temp dir");
     let path = dir.join("broken.toml");
     fs::write(&path, broken_password_line).expect("write test TOML");
-    let report = config_file_dynamic_extract(&path).expect_err("the file does not parse");
+    let report = config_file_dynamic_extract(&path, &DynamicArgs::default())
+        .expect_err("the file does not parse");
     let rendered = format!("{report} / {report:?}");
     assert!(rendered.contains("config file:"), "{rendered}");
     assert!(!rendered.contains("s3cret"), "{rendered}");
@@ -1474,6 +1603,7 @@ fn config_create_args() -> CliArgs {
     args.metrics_socket = Some("127.0.0.1:9090".parse().expect("valid socket addr"));
     args.dynamic.cache_policy = Some(CachePolicy::Fifo);
     args.dynamic.allowed_tables = Some("users,audit.orders".to_owned());
+    args.dynamic.excluded_tables = Some("sessions,audit.events".to_owned());
     args.pinned_queries = Some("SELECT 1;SELECT 2".to_owned());
     args.telemetry_off = true;
     args
@@ -1505,6 +1635,7 @@ fn test_config_file_create_writes_required_and_flagged_settings_only() {
         "socket = \"127.0.0.1:9090\"",
         "cache_policy = \"fifo\"",
         "allowed_tables = [\"users\", \"audit.orders\"]",
+        "excluded_tables = [\"sessions\", \"audit.events\"]",
         "pinned_queries = [\"SELECT 1\", \"SELECT 2\"]",
         "telemetry = false",
     ] {
@@ -1583,6 +1714,7 @@ fn test_config_file_create_round_trips_to_the_same_settings() {
         let (dynamic, expected) = (settings.dynamic.load(), from_flags.dynamic.load());
         assert_eq!(dynamic.cache_policy, expected.cache_policy);
         assert_eq!(dynamic.allowed_tables, expected.allowed_tables);
+        assert_eq!(dynamic.excluded_tables, expected.excluded_tables);
         assert_eq!(dynamic.admission_threshold, expected.admission_threshold);
         assert!(!settings.dynamic.restart_required());
     }

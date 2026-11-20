@@ -7,8 +7,11 @@ use arc_swap::ArcSwap;
 use serde::Deserialize;
 use serde::Serialize;
 
-use super::cli::{StaticFlags, allowlist_parse, static_settings_resolve};
-use super::{Allowlist, CachePolicy, CdcSettings, ListenSettings, PgSettings, SettingsToml};
+use super::cli::{DynamicArgs, StaticFlags, static_settings_resolve};
+use super::toml_file::config_file_dynamic_extract;
+use super::{
+    CachePolicy, CdcSettings, ConfigResult, ListenSettings, PgSettings, SettingsToml, TableFilter,
+};
 
 /// Runtime-adjustable configuration fields.
 /// Stored behind ArcSwap for lock-free reads on the hot path.
@@ -20,8 +23,10 @@ pub struct DynamicConfig {
     pub cache_policy: CachePolicy,
     pub admission_threshold: u32,
     pub allowed_tables: Option<Vec<String>>,
+    pub excluded_tables: Option<Vec<String>>,
+    /// `allowed_tables` and `excluded_tables`, parsed for matching.
     #[serde(skip)]
-    pub allowed_tables_parsed: Allowlist,
+    pub table_filter: TableFilter,
     pub log_level: Option<String>,
     /// Materialized-view size gate: a Measure-classified query is materialized
     /// iff `result_rows × mv_size_ratio ≤ source_rows` at first population.
@@ -85,6 +90,7 @@ impl DynamicConfig {
         cache_policy: Option<CachePolicy>,
         admission_threshold: Option<u32>,
         allowed_tables: Option<Vec<String>>,
+        excluded_tables: Option<Vec<String>>,
         log_level: Option<String>,
         mv_size_ratio: Option<u32>,
         mv_compute_min_rows: Option<u64>,
@@ -96,8 +102,9 @@ impl DynamicConfig {
             cache_size,
             cache_policy: cache_policy.unwrap_or_default(),
             admission_threshold: admission_threshold.unwrap_or(DEFAULT_ADMISSION_THRESHOLD),
-            allowed_tables_parsed: allowlist_parse(&allowed_tables),
+            table_filter: TableFilter::new(allowed_tables.as_deref(), excluded_tables.as_deref()),
             allowed_tables,
+            excluded_tables,
             log_level,
             mv_size_ratio: mv_size_ratio.unwrap_or(DEFAULT_MV_SIZE_RATIO),
             mv_compute_min_rows: mv_compute_min_rows.unwrap_or(DEFAULT_MV_COMPUTE_MIN_ROWS),
@@ -144,6 +151,8 @@ pub struct DynamicConfigHandle {
     config_path: Option<Arc<PathBuf>>,
     log_reload: Arc<Mutex<Option<LogReloadHandle>>>,
     pub(super) static_baseline: Option<Arc<StaticBaseline>>,
+    /// The flags the running dynamic config was resolved under.
+    dynamic_flags: Arc<DynamicArgs>,
 }
 
 impl Clone for DynamicConfigHandle {
@@ -153,6 +162,7 @@ impl Clone for DynamicConfigHandle {
             config_path: self.config_path.clone(),
             log_reload: Arc::clone(&self.log_reload),
             static_baseline: self.static_baseline.clone(),
+            dynamic_flags: Arc::clone(&self.dynamic_flags),
         }
     }
 }
@@ -168,13 +178,25 @@ impl fmt::Debug for DynamicConfigHandle {
 
 impl DynamicConfigHandle {
     /// The static baseline is set by `settings_build` once the settings exist.
-    pub(super) fn new(config: DynamicConfig, config_path: Option<PathBuf>) -> Self {
+    pub(super) fn new(
+        config: DynamicConfig,
+        config_path: Option<PathBuf>,
+        dynamic_flags: DynamicArgs,
+    ) -> Self {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(config)),
             config_path: config_path.map(Arc::new),
             log_reload: Arc::new(Mutex::new(None)),
             static_baseline: None,
+            dynamic_flags: Arc::new(dynamic_flags),
         }
+    }
+
+    /// The dynamic settings a restart would run with: the config file at
+    /// `path` as it stands now, under the flags and environment pgcache
+    /// started with.
+    pub fn config_file_resolve(&self, path: &Path) -> ConfigResult<DynamicConfig> {
+        config_file_dynamic_extract(path, &self.dynamic_flags)
     }
 
     /// Lock-free read of current dynamic config. Hot path.
@@ -239,6 +261,9 @@ impl DynamicConfigHandle {
     pub fn update(&self, new: DynamicConfig) {
         let old = self.inner.load();
         let log_changed = old.log_level != new.log_level;
+        if old.table_filter != new.table_filter {
+            new.table_filter.conflicts_warn();
+        }
         let new_log_level = new.log_level.clone();
         self.inner.store(Arc::new(new));
         if log_changed {
@@ -250,8 +275,11 @@ impl DynamicConfigHandle {
     #[cfg(test)]
     pub fn test_default() -> Self {
         Self::new(
-            DynamicConfig::new(None, None, None, None, None, None, None, None, None, None),
+            DynamicConfig::new(
+                None, None, None, None, None, None, None, None, None, None, None,
+            ),
             None,
+            DynamicArgs::default(),
         )
     }
 }
@@ -259,7 +287,8 @@ impl DynamicConfigHandle {
 /// Partial update for dynamic config fields via PUT /config.
 /// None = don't change, Some(None) = unset to default, Some(Some(v)) = set to v.
 ///
-/// For nullable fields (cache_size, allowed_tables, log_level), JSON `null`
+/// For nullable fields (cache_size, allowed_tables, excluded_tables,
+/// log_level), JSON `null`
 /// means "unset" (Some(None)), absent means "don't change" (None).
 #[derive(Debug, Clone, Deserialize)]
 pub struct DynamicConfigPatch {
@@ -271,6 +300,8 @@ pub struct DynamicConfigPatch {
     pub admission_threshold: Option<u32>,
     #[serde(default, deserialize_with = "deserialize_double_option")]
     pub allowed_tables: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub excluded_tables: Option<Option<Vec<String>>>,
     #[serde(default, deserialize_with = "deserialize_double_option")]
     pub log_level: Option<Option<String>>,
     #[serde(default)]
@@ -297,10 +328,14 @@ where
 impl DynamicConfigPatch {
     /// Merge this patch into an existing config, producing a new DynamicConfig.
     pub fn apply(&self, current: &DynamicConfig) -> DynamicConfig {
-        let allowlist_changed = self.allowed_tables.is_some();
+        let filter_changed = self.allowed_tables.is_some() || self.excluded_tables.is_some();
         let allowed_tables = match &self.allowed_tables {
             Some(v) => v.clone(),
             None => current.allowed_tables.clone(),
+        };
+        let excluded_tables = match &self.excluded_tables {
+            Some(v) => v.clone(),
+            None => current.excluded_tables.clone(),
         };
         DynamicConfig {
             cache_size: match self.cache_size {
@@ -311,12 +346,13 @@ impl DynamicConfigPatch {
             admission_threshold: self
                 .admission_threshold
                 .unwrap_or(current.admission_threshold),
-            allowed_tables_parsed: if allowlist_changed {
-                allowlist_parse(&allowed_tables)
+            table_filter: if filter_changed {
+                TableFilter::new(allowed_tables.as_deref(), excluded_tables.as_deref())
             } else {
-                current.allowed_tables_parsed.clone()
+                current.table_filter.clone()
             },
             allowed_tables,
+            excluded_tables,
             log_level: match &self.log_level {
                 Some(v) => v.clone(),
                 None => current.log_level.clone(),

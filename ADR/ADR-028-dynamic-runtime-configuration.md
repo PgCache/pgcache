@@ -12,7 +12,7 @@ A subset of settings can safely change at runtime (cache behavior, log level), w
 Split `Settings` into dynamic and static fields, expose the dynamic subset through an HTTP admin API, and keep the TOML file authoritative.
 
 ### Dynamic vs Static Split
-Dynamic fields (runtime-adjustable): `cache_size`, `cache_policy`, `admission_threshold`, `allowed_tables`, `log_level`. These are read on every query dispatch or eviction check and affect in-memory behavior only.
+Dynamic fields (runtime-adjustable): `cache_policy`, `admission_threshold`, `allowed_tables`, `excluded_tables`, `log_level`, `mv_size_ratio`, `mv_compute_min_rows`, `memo_cache_size`, `memory_limit`, `disk_limit` (and the deprecated, ignored `cache_size`). These are read where they are used, on query dispatch, registration or the writer's tick, and need no process-level resource rebuilt.
 
 Static fields (restart-required): DB connections, CDC settings, listen/metrics addresses, worker count, TLS cert paths, pinned queries, telemetry flag. These are bound to process-level resources or startup-only registration.
 
@@ -22,14 +22,14 @@ Dynamic config is stored in an `Arc<ArcSwap<DynamicConfig>>` held by a cloneable
 ### HTTP Admin API
 Three endpoints added to the existing admin server:
 - `GET /config` — returns current effective dynamic config and a `restart_required` flag indicating whether static fields in the file have drifted from the running process
-- `PUT /config` — accepts a partial `DynamicConfigPatch`, writes it to the TOML file (format-preserving), re-reads the file, and swaps the new config in
-- `POST /config/reload` — re-reads the TOML file and swaps dynamic fields (for file-based IaC that edits the TOML directly)
+- `PUT /config` — accepts a partial `DynamicConfigPatch`, writes it to the TOML file (format-preserving) when there is one, applies it to the running config, and swaps the result in
+- `POST /config/reload` — re-reads the TOML file, resolves its dynamic fields under the startup flags and environment as startup did, and swaps them in (for file-based IaC that edits the TOML directly)
 
 ### TOML File as Source of Truth
-All `PUT /config` changes go through the file. `toml_edit` performs a format-preserving read-modify-write on the TOML document, then the file is re-parsed to produce the new `DynamicConfig`. This keeps the file authoritative: a restart reads the same effective config, and version-controlled config files retain comments and ordering.
+All `PUT /config` changes go through the file. `toml_edit` performs a format-preserving read-modify-write on the TOML document, and the same patch is applied to the running `DynamicConfig`; a failed file write refuses the change. This keeps the file authoritative: a restart reads the same effective config, and version-controlled config files retain comments and ordering.
 
 ### Static Drift Detection
-A `StaticConfigSnapshot` is captured at startup and stored on the handle. `GET /config` compares it against a fresh parse of the TOML file; if any static field differs, the response sets `restart_required: true`. This tells operators when a file edit will only take effect after restart.
+A `StaticConfigSnapshot` is captured at startup and stored on the handle with the flags it was resolved under. `GET /config` resolves the TOML file as it stands under those flags and compares; if any static field differs, the response sets `restart_required: true`. This tells operators when a file edit will only take effect after restart.
 
 ### Dynamic Log Level via Reload Layer
 Logging uses `tracing_subscriber::reload::Layer` instead of a static `EnvFilter`. A type-erased reload function is stored on the handle; when `log_level` changes, the filter is swapped in-place.
@@ -58,6 +58,6 @@ Logging uses `tracing_subscriber::reload::Layer` instead of a static `EnvFilter`
 - The admin API currently has no authentication; production deployments must rely on bind-address isolation
 
 ## Implementation Notes
-- `DynamicConfig`, `DynamicConfigHandle`, `DynamicConfigPatch`, `StaticConfigSnapshot`, and the TOML read-modify-write functions live in `src/settings.rs` (rather than a separate `src/config.rs`) since they are an extension of the existing settings module
-- HTTP handlers (`config_get_handle`, `config_put_handle`, `config_reload_handle`) live in `src/metrics.rs` alongside the existing admin server endpoints
-- `LogReloadHandle` in `src/settings.rs` holds type-erased closures over the tracing reload handle, keeping the `tracing_subscriber` types out of the settings module's public API
+- `DynamicConfig`, `DynamicConfigHandle`, `DynamicConfigPatch` and `StaticConfigSnapshot` live in `src/settings/dynamic.rs`, and the TOML read-modify-write functions in `src/settings/toml_file.rs`, as an extension of the settings module
+- HTTP handlers (`config_get_handle`, `config_put_handle`, `config_reload_handle`) live in `src/admin.rs` with the other admin server endpoints
+- `LogReloadHandle` in `src/settings/dynamic.rs` holds type-erased closures over the tracing reload handle, keeping the `tracing_subscriber` types out of the settings module's public API

@@ -38,7 +38,7 @@ use crate::pg::Lsn;
 use crate::pg::cdc::MESSAGE_PREFIX;
 use crate::pg::protocol::ByteString;
 use crate::query::{Fingerprint, FingerprintSet};
-use crate::settings::{PgSettings, Settings};
+use crate::settings::{PgSettings, Settings, TableFilter};
 
 /// Deterministic fault injection for the restart supervisor: kill the writer on
 /// a sentinel CDC insert so a test can drive a real subsystem death → rebuild.
@@ -421,6 +421,8 @@ pub(super) struct WriterCore {
     /// The writer connection's resolved search_path: what `pg_get_expr`
     /// deparses a policy's table names under.
     pub(super) origin_search_path: Arc<[EcoString]>,
+    /// The table filter `filtered_tables_evict` last finished acting on.
+    pub(super) table_filter_applied: TableFilter,
 }
 
 /// Whether a parked population (a queued merge or a gated ready entry) at
@@ -623,6 +625,7 @@ impl WriterCore {
             collation_verdicts: RefCell::new(HashMap::new()),
             function_presence: HashSet::new(),
             origin_search_path,
+            table_filter_applied: settings.dynamic.load().table_filter.clone(),
         };
         core.rls_startup_load()
             .await

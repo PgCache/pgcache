@@ -1,6 +1,10 @@
 use std::io::Error;
+use std::time::Duration;
 
-use crate::util::{TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, metrics_delta};
+use crate::util::{
+    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, connect_cache_db, http_put,
+    metrics_delta, query_warm,
+};
 
 mod util;
 
@@ -282,5 +286,114 @@ async fn test_no_allowlist_allows_all_tables() -> Result<(), Error> {
     );
     let _ = m;
 
+    Ok(())
+}
+
+/// Whether the cache database holds a table of this name.
+async fn cache_table_exists(ctx: &TestContext, name: &str) -> Result<bool, Error> {
+    let cache_db = connect_cache_db(&ctx.dbs).await?;
+    let row = cache_db
+        .query_one(
+            "SELECT count(*) FROM pg_tables WHERE tablename = $1",
+            &[&name],
+        )
+        .await
+        .map_err(Error::other)?;
+    let count: i64 = row.try_get(0).map_err(Error::other)?;
+    Ok(count > 0)
+}
+
+/// A pinned query on a table outside the allowlist is skipped at startup:
+/// it would be populated and maintained without ever being served.
+#[tokio::test]
+async fn test_allowlist_pinned_table_outside_it_is_not_cached() -> Result<(), Error> {
+    let pinned = "SELECT id, name FROM pin_other";
+    let mut ctx = TestContext::setup_before_start_with_args(
+        |origin| async move {
+            for sql in [
+                "CREATE TABLE pin_other (id int primary key, name text)",
+                "INSERT INTO pin_other VALUES (1, 'ann')",
+            ] {
+                origin.execute(sql, &[]).await.map_err(Error::other)?;
+            }
+            Ok(origin)
+        },
+        &[
+            "--pinned_queries",
+            pinned,
+            "--allowed_tables",
+            "allowed_table",
+        ],
+    )
+    .await?;
+    ctx.cache_settle().await?;
+
+    assert!(!cache_table_exists(&ctx, "pin_other").await?);
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(pinned).await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("name", "ann")])?;
+    let after = ctx.metrics_after_outcomes(&m, 1).await?;
+    let delta = metrics_delta(&m, &after);
+    assert_eq!(delta.queries_allowlist_skipped, 1);
+    assert_eq!(delta.queries_cache_hit, 0);
+    Ok(())
+}
+
+/// Narrowing the allowlist at runtime forwards the reads of a table that
+/// left it at once and evicts the queries cached on it; widening it again
+/// caches the table from origin's current rows.
+#[tokio::test]
+async fn test_allowlist_narrowed_at_runtime_evicts_cached_queries() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    let timeout = Duration::from_secs(10);
+    for sql in [
+        "CREATE TABLE sessions (id int primary key, state text)",
+        "CREATE TABLE users (id int primary key, name text)",
+        "INSERT INTO sessions VALUES (1, 'open')",
+        "INSERT INTO users VALUES (1, 'ann')",
+    ] {
+        ctx.query(sql, &[]).await?;
+    }
+    let sessions_read = "SELECT * FROM sessions WHERE id = 1";
+    query_warm(&mut ctx, sessions_read).await?;
+    query_warm(&mut ctx, "SELECT * FROM users WHERE id = 1").await?;
+
+    let (status, body) = http_put(
+        ctx.metrics_port,
+        "/config",
+        r#"{"allowed_tables": ["users"]}"#,
+    )
+    .await?;
+    assert_eq!(status, 200, "body: {body}");
+
+    let m = ctx.metrics().await?;
+    ctx.simple_query(sessions_read).await?;
+    let after = ctx.metrics_after_outcomes(&m, 1).await?;
+    let delta = metrics_delta(&m, &after);
+    assert_eq!(delta.queries_allowlist_skipped, 1);
+    assert_eq!(delta.queries_cache_hit, 0);
+    // The writer evicts the entry on its next tick; the allowed table's stays.
+    ctx.queries_registered_wait(1, timeout).await?;
+    let m = ctx.metrics().await?;
+    ctx.simple_query("SELECT * FROM users WHERE id = 1").await?;
+    assert_cache_hit(&mut ctx, m).await?;
+
+    // A write the cache no longer follows.
+    ctx.query("UPDATE sessions SET state = 'closed' WHERE id = 1", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+
+    let (status, body) =
+        http_put(ctx.metrics_port, "/config", r#"{"allowed_tables": null}"#).await?;
+    assert_eq!(status, 200, "body: {body}");
+
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(sessions_read).await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("state", "closed")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+    let res = ctx.simple_query(sessions_read).await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("state", "closed")])?;
+    assert_cache_hit(&mut ctx, m).await?;
     Ok(())
 }

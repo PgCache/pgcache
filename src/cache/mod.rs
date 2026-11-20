@@ -278,6 +278,18 @@ error_set! {
             schema: EcoString,
             name: EcoString,
         },
+        /// The table is outside `allowed_tables`.
+        #[display("table {schema}.{name} is not in the table allowlist")]
+        TableNotAllowed {
+            schema: EcoString,
+            name: EcoString,
+        },
+        /// The table is in `excluded_tables`.
+        #[display("table {schema}.{name} is excluded from caching")]
+        TableExcluded {
+            schema: EcoString,
+            name: EcoString,
+        },
         /// A partition's replica identity does not carry the table's key:
         /// its updates and deletes stream without the columns that find the
         /// cached row.

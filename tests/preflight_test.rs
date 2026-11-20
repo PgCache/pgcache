@@ -150,6 +150,15 @@ async fn test_check_reports_every_defect_on_unprepared_origin() -> Result<(), Er
     assert!(report.contains("  PASS  row-level security"), "{report}");
     assert!(report.contains("  PASS  views"), "{report}");
     assert!(report.contains("  WARN  primary keys"), "{report}");
+
+    // Excluded tables are out of scope too: without `logs` and the view,
+    // neither the primary-key nor the view warning is left.
+    let (ok, report) = check_run(&db, &["--excluded_tables", "logs,recent_logs"])?;
+    assert!(!ok, "wal_level still fails:\n{report}");
+    assert!(report.contains("  PASS  primary keys"), "{report}");
+    assert!(report.contains("  PASS  views"), "{report}");
+    assert!(!report.contains("public.logs"), "{report}");
+    assert!(report.contains("public.tenants"), "{report}");
     Ok(())
 }
 

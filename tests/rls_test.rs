@@ -991,6 +991,76 @@ async fn test_policy_alias_shadowing_the_query_alias_keeps_the_correlation() -> 
     Ok(())
 }
 
+/// `tenant_docs` under a policy that reads `memberships`, started with
+/// `args` naming a table filter that refuses `memberships`. The client
+/// query never names that table, so the proxy's check passes; the writer
+/// refuses the registration once the policy is inlined, each read forwards
+/// under the `skipped` counter, and the table gets no cache table.
+async fn policy_table_refused_assert(
+    args: &[&str],
+    skipped: impl Fn(&MetricsSnapshot) -> u64,
+) -> Result<(), Error> {
+    let mut ctx = TestContext::setup_with_args(args).await?;
+    for sql in [
+        "CREATE TABLE tenant_docs (id int primary key, tenant int, body text)",
+        "INSERT INTO tenant_docs VALUES (1, 1, 'a'), (2, 2, 'b'), (3, 1, 'c')",
+        "CREATE TABLE memberships (user_name text primary key, tenant int)",
+        "INSERT INTO memberships VALUES ('alice', 1), ('bob', 2)",
+        "CREATE ROLE alice LOGIN",
+        "GRANT SELECT ON tenant_docs, memberships TO alice",
+        "ALTER TABLE tenant_docs ENABLE ROW LEVEL SECURITY",
+        "CREATE POLICY by_membership ON tenant_docs FOR SELECT USING (EXISTS ( \
+             SELECT 1 FROM memberships m \
+             WHERE m.user_name = current_user AND m.tenant = tenant_docs.tenant))",
+    ] {
+        ctx.origin_query(sql, &[]).await?;
+    }
+    ctx.cdc_apply_settle().await?;
+    let sql = "SELECT id, body FROM tenant_docs ORDER BY id";
+
+    let (alice, origin_alice) = sessions_as(&ctx, "alice", None).await?;
+    for _ in 0..2 {
+        let before = ctx.metrics().await?;
+        let served = rows(&alice, sql).await?;
+        let after = ctx.metrics_after_outcomes(&before, 1).await?;
+        let delta = metrics_delta(&before, &after);
+        assert_eq!(skipped(&delta), 1);
+        assert_eq!(delta.queries_cache_hit, 0);
+        assert_eq!(served, vec![row("1", "a"), row("3", "c")]);
+        assert_eq!(served, rows(&origin_alice, sql).await?);
+    }
+
+    let cache_db = connect_cache_db(&ctx.dbs).await?;
+    let cached = cache_db
+        .query_one(
+            "SELECT count(*) FROM pg_tables WHERE tablename = 'memberships'",
+            &[],
+        )
+        .await
+        .map_err(Error::other)?;
+    assert_eq!(cached.get::<_, i64>(0), 0, "memberships has a cache table");
+    Ok(())
+}
+
+/// A policy's own table is in `excluded_tables`: the read forwards.
+#[tokio::test]
+async fn test_policy_over_an_excluded_table_forwards() -> Result<(), Error> {
+    policy_table_refused_assert(&["--excluded_tables", "memberships"], |delta| {
+        delta.queries_excluded_skipped
+    })
+    .await
+}
+
+/// A policy's own table is outside `allowed_tables`: the read forwards,
+/// though the table the client query names is allowed.
+#[tokio::test]
+async fn test_policy_over_a_table_outside_the_allowlist_forwards() -> Result<(), Error> {
+    policy_table_refused_assert(&["--allowed_tables", "tenant_docs"], |delta| {
+        delta.queries_allowlist_skipped
+    })
+    .await
+}
+
 /// A policy's function call is deparsed bare when the writer connection's
 /// search_path reaches it; the inlined call means that function for a
 /// session whose own path does not reach it, so the read is cached rather

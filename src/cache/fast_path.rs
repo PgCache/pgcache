@@ -1,8 +1,7 @@
 //! Shared cache-dispatch helpers.
 //!
 //! These functions are the building blocks of [`CacheDispatch::query_dispatch`]:
-//! the allowlist check, the hit-path mutations (metrics, CLOCK bit), and the MV
-//! serve decision. They operate on the `Send` shared state ([`CacheStateView`])
+//! the hit-path mutations (metrics, CLOCK bit) and the MV serve decision. They operate on the `Send` shared state ([`CacheStateView`])
 //! and are factored out so the dispatch logic stays readable.
 
 use std::num::NonZeroU64;
@@ -18,8 +17,7 @@ use super::{
     types::CacheStateView,
 };
 use crate::query::Fingerprint;
-use crate::query::ast::rope::QueryTree;
-use crate::settings::{Allowlist, CachePolicy};
+use crate::settings::CachePolicy;
 use crate::timing::duration_to_ns_u64;
 
 /// MV serve decision.
@@ -30,30 +28,6 @@ pub(crate) enum MvDecision {
     NeedsSchedule {
         has_table: bool,
     },
-}
-
-/// Check whether all tables in the query are in the allowlist. Returns true if
-/// no allowlist is configured (all tables allowed).
-pub(crate) fn query_allowlist_check(allowlist: &Allowlist, query: &QueryTree) -> bool {
-    let Some(entries) = allowlist else {
-        return true;
-    };
-    // Allowed iff every table matches an allowlist entry. Entries are
-    // lowercased at parse time; match without allocating a lowercased copy
-    // of each table/schema name on this serve-path walk.
-    query.table_names().all(|(schema, name)| {
-        entries.iter().any(|(ws, wt)| {
-            eq_lowercased(wt, name)
-                && match ws {
-                    Some(ws) => schema.is_some_and(|s| eq_lowercased(ws, s)),
-                    None => true,
-                }
-        })
-    })
-}
-
-fn eq_lowercased(lowered: &str, raw: &str) -> bool {
-    lowered.chars().eq(raw.chars().flat_map(char::to_lowercase))
 }
 
 /// Record a cache hit in the shared view: bump the GC hit counter and the

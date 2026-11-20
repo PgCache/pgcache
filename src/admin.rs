@@ -14,8 +14,7 @@ use crate::cache::StatusRequest;
 use crate::listener::admin_listener_bind;
 use crate::proxy::{SharedProxyStatus, StatusSender};
 use crate::settings::{
-    DynamicConfig, DynamicConfigHandle, DynamicConfigPatch, config_file_dynamic_extract,
-    config_file_dynamic_update,
+    DynamicConfig, DynamicConfigHandle, DynamicConfigPatch, config_file_dynamic_update,
 };
 
 /// Spawn the admin HTTP server thread.
@@ -252,7 +251,7 @@ async fn config_reload_handle(
         return json_error(400, "no config file path available");
     };
 
-    match config_file_dynamic_extract(path) {
+    match dynamic.config_file_resolve(path) {
         Ok(new_config) => {
             dynamic.update(new_config);
             config_response(dynamic)

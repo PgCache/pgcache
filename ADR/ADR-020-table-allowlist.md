@@ -18,7 +18,7 @@ Add an optional table allowlist (`allowed_tables`) that restricts caching to que
 allowed_tables = ["settings", "products", "inventory.categories"]
 ```
 
-Also available as `--allowed_tables TABLE1,TABLE2,...` on the CLI. When omitted or empty, all tables are cacheable (backward compatible default).
+Also available as `--allowed_tables TABLE1,TABLE2,...` on the CLI and through `PUT /config` (ADR-028). When omitted or empty, all tables are cacheable (backward compatible default).
 
 ### Schema Qualification
 
@@ -28,18 +28,19 @@ Each allowlist entry is parsed into `(Option<schema>, table)`:
 
 Matching is case-insensitive. Both the allowlist entries and query table references are lowercased before comparison.
 
-### Enforcement Point
+### Enforcement Points
 
-The check runs at the top of `QueryCache::query_dispatch()` in `query_cache.rs`, before any state machine logic. This keeps the allowlist concern in the cache coordinator where admission decisions are already made, avoids threading allowlist state through proxy code, and prevents non-allowlisted queries from creating entries in `CacheStateView`.
+The allowlist is one half of the table filter (`TableFilter`, ADR-073), checked in two places:
 
-Table references are extracted via `QueryExpr::nodes::<TableNode>()`, which traverses the full AST including FROM clause tables, JOINs, CTE bodies, and subqueries in both WHERE clauses and SELECT lists. A query like `SELECT * FROM allowlisted WHERE EXISTS (SELECT 1 FROM non_allowlisted)` is correctly rejected.
+- **At dispatch**, on every request, before the query's identity is resolved: against the table names the query writes, anywhere in its tree (FROM, joins, CTE bodies, subqueries). A query like `SELECT * FROM allowlisted WHERE EXISTS (SELECT 1 FROM non_allowlisted)` is forwarded. A reference that names no schema is admitted only by an entry that names none, since where it resolves is not known there.
+- **At the writer**, where a query's cache tables are ensured: against the tables by the schema they resolved to. This refuses what dispatch cannot see, a row-level security policy's own tables (ADR-062) and a pinned query, before the table gets a cache table.
 
-### Admission, Not Retention
+### Retention
 
-The allowlist gates admission only. Queries already cached when the allowlist is changed remain in the cache until naturally evicted or invalidated by CDC. This simplifies the implementation and avoids disrupting active cache entries.
+A table that leaves the allowlist at runtime is forwarded at once by the dispatch check, and on its next tick the writer evicts the queries cached on it, which takes the table out of the publication and drops its cache table. Originally the allowlist gated admission only and left such entries to natural eviction; they were never served again but stayed maintained by CDC, and an entry reaching the table only through a policy stayed served.
 
 ## Rationale
-- **Coordinator-level check** is the simplest place to enforce the allowlist — `query_dispatch()` is the single entry point for all cacheable queries, so one check covers all paths
+- **Dispatch-level check** forwards a refused query without a writer round trip; the writer check covers the tables a query reaches without naming them
 - **All-tables-must-match** semantics prevent partial caching of join queries where one side shouldn't be cached
 - **Case-insensitive matching** with optional schema qualification handles the most common PostgreSQL naming patterns without requiring users to know the exact schema for every table
 - **Backward compatible default** (no allowlist = all tables cacheable) means existing deployments are unaffected
@@ -54,10 +55,9 @@ The allowlist gates admission only. Queries already cached when the allowlist is
 ### Negative
 - Users must manually maintain the allowlist as their caching needs evolve
 - No wildcard or pattern matching — each table must be listed explicitly
-- Runtime updates are not yet implemented; changing the allowlist currently requires a restart
+- A schema-qualified entry does not admit an unqualified reference; the query must qualify the name to be cached
 
 ## Implementation Notes
-- Config: `allowed_tables: Option<Vec<String>>` in `Settings` / `SettingsToml` (`src/settings.rs`)
-- Allowlist parsing and checking: `allowlist_parse()`, `query_allowlist_check()` in `src/cache/query_cache.rs`
-- Metric: `pgcache.queries.allowlist_skipped` counter incremented for each rejected query (`src/metrics.rs`)
-- Startup log at `info` level reports the configured allowlist or "all tables cacheable"
+- Config: `allowed_tables` in `SettingsToml` and `DynamicConfig`; parsing and matching in `TableFilter` (`src/settings/table_filter.rs`), shared with `excluded_tables` (ADR-073)
+- Metric: `pgcache.queries.allowlist_skipped` counts each refused read, at dispatch and at the writer (`CacheError::TableNotAllowed`)
+- Startup log at `info` level reports the configured allowlist or "all tables cacheable"; an entry `excluded_tables` cancels is warned of

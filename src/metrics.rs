@@ -40,7 +40,13 @@ pub mod names {
     pub const QUERIES_CACHE_HIT: &str = "pgcache.queries.cache_hit";
     pub const QUERIES_CACHE_MISS: &str = "pgcache.queries.cache_miss";
     pub const QUERIES_CACHE_ERROR: &str = "pgcache.queries.cache_error";
+    /// Reads forwarded because a table is outside `allowed_tables`; counted
+    /// at dispatch and at registration like `QUERIES_EXCLUDED_SKIPPED`.
     pub const QUERIES_ALLOWLIST_SKIPPED: &str = "pgcache.queries.allowlist_skipped";
+    /// Reads forwarded because a table is in `excluded_tables`: at dispatch
+    /// on the names the query writes, and at registration on the tables
+    /// they resolve to.
+    pub const QUERIES_EXCLUDED_SKIPPED: &str = "pgcache.queries.excluded_skipped";
     /// Registrations refused because a table has row-level security enabled
     /// (PGC-112); each such read forwards.
     pub const QUERIES_RLS_SKIPPED: &str = "pgcache.queries.rls_skipped";
@@ -669,6 +675,7 @@ pub struct QueryHandles {
     pub cache_miss: Counter,
     pub cache_error: Counter,
     pub allowlist_skipped: Counter,
+    pub excluded_skipped: Counter,
     pub rls_skipped: Counter,
     pub privilege_forward_pending: Counter,
     pub privilege_forward_denied: Counter,
@@ -690,9 +697,9 @@ impl QueryHandles {
         use names::{
             CACHE_QUERY_LATENCY_SECONDS, ORIGIN_EXECUTION_SECONDS, ORIGIN_QUERY_LATENCY_SECONDS,
             QUERIES_ALLOWLIST_SKIPPED, QUERIES_CACHE_ERROR, QUERIES_CACHE_HIT, QUERIES_CACHE_MISS,
-            QUERIES_CACHEABLE, QUERIES_FUNCTION_FORWARDS, QUERIES_INVALID,
-            QUERIES_PRIVILEGE_FORWARDS, QUERIES_RLS_FORWARDS, QUERIES_RLS_SKIPPED, QUERIES_TOTAL,
-            QUERIES_UNCACHEABLE, QUERIES_UNSUPPORTED,
+            QUERIES_CACHEABLE, QUERIES_EXCLUDED_SKIPPED, QUERIES_FUNCTION_FORWARDS,
+            QUERIES_INVALID, QUERIES_PRIVILEGE_FORWARDS, QUERIES_RLS_FORWARDS, QUERIES_RLS_SKIPPED,
+            QUERIES_TOTAL, QUERIES_UNCACHEABLE, QUERIES_UNSUPPORTED,
         };
         Self {
             total: metrics::counter!(QUERIES_TOTAL),
@@ -704,6 +711,7 @@ impl QueryHandles {
             cache_miss: metrics::counter!(QUERIES_CACHE_MISS),
             cache_error: metrics::counter!(QUERIES_CACHE_ERROR),
             allowlist_skipped: metrics::counter!(QUERIES_ALLOWLIST_SKIPPED),
+            excluded_skipped: metrics::counter!(QUERIES_EXCLUDED_SKIPPED),
             rls_skipped: metrics::counter!(QUERIES_RLS_SKIPPED),
             privilege_forward_pending: metrics::counter!(QUERIES_PRIVILEGE_FORWARDS, "reason" => "pending"),
             privilege_forward_denied: metrics::counter!(QUERIES_PRIVILEGE_FORWARDS, "reason" => "denied"),
